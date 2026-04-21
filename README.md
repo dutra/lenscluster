@@ -1,57 +1,66 @@
-# Playground Cluster-Solver Workflow
+# Lenscluster Workflow
 
-`playground` is the local sandbox for runnable `lenstronomy` experiments, prototypes, and one-off utilities. The current main workflow is the MACS0416 cluster-solver pipeline driven by [`playground/run.xsh`](/home/dutra/dev/lenstronomy/playground/run.xsh), which orchestrates staged runs of [`playground.cluster_solver`](/home/dutra/dev/lenstronomy/playground/cluster_solver.py).
+This repository currently centers on the staged MACS0416 cluster-solver workflow driven by [`run.xsh`](/home/dutra/dev/lenscluster/run.xsh). The script orchestrates runs of [`cluster_solver.py`](/home/dutra/dev/lenscluster/cluster_solver.py) with a small set of named stages.
 
-## Prerequisites
+## Repository Layout
 
-- Use the required interpreter for standard project runs:
-  `/home/dutra/.conda/envs/lenstronomy/bin/python`
-- Run commands from the repository root: `/home/dutra/dev/lenstronomy`
-- The current runner assumes JAX CPU execution with:
-  `JAX_NUM_CPU_DEVICES=30`
-- Some stages also set:
-  `XLA_FLAGS=--xla_force_host_platform_device_count=30`
+- [`run.xsh`](/home/dutra/dev/lenscluster/run.xsh): authoritative staged runner
+- [`cluster_solver.py`](/home/dutra/dev/lenscluster/cluster_solver.py): main CLI entrypoint
+- [`data/M0416_Bergamini22/Bergamini22_MACS0416.par`](/home/dutra/dev/lenscluster/data/M0416_Bergamini22/Bergamini22_MACS0416.par): active input model
+- `plots/`: run outputs
 
-## Current Experiment Configuration
+## Current `run.xsh` Configuration
 
-The committed [`run.xsh`](/home/dutra/dev/lenstronomy/playground/run.xsh) is currently configured as:
+The committed runner is currently configured as:
 
-```text
+```python
 profile_variant = "original"
-PAR_PATH = playground/M0416_Bergamini22/Bergamini22_MACS0416.par
-OUTPUT_DIR = plots/m0416_original
-STAGE1_RUN_DIR = plots/m0416_original/large
-SMC_RUN_DIR = plots/m0416_original/exp_blackjax_smc_gpu
-stages = ['large', 'ranked']
+OUTPUT_DIR = "plots/m0416_original"
+PAR_PATH = "data/M0416_Bergamini22/Bergamini22_MACS0416.par"
+STAGE1_RUN_DIR = "plots/m0416_original/large"
+SMC_RUN_DIR = "plots/m0416_original/exp_blackjax_smc_gpu"
+stages = ["large", "ranked"]
 active_scaling_galaxies = [-1]
 ```
 
-This means the default run executes:
+That means the default run executes:
 
-- `large`: a large-scale-halo reference fit
-- `ranked`: a small-only fit seeded from the saved `large` run
+- `large`: large-only reference fit
+- `ranked`: small-only run initialized from the saved `large` stage
 
-The same file also contains two optional experimental stages:
+Two additional stages are present in the script but disabled by default:
 
 - `smc`: GPU BlackJAX SMC population sampling
-- `smc_refine`: CPU NUTS refinement from saved SMC particles
+- `smc_refine`: CPU refinement from a saved SMC run
 
-## Running from `run.xsh`
+## Runtime Assumptions
 
-[`run.xsh`](/home/dutra/dev/lenstronomy/playground/run.xsh) is the authoritative source for the active workflow. If you change `stages`, `PAR_PATH`, `OUTPUT_DIR`, or `profile_variant` there, you are changing the documented workflow.
+`run.xsh` currently sets:
 
-The file is an Xonsh script that expands the staged commands below. In practice, the important part is the exact `python -m playground.cluster_solver` invocations embedded in it.
+- `JAX_NUM_CPU_DEVICES=30`
+- `XLA_FLAGS=--xla_force_host_platform_device_count=30` for the refinement section
+
+Most stages call:
+
+```bash
+python -m cluster_solver ...
+```
+
+The `smc` stage is the exception and explicitly uses:
+
+```bash
+/home/dutra/.conda/envs/lenstronomygpu/bin/python -m cluster_solver ...
+```
 
 ## Stage Commands
 
 ### `large`
 
-Large-only reference stage. This writes the stage-1 results used by later small-only runs.
+Large-only reference stage that seeds later small-only runs.
 
 ```bash
-JAX_NUM_CPU_DEVICES=30 \
-/home/dutra/.conda/envs/lenstronomy/bin/python -m playground.cluster_solver \
-  --par-path playground/M0416_Bergamini22/Bergamini22_MACS0416.par \
+python -m cluster_solver \
+  --par-path data/M0416_Bergamini22/Bergamini22_MACS0416.par \
   --output-dir plots/m0416_original \
   --run-name large \
   --fit-mode large-only \
@@ -74,12 +83,11 @@ JAX_NUM_CPU_DEVICES=30 \
 
 ### `ranked`
 
-Ranked-MAP initialization for the small-only stage, using the saved `large` run as `--stage1-run-dir`.
+Small-only ranked-MAP initialization using the saved `large` run as `--stage1-run-dir`.
 
 ```bash
-JAX_NUM_CPU_DEVICES=30 \
-/home/dutra/.conda/envs/lenstronomy/bin/python -m playground.cluster_solver \
-  --par-path playground/M0416_Bergamini22/Bergamini22_MACS0416.par \
+python -m cluster_solver \
+  --par-path data/M0416_Bergamini22/Bergamini22_MACS0416.par \
   --output-dir plots/m0416_original \
   --run-name exp_ranked \
   --fit-mode small-only \
@@ -106,14 +114,13 @@ JAX_NUM_CPU_DEVICES=30 \
   --plot-caustics
 ```
 
-### `smc` (optional, experimental)
+### `smc` (optional)
 
-Experimental small-only SMC stage. This is the one stage in `run.xsh` that switches to the GPU environment.
+Experimental GPU population-sampling stage.
 
 ```bash
-JAX_NUM_CPU_DEVICES=30 \
-/home/dutra/.conda/envs/lenstronomygpu/bin/python -m playground.cluster_solver \
-  --par-path playground/M0416_Bergamini22/Bergamini22_MACS0416.par \
+/home/dutra/.conda/envs/lenstronomygpu/bin/python -m cluster_solver \
+  --par-path data/M0416_Bergamini22/Bergamini22_MACS0416.par \
   --output-dir plots/m0416_original \
   --run-name exp_blackjax_smc_gpu \
   --fit-mode small-only \
@@ -146,14 +153,12 @@ JAX_NUM_CPU_DEVICES=30 \
   --plot-caustics
 ```
 
-### `smc_refine` (optional, experimental)
+### `smc_refine` (optional)
 
-CPU refinement stage that consumes the saved SMC run directory.
+CPU refinement stage that resumes from the saved SMC particles.
 
 ```bash
-JAX_NUM_CPU_DEVICES=30 \
-XLA_FLAGS=--xla_force_host_platform_device_count=30 \
-/home/dutra/.conda/envs/lenstronomy/bin/python -m playground.cluster_solver \
+python -m cluster_solver \
   --refine-from-run-dir plots/m0416_original/exp_blackjax_smc_gpu \
   --output-dir plots/m0416_original \
   --run-name exp_blackjax_smc_gpu_cpu_refine \
@@ -175,45 +180,26 @@ XLA_FLAGS=--xla_force_host_platform_device_count=30 \
 
 ## Outputs
 
-Runs land under `plots/m0416_original/<run-name>/`. Each run directory typically contains:
+Runs land under `plots/m0416_original/<run-name>/`.
+
+Common contents include:
 
 - `artifacts/`
-- generated plots in the run directory itself
-- generated tables in `tables/` under the run directory
+- `tables/`
+- diagnostic plots written into the run directory
 
-Common saved artifacts and summaries include:
+Typical saved files include:
 
 - `artifacts/posterior_arrays.npz`
 - `artifacts/cli_args.json`
 - `artifacts/init_diagnostics.json`
 - `artifacts/plot_bundle.h5`
-- `artifacts/stage1_prior_summary.json` for stage-1 compatible runs
 - `tables/run_summary.json`
 - `tables/potential_summary.csv`
 - `tables/family_diagnostics.csv`
-- `tables/potfile_summary.txt`
-- `tables/potfile_constraint_diagnostics.csv`
-- `tables/potfile_constraint_summary.txt`
-- `tables/scaling_rank_diagnostics.csv`
-
-Common plots include:
-
-- `corner.png`
-- `potfile_corner.png`
-- `potfile_histograms.png`
-- `trace_plot.png`
-- `run_diagnostics.png`
-- `residuals_by_family.png`
-- `image_plane_fit.png`
-- `source_plane_scatter.png`
-- `per_potential_summary.png`
-- `refresh_diagnostics.png`
-- `timing_profile.png`
-- `caustic_overlay.png` when caustic plotting is enabled
 
 ## Notes
 
-- `run.xsh` currently enables `large` and `ranked` by default.
-- `smc` and `smc_refine` are present in the script but commented out of the active `stages` list.
-- Standard documented runs use `/home/dutra/.conda/envs/lenstronomy/bin/python`.
-- The `smc` path is intentionally documented separately because it uses `/home/dutra/.conda/envs/lenstronomygpu/bin/python`.
+- [`run.xsh`](/home/dutra/dev/lenscluster/run.xsh) is the source of truth for the active workflow.
+- Changing `stages`, `PAR_PATH`, `OUTPUT_DIR`, or `profile_variant` in that script changes the documented run configuration.
+- The current default workflow enables `large` and `ranked`.
