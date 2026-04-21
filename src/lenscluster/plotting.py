@@ -23,6 +23,10 @@ from .utils import log_message as _log
 from .utils import run_logged_phase as _run_logged_phase
 
 PROFILE_VARIANT_ORIGINAL = "original"
+DEFAULT_NUTS_INIT_BOUNDARY_FRAC = 0.02
+DEFAULT_NUTS_INIT_JITTER_FRAC = 0.02
+DEFAULT_SVI_STEPS = 2000
+DEFAULT_SVI_LEARNING_RATE = 5.0e-3
 CORNER_PLOT_KWARGS = {
     "show_titles": True,
     "title_fmt": ".3g",
