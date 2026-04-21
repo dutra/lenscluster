@@ -1,102 +1,45 @@
 # Lenscluster Workflow
 
-This repository currently centers on the staged MACS0416 cluster-solver workflow driven by [`run.xsh`](/home/dutra/dev/lenscluster/run.xsh). The script orchestrates runs of [`cluster_solver.py`](/home/dutra/dev/lenscluster/cluster_solver.py) with a small set of named stages.
+This repository now uses one public fitting workflow:
 
-## Repository Layout
+1. Fit the large-scale cluster model with SVI.
+2. Fit the joint large+small model with SVI, initialized from the large-scale SVI solution.
+3. Optionally run NUTS on the joint model with `--fit-method svi+nuts`.
 
-- [`run.xsh`](/home/dutra/dev/lenscluster/run.xsh): authoritative staged runner
-- [`cluster_solver.py`](/home/dutra/dev/lenscluster/cluster_solver.py): main CLI entrypoint
-- [`data/M0416_Bergamini22/Bergamini22_MACS0416.par`](/home/dutra/dev/lenscluster/data/M0416_Bergamini22/Bergamini22_MACS0416.par): active input model
-- `plots/`: run outputs
+Use `--fit-method svi` for a fast variational result, or `--fit-method svi+nuts` for SVI initialization followed by joint posterior sampling.
 
-## Current `run.xsh` Configuration
+## Run
 
-The committed runner is currently configured as:
-
-```python
-profile_variant = "original"
-OUTPUT_DIR = "plots/m0416_original"
-PAR_PATH = "data/M0416_Bergamini22/Bergamini22_MACS0416.par"
-STAGE1_RUN_DIR = "plots/m0416_original/large"
-SMC_RUN_DIR = "plots/m0416_original/exp_blackjax_smc_gpu"
-stages = ["large", "ranked"]
-active_scaling_galaxies = [-1]
-```
-
-That means the default run executes:
-
-- `large`: large-only reference fit
-- `ranked`: small-only run initialized from the saved `large` stage
-
-Two additional stages are present in the script but disabled by default:
-
-- `smc`: GPU BlackJAX SMC population sampling
-- `smc_refine`: CPU refinement from a saved SMC run
-
-## Runtime Assumptions
-
-`run.xsh` currently sets:
-
-- `JAX_NUM_CPU_DEVICES=30`
-- `XLA_FLAGS=--xla_force_host_platform_device_count=30` for the refinement section
-
-Most stages call:
-
-```bash
-python -m cluster_solver ...
-```
-
-The `smc` stage is the exception and explicitly uses:
-
-```bash
-/home/dutra/.conda/envs/lenstronomygpu/bin/python -m cluster_solver ...
-```
-
-## Stage Commands
-
-### `large`
-
-Large-only reference stage that seeds later small-only runs.
+Fast NUTS smoke test:
 
 ```bash
 python -m cluster_solver \
   --par-path data/M0416_Bergamini22/Bergamini22_MACS0416.par \
   --output-dir plots/m0416_original \
-  --run-name large \
-  --fit-mode large-only \
-  --map-broad-seeds 3 \
-  --map-local-refine-seeds 3 \
-  --map-local-jitter-scale 0.06 \
-  --continuation-sigma-scale 2.5 \
-  --continuation-validation-top-k 0 \
-  --warmup 1000 \
-  --samples 250 \
+  --run-name joint_nuts_smoke \
+  --fit-method svi+nuts \
+  --svi-steps 1000 \
+  --warmup 100 \
+  --samples 50 \
+  --chains 1 \
+  --sampling-engine refreshing_surrogate \
+  --active-scaling-galaxies 32 \
+  --target-accept 0.75 \
+  --max-tree-depth 5 \
   --likelihood-mode source \
-  --nuts-init-strategy prior_center \
   --validate-top-k-families 0 \
-  --validation-approx adaptive \
   --z-bin-tol 0.25 \
-  --chains 6 \
-  --profile-variant original \
-  --plot-caustics
+  --profile-variant original
 ```
 
-### `ranked`
-
-Small-only ranked-MAP initialization using the saved `large` run as `--stage1-run-dir`.
+Longer joint run:
 
 ```bash
 python -m cluster_solver \
   --par-path data/M0416_Bergamini22/Bergamini22_MACS0416.par \
   --output-dir plots/m0416_original \
-  --run-name exp_ranked \
-  --fit-mode small-only \
-  --stage1-run-dir plots/m0416_original/large \
-  --map-broad-seeds 1 \
-  --map-local-refine-seeds 1 \
-  --map-local-jitter-scale 0.05 \
-  --continuation-sigma-scale 2.0 \
-  --continuation-validation-top-k 4 \
+  --run-name joint_workflow \
+  --fit-method svi+nuts \
   --warmup 1000 \
   --samples 250 \
   --chains 4 \
@@ -105,7 +48,6 @@ python -m cluster_solver \
   --refresh-param-drift-frac 0.08 \
   --target-accept 0.9 \
   --max-tree-depth 8 \
-  --nuts-init-strategy prior_center \
   --likelihood-mode source \
   --validate-top-k-families 0 \
   --validation-approx adaptive \
@@ -114,92 +56,82 @@ python -m cluster_solver \
   --plot-caustics
 ```
 
-### `smc` (optional)
+The same command with `--fit-method svi` skips NUTS and writes the AutoNormal guide posterior.
 
-Experimental GPU population-sampling stage.
+## Model
 
-```bash
-/home/dutra/.conda/envs/lenstronomygpu/bin/python -m cluster_solver \
-  --par-path data/M0416_Bergamini22/Bergamini22_MACS0416.par \
-  --output-dir plots/m0416_original \
-  --run-name exp_blackjax_smc_gpu \
-  --fit-mode small-only \
-  --stage1-run-dir plots/m0416_original/large \
-  --sampler blackjax_smc \
-  --smc-particles 1024 \
-  --smc-ess-threshold 0.5 \
-  --smc-move-steps 12 \
-  --smc-move-scale 0.02 \
-  --smc-seed-mode prior \
-  --map-broad-seeds 1 \
-  --map-local-refine-seeds 1 \
-  --map-local-jitter-scale 0.05 \
-  --continuation-sigma-scale 2.0 \
-  --continuation-validation-top-k 0 \
-  --warmup 1000 \
-  --samples 250 \
-  --chains 4 \
-  --sampling-engine refreshing_surrogate \
-  --active-scaling-galaxies -1 \
-  --refresh-param-drift-frac 0.08 \
-  --target-accept 0.9 \
-  --max-tree-depth 8 \
-  --nuts-init-strategy prior_center \
-  --likelihood-mode source \
-  --validate-top-k-families 0 \
-  --validation-approx adaptive \
-  --z-bin-tol 0.25 \
-  --profile-variant original \
-  --plot-caustics
+The sampled model is assembled from the priors in the Lenstool `.par` file and
+any potfile scaling priors. A quantity is free only if it has a decoded prior;
+otherwise it remains fixed at the input value.
+
+Free large-scale parameters come from supported potential profiles with priors
+in the `.par` file. Supported profiles are dPIE (`81`) and shear (`14`), with
+fields such as `x_centre`, `y_centre`, `ellipticite`, `angle_pos`,
+`core_radius_kpc`, `cut_radius_kpc`, `v_disp`, and `gamma`.
+
+Member-galaxy subhalos are dPIE components generated from potfiles. If the
+potfile provides priors, the free scaling hyperparameters are `sigma`, `cutkpc`,
+`corekpc`, `vdslope`, and `slope`. Their nominal scaling relation is:
+
+```text
+sigma_i = sigma_ref * L_i^(1 / vdslope)
+core_i  = core_ref  * L_i^0.5
+cut_i   = cut_ref   * L_i^(2 / slope)
 ```
 
-### `smc_refine` (optional)
+where `L_i` is the catalog luminosity ratio relative to `mag0`.
 
-CPU refinement stage that resumes from the saved SMC particles.
+With `--scaling-scatter`, the model also samples positive scatter
+hyperparameters per potfile for the requested fields: `sigma_log_scatter`,
+`core_log_scatter`, and/or `cut_log_scatter`. Each member then gets a latent
+offset for each enabled field:
 
-```bash
-python -m cluster_solver \
-  --refine-from-run-dir plots/m0416_original/exp_blackjax_smc_gpu \
-  --output-dir plots/m0416_original \
-  --run-name exp_blackjax_smc_gpu_cpu_refine \
-  --warmup 500 \
-  --samples 250 \
-  --chains 4 \
-  --sampling-engine refreshing_surrogate \
-  --active-scaling-galaxies -1 \
-  --refresh-param-drift-frac 0.08 \
-  --target-accept 0.9 \
-  --max-tree-depth 8 \
-  --nuts-init-strategy prior_center \
-  --likelihood-mode source \
-  --validate-top-k-families 0 \
-  --validation-approx adaptive \
-  --profile-variant original \
-  --plot-caustics
+```text
+delta_i ~ Normal(0, scatter)
+scaled_value_i *= exp(delta_i)
 ```
+
+Positive quantities such as scaling `sigma` and `cutkpc` are sampled in latent
+log space and converted back to physical units when building the lens model and
+writing outputs.
+
+## Likelihood
+
+Inference uses a source-plane Gaussian likelihood. For each observed image, the
+current lens model ray-shoots the image position to the source plane. Within
+each multiply imaged family, the source position is estimated as the weighted
+centroid of those ray-shot source positions. The log likelihood penalizes the
+scatter around that family centroid:
+
+```text
+log L = -0.5 * sum_i [
+  ((beta_x_i - beta_bar_x)^2 + (beta_y_i - beta_bar_y)^2) / sigma_i^2
+  + 2 log(2 pi sigma_i^2)
+]
+```
+
+`sigma_i` is the positional uncertainty for the image. Exact image-plane solving
+is used for validation, diagnostics, and plots; it is not currently the sampled
+posterior likelihood.
 
 ## Outputs
 
-Runs land under `plots/m0416_original/<run-name>/`.
+For `--run-name joint_workflow`, outputs are written to:
 
-Common contents include:
+- `plots/m0416_original/joint_workflow/stage1_large_only/`
+- `plots/m0416_original/joint_workflow/stage2_joint/`
+- `plots/m0416_original/joint_workflow/sequential_summary.json`
 
-- `artifacts/`
-- `tables/`
-- diagnostic plots written into the run directory
+Each stage writes:
 
-Typical saved files include:
-
-- `artifacts/posterior_arrays.npz`
-- `artifacts/cli_args.json`
-- `artifacts/init_diagnostics.json`
 - `artifacts/plot_bundle.h5`
 - `tables/run_summary.json`
 - `tables/potential_summary.csv`
 - `tables/family_diagnostics.csv`
+- diagnostic PNGs in the stage directory
 
-## Notes
+`run.xsh` is a thin wrapper around the same command.
 
-- [`run.xsh`](/home/dutra/dev/lenscluster/run.xsh) is the source of truth for the active workflow.
-- Changing `stages`, `PAR_PATH`, `OUTPUT_DIR`, or `profile_variant` in that script changes the documented run configuration.
-- The current default workflow enables `large` and `ranked`.
+The implementation uses a standard `src/lenscluster/` package layout. The
+repository-root `cluster_solver.py` remains as a compatibility shim, so existing
+`python -m cluster_solver` commands continue to work.
