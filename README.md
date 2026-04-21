@@ -83,12 +83,14 @@ where `L_i` is the catalog luminosity ratio relative to `mag0`.
 
 With `--scaling-scatter`, the model also samples positive scatter
 hyperparameters per potfile for the requested fields: `sigma_log_scatter`,
-`core_log_scatter`, and/or `cut_log_scatter`. Each member then gets a latent
-offset for each enabled field:
+`core_log_scatter`, and/or `cut_log_scatter`. These are marginalized with a
+linearized source-plane covariance approximation rather than sampled as
+per-member latent offsets. The approximation perturbs each enabled scaling
+field around the current model, estimates the first-order source-plane
+sensitivity, and adds that variance to the source-plane likelihood.
 
 ```text
-delta_i ~ Normal(0, scatter)
-scaled_value_i *= exp(delta_i)
+Cov_extra ~= J_scatter diag(scatter^2) J_scatter^T
 ```
 
 Positive quantities such as scaling `sigma` and `cutkpc` are sampled in latent
@@ -119,10 +121,12 @@ log L = -0.5 * sum_i [
 ```
 
 `sigma_eff_i` is the positional uncertainty plus inferred intrinsic scatter.
-Single-image families are excluded from this source-plane scatter likelihood
-because their source-plane residual is zero by construction. Exact image-plane
-solving is used for validation, diagnostics, and plots; it is not currently the
-sampled posterior likelihood.
+When scaling scatter is enabled, the likelihood uses separate diagonal
+`x`/`y` variances with the linearized scaling-scatter contribution added on top
+of `sigma_eff_i^2`. Single-image families are excluded from this source-plane
+scatter likelihood because their source-plane residual is zero by construction.
+Exact image-plane solving is used for validation, diagnostics, and plots; it is
+not currently the sampled posterior likelihood.
 
 ## Outputs
 

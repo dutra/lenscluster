@@ -1363,53 +1363,6 @@ def _build_scaling_scatter_parameter_specs(
     return specs, scatter_indices_by_potfile
 
 
-def _build_scaling_offset_parameter_specs(
-    potfiles: list[dict[str, Any]],
-    fields: set[str],
-    scatter_indices_by_potfile: list[dict[str, int]],
-    scatter_specs: list[ParameterSpec],
-    *,
-    start_index: int,
-) -> tuple[list[ParameterSpec], list[list[dict[str, int]]]]:
-    specs: list[ParameterSpec] = []
-    offset_indices_by_component: list[list[dict[str, int]]] = []
-    scatter_spec_by_index = {start_index - len(scatter_specs) + idx: spec for idx, spec in enumerate(scatter_specs)}
-    for potfile, scatter_lookup in zip(potfiles, scatter_indices_by_potfile):
-        potfile_id = str(potfile["id"])
-        catalog_offsets: list[dict[str, int]] = []
-        for row in potfile["catalog_df"].itertuples(index=False):
-            row_lookup: dict[str, int] = {}
-            for field_name in ("sigma", "core", "cut"):
-                if field_name not in fields:
-                    continue
-                parent_index = scatter_lookup.get(field_name, -1)
-                if parent_index < 0:
-                    continue
-                index = start_index + len(specs)
-                parent_spec = scatter_spec_by_index[parent_index]
-                specs.append(
-                    ParameterSpec(
-                        name=f"{potfile_id}.{row.id}.{field_name}_log_offset",
-                        sample_name=_sample_name(f"{potfile_id}_{row.id}", f"{field_name}_log_offset"),
-                        potential_id=potfile_id,
-                        profile_type=int(potfile["type"]),
-                        field=f"{field_name}_log_offset",
-                        prior_kind="hierarchical_normal",
-                        lower=float("-inf"),
-                        upper=float("inf"),
-                        step=0.1,
-                        mean=0.0,
-                        std=0.1,
-                        component_family="scaling_offset",
-                        parent_sample_name=parent_spec.sample_name,
-                    )
-                )
-                row_lookup[field_name] = index
-            catalog_offsets.append(row_lookup)
-        offset_indices_by_component.append(catalog_offsets)
-    return specs, offset_indices_by_component
-
-
 def _build_stage2_large_parameter_specs(
     large_specs: list[ParameterSpec],
     stage1_prior_summary: Stage1PriorSummary,
@@ -1611,7 +1564,7 @@ def _build_scaling_components(
     potfiles: list[dict[str, Any]],
     reference: tuple[int, float, float],
     scaling_param_indices: list[dict[str, int]],
-    scaling_offset_indices: list[list[dict[str, int]]] | None,
+    scaling_scatter_indices: list[dict[str, int]] | None,
     start_component_index: int,
     kpc_per_arcsec: float = 1.0,
 ) -> tuple[list[dict[str, Any]], list[list[tuple[str, int]]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1620,9 +1573,9 @@ def _build_scaling_components(
     assignments: list[list[tuple[str, int]]] = []
     scaling_component_assignments: list[dict[str, Any]] = []
     scaling_component_records: list[dict[str, Any]] = []
-    scaling_offset_indices = scaling_offset_indices or [[] for _ in potfiles]
-    for potfile_order, (potfile, param_index_lookup, offset_index_lookup) in enumerate(
-        zip(potfiles, scaling_param_indices, scaling_offset_indices)
+    scaling_scatter_indices = scaling_scatter_indices or [{} for _ in potfiles]
+    for potfile_order, (potfile, param_index_lookup, scatter_index_lookup) in enumerate(
+        zip(potfiles, scaling_param_indices, scaling_scatter_indices)
     ):
         catalog_df = potfile["catalog_df"]
         if catalog_df.empty:
@@ -1640,7 +1593,6 @@ def _build_scaling_components(
         for row_index, row in enumerate(catalog_df.itertuples(index=False)):
             ellipticite, angle_pos = _catalog_shape_to_ellipticity(row.catalog_a, row.catalog_b, row.catalog_theta)
             component_index = start_component_index + len(components)
-            row_offset_lookup = offset_index_lookup[row_index] if row_index < len(offset_index_lookup) else {}
             components.append(
                 {
                     "id": f"{potfile['id']}.{row.id}",
@@ -1670,9 +1622,9 @@ def _build_scaling_components(
                     "core_ref_param_index": int(param_index_lookup.get("corekpc", -1)),
                     "vdslope_param_index": int(param_index_lookup.get("vdslope", -1)),
                     "slope_param_index": int(param_index_lookup.get("slope", -1)),
-                    "sigma_log_scatter_param_index": int(row_offset_lookup.get("sigma", -1)),
-                    "core_log_scatter_param_index": int(row_offset_lookup.get("core", -1)),
-                    "cut_log_scatter_param_index": int(row_offset_lookup.get("cut", -1)),
+                    "sigma_log_scatter_param_index": int(scatter_index_lookup.get("sigma", -1)),
+                    "core_log_scatter_param_index": int(scatter_index_lookup.get("core", -1)),
+                    "cut_log_scatter_param_index": int(scatter_index_lookup.get("cut", -1)),
                 }
             )
             scaling_component_records.append(
@@ -1924,6 +1876,10 @@ class ClusterJAXEvaluator:
             [idx for idx, spec in enumerate(self.state.parameter_specs) if spec.component_family == "scaling"],
             dtype=np.int32,
         )
+        self.scaling_scatter_param_indices = np.asarray(
+            [idx for idx, spec in enumerate(self.state.parameter_specs) if spec.component_family == "scaling_scatter"],
+            dtype=np.int32,
+        )
         source_scatter_indices = [
             idx for idx, spec in enumerate(self.state.parameter_specs) if spec.component_family == "source_scatter"
         ]
@@ -1985,6 +1941,8 @@ class ClusterJAXEvaluator:
         self.surrogate_reference_params: np.ndarray | None = None
         self.surrogate_reference_scaling_params = np.zeros(len(self.scaling_param_indices), dtype=float)
         self.surrogate_cache_by_z: dict[float, SurrogateBinCache] = {}
+        self.scaling_scatter_reference_params: np.ndarray | None = None
+        self.scaling_scatter_cache_by_z: dict[float, dict[str, np.ndarray]] = {}
         self._source_loglike_fn = jax.jit(self._source_loglike_impl)
 
     def _physical_parameter_vector(self, params: jnp.ndarray) -> jnp.ndarray:
@@ -2007,6 +1965,127 @@ class ClusterJAXEvaluator:
         params_array = np.asarray(params, dtype=float)
         physical_params = _convert_theta_to_physical(params_array, self.state.parameter_specs)
         return float(physical_params[self.source_sigma_int_param_index])
+
+    def _scaling_scatter_field_scales(self, params: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        spec = self.state.packed_lens_spec
+        physical_params = self._physical_parameter_vector(jnp.asarray(params, dtype=jnp.float64))
+        is_scaling = jnp.asarray(spec.component_family, dtype=jnp.int32) == 1
+
+        def _field_scale(index_array: np.ndarray) -> jnp.ndarray:
+            index_jax = jnp.asarray(index_array, dtype=jnp.int32)
+            values = self._apply_param_updates(jnp.zeros_like(jnp.asarray(spec.luminosity_ratio, dtype=jnp.float64)), index_array, physical_params)
+            mask = is_scaling & (index_jax >= 0)
+            squared_sum = jnp.sum(jnp.where(mask, jnp.square(values), 0.0))
+            count = jnp.sum(jnp.where(mask, 1.0, 0.0))
+            return jnp.sqrt(squared_sum / jnp.maximum(count, 1.0))
+
+        return (
+            _field_scale(spec.sigma_log_scatter_param_index),
+            _field_scale(spec.core_log_scatter_param_index),
+            _field_scale(spec.cut_log_scatter_param_index),
+        )
+
+    def _scaling_scatter_extra_variance(
+        self,
+        params: jnp.ndarray,
+        bin_data: BinData,
+        beta_x: jnp.ndarray,
+        beta_y: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        if len(self.scaling_component_indices) == 0 or len(self.scaling_scatter_param_indices) == 0:
+            zeros = jnp.zeros_like(beta_x)
+            return zeros, zeros
+        cache = self.scaling_scatter_cache_by_z.get(float(bin_data.effective_z_source))
+        if cache is None:
+            zeros = jnp.zeros_like(beta_x)
+            return zeros, zeros
+        sigma_scatter, core_scatter, cut_scatter = self._scaling_scatter_field_scales(params)
+        sigma_dx = jnp.asarray(cache["sigma_x"], dtype=jnp.float64)
+        sigma_dy = jnp.asarray(cache["sigma_y"], dtype=jnp.float64)
+        core_dx = jnp.asarray(cache["core_x"], dtype=jnp.float64)
+        core_dy = jnp.asarray(cache["core_y"], dtype=jnp.float64)
+        cut_dx = jnp.asarray(cache["cut_x"], dtype=jnp.float64)
+        cut_dy = jnp.asarray(cache["cut_y"], dtype=jnp.float64)
+        var_x = (
+            jnp.square(sigma_scatter * sigma_dx)
+            + jnp.square(core_scatter * core_dx)
+            + jnp.square(cut_scatter * cut_dx)
+        )
+        var_y = (
+            jnp.square(sigma_scatter * sigma_dy)
+            + jnp.square(core_scatter * core_dy)
+            + jnp.square(cut_scatter * cut_dy)
+        )
+        return var_x, var_y
+
+    def refresh_scaling_scatter_cache(self, reference_params: np.ndarray, reason: str = "manual") -> None:
+        self.scaling_scatter_cache_by_z = {}
+        self.scaling_scatter_reference_params = None
+        if len(self.scaling_component_indices) == 0 or len(self.scaling_scatter_param_indices) == 0:
+            return
+        reference = np.asarray(reference_params, dtype=float)
+        reference_jax = jnp.asarray(reference, dtype=jnp.float64)
+        eps = 1.0e-3
+
+        def _derivative_for_field(
+            bin_data: BinData,
+            x_obs: jnp.ndarray,
+            y_obs: jnp.ndarray,
+            beta_x: jnp.ndarray,
+            beta_y: jnp.ndarray,
+            sigma_offset: float,
+            core_offset: float,
+            cut_offset: float,
+        ) -> tuple[np.ndarray, np.ndarray]:
+            packed_plus = self._build_packed_lens_state(
+                reference_jax,
+                bin_data.effective_z_source,
+                sigma_log_offset=sigma_offset,
+                core_log_offset=core_offset,
+                cut_log_offset=cut_offset,
+            )
+            beta_plus_x, beta_plus_y = self._ray_shooting_for_components(
+                bin_data.effective_z_source,
+                x_obs,
+                y_obs,
+                packed_plus,
+            )
+            deriv_x = np.asarray((beta_plus_x - beta_x) / eps, dtype=float)
+            deriv_y = np.asarray((beta_plus_y - beta_y) / eps, dtype=float)
+            return deriv_x, deriv_y
+
+        for bin_data in self.state.bin_data:
+            x_obs = jnp.asarray(bin_data.x_obs, dtype=jnp.float64)
+            y_obs = jnp.asarray(bin_data.y_obs, dtype=jnp.float64)
+            packed_state = self._build_packed_lens_state(reference_jax, bin_data.effective_z_source)
+            validity = self._packed_lens_validity_from_params(reference_jax, bin_data.effective_z_source, stop_gradient=False)
+            if not bool(np.asarray(validity["is_valid"], dtype=bool)):
+                self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+                self.scaling_scatter_cache_by_z = {}
+                return
+            beta_x, beta_y = self._ray_shooting_for_components(
+                bin_data.effective_z_source,
+                x_obs,
+                y_obs,
+                packed_state,
+            )
+            sigma_dx, sigma_dy = _derivative_for_field(bin_data, x_obs, y_obs, beta_x, beta_y, eps, 0.0, 0.0)
+            core_dx, core_dy = _derivative_for_field(bin_data, x_obs, y_obs, beta_x, beta_y, 0.0, eps, 0.0)
+            cut_dx, cut_dy = _derivative_for_field(bin_data, x_obs, y_obs, beta_x, beta_y, 0.0, 0.0, eps)
+            derivatives = {
+                "sigma_x": sigma_dx,
+                "sigma_y": sigma_dy,
+                "core_x": core_dx,
+                "core_y": core_dy,
+                "cut_x": cut_dx,
+                "cut_y": cut_dy,
+            }
+            if not all(np.isfinite(value).all() for value in derivatives.values()):
+                self.scaling_scatter_cache_by_z = {}
+                return
+            self.scaling_scatter_cache_by_z[float(bin_data.effective_z_source)] = derivatives
+        self.scaling_scatter_reference_params = reference.copy()
+        self._source_loglike_fn = jax.jit(self._source_loglike_impl)
 
     def _record_invalid_state_callback(self, reason_flags: Any) -> None:
         flags = np.asarray(reason_flags, dtype=bool).reshape(-1)
@@ -2219,18 +2298,6 @@ class ClusterJAXEvaluator:
         scaled_vdisp = sigma_ref * jnp.power(luminosity_ratio, 1.0 / safe_vdslope)
         scaled_core = core_ref * jnp.power(luminosity_ratio, 0.5)
         scaled_cut = cut_ref * jnp.power(luminosity_ratio, 2.0 / safe_slope)
-        sigma_log_offset = self._apply_param_updates(
-            jnp.zeros_like(scaled_vdisp), spec.sigma_log_scatter_param_index, physical_params
-        )
-        core_log_offset = self._apply_param_updates(
-            jnp.zeros_like(scaled_core), spec.core_log_scatter_param_index, physical_params
-        )
-        cut_log_offset = self._apply_param_updates(
-            jnp.zeros_like(scaled_cut), spec.cut_log_scatter_param_index, physical_params
-        )
-        scaled_vdisp = scaled_vdisp * jnp.exp(sigma_log_offset)
-        scaled_core = scaled_core * jnp.exp(core_log_offset)
-        scaled_cut = scaled_cut * jnp.exp(cut_log_offset)
         v_disp = jnp.where(is_scaling, scaled_vdisp, v_disp)
         core_radius_kpc = jnp.where(is_scaling, scaled_core, core_radius_kpc)
         cut_radius_kpc = jnp.where(is_scaling, scaled_cut, cut_radius_kpc)
@@ -2336,7 +2403,15 @@ class ClusterJAXEvaluator:
         packed_state = self._build_packed_lens_state(params, z_source)
         return packed_state, self._packed_lens_validity_from_params(params, z_source, stop_gradient=False)
 
-    def _build_packed_lens_state(self, params: jnp.ndarray, z_source: float) -> dict[str, Any]:
+    def _build_packed_lens_state(
+        self,
+        params: jnp.ndarray,
+        z_source: float,
+        *,
+        sigma_log_offset: float | jnp.ndarray = 0.0,
+        core_log_offset: float | jnp.ndarray = 0.0,
+        cut_log_offset: float | jnp.ndarray = 0.0,
+    ) -> dict[str, Any]:
         pack_start = time.perf_counter()
         spec = self.state.packed_lens_spec
         transform_kind_log_positive_mask = getattr(self, "transform_kind_log_positive_mask", None)
@@ -2407,18 +2482,9 @@ class ClusterJAXEvaluator:
         scaled_vdisp = sigma_ref * jnp.power(luminosity_ratio, 1.0 / safe_vdslope)
         scaled_core = core_ref * jnp.power(luminosity_ratio, 0.5)
         scaled_cut = cut_ref * jnp.power(luminosity_ratio, 2.0 / safe_slope)
-        sigma_log_offset = self._apply_param_updates(
-            jnp.zeros_like(scaled_vdisp), spec.sigma_log_scatter_param_index, physical_params
-        )
-        core_log_offset = self._apply_param_updates(
-            jnp.zeros_like(scaled_core), spec.core_log_scatter_param_index, physical_params
-        )
-        cut_log_offset = self._apply_param_updates(
-            jnp.zeros_like(scaled_cut), spec.cut_log_scatter_param_index, physical_params
-        )
-        scaled_vdisp = scaled_vdisp * jnp.exp(sigma_log_offset)
-        scaled_core = scaled_core * jnp.exp(core_log_offset)
-        scaled_cut = scaled_cut * jnp.exp(cut_log_offset)
+        scaled_vdisp = scaled_vdisp * jnp.exp(jnp.asarray(sigma_log_offset, dtype=jnp.float64))
+        scaled_core = scaled_core * jnp.exp(jnp.asarray(core_log_offset, dtype=jnp.float64))
+        scaled_cut = scaled_cut * jnp.exp(jnp.asarray(cut_log_offset, dtype=jnp.float64))
         v_disp = jnp.where(is_scaling, scaled_vdisp, v_disp)
         core_radius_kpc = jnp.where(is_scaling, scaled_core, core_radius_kpc)
         cut_radius_kpc = jnp.where(is_scaling, scaled_cut, cut_radius_kpc)
@@ -2799,7 +2865,16 @@ class ClusterJAXEvaluator:
             family_idx = jnp.asarray(bin_data.family_index_per_image, dtype=jnp.int32)
             sigma_base = jnp.asarray(bin_data.sigma_per_image, dtype=jnp.float64)
             sigma = jnp.sqrt(jnp.square(sigma_base) + jnp.square(source_sigma_int))
-            weights = 1.0 / jnp.square(sigma)
+            scatter_var_x, scatter_var_y = self._scaling_scatter_extra_variance(
+                params,
+                bin_data,
+                beta_x,
+                beta_y,
+            )
+            sigma2_x = jnp.square(sigma) + scatter_var_x
+            sigma2_y = jnp.square(sigma) + scatter_var_y
+            sigma2_weight = 0.5 * (sigma2_x + sigma2_y)
+            weights = 1.0 / jnp.maximum(sigma2_weight, 1.0e-18)
             n_families = len(bin_data.family_ids)
             family_counts = jnp.zeros(n_families, dtype=jnp.int32).at[family_idx].add(1)
             image_has_constraint = family_counts[family_idx] > 1
@@ -2810,11 +2885,10 @@ class ClusterJAXEvaluator:
             centroid_y = sum_by / jnp.maximum(sum_w, 1.0e-18)
             dx = beta_x - centroid_x[family_idx]
             dy = beta_y - centroid_y[family_idx]
-            sigma2 = jnp.square(sigma)
             bin_loglike = -0.5 * jnp.sum(
                 jnp.where(
                     image_has_constraint,
-                    (dx**2 + dy**2) / sigma2 + 2.0 * jnp.log(2.0 * jnp.pi * sigma2),
+                    (dx**2) / sigma2_x + (dy**2) / sigma2_y + jnp.log(2.0 * jnp.pi * sigma2_x) + jnp.log(2.0 * jnp.pi * sigma2_y),
                     0.0,
                 )
             )
@@ -2999,6 +3073,7 @@ class ClusterJAXEvaluator:
     def evaluate(self, params: np.ndarray, likelihood_mode: str) -> EvaluationResult:
         if self.surrogate_enabled and self._surrogate_needs_refresh(np.asarray(params, dtype=float)):
             self.refresh_surrogate(np.asarray(params, dtype=float), reason="validation_drift")
+            self.refresh_scaling_scatter_cache(np.asarray(params, dtype=float), reason="validation_drift")
         source_loglike = self.source_loglike(params)
         family_predictions = self._family_source_summary(params)
         should_validate_all = likelihood_mode == "image"
@@ -3420,19 +3495,11 @@ def _build_state_from_inputs(
             scatter_max=float(args.scaling_scatter_max),
         )
         parameter_specs.extend(scaling_scatter_specs)
-        scaling_offset_specs, scaling_offset_indices = _build_scaling_offset_parameter_specs(
-            potfiles,
-            scatter_fields,
-            scaling_scatter_indices,
-            scaling_scatter_specs,
-            start_index=len(parameter_specs),
-        )
-        parameter_specs.extend(scaling_offset_specs)
         scaling_components, scaling_assignments, scaling_component_assignments, scaling_component_records = _build_scaling_components(
             potfiles,
             reference,
             scaling_param_indices,
-            scaling_offset_indices,
+            scaling_scatter_indices,
             start_component_index=len(base_components),
             kpc_per_arcsec=scaling_kpc_per_arcsec,
         )
@@ -3642,6 +3709,7 @@ def _prepare_direct_evaluator(
             ),
         )
         evaluator.refresh_surrogate(midpoint, reason="svi_nuts_initial")
+    evaluator.refresh_scaling_scatter_cache(midpoint, reason="svi_nuts_initial")
     _log(args, "[compile] tracing first JAX likelihood evaluation")
     compile_start = time.time()
     compile_loglike = evaluator.source_loglike(midpoint)
@@ -3756,6 +3824,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
     evaluator, _midpoint = _prepare_direct_evaluator(args, state)
     sample_model = _posterior_model(state.parameter_specs, evaluator)
     best_fit, posterior, svi_diagnostics = _run_svi_fit(args, state, evaluator, sample_model)
+    evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_svi")
     _log(
         args,
         (
@@ -3776,6 +3845,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
         if posterior.samples.size:
             best_index = int(np.nanargmax(posterior.log_prob))
             best_fit = np.asarray(posterior.samples[best_index], dtype=float)
+            evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_nuts")
             _log(args, f"[nuts] best_fit updated from retained posterior sample index={best_index}")
 
     if args.skip_validation:
@@ -3876,6 +3946,7 @@ def _rerender_plots(args: argparse.Namespace, run_dir: Path) -> None:
     best_fit_latent = _convert_theta_to_latent(best_fit, state.parameter_specs)
     if evaluator.surrogate_enabled:
         evaluator.refresh_surrogate(best_fit_latent, reason="plots_only")
+    evaluator.refresh_scaling_scatter_cache(best_fit_latent, reason="plots_only")
     best_eval = _run_logged_phase(
         args,
         "plots_only.validation.evaluate",
