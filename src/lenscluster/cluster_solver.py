@@ -107,6 +107,8 @@ DEFAULT_NUTS_INIT_JITTER_FRAC = 0.02
 DEFAULT_SVI_STEPS = 2000
 DEFAULT_SVI_LEARNING_RATE = 5.0e-3
 DEFAULT_SAMPLER = "numpyro_nuts"
+DEFAULT_SOURCE_SIGMA_INT_LOWER_ARCSEC = 1.0e-3
+DEFAULT_SOURCE_SIGMA_INT_UPPER_ARCSEC = 2.0
 SAFE_SCALING_EXPONENT_ABS_MIN = 1.0e-3
 SAFE_RADIUS_MARGIN_ARCSEC = 1.0e-3
 BAD_LOG_LIKE = -1.0e30
@@ -1448,6 +1450,25 @@ def _build_stage2_large_parameter_specs(
     return stage2_specs
 
 
+def _build_source_scatter_parameter_spec(start_index: int) -> ParameterSpec:
+    del start_index
+    return ParameterSpec(
+        name="source.sigma_int",
+        sample_name="source_sigma_int",
+        potential_id="source",
+        profile_type=0,
+        field="sigma_int",
+        prior_kind="uniform",
+        lower=float(np.log(DEFAULT_SOURCE_SIGMA_INT_LOWER_ARCSEC)),
+        upper=float(np.log(DEFAULT_SOURCE_SIGMA_INT_UPPER_ARCSEC)),
+        step=0.05,
+        component_family="source_scatter",
+        transform_kind="log_positive",
+        physical_lower=DEFAULT_SOURCE_SIGMA_INT_LOWER_ARCSEC,
+        physical_upper=DEFAULT_SOURCE_SIGMA_INT_UPPER_ARCSEC,
+    )
+
+
 def _field_param_index(assignments: list[tuple[str, int]], field: str) -> int:
     for name, index in assignments:
         if name == field:
@@ -1903,6 +1924,10 @@ class ClusterJAXEvaluator:
             [idx for idx, spec in enumerate(self.state.parameter_specs) if spec.component_family == "scaling"],
             dtype=np.int32,
         )
+        source_scatter_indices = [
+            idx for idx, spec in enumerate(self.state.parameter_specs) if spec.component_family == "source_scatter"
+        ]
+        self.source_sigma_int_param_index = int(source_scatter_indices[0]) if source_scatter_indices else -1
         self.scaling_param_indices_jax = jnp.asarray(self.scaling_param_indices, dtype=jnp.int32)
         transform_kind_array = np.asarray(
             [str(spec.transform_kind) for spec in self.state.parameter_specs],
@@ -1961,6 +1986,27 @@ class ClusterJAXEvaluator:
         self.surrogate_reference_scaling_params = np.zeros(len(self.scaling_param_indices), dtype=float)
         self.surrogate_cache_by_z: dict[float, SurrogateBinCache] = {}
         self._source_loglike_fn = jax.jit(self._source_loglike_impl)
+
+    def _physical_parameter_vector(self, params: jnp.ndarray) -> jnp.ndarray:
+        return _apply_parameter_transforms_jax(
+            params,
+            self.transform_kind_log_positive_mask,
+            self.transform_kind_log_offset_positive_mask,
+            self.transform_offset_array,
+        )
+
+    def _source_sigma_int_jax(self, params: jnp.ndarray) -> jnp.ndarray:
+        if self.source_sigma_int_param_index < 0:
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        physical_params = self._physical_parameter_vector(jnp.asarray(params, dtype=jnp.float64))
+        return jnp.take(physical_params, jnp.asarray(self.source_sigma_int_param_index, dtype=jnp.int32))
+
+    def _source_sigma_int_numpy(self, params: np.ndarray | jnp.ndarray) -> float:
+        if self.source_sigma_int_param_index < 0:
+            return 0.0
+        params_array = np.asarray(params, dtype=float)
+        physical_params = _convert_theta_to_physical(params_array, self.state.parameter_specs)
+        return float(physical_params[self.source_sigma_int_param_index])
 
     def _record_invalid_state_callback(self, reason_flags: Any) -> None:
         flags = np.asarray(reason_flags, dtype=bool).reshape(-1)
@@ -2728,6 +2774,7 @@ class ClusterJAXEvaluator:
     def _source_loglike_impl(self, params: jnp.ndarray) -> jnp.ndarray:
         total_loglike = jnp.array(0.0, dtype=jnp.float64)
         invalid_seen = jnp.array(False)
+        source_sigma_int = self._source_sigma_int_jax(params)
         for bin_data in self.state.bin_data:
             if self.surrogate_enabled and self.surrogate_cache_by_z:
                 beta_x, beta_y, invalid = self._surrogate_beta(params, bin_data)
@@ -2750,9 +2797,12 @@ class ClusterJAXEvaluator:
                     packed_state,
                 )
             family_idx = jnp.asarray(bin_data.family_index_per_image, dtype=jnp.int32)
-            sigma = jnp.asarray(bin_data.sigma_per_image, dtype=jnp.float64)
+            sigma_base = jnp.asarray(bin_data.sigma_per_image, dtype=jnp.float64)
+            sigma = jnp.sqrt(jnp.square(sigma_base) + jnp.square(source_sigma_int))
             weights = 1.0 / jnp.square(sigma)
             n_families = len(bin_data.family_ids)
+            family_counts = jnp.zeros(n_families, dtype=jnp.int32).at[family_idx].add(1)
+            image_has_constraint = family_counts[family_idx] > 1
             sum_w = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights)
             sum_bx = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights * beta_x)
             sum_by = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights * beta_y)
@@ -2762,7 +2812,11 @@ class ClusterJAXEvaluator:
             dy = beta_y - centroid_y[family_idx]
             sigma2 = jnp.square(sigma)
             bin_loglike = -0.5 * jnp.sum(
-                (dx**2 + dy**2) / sigma2 + 2.0 * jnp.log(2.0 * jnp.pi * sigma2)
+                jnp.where(
+                    image_has_constraint,
+                    (dx**2 + dy**2) / sigma2 + 2.0 * jnp.log(2.0 * jnp.pi * sigma2),
+                    0.0,
+                )
             )
             total_loglike = jnp.where(invalid, total_loglike, total_loglike + bin_loglike)
             invalid_seen = jnp.logical_or(invalid_seen, invalid)
@@ -2786,6 +2840,7 @@ class ClusterJAXEvaluator:
     def _family_source_summary(self, params: np.ndarray | jnp.ndarray) -> dict[str, dict[str, Any]]:
         summaries: dict[str, dict[str, Any]] = {}
         params_jax = jnp.asarray(params, dtype=jnp.float64)
+        source_sigma_int = self._source_sigma_int_numpy(params)
         for bin_data in self.state.bin_data:
             if self.surrogate_enabled and self.surrogate_cache_by_z:
                 beta_x, beta_y, invalid = self._surrogate_beta(params_jax, bin_data)
@@ -2823,7 +2878,8 @@ class ClusterJAXEvaluator:
             for family_index, family_id in enumerate(bin_data.family_ids):
                 mask = idx == family_index
                 family = next(item for item in self.state.family_data if item.family_id == family_id)
-                weights = np.full(np.sum(mask), 1.0 / (family.sigma_arcsec**2), dtype=float)
+                sigma_eff = float(np.sqrt(family.sigma_arcsec**2 + source_sigma_int**2))
+                weights = np.full(np.sum(mask), 1.0 / (sigma_eff**2), dtype=float)
                 source_x = float(np.average(beta_x[mask], weights=weights))
                 source_y = float(np.average(beta_y[mask], weights=weights))
                 dx = beta_x[mask] - source_x
@@ -2832,6 +2888,10 @@ class ClusterJAXEvaluator:
                 summaries[family_id] = {
                     "source_x": source_x,
                     "source_y": source_y,
+                    "source_beta_x": beta_x[mask],
+                    "source_beta_y": beta_y[mask],
+                    "source_sigma_int_arcsec": source_sigma_int,
+                    "source_sigma_eff_arcsec": sigma_eff,
                     "source_plane_rms": float(np.sqrt(np.mean(residuals**2))),
                     "residual_max": float(np.max(residuals)),
                     "x_pred": np.full(family.n_images, np.nan),
@@ -3379,6 +3439,7 @@ def _build_state_from_inputs(
         component_param_assignments.extend(scaling_assignments)
         lens_model_list.extend(scaling_lens_model_list)
         base_components.extend(scaling_components)
+    parameter_specs.append(_build_source_scatter_parameter_spec(start_index=len(parameter_specs)))
     packed_lens_spec = _build_packed_lens_spec(base_components, component_param_assignments, scaling_component_assignments)
     family_data, family_redshift_binning_sec = _prepare_family_data(images_df, sigma_arcsec, reference, args.z_bin_tol)
     bin_data = _build_bin_data(family_data)

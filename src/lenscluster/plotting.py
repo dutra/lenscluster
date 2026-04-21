@@ -37,7 +37,7 @@ CORNER_PLOT_KWARGS = {
     "smooth1d": 1.0,
     "max_n_ticks": 4,
 }
-CORNER_PLOT_DPI = 220
+CORNER_PLOT_DPI = 300
 
 
 def plot_path(root: Path, name: str) -> Path:
@@ -481,6 +481,8 @@ def _family_diagnostics_table(evaluator: ClusterJAXEvaluator, best_eval: Evaluat
                 "effective_z_source": family.effective_z_source,
                 "n_images": family.n_images,
                 "sigma_arcsec": family.sigma_arcsec,
+                "source_sigma_int_arcsec": pred.get("source_sigma_int_arcsec"),
+                "source_sigma_eff_arcsec": pred.get("source_sigma_eff_arcsec"),
                 "source_plane_rms_arcsec": pred.get("source_plane_rms"),
                 "approx_image_rms_arcsec": pred.get("approx_image_rms_arcsec"),
                 "exact_image_rms_arcsec": pred.get("exact_image_rms"),
@@ -518,6 +520,7 @@ def _run_summary(
         "n_images": int(sum(f.n_images for f in state.family_data)),
         "n_large_scale_parameters": int(sum(spec.component_family == "large" for spec in state.parameter_specs)),
         "n_scaling_parameters": int(sum(spec.component_family == "scaling" for spec in state.parameter_specs)),
+        "n_source_scatter_parameters": int(sum(spec.component_family == "source_scatter" for spec in state.parameter_specs)),
         "n_scaling_galaxy_components": int(np.sum(state.packed_lens_spec.component_family == 1)),
         "likelihood_mode": args.likelihood_mode,
         "fit_method": str(getattr(args, "fit_method", "svi+nuts")),
@@ -636,17 +639,17 @@ def _plot_corner(
     finite_samples = _finite_sample_rows(samples)
     if finite_samples.shape[0] == 0:
         return
-    subset = _corner_dynamic_subset(finite_samples, parameter_specs, "corner.png")
+    subset = _corner_dynamic_subset(finite_samples, parameter_specs, "corner.pdf")
     if subset is None:
         return
     finite_samples, subset_specs = subset
     _log(
         None,
-        f"[plot:corner] path={_plot_path(plot_dir, 'corner.png')} ndim={len(subset_specs)} samples_shape={tuple(finite_samples.shape)}",
+        f"[plot:corner] path={_plot_path(plot_dir, 'corner.pdf')} ndim={len(subset_specs)} samples_shape={tuple(finite_samples.shape)}",
     )
     labels = [spec.name for spec in subset_specs]
     fig = corner.corner(finite_samples, labels=labels, **CORNER_PLOT_KWARGS)
-    fig.savefig(_plot_path(plot_dir, "corner.png"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
+    fig.savefig(_plot_path(plot_dir, "corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -689,17 +692,17 @@ def _plot_potfile_corner(
     finite_samples = _finite_sample_rows(samples)
     if finite_samples.shape[0] == 0:
         return
-    subset = _corner_dynamic_subset(finite_samples, parameter_specs, "potfile_corner.png")
+    subset = _corner_dynamic_subset(finite_samples, parameter_specs, "potfile_corner.pdf")
     if subset is None:
         return
     finite_samples, subset_specs = subset
     _log(
         None,
-        f"[plot:corner] path={_plot_path(plot_dir, 'potfile_corner.png')} ndim={len(subset_specs)} samples_shape={tuple(finite_samples.shape)}",
+        f"[plot:corner] path={_plot_path(plot_dir, 'potfile_corner.pdf')} ndim={len(subset_specs)} samples_shape={tuple(finite_samples.shape)}",
     )
     labels = [spec.name for spec in subset_specs]
     fig = corner.corner(finite_samples, labels=labels, **CORNER_PLOT_KWARGS)
-    fig.savefig(_plot_path(plot_dir, "potfile_corner.png"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
+    fig.savefig(_plot_path(plot_dir, "potfile_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -921,6 +924,134 @@ def _plot_residuals_by_family(plot_dir: Path, family_df: pd.DataFrame) -> None:
     ax.tick_params(axis="x", rotation=90)
     fig.tight_layout()
     fig.savefig(_plot_path(plot_dir, "residuals_by_family.png"), dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _source_plane_residual_components(
+    state: BuildState,
+    best_eval: EvaluationResult,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    dx_values: list[np.ndarray] = []
+    dy_values: list[np.ndarray] = []
+    norm_x_values: list[np.ndarray] = []
+    norm_y_values: list[np.ndarray] = []
+    radial_values: list[np.ndarray] = []
+    for family in state.family_data:
+        if family.n_images < 2:
+            continue
+        pred = best_eval.family_predictions.get(family.family_id)
+        if not pred or bool(pred.get("failed", False)):
+            continue
+        source_x = pred.get("source_x")
+        source_y = pred.get("source_y")
+        if source_x is None or source_y is None or not np.isfinite(source_x) or not np.isfinite(source_y):
+            continue
+        sigma = float(pred.get("source_sigma_eff_arcsec", family.sigma_arcsec))
+        if not np.isfinite(sigma) or sigma <= 0.0:
+            continue
+        if "source_beta_x" not in pred or "source_beta_y" not in pred:
+            continue
+        beta_x = np.asarray(pred["source_beta_x"], dtype=float)
+        beta_y = np.asarray(pred["source_beta_y"], dtype=float)
+        if beta_x.shape != family.x_obs.shape or beta_y.shape != family.y_obs.shape:
+            continue
+        dx = beta_x - float(source_x)
+        dy = beta_y - float(source_y)
+        finite = np.isfinite(dx) & np.isfinite(dy)
+        if not finite.any():
+            continue
+        dx = dx[finite]
+        dy = dy[finite]
+        dx_values.append(dx)
+        dy_values.append(dy)
+        norm_x_values.append(dx / sigma)
+        norm_y_values.append(dy / sigma)
+        radial_values.append(np.sqrt(dx**2 + dy**2) / sigma)
+    dx = np.concatenate(dx_values) if dx_values else np.asarray([], dtype=float)
+    dy = np.concatenate(dy_values) if dy_values else np.asarray([], dtype=float)
+    norm_x = np.concatenate(norm_x_values) if norm_x_values else np.asarray([], dtype=float)
+    norm_y = np.concatenate(norm_y_values) if norm_y_values else np.asarray([], dtype=float)
+    radial = np.concatenate(radial_values) if radial_values else np.asarray([], dtype=float)
+    return dx, dy, norm_x, norm_y, radial
+
+
+def _plot_gaussian_component_histogram(
+    ax: Any,
+    component: np.ndarray,
+    *,
+    xlabel: str,
+    title: str,
+    standard_normal: bool = False,
+) -> None:
+    bins = min(60, max(16, int(np.sqrt(component.size))))
+    ax.hist(component, bins=bins, density=True, alpha=0.65, color="tab:blue", label="components")
+    x_min = float(np.nanmin(component))
+    x_max = float(np.nanmax(component))
+    span = max(abs(x_min), abs(x_max), 1.0)
+    x_grid = np.linspace(-1.05 * span, 1.05 * span, 400)
+    mu = float(np.mean(component))
+    std = float(np.std(component, ddof=1)) if component.size > 1 else float("nan")
+    if standard_normal:
+        ax.plot(x_grid, norm.pdf(x_grid, 0.0, 1.0), color="black", linestyle="--", label="N(0, 1)")
+    if np.isfinite(std) and std > 0:
+        ax.plot(x_grid, norm.pdf(x_grid, mu, std), color="tab:red", label=f"fit mu={mu:.2f}, sigma={std:.2f}")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Density")
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+
+
+def _plot_source_plane_residual_histogram(
+    plot_dir: Path,
+    state: BuildState,
+    best_eval: EvaluationResult,
+) -> None:
+    dx, dy, norm_x, norm_y, radial = _source_plane_residual_components(state, best_eval)
+    if radial.size == 0:
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
+    arcsec_component = np.concatenate([dx, dy])
+    normalized_component = np.concatenate([norm_x, norm_y])
+    _plot_gaussian_component_histogram(
+        axes[0],
+        arcsec_component,
+        xlabel="Signed source-plane residual [arcsec]",
+        title="Signed Components",
+    )
+    _plot_gaussian_component_histogram(
+        axes[1],
+        normalized_component,
+        xlabel="Signed source-plane residual / sigma_eff",
+        title="Normalized Components",
+        standard_normal=True,
+    )
+
+    bins = min(60, max(16, int(np.sqrt(radial.size))))
+    max_x = max(4.0, float(np.nanmax(radial)) * 1.05)
+    axes[2].hist(radial, bins=bins, density=True, alpha=0.65, color="tab:purple", label="radial")
+    x_grid = np.linspace(0.0, max_x, 400)
+    rayleigh_pdf = x_grid * np.exp(-0.5 * x_grid**2)
+    axes[2].plot(x_grid, rayleigh_pdf, color="black", linestyle="--", label="Rayleigh scale=1")
+    median = float(np.median(radial))
+    p68, p95 = np.quantile(radial, [0.68, 0.95])
+    axes[2].axvline(median, color="tab:red", linewidth=1.5, label=f"median={median:.2f}")
+    axes[2].text(
+        0.98,
+        0.95,
+        f"N={radial.size}\n68%={p68:.2f}\n95%={p95:.2f}",
+        transform=axes[2].transAxes,
+        ha="right",
+        va="top",
+        fontsize=9,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "0.8", "alpha": 0.9},
+    )
+    axes[2].set_xlabel("Radial source-plane residual / sigma_eff")
+    axes[2].set_ylabel("Density")
+    axes[2].set_title("Radial Residuals")
+    axes[2].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(_plot_path(plot_dir, "source_plane_residual_histogram.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1236,6 +1367,11 @@ def _generate_plots_and_tables(
     _run_logged_phase(args, "plots.run_diagnostics", lambda: _plot_run_diagnostics(run_dir, results))
     _run_logged_phase(args, "plots.weights_logl", lambda: _plot_weights_logl(run_dir, results))
     _run_logged_phase(args, "plots.residuals_by_family", lambda: _plot_residuals_by_family(run_dir, family_df))
+    _run_logged_phase(
+        args,
+        "plots.source_plane_residual_histogram",
+        lambda: _plot_source_plane_residual_histogram(run_dir, state, best_eval),
+    )
     _run_logged_phase(args, "plots.image_plane_fit", lambda: _plot_image_plane_fit(run_dir, state, best_eval))
     _run_logged_phase(args, "plots.source_plane_scatter", lambda: _plot_source_plane_scatter(run_dir, state, best_eval))
     _run_logged_phase(

@@ -95,6 +95,14 @@ Positive quantities such as scaling `sigma` and `cutkpc` are sampled in latent
 log space and converted back to physical units when building the lens model and
 writing outputs.
 
+The source-plane likelihood also includes a global positive intrinsic scatter
+parameter, `source.sigma_int`, sampled in log space. It is combined in
+quadrature with the configured positional uncertainty:
+
+```text
+sigma_eff_i^2 = sigma_arcsec_i^2 + source_sigma_int^2
+```
+
 ## Likelihood
 
 Inference uses a source-plane Gaussian likelihood. For each observed image, the
@@ -105,14 +113,16 @@ scatter around that family centroid:
 
 ```text
 log L = -0.5 * sum_i [
-  ((beta_x_i - beta_bar_x)^2 + (beta_y_i - beta_bar_y)^2) / sigma_i^2
-  + 2 log(2 pi sigma_i^2)
+  ((beta_x_i - beta_bar_x)^2 + (beta_y_i - beta_bar_y)^2) / sigma_eff_i^2
+  + 2 log(2 pi sigma_eff_i^2)
 ]
 ```
 
-`sigma_i` is the positional uncertainty for the image. Exact image-plane solving
-is used for validation, diagnostics, and plots; it is not currently the sampled
-posterior likelihood.
+`sigma_eff_i` is the positional uncertainty plus inferred intrinsic scatter.
+Single-image families are excluded from this source-plane scatter likelihood
+because their source-plane residual is zero by construction. Exact image-plane
+solving is used for validation, diagnostics, and plots; it is not currently the
+sampled posterior likelihood.
 
 ## Outputs
 
