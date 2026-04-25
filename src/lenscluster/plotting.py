@@ -626,6 +626,22 @@ def _corner_dynamic_subset(
         _log(None, f"[plot:corner] {plot_name}: dropped constant parameters={', '.join(dropped)}")
     subset_samples = sample_array[:, dynamic_mask]
     subset_specs = [spec for spec, keep in zip(parameter_specs, dynamic_mask) if keep]
+    if subset_samples.shape[1] > subset_samples.shape[0]:
+        spans_subset = spans[dynamic_mask]
+        keep_count = max(2, int(subset_samples.shape[0]))
+        keep_order = np.argsort(-spans_subset)[:keep_count]
+        keep_order = np.sort(keep_order)
+        dropped = [spec.name for idx, spec in enumerate(subset_specs) if idx not in set(keep_order.tolist())]
+        _log(
+            None,
+            (
+                f"[plot:corner] {plot_name}: limited plotted parameters to {keep_count} "
+                f"because samples={subset_samples.shape[0]} < parameters={subset_samples.shape[1]}; "
+                f"dropped={', '.join(dropped)}"
+            ),
+        )
+        subset_samples = subset_samples[:, keep_order]
+        subset_specs = [subset_specs[idx] for idx in keep_order.tolist()]
     return subset_samples, subset_specs
 
 

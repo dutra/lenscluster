@@ -58,6 +58,95 @@ python -m cluster_solver \
 
 The same command with `--fit-method svi` skips NUTS and writes the AutoNormal guide posterior.
 
+## Mock-Cluster Validation
+
+The validation runner builds a synthetic single-BCG cluster, runs the normal
+parser/build/inference workflow, and writes PDF-only recovery figures. By
+default it uses SVI initialization followed by NumPyro NUTS:
+
+```bash
+python -m lenscluster.validation \
+  --n-subhalos 50
+```
+
+Useful explicit configuration for the current subhalo validation setup:
+
+```bash
+python -m lenscluster.validation \
+  --n-subhalos 50 \
+  --sampling-engine refreshing_surrogate \
+  --active-scaling-selection adaptive \
+  --active-scaling-cumulative-fraction 0.995 \
+  --active-scaling-min 4
+```
+
+The adaptive subhalo selection ranks potfile galaxies by brightness and
+proximity to the observed multiple images, then chooses the active exact
+subhalo cutoff from the cumulative-importance curve. The default keeps enough
+ranked subhalos to capture 99.5% of the ranking importance, with at least four
+active subhalos per potfile. The remaining subhalos are retained through the
+refreshing surrogate rather than removed from the model.
+
+For a faster variational-only validation run:
+
+```bash
+python -m lenscluster.validation \
+  --n-subhalos 50 \
+  --fit-method svi \
+  --svi-steps 1000 \
+  --samples 500
+```
+
+For a smaller NUTS test:
+
+```bash
+python -m lenscluster.validation \
+  --n-subhalos 50 \
+  --fit-method svi+nuts \
+  --svi-steps 500 \
+  --warmup 100 \
+  --samples 200
+```
+
+Validation outputs are written to:
+
+```text
+validation_runs/single_bcg/<run-name>/seed_<seed>/
+```
+
+The default run name and seed produce:
+
+```text
+validation_runs/single_bcg/single_bcg_recovery/seed_12345/
+```
+
+Main validation PDFs:
+
+- `parameter_recovery.pdf`
+- `mass_profile_recovery.pdf`
+- `magnification_recovery.pdf`
+- `image_recovery.pdf`
+- `source_recovery.pdf`
+- `subhalo_population.pdf`
+- `validation_summary.pdf`
+- `corner.pdf`
+- `potfile_corner.pdf` when potfile scaling parameters are present
+
+The mass-profile validation figure decomposes the recovered deflection profile
+into total, halo, BCG, subhalos, and BCG+subhalos. This is important because
+strong-lensing image positions mostly constrain the total deflection field; the
+halo, BCG, and subhalo components can trade mass unless the priors and image
+configuration break that degeneracy.
+
+The posterior artifacts used to make these PDFs are saved under:
+
+```text
+validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage2_joint/artifacts/plot_bundle.h5
+```
+
+All validation figures are saved as PDFs. The validation runner does not write
+CSV tables.
+
 ## Model
 
 The sampled model is assembled from the priors in the Lenstool `.par` file and

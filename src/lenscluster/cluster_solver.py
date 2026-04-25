@@ -99,6 +99,8 @@ DEFAULT_SAMPLES = 500
 DEFAULT_TARGET_ACCEPT = 0.85
 DEFAULT_MAX_TREE_DEPTH = 10
 DEFAULT_ACTIVE_SCALING_GALAXIES = 64
+DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION = 0.995
+DEFAULT_ACTIVE_SCALING_MIN = 4
 DEFAULT_REFRESH_EVERY = 250
 DEFAULT_REFRESH_PARAM_DRIFT_FRAC = 0.25
 DEFAULT_VALIDATION_RMS_FACTOR = 1.5
@@ -299,7 +301,31 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         default=None,
-        help="Per-potfile counts of most-important scaling-law galaxies to keep exact in surrogate mode, in potfile order. Negative values mean use all galaxies for that potfile.",
+        help=(
+            "Per-potfile fixed counts, or adaptive maximum counts, of most-important scaling-law galaxies "
+            "to keep exact in surrogate mode, in potfile order. Negative values mean use all galaxies."
+        ),
+    )
+    parser.add_argument(
+        "--active-scaling-selection",
+        choices=("fixed", "adaptive"),
+        default="adaptive",
+        help=(
+            "How to choose active scaling-law galaxies. fixed uses --active-scaling-galaxies directly; "
+            "adaptive chooses the cutoff from the ranked importance curve."
+        ),
+    )
+    parser.add_argument(
+        "--active-scaling-cumulative-fraction",
+        type=float,
+        default=DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
+        help="Adaptive selection target cumulative ranking importance to include exactly.",
+    )
+    parser.add_argument(
+        "--active-scaling-min",
+        type=int,
+        default=DEFAULT_ACTIVE_SCALING_MIN,
+        help="Minimum active galaxies per potfile for adaptive scaling selection.",
     )
     parser.add_argument(
         "--scaling-scatter",
@@ -1669,6 +1695,40 @@ def _normalize_active_scaling_counts(
     return resolved
 
 
+def _adaptive_active_scaling_count(
+    importance: np.ndarray,
+    *,
+    cumulative_fraction: float,
+    min_count: int,
+    max_count: int,
+) -> tuple[int, int, int]:
+    values = np.asarray(importance, dtype=float)
+    values = values[np.isfinite(values) & (values > 0.0)]
+    n_values = int(values.size)
+    if n_values == 0:
+        return 0, 0, 0
+    total = float(np.sum(values))
+    if not np.isfinite(total) or total <= 0.0:
+        return min(max(int(min_count), 1), n_values), 0, 0
+    cumulative = np.cumsum(values) / total
+    target = float(np.clip(cumulative_fraction, 0.0, 1.0))
+    cumulative_count = int(np.searchsorted(cumulative, target, side="left") + 1)
+    if n_values <= 2:
+        knee_count = n_values
+    else:
+        rank_fraction = (np.arange(n_values, dtype=float) + 1.0) / float(n_values)
+        knee_count = int(np.argmax(cumulative - rank_fraction) + 1)
+    if max_count < 0:
+        cap = n_values
+    elif max_count == 0:
+        cap = min(DEFAULT_ACTIVE_SCALING_GALAXIES, n_values)
+    else:
+        cap = min(int(max_count), n_values)
+    selected = max(int(min_count), knee_count, cumulative_count)
+    selected = min(max(selected, 1), cap)
+    return selected, cumulative_count, knee_count
+
+
 def _prepare_family_data(
     images_df: pd.DataFrame,
     sigma_arcsec: float,
@@ -1794,6 +1854,9 @@ class ClusterJAXEvaluator:
         validate_top_k_families: int,
         sampling_engine: str = "full",
         active_scaling_galaxies: list[int] | int | None = None,
+        active_scaling_selection: str = "adaptive",
+        active_scaling_cumulative_fraction: float = DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
+        active_scaling_min: int = DEFAULT_ACTIVE_SCALING_MIN,
         refresh_every: int = DEFAULT_REFRESH_EVERY,
         refresh_param_drift_frac: float = DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
         validation_approx: str = "exact",
@@ -1803,6 +1866,9 @@ class ClusterJAXEvaluator:
         self.validate_top_k_families = max(0, int(validate_top_k_families))
         self.sampling_engine = str(sampling_engine)
         self.active_scaling_galaxies_by_potfile = _normalize_active_scaling_counts(active_scaling_galaxies, state.potfiles)
+        self.active_scaling_selection = str(active_scaling_selection)
+        self.active_scaling_cumulative_fraction = float(active_scaling_cumulative_fraction)
+        self.active_scaling_min = max(1, int(active_scaling_min))
         self.refresh_every = max(1, int(refresh_every))
         self.refresh_param_drift_frac = float(refresh_param_drift_frac)
         self.validation_approx = str(validation_approx)
@@ -2145,6 +2211,10 @@ class ClusterJAXEvaluator:
                     "rank",
                     "selected_active",
                     "requested_active_count",
+                    "selection_mode",
+                    "adaptive_cumulative_count",
+                    "adaptive_knee_count",
+                    "cumulative_importance_fraction",
                     "importance",
                     "min_distance_arcsec",
                     "brightness",
@@ -2177,8 +2247,21 @@ class ClusterJAXEvaluator:
             brightness = np.power(10.0, -0.4 * (magnitudes - mag0))
             importance = brightness / np.square(min_dist + 0.5)
             order = np.argsort(-importance)
-            top_k = min(requested_active_count, len(order))
+            if self.active_scaling_selection == "adaptive":
+                top_k, cumulative_count, knee_count = _adaptive_active_scaling_count(
+                    importance[order],
+                    cumulative_fraction=self.active_scaling_cumulative_fraction,
+                    min_count=self.active_scaling_min,
+                    max_count=requested_active_count,
+                )
+            else:
+                top_k = min(requested_active_count, len(order))
+                cumulative_count = top_k
+                knee_count = top_k
             active_positions = set(order[:top_k].tolist())
+            ordered_importance = importance[order]
+            total_importance = float(np.sum(ordered_importance[np.isfinite(ordered_importance)]))
+            cumulative_importance = np.cumsum(np.nan_to_num(ordered_importance, nan=0.0, posinf=0.0, neginf=0.0))
             for rank, record_pos in enumerate(order.tolist(), start=1):
                 record = records[record_pos]
                 rows.append(
@@ -2190,6 +2273,12 @@ class ClusterJAXEvaluator:
                         "rank": rank,
                         "selected_active": bool(record_pos in active_positions),
                         "requested_active_count": requested_active_count,
+                        "selection_mode": self.active_scaling_selection,
+                        "adaptive_cumulative_count": int(cumulative_count),
+                        "adaptive_knee_count": int(knee_count),
+                        "cumulative_importance_fraction": float(cumulative_importance[rank - 1] / total_importance)
+                        if total_importance > 0.0
+                        else float("nan"),
                         "importance": float(importance[record_pos]),
                         "min_distance_arcsec": float(min_dist[record_pos]),
                         "brightness": float(brightness[record_pos]),
@@ -3695,6 +3784,9 @@ def _prepare_direct_evaluator(
         validate_top_k_families=args.validate_top_k_families,
         sampling_engine=args.sampling_engine,
         active_scaling_galaxies=args.active_scaling_galaxies,
+        active_scaling_selection=args.active_scaling_selection,
+        active_scaling_cumulative_fraction=args.active_scaling_cumulative_fraction,
+        active_scaling_min=args.active_scaling_min,
         refresh_every=args.refresh_every,
         refresh_param_drift_frac=args.refresh_param_drift_frac,
         validation_approx=args.validation_approx,
@@ -3938,6 +4030,11 @@ def _rerender_plots(args: argparse.Namespace, run_dir: Path) -> None:
         validate_top_k_families=int(saved_args.get("validate_top_k_families", 8)),
         sampling_engine=str(saved_args.get("sampling_engine", "full")),
         active_scaling_galaxies=saved_args.get("active_scaling_galaxies"),
+        active_scaling_selection=str(saved_args.get("active_scaling_selection", "adaptive")),
+        active_scaling_cumulative_fraction=float(
+            saved_args.get("active_scaling_cumulative_fraction", DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION)
+        ),
+        active_scaling_min=int(saved_args.get("active_scaling_min", DEFAULT_ACTIVE_SCALING_MIN)),
         refresh_every=int(saved_args.get("refresh_every", DEFAULT_REFRESH_EVERY)),
         refresh_param_drift_frac=float(saved_args.get("refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
         validation_approx=str(saved_args.get("validation_approx", "exact")),
