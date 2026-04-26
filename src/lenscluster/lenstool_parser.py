@@ -207,6 +207,10 @@ def _normalize_potential_definition(
     normalized = dict(potential)
     normalized_priors = dict(priors)
     potential_id = str(normalized.get("id", "potential"))
+    if "profil" not in normalized and "profile" in normalized:
+        normalized["profil"] = normalized.pop("profile")
+    if "profil" not in normalized_priors and "profile" in normalized_priors:
+        normalized_priors["profil"] = normalized_priors.pop("profile")
     profile_type = int(normalized.get("profil"))
 
     if profile_type == DP_IE_PROFILE:

@@ -54,9 +54,11 @@ def test_generate_single_bcg_mock_parses_and_has_finite_magnifications(tmp_path:
     assert paths.image_catalog_path.exists()
     assert len(potentials_with_priors) == 2
     assert images_df["family_id"].nunique() == 2
+    assert sorted(images_df.groupby("family_id")["catalog_z"].first().round(3).tolist()) == [1.5, 2.0]
     assert (images.groupby("family_id").size() >= config.min_images_per_family).all()
     assert np.isfinite(images["magnification_true"].to_numpy(dtype=float)).all()
     assert set(truth["parameter_truth"]) >= {"halo.v_disp", "bcg.v_disp", "source.sigma_int"}
+    assert truth["parameter_truth"]["source.sigma_int"] == config.source_sigma_int_arcsec
 
 
 def test_generate_single_bcg_mock_with_subhalos_uses_potfile(tmp_path: Path) -> None:

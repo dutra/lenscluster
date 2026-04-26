@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover
     corner = None
 
 from .model import BuildState, EvaluationResult, ParameterSpec, PosteriorResults
+from .model import convert_theta_to_latent as _convert_theta_to_latent
 from .model import display_lower as _display_lower
 from .model import display_upper as _display_upper
 from .utils import log_message as _log
@@ -1220,6 +1221,7 @@ def _resample_curve_vertices(vertices: np.ndarray, target_points: int) -> np.nda
 
 
 def _plot_caustic_overlay(plot_dir: Path, evaluator: ClusterJAXEvaluator, best_fit: np.ndarray, caustic_num_pix: int) -> None:
+    best_fit_latent = _convert_theta_to_latent(np.asarray(best_fit, dtype=float), evaluator.state.parameter_specs)
     x_all = np.concatenate([fam.x_obs for fam in evaluator.state.family_data])
     y_all = np.concatenate([fam.y_obs for fam in evaluator.state.family_data])
     center_x = float(np.mean(x_all))
@@ -1234,7 +1236,7 @@ def _plot_caustic_overlay(plot_dir: Path, evaluator: ClusterJAXEvaluator, best_f
     model = evaluator.exact_models_by_z.get(family.z_source)
     if model is None:
         model, _ = evaluator._get_exact_model_solver(family.z_source)
-    packed_state = evaluator._build_packed_lens_state(jnp.asarray(best_fit, dtype=jnp.float64), family.z_source)
+    packed_state = evaluator._build_packed_lens_state(jnp.asarray(best_fit_latent, dtype=jnp.float64), family.z_source)
     kwargs_lens = evaluator._packed_to_kwargs_lens(packed_state)
     inv_mag = np.asarray(
         1.0
@@ -1274,7 +1276,7 @@ def _plot_caustic_overlay(plot_dir: Path, evaluator: ClusterJAXEvaluator, best_f
             alpha=0.75,
             linewidths=0.0,
         )
-    best_source_eval = evaluator.evaluate(best_fit, likelihood_mode="source")
+    best_source_eval = evaluator.evaluate(best_fit_latent, likelihood_mode="source")
     for idx, fam in enumerate(evaluator.state.family_data):
         pred = best_source_eval.family_predictions[fam.family_id]
         source_ax.scatter(pred["source_x"], pred["source_y"], color=cmap(idx), s=14)

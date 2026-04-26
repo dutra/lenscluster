@@ -62,7 +62,10 @@ The same command with `--fit-method svi` skips NUTS and writes the AutoNormal gu
 
 The validation runner builds a synthetic single-BCG cluster, runs the normal
 parser/build/inference workflow, and writes PDF-only recovery figures. By
-default it uses SVI initialization followed by NumPyro NUTS:
+default it uses a mildly realistic mock: source families cycle through
+`z=1.5,2.0,3.0`, the BCG is slightly offset from the cluster halo, the image
+position uncertainty is `0.15"` and the reported source-scatter truth is
+`0.05"`. It uses SVI initialization followed by NumPyro NUTS:
 
 ```bash
 python -m lenscluster.validation \
@@ -74,6 +77,8 @@ Useful explicit configuration for the current subhalo validation setup:
 ```bash
 python -m lenscluster.validation \
   --n-subhalos 50 \
+  --source-redshifts 1.5,2.0,3.0 \
+  --pos-sigma-arcsec 0.15 \
   --sampling-engine refreshing_surrogate \
   --active-scaling-selection adaptive \
   --active-scaling-cumulative-fraction 0.995 \

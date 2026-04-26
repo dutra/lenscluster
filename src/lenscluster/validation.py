@@ -71,9 +71,11 @@ class SingleBCGMockConfig:
     z_lens: float = 0.396
     reference_ra_deg: float = 64.0381417
     reference_dec_deg: float = -24.0674722
-    pos_sigma_arcsec: float = 0.05
+    pos_sigma_arcsec: float = 0.15
     seed: int = 12345
     source_redshift: float = 2.0
+    source_redshifts: tuple[float, ...] = (1.5, 2.0, 3.0)
+    source_sigma_int_arcsec: float = 0.05
     n_families: int = 3
     min_images_per_family: int = 2
     max_sources_to_try: int = 400
@@ -102,8 +104,8 @@ class SingleBCGMockConfig:
     )
     bcg: DPIETruth = DPIETruth(
         potential_id="bcg",
-        x_centre=0.0,
-        y_centre=0.0,
+        x_centre=0.35,
+        y_centre=-0.22,
         ellipticite=0.12,
         angle_pos=10.0,
         core_radius_arcsec=0.15,
@@ -166,6 +168,7 @@ def load_chires_family_summary(path: str | Path) -> pd.DataFrame:
 
 def _config_to_jsonable(config: SingleBCGMockConfig, kpc_per_arcsec: float) -> dict[str, Any]:
     payload = asdict(config)
+    payload["source_redshifts"] = [float(value) for value in config.source_redshifts]
     for component_name in ("halo", "bcg"):
         component = payload[component_name]
         component["core_radius_kpc"] = float(component["core_radius_arcsec"]) * float(kpc_per_arcsec)
@@ -286,7 +289,7 @@ def _truth_parameter_values(config: SingleBCGMockConfig, kpc_per_arcsec: float) 
         truth[f"{prefix}.core_radius_kpc"] = float(component.core_radius_arcsec) * float(kpc_per_arcsec)
         truth[f"{prefix}.cut_radius_kpc"] = float(component.cut_radius_arcsec) * float(kpc_per_arcsec)
         truth[f"{prefix}.v_disp"] = float(component.v_disp)
-    truth["source.sigma_int"] = 0.0
+    truth["source.sigma_int"] = float(config.source_sigma_int_arcsec)
     if config.n_subhalos > 0:
         truth["potfile.sigma"] = float(config.subhalo_sigma_ref)
         truth["potfile.cutkpc"] = float(config.subhalo_cut_radius_arcsec) * float(kpc_per_arcsec)
@@ -405,6 +408,33 @@ def _candidate_sources(config: SingleBCGMockConfig, rng: np.random.Generator) ->
     return anchors + [(float(x), float(y)) for x, y in random_items]
 
 
+def _family_source_redshifts(config: SingleBCGMockConfig) -> tuple[float, ...]:
+    values = tuple(float(value) for value in config.source_redshifts if np.isfinite(float(value)) and float(value) > config.z_lens)
+    return values if values else (float(config.source_redshift),)
+
+
+def _mock_model_and_kwargs(
+    config: SingleBCGMockConfig,
+    subhalo_components: list[DPIETruth],
+    z_source: float,
+    cosmo: Any,
+) -> tuple[LensModel, list[dict[str, float]]]:
+    lens_model_list = [ORIGINAL_DPIE_PROFILE_NAME, ORIGINAL_DPIE_PROFILE_NAME] + [
+        ORIGINAL_DPIE_PROFILE_NAME for _ in subhalo_components
+    ]
+    model = LensModel(
+        lens_model_list=lens_model_list,
+        z_lens=config.z_lens,
+        z_source=float(z_source),
+        cosmo=cosmo,
+    )
+    kwargs_lens = [
+        _component_kwargs(config.halo, config, float(z_source), cosmo),
+        _component_kwargs(config.bcg, config, float(z_source), cosmo),
+    ] + [_component_kwargs(component, config, float(z_source), cosmo) for component in subhalo_components]
+    return model, kwargs_lens
+
+
 def generate_single_bcg_mock(
     output_dir: str | Path,
     config: SingleBCGMockConfig | None = None,
@@ -428,24 +458,23 @@ def generate_single_bcg_mock(
     kpc_per_arcsec = float(cosmo.kpc_proper_per_arcmin(config.z_lens).to("kpc/arcsec").value)
     subhalos = _generate_subhalo_catalog(config, rng)
     subhalo_components = [_scaled_subhalo_params(row, config) for row in subhalos]
-    model = LensModel(
-        lens_model_list=[ORIGINAL_DPIE_PROFILE_NAME, ORIGINAL_DPIE_PROFILE_NAME]
-        + [ORIGINAL_DPIE_PROFILE_NAME for _ in subhalo_components],
-        z_lens=config.z_lens,
-        z_source=config.source_redshift,
-        cosmo=cosmo,
-    )
-    solver = LensEquationSolver(model)
-    kwargs_lens = [
-        _component_kwargs(config.halo, config, config.source_redshift, cosmo),
-        _component_kwargs(config.bcg, config, config.source_redshift, cosmo),
-    ] + [_component_kwargs(component, config, config.source_redshift, cosmo) for component in subhalo_components]
+    source_redshifts = _family_source_redshifts(config)
+    model_cache: dict[float, tuple[LensModel, LensEquationSolver, list[dict[str, float]]]] = {}
+
+    def get_model(z_source: float) -> tuple[LensModel, LensEquationSolver, list[dict[str, float]]]:
+        z_key = float(z_source)
+        if z_key not in model_cache:
+            model, kwargs_lens = _mock_model_and_kwargs(config, subhalo_components, z_key, cosmo)
+            model_cache[z_key] = (model, LensEquationSolver(model), kwargs_lens)
+        return model_cache[z_key]
 
     image_rows: list[dict[str, Any]] = []
     source_rows: list[dict[str, Any]] = []
     for beta_x, beta_y in _candidate_sources(config, rng):
         if len(source_rows) >= config.n_families:
             break
+        z_source = source_redshifts[len(source_rows) % len(source_redshifts)]
+        model, solver, kwargs_lens = get_model(z_source)
         x_img, y_img = solver.image_position_from_source(
             beta_x,
             beta_y,
@@ -465,7 +494,7 @@ def generate_single_bcg_mock(
                 "family_id": family_id,
                 "beta_x": float(beta_x),
                 "beta_y": float(beta_y),
-                "z_source": float(config.source_redshift),
+                "z_source": float(z_source),
                 "n_images": int(len(x_arr)),
             }
         )
@@ -478,7 +507,7 @@ def generate_single_bcg_mock(
                     "image_label": f"{family_id}.{image_index}",
                     "family_id": family_id,
                     "image_id": str(image_index),
-                    "z_source": float(config.source_redshift),
+                    "z_source": float(z_source),
                     "x_true_arcsec": float(x_true),
                     "y_true_arcsec": float(y_true),
                     "x_obs_arcsec": x_obs,
@@ -520,7 +549,8 @@ def generate_single_bcg_mock(
         "subhalo_components": [asdict(component) for component in subhalo_components],
         "lens_model_list": [ORIGINAL_DPIE_PROFILE_NAME, ORIGINAL_DPIE_PROFILE_NAME]
         + [ORIGINAL_DPIE_PROFILE_NAME for _ in subhalo_components],
-        "kwargs_lens": kwargs_lens,
+        "kwargs_lens": get_model(float(config.source_redshift))[2],
+        "kwargs_lens_by_source_redshift": {f"{z:.8f}": get_model(float(z))[2] for z in source_redshifts},
     }
     truth_path.write_text(json.dumps(truth_payload, indent=2), encoding="utf-8")
     mock_images_path.write_text(json.dumps(image_rows, indent=2), encoding="utf-8")
@@ -931,7 +961,8 @@ def _deflection_profile_for_samples(
         "subhalos": "subhalos",
         "bcg_plus_subhalos": "BCG + subhalos",
     }
-    truth_kwargs = truth.get("kwargs_lens", [])
+    truth_kwargs_by_z = truth.get("kwargs_lens_by_source_redshift", {})
+    truth_kwargs = truth_kwargs_by_z.get(f"{z_source:.8f}", truth.get("kwargs_lens", []))
 
     def alpha_magnitude(kwargs_lens: list[dict[str, float]], radius: float, indices: list[int]) -> float:
         if not indices:
@@ -1059,13 +1090,13 @@ def write_recovery_outputs(
         "subhalo_population_plot": output_dir / "subhalo_population.pdf",
         "summary_plot": output_dir / "validation_summary.pdf",
     }
-    _plot_corner(output_dir, samples, state.parameter_specs)
+    _plot_corner_pdf(output_dir, samples, state.parameter_specs, "corner.pdf")
     scaling_specs, scaling_samples, _scaling_best_fit = _scaling_parameter_subset(
         state.parameter_specs,
         samples,
         best_fit,
     )
-    _plot_potfile_corner(output_dir, scaling_samples, scaling_specs)
+    _plot_corner_pdf(output_dir, scaling_samples, scaling_specs, "potfile_corner.pdf")
     _plot_parameter_recovery(parameter_df, paths["parameter_pull_plot"])
     _plot_mass_profile_recovery(mass_profile_df, paths["mass_profile_plot"])
     _plot_magnification_recovery(magnification_df, paths["magnification_plot"])
@@ -1092,6 +1123,69 @@ def _plot_parameter_recovery(parameter_df: pd.DataFrame, path: Path) -> None:
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
+
+
+def _write_corner_placeholder(samples: np.ndarray, parameter_names: list[str], path: Path, plot_name: str) -> None:
+    sample_array = np.asarray(samples, dtype=float)
+    if sample_array.ndim != 2 or sample_array.size == 0:
+        n_samples = 0
+        n_params = len(parameter_names)
+        n_dynamic = 0
+    else:
+        finite_rows = sample_array[np.all(np.isfinite(sample_array), axis=1)]
+        n_samples = int(finite_rows.shape[0])
+        n_params = int(finite_rows.shape[1]) if finite_rows.ndim == 2 else len(parameter_names)
+        if finite_rows.ndim == 2 and finite_rows.shape[0] > 0:
+            spans = np.nanmax(finite_rows, axis=0) - np.nanmin(finite_rows, axis=0)
+            n_dynamic = int(np.sum(np.isfinite(spans) & (spans > 0.0)))
+        else:
+            n_dynamic = 0
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.axis("off")
+    ax.text(
+        0.5,
+        0.62,
+        f"{plot_name} was not generated",
+        ha="center",
+        va="center",
+        fontsize=14,
+        weight="bold",
+        transform=ax.transAxes,
+    )
+    ax.text(
+        0.5,
+        0.42,
+        (
+            "The saved posterior has fewer than two parameters with dynamic range.\n"
+            f"finite samples: {n_samples}, parameters: {n_params}, dynamic parameters: {n_dynamic}.\n"
+            "This usually means the sampler/guide posterior collapsed or all retained samples are identical."
+        ),
+        ha="center",
+        va="center",
+        fontsize=10,
+        transform=ax.transAxes,
+    )
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_corner_pdf(output_dir: Path, samples: np.ndarray, parameter_specs: list[Any], filename: str = "corner.pdf") -> None:
+    path = output_dir / filename
+    if path.exists():
+        path.unlink()
+    try:
+        if filename == "corner.pdf":
+            _plot_corner(output_dir, samples, parameter_specs)
+        else:
+            _plot_potfile_corner(output_dir, samples, parameter_specs)
+    except Exception as exc:  # pragma: no cover - defensive plotting fallback
+        _write_corner_placeholder(samples, [getattr(spec, "name", str(spec)) for spec in parameter_specs], path, filename)
+        _log_message = f"[validation:corner] wrote placeholder {path}: {exc}"
+        print(_log_message)
+        return
+    if not path.exists():
+        _write_corner_placeholder(samples, [getattr(spec, "name", str(spec)) for spec in parameter_specs], path, filename)
 
 
 def _summary_uncertainty(
@@ -1600,6 +1694,7 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
 def run_single_bcg_validation(args: argparse.Namespace) -> list[dict[str, Path]]:
     root = Path(args.output_dir) / "single_bcg" / str(args.run_name)
     outputs: list[dict[str, Path]] = []
+    source_redshifts = _parse_source_redshifts(args.source_redshifts, fallback=float(args.source_redshift))
     for realization in range(int(args.realizations)):
         seed = int(args.seed) + realization
         realization_dir = root / f"seed_{seed}"
@@ -1608,6 +1703,8 @@ def run_single_bcg_validation(args: argparse.Namespace) -> list[dict[str, Path]]
             pos_sigma_arcsec=float(args.pos_sigma_arcsec),
             n_families=int(args.n_families),
             source_redshift=float(args.source_redshift),
+            source_redshifts=source_redshifts,
+            source_sigma_int_arcsec=float(args.source_sigma_int_arcsec),
             n_subhalos=int(args.n_subhalos),
         )
         paths, _images, _truth = generate_single_bcg_mock(realization_dir / "mock", config)
@@ -1624,6 +1721,15 @@ def run_single_bcg_validation(args: argparse.Namespace) -> list[dict[str, Path]]
     return outputs
 
 
+def _parse_source_redshifts(raw: str | None, *, fallback: float) -> tuple[float, ...]:
+    if raw is None or not str(raw).strip():
+        return (float(fallback),)
+    values = tuple(float(item.strip()) for item in str(raw).split(",") if item.strip())
+    if not values:
+        return (float(fallback),)
+    return values
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Mock-recovery validation suite for lenscluster.")
     parser.add_argument("--mock", choices=("single-bcg",), default="single-bcg")
@@ -1634,7 +1740,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-families", type=int, default=3)
     parser.add_argument("--n-subhalos", type=int, default=0)
     parser.add_argument("--source-redshift", type=float, default=2.0)
-    parser.add_argument("--pos-sigma-arcsec", type=float, default=0.05)
+    parser.add_argument(
+        "--source-redshifts",
+        default="1.5,2.0,3.0",
+        help="Comma-separated source redshifts cycled across mock families. Empty string falls back to --source-redshift.",
+    )
+    parser.add_argument("--source-sigma-int-arcsec", type=float, default=0.05)
+    parser.add_argument("--pos-sigma-arcsec", type=float, default=0.15)
     parser.add_argument("--fit-method", choices=("svi", "svi+nuts"), default="svi+nuts")
     parser.add_argument("--svi-steps", type=int, default=1000)
     parser.add_argument("--warmup", type=int, default=300)

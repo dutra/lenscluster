@@ -98,6 +98,7 @@ DEFAULT_WARMUP = 300
 DEFAULT_SAMPLES = 500
 DEFAULT_TARGET_ACCEPT = 0.85
 DEFAULT_MAX_TREE_DEPTH = 10
+DEFAULT_INITIAL_STEP_SIZE = 1.0e-3
 DEFAULT_ACTIVE_SCALING_GALAXIES = 64
 DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION = 0.995
 DEFAULT_ACTIVE_SCALING_MIN = 4
@@ -113,6 +114,7 @@ DEFAULT_SOURCE_SIGMA_INT_LOWER_ARCSEC = 1.0e-3
 DEFAULT_SOURCE_SIGMA_INT_UPPER_ARCSEC = 2.0
 SAFE_SCALING_EXPONENT_ABS_MIN = 1.0e-3
 SAFE_RADIUS_MARGIN_ARCSEC = 1.0e-3
+SAFE_RADIUS_MARGIN_KPC = 1.0e-3
 BAD_LOG_LIKE = -1.0e30
 PROFILE_VARIANT_ORIGINAL = "original"
 PROFILE_VARIANT_COMPACT = "compact"
@@ -410,6 +412,12 @@ def _parse_args() -> argparse.Namespace:
     parser.set_defaults(fit_mode="sequential", sampler="numpyro_nuts", stage1_run_dir=None)
     parser.add_argument("--max-tree-depth", type=int, default=DEFAULT_MAX_TREE_DEPTH)
     parser.add_argument("--target-accept", type=float, default=DEFAULT_TARGET_ACCEPT)
+    parser.add_argument(
+        "--initial-step-size",
+        type=float,
+        default=DEFAULT_INITIAL_STEP_SIZE,
+        help="Initial NUTS step size before warmup adaptation. Small defaults avoid invalid dPIE states during early warmup.",
+    )
     parser.set_defaults(nuts_init_strategy="svi")
     parser.add_argument(
         "--nuts-init-boundary-frac",
@@ -547,10 +555,11 @@ def _seed_values_to_init_params(
         )
     payload: dict[str, jnp.ndarray] = {}
     for spec in parameter_specs:
-        payload[spec.sample_name] = jnp.asarray(
-            np.stack([item[spec.sample_name] for item in unconstrained_payloads], axis=0),
-            dtype=jnp.float64,
-        )
+        if len(unconstrained_payloads) == 1:
+            value = np.asarray(unconstrained_payloads[0][spec.sample_name], dtype=float)
+        else:
+            value = np.stack([item[spec.sample_name] for item in unconstrained_payloads], axis=0)
+        payload[spec.sample_name] = jnp.asarray(value, dtype=jnp.float64)
     return payload
 
 
@@ -609,14 +618,17 @@ def _small_svi_nuts_perturbation(
     theta: np.ndarray,
     parameter_specs: list[ParameterSpec],
     rng: np.random.Generator,
+    jitter_frac: float = DEFAULT_NUTS_INIT_JITTER_FRAC,
     boundary_frac: float = DEFAULT_NUTS_INIT_BOUNDARY_FRAC,
 ) -> np.ndarray:
     perturbed = np.asarray(theta, dtype=float).copy()
+    if float(jitter_frac) <= 0.0:
+        return _clip_theta_to_support(perturbed, parameter_specs, boundary_frac=boundary_frac)
     for idx, spec in enumerate(parameter_specs):
         if spec.prior_kind == "normal":
-            scale = max(0.10 * float(spec.std or 0.0), 1.0e-6)
+            scale = max(float(jitter_frac) * float(spec.std or 0.0), 1.0e-6)
         else:
-            scale = max(0.01 * float(spec.upper - spec.lower), 1.0e-6)
+            scale = max(float(jitter_frac) * float(spec.upper - spec.lower), 1.0e-6)
         perturbed[idx] += float(rng.normal(0.0, scale))
     return _clip_theta_to_support(perturbed, parameter_specs, boundary_frac=boundary_frac)
 
@@ -652,6 +664,7 @@ def _run_svi_initializer(
             center_theta,
             parameter_specs,
             rng,
+            jitter_frac=float(getattr(args, "nuts_init_jitter_frac", DEFAULT_NUTS_INIT_JITTER_FRAC)),
             boundary_frac=float(getattr(args, "nuts_init_boundary_frac", DEFAULT_NUTS_INIT_BOUNDARY_FRAC)),
         )
         if not np.all(np.isfinite(seed_theta)):
@@ -699,6 +712,7 @@ def _nuts_initialization_from_svi_center(
             center_theta,
             parameter_specs,
             rng,
+            jitter_frac=float(getattr(args, "nuts_init_jitter_frac", DEFAULT_NUTS_INIT_JITTER_FRAC)),
             boundary_frac=float(getattr(args, "nuts_init_boundary_frac", DEFAULT_NUTS_INIT_BOUNDARY_FRAC)),
         )
         chain_label = f"svi_nuts_chain_{chain_index + 1}"
@@ -846,6 +860,7 @@ def _run_numpyro_nuts_sampler(
             f"[nuts] preparing sampler chains={args.chains} chain_method={chain_method} "
             f"warmup={args.warmup} samples={args.samples} thin={args.thin} "
             f"target_accept={args.target_accept:.2f} max_tree_depth={args.max_tree_depth} "
+            f"initial_step_size={float(args.initial_step_size):.3g} "
             f"init={nuts_init.diagnostics['strategy_used']} distinct_seeds={nuts_init.diagnostics['distinct_chain_seeds']}"
         ),
     )
@@ -853,6 +868,8 @@ def _run_numpyro_nuts_sampler(
         sample_model,
         target_accept_prob=args.target_accept,
         max_tree_depth=args.max_tree_depth,
+        step_size=float(args.initial_step_size),
+        dense_mass=True,
     )
     mcmc = MCMC(
         nuts,
@@ -953,6 +970,27 @@ def _run_numpyro_nuts_sampler(
         ),
     )
     return posterior
+
+
+def _nuts_posterior_is_usable(posterior: PosteriorResults) -> tuple[bool, str]:
+    samples = np.asarray(posterior.samples, dtype=float)
+    if samples.ndim != 2 or samples.shape[0] < 2:
+        return False, "fewer than two retained samples"
+    if not np.isfinite(samples).all():
+        return False, "non-finite posterior samples"
+    accept_prob = np.asarray(posterior.accept_prob, dtype=float)
+    diverging = np.asarray(posterior.diverging, dtype=bool)
+    accept_mean = float(np.nanmean(accept_prob)) if accept_prob.size else float("nan")
+    divergence_fraction = float(np.mean(diverging)) if diverging.size else 0.0
+    spans = np.nanmax(samples, axis=0) - np.nanmin(samples, axis=0)
+    dynamic_parameters = int(np.sum(np.isfinite(spans) & (spans > 1.0e-10)))
+    if not np.isfinite(accept_mean) or accept_mean < 1.0e-3:
+        return False, f"mean acceptance is {accept_mean:.3g}"
+    if divergence_fraction > 0.95:
+        return False, f"divergence fraction is {divergence_fraction:.3f}"
+    if dynamic_parameters < 2:
+        return False, f"only {dynamic_parameters} parameters have dynamic range"
+    return True, "ok"
 
 
 def _fail(message: str) -> None:
@@ -1187,6 +1225,71 @@ def _normalize_component_field_name(field_name: str) -> str:
     return field_name
 
 
+def _radius_transform_for_component_prior(
+    potential: dict[str, Any],
+    field_name: str,
+    decoded_prior: dict[str, Any],
+) -> dict[str, Any]:
+    prior_kind = str(decoded_prior["prior_kind"])
+    lower = float(decoded_prior["lower"])
+    upper = float(decoded_prior["upper"])
+    mean = None if decoded_prior["mean"] is None else float(decoded_prior["mean"])
+    std = None if decoded_prior["std"] is None else float(decoded_prior["std"])
+    step = float(decoded_prior["step"])
+    transform_kind = "identity"
+    transform_offset = 0.0
+    physical_lower = lower
+    physical_upper = upper
+    physical_mean = mean
+    physical_std = std
+
+    if field_name == "core_radius_kpc":
+        transform_kind = "log_positive"
+        safe_lower = max(lower, SAFE_RADIUS_MARGIN_KPC)
+        safe_upper = max(upper, safe_lower * (1.0 + 1.0e-9))
+        if prior_kind == "normal":
+            if mean is None or std is None:
+                raise ValueError(f"Radius prior for {potential.get('id', 'potential')}.{field_name} requires mean/std.")
+            mean, std = _positive_lognormal_parameters(max(mean, safe_lower), std, floor=safe_lower)
+            lower = float("-inf")
+            upper = float("inf")
+        else:
+            lower = float(np.log(safe_lower))
+            upper = float(np.log(safe_upper))
+            step = float(max(step, SAFE_RADIUS_MARGIN_KPC))
+    elif field_name == "cut_radius_kpc":
+        core_radius = _coerce_numeric(potential.get("core_radius_kpc", SAFE_RADIUS_MARGIN_KPC), "core_radius_kpc")
+        transform_kind = "log_offset_positive"
+        transform_offset = max(float(core_radius), 0.0)
+        gap_lower = max(lower - transform_offset, SAFE_RADIUS_MARGIN_KPC)
+        gap_upper = max(upper - transform_offset, gap_lower * (1.0 + 1.0e-9))
+        if prior_kind == "normal":
+            if mean is None or std is None:
+                raise ValueError(f"Radius prior for {potential.get('id', 'potential')}.{field_name} requires mean/std.")
+            mean, std = _positive_lognormal_parameters(max(mean - transform_offset, gap_lower), std, floor=gap_lower)
+            lower = float("-inf")
+            upper = float("inf")
+        else:
+            lower = float(np.log(gap_lower))
+            upper = float(np.log(gap_upper))
+            step = float(max(step, SAFE_RADIUS_MARGIN_KPC))
+
+    return {
+        "prior_kind": prior_kind,
+        "lower": lower,
+        "upper": upper,
+        "step": step,
+        "mean": mean,
+        "std": std,
+        "transform_kind": transform_kind,
+        "transform_offset": transform_offset,
+        "physical_lower": physical_lower,
+        "physical_upper": physical_upper,
+        "physical_mean": physical_mean,
+        "physical_std": physical_std,
+    }
+
+
 def _build_parameter_specs(
     potentials_with_priors: list[dict[str, Any]],
     profile_variant: str = PROFILE_VARIANT_ORIGINAL,
@@ -1214,6 +1317,24 @@ def _build_parameter_specs(
             decoded_prior = _decode_parameter_prior(prior, f"{potential_id}.{normalized_field_name}")
             if decoded_prior is None:
                 continue
+            prior_spec = (
+                _radius_transform_for_component_prior(potential, normalized_field_name, decoded_prior)
+                if profile_type == DP_IE_PROFILE and normalized_field_name in {"core_radius_kpc", "cut_radius_kpc"}
+                else {
+                    "prior_kind": str(decoded_prior["prior_kind"]),
+                    "lower": float(decoded_prior["lower"]),
+                    "upper": float(decoded_prior["upper"]),
+                    "step": float(decoded_prior["step"]),
+                    "mean": None if decoded_prior["mean"] is None else float(decoded_prior["mean"]),
+                    "std": None if decoded_prior["std"] is None else float(decoded_prior["std"]),
+                    "transform_kind": "identity",
+                    "transform_offset": 0.0,
+                    "physical_lower": None,
+                    "physical_upper": None,
+                    "physical_mean": None,
+                    "physical_std": None,
+                }
+            )
             index = len(specs)
             specs.append(
                 ParameterSpec(
@@ -1222,12 +1343,18 @@ def _build_parameter_specs(
                     potential_id=potential_id,
                     profile_type=profile_type,
                     field=normalized_field_name,
-                    prior_kind=str(decoded_prior["prior_kind"]),
-                    lower=float(decoded_prior["lower"]),
-                    upper=float(decoded_prior["upper"]),
-                    step=float(decoded_prior["step"]),
-                    mean=None if decoded_prior["mean"] is None else float(decoded_prior["mean"]),
-                    std=None if decoded_prior["std"] is None else float(decoded_prior["std"]),
+                    prior_kind=str(prior_spec["prior_kind"]),
+                    lower=float(prior_spec["lower"]),
+                    upper=float(prior_spec["upper"]),
+                    step=float(prior_spec["step"]),
+                    mean=prior_spec["mean"],
+                    std=prior_spec["std"],
+                    transform_kind=str(prior_spec["transform_kind"]),
+                    physical_lower=prior_spec["physical_lower"],
+                    physical_upper=prior_spec["physical_upper"],
+                    physical_mean=prior_spec["physical_mean"],
+                    physical_std=prior_spec["physical_std"],
+                    transform_offset=float(prior_spec["transform_offset"]),
                 )
             )
             assignments.append((normalized_field_name, index))
@@ -3916,6 +4043,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
     evaluator, _midpoint = _prepare_direct_evaluator(args, state)
     sample_model = _posterior_model(state.parameter_specs, evaluator)
     best_fit, posterior, svi_diagnostics = _run_svi_fit(args, state, evaluator, sample_model)
+    svi_posterior = posterior
     evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_svi")
     _log(
         args,
@@ -3933,8 +4061,28 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                 f"distinct_seeds={int(nuts_init.diagnostics.get('distinct_chain_seeds', 0))}"
             ),
         )
-        posterior = _run_numpyro_nuts_sampler(args, state, evaluator, sample_model, nuts_init)
-        if posterior.samples.size:
+        nuts_posterior = _run_numpyro_nuts_sampler(args, state, evaluator, sample_model, nuts_init)
+        nuts_usable, nuts_reason = _nuts_posterior_is_usable(nuts_posterior)
+        if not nuts_usable:
+            _log(
+                args,
+                (
+                    "[nuts] posterior rejected; falling back to SVI guide posterior "
+                    f"reason={nuts_reason}"
+                ),
+            )
+            posterior = svi_posterior
+            posterior.sampler = "svi_fallback_after_failed_nuts"
+            posterior.init_diagnostics["nuts_rejected"] = True
+            posterior.init_diagnostics["nuts_rejection_reason"] = nuts_reason
+            posterior.init_diagnostics["nuts_accept_mean"] = (
+                float(np.nanmean(nuts_posterior.accept_prob)) if np.asarray(nuts_posterior.accept_prob).size else float("nan")
+            )
+            posterior.init_diagnostics["nuts_divergence_fraction"] = (
+                float(np.mean(nuts_posterior.diverging)) if np.asarray(nuts_posterior.diverging).size else float("nan")
+            )
+        elif nuts_posterior.samples.size:
+            posterior = nuts_posterior
             best_index = int(np.nanargmax(posterior.log_prob))
             best_fit = np.asarray(posterior.samples[best_index], dtype=float)
             evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_nuts")
