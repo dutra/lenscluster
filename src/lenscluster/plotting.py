@@ -44,7 +44,10 @@ CORNER_PLOT_DPI = 300
 def plot_path(root: Path, name: str) -> Path:
     """Return an output plot path, creating the output directory first."""
     root.mkdir(parents=True, exist_ok=True)
-    return root / name
+    path = root / name
+    if path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+        path = path.with_suffix(".pdf")
+    return path
 
 
 def _plot_path(root: Path, name: str) -> Path:
@@ -650,6 +653,7 @@ def _plot_corner(
     plot_dir: Path,
     samples: np.ndarray,
     parameter_specs: list[ParameterSpec],
+    truth_values: dict[str, float] | None = None,
 ) -> None:
     if corner is None or not parameter_specs:
         return
@@ -665,7 +669,10 @@ def _plot_corner(
         f"[plot:corner] path={_plot_path(plot_dir, 'corner.pdf')} ndim={len(subset_specs)} samples_shape={tuple(finite_samples.shape)}",
     )
     labels = [spec.name for spec in subset_specs]
-    fig = corner.corner(finite_samples, labels=labels, **CORNER_PLOT_KWARGS)
+    truths = None
+    if truth_values:
+        truths = [truth_values.get(spec.name, np.nan) for spec in subset_specs]
+    fig = corner.corner(finite_samples, labels=labels, truths=truths, **CORNER_PLOT_KWARGS)
     fig.savefig(_plot_path(plot_dir, "corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -703,6 +710,7 @@ def _plot_potfile_corner(
     plot_dir: Path,
     samples: np.ndarray,
     parameter_specs: list[ParameterSpec],
+    truth_values: dict[str, float] | None = None,
 ) -> None:
     if corner is None or samples.size == 0 or not parameter_specs:
         return
@@ -718,7 +726,10 @@ def _plot_potfile_corner(
         f"[plot:corner] path={_plot_path(plot_dir, 'potfile_corner.pdf')} ndim={len(subset_specs)} samples_shape={tuple(finite_samples.shape)}",
     )
     labels = [spec.name for spec in subset_specs]
-    fig = corner.corner(finite_samples, labels=labels, **CORNER_PLOT_KWARGS)
+    truths = None
+    if truth_values:
+        truths = [truth_values.get(spec.name, np.nan) for spec in subset_specs]
+    fig = corner.corner(finite_samples, labels=labels, truths=truths, **CORNER_PLOT_KWARGS)
     fig.savefig(_plot_path(plot_dir, "potfile_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 

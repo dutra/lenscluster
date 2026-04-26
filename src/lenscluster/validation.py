@@ -86,10 +86,12 @@ class SingleBCGMockConfig:
     subhalo_mag_sigma: float = 1.1
     subhalo_sigma_ref: float = 245.0
     subhalo_sigma_ref_std: float = 35.0
+    subhalo_sigma_scatter_dex: float = 0.07
     subhalo_core_radius_arcsec: float = 0.0001
     subhalo_cut_radius_arcsec: float = 35.0
     subhalo_cut_lower_arcsec: float = 8.0
     subhalo_cut_upper_arcsec: float = 80.0
+    subhalo_cut_scatter_dex: float = 0.20
     subhalo_vdslope: float = 3.33333
     subhalo_slope: float = 3.33333
     halo: DPIETruth = DPIETruth(
@@ -169,6 +171,8 @@ def load_chires_family_summary(path: str | Path) -> pd.DataFrame:
 def _config_to_jsonable(config: SingleBCGMockConfig, kpc_per_arcsec: float) -> dict[str, Any]:
     payload = asdict(config)
     payload["source_redshifts"] = [float(value) for value in config.source_redshifts]
+    payload["subhalo_sigma_log_scatter"] = _dex_scatter_to_ln(config.subhalo_sigma_scatter_dex)
+    payload["subhalo_cut_log_scatter"] = _dex_scatter_to_ln(config.subhalo_cut_scatter_dex)
     for component_name in ("halo", "bcg"):
         component = payload[component_name]
         component["core_radius_kpc"] = float(component["core_radius_arcsec"]) * float(kpc_per_arcsec)
@@ -176,8 +180,14 @@ def _config_to_jsonable(config: SingleBCGMockConfig, kpc_per_arcsec: float) -> d
     return payload
 
 
+def _dex_scatter_to_ln(scatter_dex: float) -> float:
+    return float(np.log(10.0) * max(float(scatter_dex), 0.0))
+
+
 def _scaled_subhalo_params(row: dict[str, Any], config: SingleBCGMockConfig) -> DPIETruth:
     luminosity_ratio = float(row["luminosity_ratio"])
+    sigma_log_offset = float(row.get("sigma_log_offset", 0.0))
+    cut_log_offset = float(row.get("cut_log_offset", 0.0))
     return DPIETruth(
         potential_id=str(row["id"]),
         x_centre=float(row["x_arcsec"]),
@@ -185,8 +195,12 @@ def _scaled_subhalo_params(row: dict[str, Any], config: SingleBCGMockConfig) -> 
         ellipticite=float(row["ellipticite"]),
         angle_pos=float(row["angle_pos"]),
         core_radius_arcsec=float(config.subhalo_core_radius_arcsec * luminosity_ratio**0.5),
-        cut_radius_arcsec=float(config.subhalo_cut_radius_arcsec * luminosity_ratio ** (2.0 / config.subhalo_slope)),
-        v_disp=float(config.subhalo_sigma_ref * luminosity_ratio ** (1.0 / config.subhalo_vdslope)),
+        cut_radius_arcsec=float(
+            config.subhalo_cut_radius_arcsec
+            * luminosity_ratio ** (2.0 / config.subhalo_slope)
+            * np.exp(cut_log_offset)
+        ),
+        v_disp=float(config.subhalo_sigma_ref * luminosity_ratio ** (1.0 / config.subhalo_vdslope) * np.exp(sigma_log_offset)),
     )
 
 
@@ -211,6 +225,8 @@ def _generate_subhalo_catalog(config: SingleBCGMockConfig, rng: np.random.Genera
         angle_pos = float(rng.uniform(-90.0, 90.0))
         mag = float(np.clip(mag, config.subhalo_mag0 - 0.2, config.subhalo_mag0 + 6.0))
         luminosity_ratio = float(10.0 ** (-0.4 * (mag - config.subhalo_mag0)))
+        sigma_log_offset = float(rng.normal(0.0, _dex_scatter_to_ln(config.subhalo_sigma_scatter_dex)))
+        cut_log_offset = float(rng.normal(0.0, _dex_scatter_to_ln(config.subhalo_cut_scatter_dex)))
         rows.append(
             {
                 "id": f"member{idx + 1:03d}",
@@ -224,6 +240,8 @@ def _generate_subhalo_catalog(config: SingleBCGMockConfig, rng: np.random.Genera
                 "ellipticite": ellipticite,
                 "angle_pos": angle_pos,
                 "luminosity_ratio": luminosity_ratio,
+                "sigma_log_offset": sigma_log_offset,
+                "cut_log_offset": cut_log_offset,
             }
         )
     return rows
@@ -293,6 +311,10 @@ def _truth_parameter_values(config: SingleBCGMockConfig, kpc_per_arcsec: float) 
     if config.n_subhalos > 0:
         truth["potfile.sigma"] = float(config.subhalo_sigma_ref)
         truth["potfile.cutkpc"] = float(config.subhalo_cut_radius_arcsec) * float(kpc_per_arcsec)
+        if config.subhalo_sigma_scatter_dex > 0.0:
+            truth["potfile.sigma_log_scatter"] = _dex_scatter_to_ln(config.subhalo_sigma_scatter_dex)
+        if config.subhalo_cut_scatter_dex > 0.0:
+            truth["potfile.cut_log_scatter"] = _dex_scatter_to_ln(config.subhalo_cut_scatter_dex)
     return truth
 
 
@@ -1090,13 +1112,14 @@ def write_recovery_outputs(
         "subhalo_population_plot": output_dir / "subhalo_population.pdf",
         "summary_plot": output_dir / "validation_summary.pdf",
     }
-    _plot_corner_pdf(output_dir, samples, state.parameter_specs, "corner.pdf")
+    truth_values = {str(key): float(value) for key, value in truth["parameter_truth"].items()}
+    _plot_corner_pdf(output_dir, samples, state.parameter_specs, "corner.pdf", truth_values=truth_values)
     scaling_specs, scaling_samples, _scaling_best_fit = _scaling_parameter_subset(
         state.parameter_specs,
         samples,
         best_fit,
     )
-    _plot_corner_pdf(output_dir, scaling_samples, scaling_specs, "potfile_corner.pdf")
+    _plot_corner_pdf(output_dir, scaling_samples, scaling_specs, "potfile_corner.pdf", truth_values=truth_values)
     _plot_parameter_recovery(parameter_df, paths["parameter_pull_plot"])
     _plot_mass_profile_recovery(mass_profile_df, paths["mass_profile_plot"])
     _plot_magnification_recovery(magnification_df, paths["magnification_plot"])
@@ -1170,15 +1193,21 @@ def _write_corner_placeholder(samples: np.ndarray, parameter_names: list[str], p
     plt.close(fig)
 
 
-def _plot_corner_pdf(output_dir: Path, samples: np.ndarray, parameter_specs: list[Any], filename: str = "corner.pdf") -> None:
+def _plot_corner_pdf(
+    output_dir: Path,
+    samples: np.ndarray,
+    parameter_specs: list[Any],
+    filename: str = "corner.pdf",
+    truth_values: dict[str, float] | None = None,
+) -> None:
     path = output_dir / filename
     if path.exists():
         path.unlink()
     try:
         if filename == "corner.pdf":
-            _plot_corner(output_dir, samples, parameter_specs)
+            _plot_corner(output_dir, samples, parameter_specs, truth_values=truth_values)
         else:
-            _plot_potfile_corner(output_dir, samples, parameter_specs)
+            _plot_potfile_corner(output_dir, samples, parameter_specs, truth_values=truth_values)
     except Exception as exc:  # pragma: no cover - defensive plotting fallback
         _write_corner_placeholder(samples, [getattr(spec, "name", str(spec)) for spec in parameter_specs], path, filename)
         _log_message = f"[validation:corner] wrote placeholder {path}: {exc}"
@@ -1529,8 +1558,8 @@ def _plot_subhalo_population(
     parameter_df: pd.DataFrame,
     path: Path,
 ) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    ax = axes[0]
+    del parameter_df
+    fig, ax = plt.subplots(figsize=(6, 5))
     ax.scatter(images["x_obs_arcsec"], images["y_obs_arcsec"], color="black", marker="x", s=26, label="images")
     if not subhalo_df.empty:
         sizes = 12.0 + 80.0 * np.sqrt(subhalo_df["luminosity_ratio"].to_numpy(dtype=float))
@@ -1551,40 +1580,6 @@ def _plot_subhalo_population(
     ax.set_ylabel("y [arcsec]")
     ax.set_title("Subhalo field")
     ax.legend(loc="best", fontsize=8)
-
-    potfile_params = parameter_df[parameter_df["parameter"].astype(str).isin(["potfile.sigma", "potfile.cutkpc"])]
-    if not potfile_params.empty:
-        y = np.arange(len(potfile_params))
-        median = potfile_params["median"].to_numpy(dtype=float)
-        q16 = potfile_params["q16"].to_numpy(dtype=float)
-        q84 = potfile_params["q84"].to_numpy(dtype=float)
-        truth = potfile_params["truth"].to_numpy(dtype=float)
-        axes[1].errorbar(
-            median,
-            y,
-            xerr=[median - q16, q84 - median],
-            fmt="o",
-            color="tab:blue",
-            ecolor="tab:blue",
-            label="posterior 1 sigma",
-        )
-        axes[1].scatter(truth, y, marker="x", color="black", label="truth")
-        axes[1].set_yticks(y, potfile_params["parameter"].astype(str))
-        axes[1].invert_yaxis()
-        axes[1].set_xlabel("scaling parameter value")
-        axes[1].legend(loc="best", fontsize=8)
-    else:
-        axes[1].axis("off")
-        axes[1].text(
-            0.5,
-            0.5,
-            "No fitted subhalo scaling parameters in this run",
-            ha="center",
-            va="center",
-            transform=axes[1].transAxes,
-            fontsize=9,
-        )
-    axes[1].set_title("Subhalo scaling posterior")
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -1643,7 +1638,7 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
     cmd = [
         sys.executable,
         "-m",
-        "cluster_solver",
+        "lenscluster.cluster_solver",
         "--par-path",
         str(par_path),
         "--output-dir",
@@ -1686,7 +1681,29 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
     if args.active_scaling_galaxies is not None:
         cmd.append("--active-scaling-galaxies")
         cmd.extend(str(value) for value in args.active_scaling_galaxies)
-    cmd.append("--skip-plots")
+    if args.fit_scaling_scatter and int(args.n_subhalos) > 0:
+        scatter_fields: list[str] = []
+        if float(args.subhalo_sigma_scatter_dex) > 0.0:
+            scatter_fields.append("sigma")
+        if float(args.subhalo_cut_scatter_dex) > 0.0:
+            scatter_fields.append("cut")
+        if scatter_fields:
+            scatter_max = max(
+                float(args.scaling_scatter_max),
+                1.25 * _dex_scatter_to_ln(float(args.subhalo_sigma_scatter_dex)),
+                1.25 * _dex_scatter_to_ln(float(args.subhalo_cut_scatter_dex)),
+            )
+            cmd.extend(
+                [
+                    "--scaling-scatter",
+                    "--scaling-scatter-fields",
+                    ",".join(scatter_fields),
+                    "--scaling-scatter-max",
+                    f"{scatter_max:.8g}",
+                ]
+            )
+    if args.skip_plots:
+        cmd.append("--skip-plots")
     subprocess.run(cmd, cwd=Path(__file__).resolve().parents[2], check=True)
     return output_dir / run_name / "stage2_joint"
 
@@ -1706,6 +1723,8 @@ def run_single_bcg_validation(args: argparse.Namespace) -> list[dict[str, Path]]
             source_redshifts=source_redshifts,
             source_sigma_int_arcsec=float(args.source_sigma_int_arcsec),
             n_subhalos=int(args.n_subhalos),
+            subhalo_sigma_scatter_dex=float(args.subhalo_sigma_scatter_dex),
+            subhalo_cut_scatter_dex=float(args.subhalo_cut_scatter_dex),
         )
         paths, _images, _truth = generate_single_bcg_mock(realization_dir / "mock", config)
         solver_run_name = "fit"
@@ -1739,6 +1758,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--n-families", type=int, default=3)
     parser.add_argument("--n-subhalos", type=int, default=0)
+    parser.add_argument(
+        "--subhalo-sigma-scatter-dex",
+        type=float,
+        default=0.07,
+        help="Injected log10 scatter in the subhalo velocity-dispersion scaling relation.",
+    )
+    parser.add_argument(
+        "--subhalo-cut-scatter-dex",
+        type=float,
+        default=0.20,
+        help="Injected log10 scatter in the subhalo cut-radius scaling relation.",
+    )
     parser.add_argument("--source-redshift", type=float, default=2.0)
     parser.add_argument(
         "--source-redshifts",
@@ -1764,6 +1795,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--active-scaling-cumulative-fraction", type=float, default=0.995)
     parser.add_argument("--active-scaling-min", type=int, default=4)
     parser.add_argument(
+        "--fit-scaling-scatter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fit scaling-relation scatter hyperparameters when subhalos with injected scatter are present.",
+    )
+    parser.add_argument(
+        "--scaling-scatter-max",
+        type=float,
+        default=0.5,
+        help="Upper bound, in natural-log units, for fitted scaling-scatter hyperparameters.",
+    )
+    parser.add_argument(
         "--posterior-diagnostic-draws",
         type=int,
         default=8,
@@ -1774,7 +1817,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-plots",
         action="store_true",
-        help="Accepted for compatibility; solver plots are always skipped and validation figures are always PDFs.",
+        help="Skip the standard solver plot suite. Validation recovery figures are still written as PDFs.",
     )
     return parser
 

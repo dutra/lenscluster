@@ -92,6 +92,16 @@ ranked subhalos to capture 99.5% of the ranking importance, with at least four
 active subhalos per potfile. The remaining subhalos are retained through the
 refreshing surrogate rather than removed from the model.
 
+When subhalos are enabled, the mock injects intrinsic log-normal scatter around
+the member-galaxy scaling relations by default:
+
+- `--subhalo-sigma-scatter-dex 0.07`
+- `--subhalo-cut-scatter-dex 0.20`
+
+Member-galaxy core radii remain fixed at the tiny configured value. The
+validation runner also fits matching scaling-scatter hyperparameters by default
+for the injected fields; disable that with `--no-fit-scaling-scatter`.
+
 For a faster variational-only validation run:
 
 ```bash
@@ -125,7 +135,16 @@ The default run name and seed produce:
 validation_runs/single_bcg/single_bcg_recovery/seed_12345/
 ```
 
-Main validation PDFs:
+The validation runner first runs the normal `lenscluster.cluster_solver`
+pipeline on the mock `.par` file, so the standard real-data stage outputs are
+also present under:
+
+```text
+validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage1_large_only/
+validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage2_joint/
+```
+
+Mock-truth recovery PDFs are additionally written at the seed directory level:
 
 - `parameter_recovery.pdf`
 - `mass_profile_recovery.pdf`
@@ -149,8 +168,10 @@ The posterior artifacts used to make these PDFs are saved under:
 validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage2_joint/artifacts/plot_bundle.h5
 ```
 
-All validation figures are saved as PDFs. The validation runner does not write
-CSV tables.
+All figures are saved as PDFs. The standard solver stage still writes its usual
+diagnostic tables under each stage's `tables/` directory. Use `--skip-plots` on
+the validation command only when you want to suppress the standard solver plot
+suite; the mock-truth recovery PDFs are still generated.
 
 ## Model
 
@@ -236,7 +257,7 @@ Each stage writes:
 - `tables/run_summary.json`
 - `tables/potential_summary.csv`
 - `tables/family_diagnostics.csv`
-- diagnostic PNGs in the stage directory
+- diagnostic PDFs in the stage directory
 
 `run.xsh` is a thin wrapper around the same command.
 
