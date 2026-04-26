@@ -243,6 +243,20 @@ scatter likelihood because their source-plane residual is zero by construction.
 Exact image-plane solving is used for validation, diagnostics, and plots; it is
 not currently the sampled posterior likelihood.
 
+The sampled likelihood uses a cached magnification-weighted source-plane
+metric. It periodically computes the local magnification at each observed image
+and uses the equal-area circularized source-plane variance
+`sigma_img^2 / |mu| + sigma_int^2`. It preserves the local area scaling of the
+full Jacobian covariance while keeping likelihood evaluations scalar and fast.
+The covariance floor for this metric is controlled with
+`--source-plane-covariance-floor`.
+
+When `--svi-steps` is larger than `--refresh-every`, SVI is run in blocks.
+Between blocks the inactive-subhalo surrogate, scaling-scatter cache, and
+magnification weights are refreshed at the current guide median, then the final
+fixed cache is used for NUTS. This incorporates updated Jacobian information
+without changing the target density inside a NUTS trajectory.
+
 ## Outputs
 
 For `--run-name joint_workflow`, outputs are written to:
