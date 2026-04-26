@@ -28,7 +28,7 @@ python -m cluster_solver \
   --max-tree-depth 5 \
   --likelihood-mode source \
   --validate-top-k-families 0 \
-  --z-bin-tol 0.25 \
+  --z-bin-efficiency-tol 0.01 \
   --profile-variant original
 ```
 
@@ -51,7 +51,7 @@ python -m cluster_solver \
   --likelihood-mode source \
   --validate-top-k-families 0 \
   --validation-approx adaptive \
-  --z-bin-tol 0.25 \
+  --z-bin-efficiency-tol 0.01 \
   --profile-variant original \
   --plot-caustics
 ```
@@ -251,6 +251,12 @@ full Jacobian covariance while keeping likelihood evaluations scalar and fast.
 The covariance floor for this metric is controlled with
 `--source-plane-covariance-floor`.
 
+Nearby source redshifts are grouped by fractional lensing-efficiency
+`D_ls / D_s` tolerance instead of raw redshift. The default
+`--z-bin-efficiency-tol 0.01` keeps each effective source plane within about
+1% in lensing strength, which automatically makes bins finer near the cluster
+and coarser at high source redshift.
+
 When `--svi-steps` is larger than `--refresh-every`, SVI is run in blocks.
 Between blocks the inactive-subhalo surrogate, scaling-scatter cache, and
 magnification weights are refreshed at the current guide median, then the final
@@ -278,3 +284,64 @@ Each stage writes:
 The implementation uses a standard `src/lenscluster/` package layout. The
 repository-root `cluster_solver.py` remains as a compatibility shim, so existing
 `python -m cluster_solver` commands continue to work.
+
+## HFF Pagul21 Catalogs
+
+The Pagul21 HFF Zenodo record can be read and split into cluster-specific
+tables with:
+
+```bash
+python -m lenscluster.hff_pagul21 --summary-only
+python -m lenscluster.hff_pagul21
+```
+
+This writes prepared directories under `data/HFF_Pagul21/prepared/<cluster>/`
+with photometric catalogs, magnification summaries, an `obs_arcs.cat`, and a
+bootstrap `.par` file. By default the bootstrap `.par` includes a Pagul21
+photometry-selected BCG candidate plus a `cluster_members_potfile.cat` for
+likely cluster members; use `--no-pagul21-members` to omit these. For example:
+
+```bash
+python -m lenscluster.cluster_solver \
+  --par-path data/HFF_Pagul21/prepared/a2744/a2744_bootstrap.par \
+  --fit-mode joint \
+  --fit-method svi
+```
+
+The upstream `ZSPEC` values in the Pagul21 files are unset. To enrich the
+prepared catalogs with coordinate-matched SIMBAD spectroscopic redshifts, run:
+
+```bash
+python -m lenscluster.hff_pagul21 --query-simbad-specz --simbad-match-arcsec 1.0
+```
+
+This leaves the raw Zenodo files unchanged, writes `simbad_sources.csv` and
+match tables into each prepared cluster directory, and uses a matched SIMBAD
+redshift in `obs_arcs.cat` only when it is behind the cluster lens and
+consistent with the catalog redshift. Add `--no-use-simbad-specz` to write the
+match diagnostics without changing the generated arc redshifts.
+
+To also assign heuristic candidate family labels from close SIMBAD spec-z, HST
+color agreement, and a strong-lensing-scale angular span, add:
+
+```bash
+python -m lenscluster.hff_pagul21 \
+  --query-simbad-specz \
+  --assign-families
+```
+
+This writes `candidate_families.csv` and `candidate_family_members.csv`, then
+uses those labels in `obs_arcs.cat`. These are candidate labels for inspection,
+not a replacement for a vetted multiple-image catalog. The default maximum
+within-family span is 120 arcsec and can be changed with
+`--family-max-separation-arcsec`. Candidate-family rows also get a fixed
+`family_reliability` value from their redshift offset, color offset, and
+angular distance from the family centroid. The source-plane likelihood uses
+that value in a reliability-weighted per-image mixture, with a broad outlier
+term controlled by `--source-plane-outlier-sigma-arcsec`.
+
+These generated `.par` files are parser/integration bootstrap inputs only. The
+Pagul21 catalogs do not include multiple-image family memberships, so each
+generated image is a single-image pseudo-family and does not by itself provide
+a science-ready strong-lensing constraint. Replace `obs_arcs.cat` with real HFF
+multiple-image family labels before using these files for an actual mass fit.

@@ -46,7 +46,6 @@ matplotlib_use("Agg")
 jax_config.update("jax_enable_x64", True)
 
 from jaxtronomy.LensModel.lens_model_bulk import LensModelBulk
-from jaxtronomy.LensModel.lens_model import LensModel
 from jaxtronomy.Util import param_util
 
 from .lenstool_parser import load_best_par
@@ -94,7 +93,7 @@ DP_IE_PROFILE = 81
 SHEAR_PROFILE = 14
 DEFAULT_MATCH_TOLERANCE = 1.5
 DEFAULT_SEARCH_PADDING = 8.0
-DEFAULT_Z_BIN_TOL = 0.02
+DEFAULT_Z_BIN_EFFICIENCY_TOL = 0.01
 DEFAULT_WARMUP = 300
 DEFAULT_SAMPLES = 500
 DEFAULT_TARGET_ACCEPT = 0.85
@@ -113,6 +112,7 @@ DEFAULT_SVI_LEARNING_RATE = 5.0e-3
 DEFAULT_SAMPLER = "numpyro_nuts"
 DEFAULT_SOURCE_SIGMA_INT_LOWER_ARCSEC = 1.0e-3
 DEFAULT_SOURCE_SIGMA_INT_UPPER_ARCSEC = 2.0
+DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC = 10.0
 SAFE_SCALING_EXPONENT_ABS_MIN = 1.0e-3
 SAFE_RADIUS_MARGIN_ARCSEC = 1.0e-3
 SAFE_RADIUS_MARGIN_KPC = 1.0e-3
@@ -130,6 +130,7 @@ class TracedBinData:
     x_obs: jnp.ndarray
     y_obs: jnp.ndarray
     sigma_per_image: jnp.ndarray
+    reliability_per_image: jnp.ndarray
     image_has_constraint: jnp.ndarray
 ORIGINAL_DPIE_PROFILE_NAME = "PJAFFE_ELLIPSE_POTENTIAL"
 COMPACT_DPIE_PROFILE_NAME = "PJAFFE_ELLIPSE_POTENTIAL_COMPACT"
@@ -408,10 +409,19 @@ def _parse_args() -> argparse.Namespace:
         help="Use exact lens-equation validation for all selected families or only for degraded families.",
     )
     parser.add_argument(
-        "--z-bin-tol",
+        "--source-plane-outlier-sigma-arcsec",
         type=float,
-        default=DEFAULT_Z_BIN_TOL,
-        help="Tolerance for grouping close family redshifts into one effective source plane.",
+        default=DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
+        help="Broad source-plane sigma for fixed reliability-weighted candidate-family mixture terms.",
+    )
+    parser.add_argument(
+        "--z-bin-efficiency-tol",
+        type=float,
+        default=DEFAULT_Z_BIN_EFFICIENCY_TOL,
+        help=(
+            "Fractional tolerance for grouping source planes by lensing efficiency D_ls / D_s. "
+            "Higher-redshift sources are binned more coarsely because their efficiency changes slowly."
+        ),
     )
     parser.add_argument(
         "--validate-top-k-families",
@@ -1153,19 +1163,58 @@ def _kpc_to_arcsec(radius_kpc: float, z_lens: float, cosmo: Any) -> float:
     return float(radius_kpc / scale)
 
 
-def _bin_redshifts(redshifts: list[float], tolerance: float) -> dict[float, float]:
-    sorted_unique = sorted(set(float(z) for z in redshifts))
-    groups: list[list[float]] = []
-    for value in sorted_unique:
-        if not groups or abs(value - groups[-1][-1]) > tolerance:
-            groups.append([value])
+def _lensing_efficiency(z_lens: float, z_source: float, cosmo: Any) -> float:
+    ds = cosmo.angular_diameter_distance(z_source).to(u.m).value
+    dds = cosmo.angular_diameter_distance_z1z2(z_lens, z_source).to(u.m).value
+    if ds <= 0.0 or dds <= 0.0:
+        return float("nan")
+    return float(dds / ds)
+
+
+def _bin_redshifts_by_lensing_efficiency(
+    redshifts: list[float],
+    *,
+    z_lens: float,
+    cosmo: Any,
+    fractional_tolerance: float,
+) -> dict[float, float]:
+    tolerance = max(float(fractional_tolerance), 0.0)
+    unique_redshifts = sorted(set(float(z) for z in redshifts))
+    entries: list[tuple[float, float]] = []
+    for z_source in unique_redshifts:
+        efficiency = _lensing_efficiency(z_lens, z_source, cosmo)
+        if not np.isfinite(efficiency) or efficiency <= 0.0:
+            raise ValueError(
+                f"Cannot bin source redshift z={z_source:.8g}: lensing efficiency D_ls/D_s is invalid "
+                f"for lens redshift z_lens={z_lens:.8g}."
+            )
+        entries.append((z_source, efficiency))
+    entries.sort(key=lambda item: item[1])
+
+    groups: list[list[tuple[float, float]]] = []
+    current: list[tuple[float, float]] = []
+    for entry in entries:
+        candidate = current + [entry]
+        efficiencies = np.asarray([value[1] for value in candidate], dtype=float)
+        representative = float(np.median(efficiencies))
+        fractional_spread = float((np.max(efficiencies) - np.min(efficiencies)) / max(abs(representative), 1.0e-12))
+        if current and fractional_spread > tolerance:
+            groups.append(current)
+            current = [entry]
         else:
-            groups[-1].append(value)
+            current = candidate
+    if current:
+        groups.append(current)
+
     mapping: dict[float, float] = {}
     for group in groups:
-        representative = float(np.mean(group))
-        for value in group:
-            mapping[value] = representative
+        efficiencies = np.asarray([value[1] for value in group], dtype=float)
+        representative_efficiency = float(np.median(efficiencies))
+        representative_z = float(
+            min(group, key=lambda item: abs(float(item[1]) - representative_efficiency))[0]
+        )
+        for z_source, _efficiency in group:
+            mapping[float(z_source)] = representative_z
     return mapping
 
 
@@ -1951,7 +2000,10 @@ def _prepare_family_data(
     images_df: pd.DataFrame,
     sigma_arcsec: float,
     reference: tuple[int, float, float],
-    z_bin_tol: float,
+    *,
+    z_lens: float,
+    cosmo: Any,
+    z_bin_efficiency_tol: float,
 ) -> tuple[list[FamilyData], float]:
     family_start = time.perf_counter()
     _, ra0_deg, dec0_deg = reference
@@ -1982,7 +2034,12 @@ def _prepare_family_data(
                 f"Family {family_id} has non-positive catalog_z={z_source} in image catalog {source_label}."
             )
         family_redshifts[family_id] = z_source
-    z_mapping = _bin_redshifts(list(family_redshifts.values()), z_bin_tol)
+    z_mapping = _bin_redshifts_by_lensing_efficiency(
+        list(family_redshifts.values()),
+        z_lens=float(z_lens),
+        cosmo=cosmo,
+        fractional_tolerance=float(z_bin_efficiency_tol),
+    )
     families: list[FamilyData] = []
     for family_id in image_families:
         family_df = images_df[images_df["family_id"].astype(str) == family_id].copy()
@@ -2002,9 +2059,29 @@ def _prepare_family_data(
                 image_labels=family_df["image_label"].astype(str).tolist(),
                 x_obs=np.asarray(x_obs, dtype=float),
                 y_obs=np.asarray(y_obs, dtype=float),
+                reliability=np.asarray(
+                    pd.to_numeric(family_df.get("family_reliability", 1.0), errors="coerce")
+                    .fillna(1.0)
+                    .clip(0.0, 1.0)
+                    .to_numpy(dtype=float),
+                    dtype=float,
+                ),
             )
         )
     return families, float(time.perf_counter() - family_start)
+
+
+def _filter_singleton_families(images_df: pd.DataFrame) -> tuple[pd.DataFrame, int, int]:
+    if images_df.empty:
+        return images_df.copy(), 0, 0
+    family_counts = images_df["family_id"].astype(str).value_counts()
+    constrained_family_ids = set(family_counts[family_counts > 1].index.astype(str))
+    filtered = images_df[images_df["family_id"].astype(str).isin(constrained_family_ids)].copy()
+    return (
+        filtered.reset_index(drop=True),
+        int(len(images_df) - len(filtered)),
+        int(len(family_counts) - len(constrained_family_ids)),
+    )
 
 
 def _build_bin_data(families: list[FamilyData]) -> list[BinData]:
@@ -2019,6 +2096,7 @@ def _build_bin_data(families: list[FamilyData]) -> list[BinData]:
         sigma_per_image = np.concatenate(
             [np.full(family.n_images, family.sigma_arcsec, dtype=float) for family in family_list]
         )
+        reliability_per_image = np.concatenate([family.reliability for family in family_list])
         family_index_per_image = np.concatenate(
             [np.full(family.n_images, idx, dtype=int) for idx, family in enumerate(family_list)]
         )
@@ -2030,6 +2108,7 @@ def _build_bin_data(families: list[FamilyData]) -> list[BinData]:
                 x_obs=x_obs,
                 y_obs=y_obs,
                 sigma_per_image=sigma_per_image,
+                reliability_per_image=reliability_per_image,
             )
         )
     return bin_data
@@ -2079,6 +2158,7 @@ class ClusterJAXEvaluator:
         refresh_param_drift_frac: float = DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
         validation_approx: str = "exact",
         source_plane_covariance_floor: float = 1.0e-6,
+        source_plane_outlier_sigma_arcsec: float = DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
     ):
         self.state = state
         self.match_tolerance_arcsec = float(match_tolerance_arcsec)
@@ -2092,6 +2172,7 @@ class ClusterJAXEvaluator:
         self.refresh_param_drift_frac = float(refresh_param_drift_frac)
         self.validation_approx = str(validation_approx)
         self.source_plane_covariance_floor = max(float(source_plane_covariance_floor), 0.0)
+        self.source_plane_outlier_sigma_arcsec = max(float(source_plane_outlier_sigma_arcsec), 1.0e-6)
         geometry_setup_start = time.perf_counter()
         if state.cosmo_config:
             self.cosmo = _build_cosmology_from_config(state.cosmo_config)
@@ -2138,7 +2219,6 @@ class ClusterJAXEvaluator:
             )
             for effective_z_source in geometry_cache.effective_z_source_values
         }
-        self.hessian_models_by_effective_z: dict[float, LensModel] = {}
         self.kpc_per_arcsec = self.cosmo.kpc_proper_per_arcmin(state.z_lens).to(u.kpc / u.arcsec).value
         self.dpie_sigma0_factors = {
             float(z_source): float(value)
@@ -2228,15 +2308,6 @@ class ClusterJAXEvaluator:
             and len(self.inactive_scaling_component_indices) > 0
             and len(self.scaling_param_indices) > 0
         )
-        self.hessian_models_by_effective_z = {
-            float(effective_z_source): LensModel(
-                lens_model_list=state.lens_model_list,
-                multi_plane=False,
-                cosmo=self.cosmo,
-                profile_kwargs_list=_jax_profile_kwargs_list(state.lens_model_list, compact_skip_factor),
-            )
-            for effective_z_source in geometry_cache.effective_z_source_values
-        }
         self.surrogate_reference_params: np.ndarray | None = None
         self.surrogate_reference_scaling_params = np.zeros(len(self.scaling_param_indices), dtype=float)
         self.surrogate_cache_by_z: dict[float, SurrogateBinCache] = {}
@@ -2259,6 +2330,7 @@ class ClusterJAXEvaluator:
             x_obs=jnp.asarray(bin_data.x_obs, dtype=jnp.float64),
             y_obs=jnp.asarray(bin_data.y_obs, dtype=jnp.float64),
             sigma_per_image=jnp.asarray(bin_data.sigma_per_image, dtype=jnp.float64),
+            reliability_per_image=jnp.asarray(bin_data.reliability_per_image, dtype=jnp.float64),
             image_has_constraint=jnp.asarray(family_counts[family_idx] > 1, dtype=bool),
         )
 
@@ -2479,14 +2551,13 @@ class ClusterJAXEvaluator:
             if not bool(np.asarray(validity["is_valid"], dtype=bool)):
                 self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
                 return
-            a00, a01, a10, a11 = self._inverse_magnification_matrix_for_components(
+            inv_abs_mu = self._finite_difference_inv_abs_magnification_for_components(
                 bin_data.effective_z_source,
                 bin_data.x_obs,
                 bin_data.y_obs,
                 packed_state,
             )
-            det_a = np.asarray(a00 * a11 - a01 * a10, dtype=float)
-            inv_abs_mu = np.clip(np.abs(det_a), 1.0e-6, 1.0e6)
+            inv_abs_mu = np.clip(np.asarray(inv_abs_mu, dtype=float), 1.0e-6, 1.0e6)
             if not np.isfinite(inv_abs_mu).all():
                 return
             refreshed_cache[float(bin_data.effective_z_source)] = {
@@ -2499,7 +2570,7 @@ class ClusterJAXEvaluator:
     def _magnification_inv_abs_mu(self, bin_data: TracedBinData) -> jnp.ndarray:
         cache = self.source_metric_cache_by_z.get(float(bin_data.effective_z_source))
         if cache is None:
-            return jnp.full_like(bin_data.sigma_per_image, jnp.nan)
+            return jnp.ones_like(bin_data.sigma_per_image)
         return jnp.asarray(cache["inv_abs_mu"], dtype=jnp.float64)
 
     def _record_invalid_state_callback(self, reason_flags: Any) -> None:
@@ -3038,17 +3109,23 @@ class ClusterJAXEvaluator:
             return model.ray_shooting(x, y, packed_state, k=tuple(int(idx) for idx in component_indices.tolist()))
         return model.ray_shooting(x, y, packed_state)
 
-    def _inverse_magnification_matrix_for_components(
+    def _finite_difference_inv_abs_magnification_for_components(
         self,
         z_source: float,
         x: jnp.ndarray,
         y: jnp.ndarray,
         packed_state: dict[str, Any],
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        model = self.hessian_models_by_effective_z[z_source]
-        kwargs_lens = self._packed_state_to_kwargs_lens_jax(packed_state)
-        f_xx, f_xy, f_yx, f_yy = model.hessian(x, y, kwargs_lens)
-        return 1.0 - f_xx, -f_xy, -f_yx, 1.0 - f_yy
+    ) -> jnp.ndarray:
+        eps = jnp.asarray(1.0e-3, dtype=jnp.float64)
+        beta_x_plus, beta_y_plus = self._ray_shooting_for_components(z_source, x + eps, y, packed_state)
+        beta_x_minus, beta_y_minus = self._ray_shooting_for_components(z_source, x - eps, y, packed_state)
+        beta_x_y_plus, beta_y_y_plus = self._ray_shooting_for_components(z_source, x, y + eps, packed_state)
+        beta_x_y_minus, beta_y_y_minus = self._ray_shooting_for_components(z_source, x, y - eps, packed_state)
+        a00 = (beta_x_plus - beta_x_minus) / (2.0 * eps)
+        a10 = (beta_y_plus - beta_y_minus) / (2.0 * eps)
+        a01 = (beta_x_y_plus - beta_x_y_minus) / (2.0 * eps)
+        a11 = (beta_y_y_plus - beta_y_y_minus) / (2.0 * eps)
+        return jnp.abs(a00 * a11 - a01 * a10)
 
     def _inactive_fd_step(self, spec: ParameterSpec) -> float:
         if spec.prior_kind == "normal" and spec.std is not None:
@@ -3393,7 +3470,8 @@ class ClusterJAXEvaluator:
             sigma2_x = sigma2_image + jnp.square(source_sigma_int) + scatter_var_x + cov_floor
             sigma2_y = sigma2_image + jnp.square(source_sigma_int) + scatter_var_y + cov_floor
             sigma2_weight = 0.5 * (sigma2_x + sigma2_y)
-            weights = 1.0 / jnp.maximum(sigma2_weight, 1.0e-18)
+            reliability = jnp.clip(bin_data.reliability_per_image, 1.0e-6, 1.0 - 1.0e-6)
+            weights = reliability / jnp.maximum(sigma2_weight, 1.0e-18)
             sum_w = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights)
             sum_bx = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights * beta_x)
             sum_by = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights * beta_y)
@@ -3401,13 +3479,21 @@ class ClusterJAXEvaluator:
             centroid_y = sum_by / jnp.maximum(sum_w, 1.0e-18)
             dx = beta_x - centroid_x[family_idx]
             dy = beta_y - centroid_y[family_idx]
-            bin_loglike = -0.5 * jnp.sum(
+            family_ll = -0.5 * (
+                (dx**2) / sigma2_x
+                + (dy**2) / sigma2_y
+                + jnp.log(2.0 * jnp.pi * sigma2_x)
+                + jnp.log(2.0 * jnp.pi * sigma2_y)
+            )
+            outlier_sigma2 = jnp.square(jnp.asarray(self.source_plane_outlier_sigma_arcsec, dtype=jnp.float64))
+            outlier_ll = -0.5 * (
+                (dx**2 + dy**2) / outlier_sigma2 + 2.0 * jnp.log(2.0 * jnp.pi * outlier_sigma2)
+            )
+            mixture_ll = jnp.logaddexp(jnp.log(reliability) + family_ll, jnp.log1p(-reliability) + outlier_ll)
+            bin_loglike = jnp.sum(
                 jnp.where(
                     image_has_constraint,
-                    (dx**2) / sigma2_x
-                    + (dy**2) / sigma2_y
-                    + jnp.log(2.0 * jnp.pi * sigma2_x)
-                    + jnp.log(2.0 * jnp.pi * sigma2_y),
+                    mixture_ll,
                     0.0,
                 )
             )
@@ -3642,7 +3728,6 @@ class ClusterJAXEvaluator:
 
     def release_runtime_caches(self) -> None:
         self.models_by_effective_z = {}
-        self.hessian_models_by_effective_z = {}
         self.exact_models_by_z = {}
         self.exact_solvers_by_z = {}
         self.surrogate_cache_by_z = {}
@@ -3804,6 +3889,7 @@ def _save_plot_bundle_h5(
                         "image_labels": family.image_labels,
                         "x_obs": family.x_obs,
                         "y_obs": family.y_obs,
+                        "reliability": family.reliability,
                     }
                     for family in state.family_data
                 ],
@@ -3815,6 +3901,7 @@ def _save_plot_bundle_h5(
                         "x_obs": bin_item.x_obs,
                         "y_obs": bin_item.y_obs,
                         "sigma_per_image": bin_item.sigma_per_image,
+                        "reliability_per_image": bin_item.reliability_per_image,
                     }
                     for bin_item in state.bin_data
                 ],
@@ -3859,6 +3946,10 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
                     image_labels=[str(label) for label in item["image_labels"]],
                     x_obs=np.asarray(item["x_obs"], dtype=float),
                     y_obs=np.asarray(item["y_obs"], dtype=float),
+                    reliability=np.asarray(
+                        item.get("reliability", np.ones(len(item["image_labels"]), dtype=float)),
+                        dtype=float,
+                    ),
                 )
                 for item in meta.get("family_data", [])
             ],
@@ -3870,6 +3961,10 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
                     x_obs=np.asarray(item["x_obs"], dtype=float),
                     y_obs=np.asarray(item["y_obs"], dtype=float),
                     sigma_per_image=np.asarray(item["sigma_per_image"], dtype=float),
+                    reliability_per_image=np.asarray(
+                        item.get("reliability_per_image", np.ones(len(item["x_obs"]), dtype=float)),
+                        dtype=float,
+                    ),
                 )
                 for item in meta.get("bin_data", [])
             ],
@@ -4060,7 +4155,28 @@ def _build_state_from_inputs(
         base_components.extend(scaling_components)
     parameter_specs.append(_build_source_scatter_parameter_spec(start_index=len(parameter_specs)))
     packed_lens_spec = _build_packed_lens_spec(base_components, component_param_assignments, scaling_component_assignments)
-    family_data, family_redshift_binning_sec = _prepare_family_data(images_df, sigma_arcsec, reference, args.z_bin_tol)
+    fit_images_df, n_singleton_images_skipped, n_singleton_families_skipped = _filter_singleton_families(images_df)
+    if fit_images_df.empty:
+        raise ValueError(
+            "No multi-image families remain after dropping singleton pseudo-families. "
+            "At least one family must contain two or more images."
+        )
+    if n_singleton_images_skipped > 0:
+        _log(
+            args,
+            (
+                f"[input] dropped singleton pseudo-families before fitting: "
+                f"families={n_singleton_families_skipped} images={n_singleton_images_skipped}"
+            ),
+        )
+    family_data, family_redshift_binning_sec = _prepare_family_data(
+        fit_images_df,
+        sigma_arcsec,
+        reference,
+        z_lens=z_lens,
+        cosmo=cosmo,
+        z_bin_efficiency_tol=float(args.z_bin_efficiency_tol),
+    )
     bin_data = _build_bin_data(family_data)
     cosmo_config = {
         "class": cosmo.__class__.__name__,
@@ -4254,6 +4370,7 @@ def _prepare_direct_evaluator(
         refresh_param_drift_frac=args.refresh_param_drift_frac,
         validation_approx=args.validation_approx,
         source_plane_covariance_floor=args.source_plane_covariance_floor,
+        source_plane_outlier_sigma_arcsec=args.source_plane_outlier_sigma_arcsec,
     )
     midpoint = _default_theta(state.parameter_specs)
     if evaluator.surrogate_enabled:
@@ -4541,6 +4658,9 @@ def _rerender_plots(args: argparse.Namespace, run_dir: Path) -> None:
         refresh_param_drift_frac=float(saved_args.get("refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
         validation_approx=str(saved_args.get("validation_approx", "exact")),
         source_plane_covariance_floor=float(saved_args.get("source_plane_covariance_floor", 1.0e-6)),
+        source_plane_outlier_sigma_arcsec=float(
+            saved_args.get("source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
+        ),
     )
     best_fit = np.asarray(arrays["best_fit"], dtype=float)
     best_fit_latent = _convert_theta_to_latent(best_fit, state.parameter_specs)

@@ -1659,6 +1659,8 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(args.sampling_engine),
         "--source-plane-covariance-floor",
         str(args.source_plane_covariance_floor),
+        "--z-bin-efficiency-tol",
+        str(args.z_bin_efficiency_tol),
         "--active-scaling-selection",
         str(args.active_scaling_selection),
         "--active-scaling-cumulative-fraction",
@@ -1787,6 +1789,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chains", type=int, default=1)
     parser.add_argument("--sampling-engine", choices=("full", "refreshing_surrogate"), default="refreshing_surrogate")
     parser.add_argument("--source-plane-covariance-floor", type=float, default=1.0e-6)
+    parser.add_argument("--z-bin-efficiency-tol", type=float, default=0.01)
     parser.add_argument(
         "--active-scaling-galaxies",
         type=int,

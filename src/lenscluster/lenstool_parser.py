@@ -313,7 +313,15 @@ def _load_dat_catalog(
         )
 
     if catalog_kind == "multiple_images":
-        df = pd.DataFrame(rows, columns=["id", "coord_1", "coord_2", "a", "b", "theta", "z", "mag"])
+        base_columns = ["id", "coord_1", "coord_2", "a", "b", "theta", "z", "mag"]
+        max_columns = max(len(row) for row in rows)
+        if max_columns < len(base_columns):
+            raise ValueError(f"Multiple-image catalog '{path}' has rows with fewer than {len(base_columns)} columns.")
+        padded_rows = [row + [np.nan] * (max_columns - len(row)) for row in rows]
+        extra_columns = ["family_reliability"] + [
+            f"extra_{idx}" for idx in range(max(0, max_columns - len(base_columns) - 1))
+        ]
+        df = pd.DataFrame(padded_rows, columns=base_columns + extra_columns[: max_columns - len(base_columns)])
         df["lum"] = np.nan
     elif catalog_kind == "potfile_galaxies":
         df = pd.DataFrame(rows, columns=["id", "coord_1", "coord_2", "a", "b", "theta", "mag", "lum"])
@@ -323,6 +331,10 @@ def _load_dat_catalog(
     df["id"] = df["id"].astype(str)
     for column in ["coord_1", "coord_2", "a", "b", "theta", "mag", "z", "lum"]:
         df[column] = pd.to_numeric(df[column], errors="raise")
+    if "family_reliability" in df.columns:
+        df["family_reliability"] = pd.to_numeric(df["family_reliability"], errors="coerce").fillna(1.0).clip(0.0, 1.0)
+    else:
+        df["family_reliability"] = 1.0
 
     if header_reference == 0:
         df["ra"] = df["coord_1"]
@@ -368,6 +380,7 @@ def _load_dat_catalog(
         "catalog_mag",
         "catalog_z",
         "catalog_lum",
+        "family_reliability",
     ]
     return df.loc[:, keep_columns].drop_duplicates(subset=["id"], keep="first").reset_index(drop=True)
 
@@ -388,6 +401,7 @@ def _empty_images_df() -> pd.DataFrame:
             "catalog_mag",
             "catalog_z",
             "catalog_lum",
+            "family_reliability",
         ]
     )
 
@@ -426,6 +440,7 @@ def _load_multiple_images_catalog(
             "catalog_mag": catalog_df["catalog_mag"].to_numpy(),
             "catalog_z": catalog_df["catalog_z"].to_numpy(),
             "catalog_lum": catalog_df["catalog_lum"].to_numpy(),
+            "family_reliability": catalog_df["family_reliability"].to_numpy(),
         }
     )
     return result.reset_index(drop=True)

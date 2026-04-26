@@ -92,6 +92,7 @@ class FamilyData:
     image_labels: list[str]
     x_obs: np.ndarray
     y_obs: np.ndarray
+    reliability: np.ndarray
 
     @property
     def n_images(self) -> int:
@@ -120,6 +121,7 @@ class BinData:
     x_obs: np.ndarray
     y_obs: np.ndarray
     sigma_per_image: np.ndarray
+    reliability_per_image: np.ndarray
 
 
 @dataclass(frozen=True)
