@@ -1,12 +1,14 @@
 # Lenscluster Workflow
 
-This repository now uses one public fitting workflow:
+This repository now has two public fitting workflows: the sequential optimizer/sampler path and the one-shot `evidence-ns` path. The sequential path runs:
 
 1. Fit the large-scale cluster model with SVI.
 2. Fit the joint large+small model with SVI, initialized from the large-scale SVI solution.
 3. Optionally run NUTS on the joint model with `--fit-method svi+nuts`.
+4. Optionally run an image-plane refinement stage with `--image-plane-mode local-jacobian`.
+5. Optionally run a final explicit-source image-plane stage using `--image-plane-mode linearized-forward-beta-image-plane`.
 
-Use `--fit-method svi` for a fast variational result, or `--fit-method svi+nuts` for SVI initialization followed by joint posterior sampling.
+Use `--fit-method svi` for a fast variational result or `--fit-method svi+nuts` for SVI initialization followed by joint posterior sampling. In the optional sequential image-plane workflow, `--fit-method`, `--warmup`, and `--samples` may each take one value for all sampled stages, two values mapping to `stage2_joint` and `stage3_image_plane`, or three values when a stage-4 explicit-source image-plane mode is enabled. Nested sampling is reserved for the one-shot evidence workflow: use `--fit-mode evidence-ns` with an explicit `--evidence-source-prior-sigma-arcsec`; `--fit-method`, `--warmup`, and `--samples` are ignored in that mode.
 
 ## Run
 
@@ -26,7 +28,6 @@ python -m cluster_solver \
   --active-scaling-galaxies 32 \
   --target-accept 0.75 \
   --max-tree-depth 5 \
-  --likelihood-mode source \
   --validate-top-k-families 0 \
   --z-bin-efficiency-tol 0.01 \
   --profile-variant original
@@ -39,16 +40,17 @@ python -m cluster_solver \
   --par-path data/M0416_Bergamini22/Bergamini22_MACS0416.par \
   --output-dir plots/m0416_original \
   --run-name joint_workflow \
-  --fit-method svi+nuts \
-  --warmup 1000 \
-  --samples 250 \
+  --fit-method svi+nuts svi+nuts svi \
+  --image-plane-mode linearized-forward-beta-image-plane \
+  --image-plane-newton-steps 0 \
+  --warmup 1000 1000 0 \
+  --samples 250 250 100 \
   --chains 4 \
   --sampling-engine refreshing_surrogate \
   --active-scaling-galaxies -1 \
   --refresh-param-drift-frac 0.08 \
   --target-accept 0.9 \
   --max-tree-depth 8 \
-  --likelihood-mode source \
   --validate-top-k-families 0 \
   --validation-approx adaptive \
   --z-bin-efficiency-tol 0.01 \
@@ -56,19 +58,51 @@ python -m cluster_solver \
   --plot-caustics
 ```
 
-The same command with `--fit-method svi` skips NUTS and writes the AutoNormal guide posterior.
+The same command with scalar `--fit-method svi` skips NUTS in every sampled stage and writes the AutoNormal guide posterior. A mixed command such as `--fit-method svi+nuts svi --warmup 1000 0 --samples 250 100` runs NUTS in stage 2 and an SVI-only image-plane stage 3; with stage 4 enabled, a third value controls the final stage-4 directory.
+
+One-shot evidence nested sampling example:
+
+```bash
+python -m cluster_solver \
+  --par-path data/M0416_Bergamini22/Bergamini22_MACS0416.par \
+  --output-dir plots/m0416_original \
+  --run-name joint_workflow_evidence_ns \
+  --fit-mode evidence-ns \
+  --evidence-source-prior-sigma-arcsec 20.0 \
+  --ns-num-live-points 2000 \
+  --ns-max-samples 200000 \
+  --ns-dlogz 1e-3 \
+  --sampling-engine refreshing_surrogate \
+  --active-scaling-galaxies -1
+```
+
+For mock runs with known truth values, pass a truth JSON directly to the solver:
+
+```bash
+python -m cluster_solver \
+  --par-path data/clustersim/input.par \
+  --truth data/clustersim/truth.json \
+  --output-dir plots/clustersim \
+  --run-name joint_workflow
+```
+
+When `--truth` is provided, recovery validation PDFs are written under the run's
+`validation/` directory after solver artifacts are saved.
 
 ## Mock-Cluster Validation
 
 The validation runner builds a synthetic single-BCG cluster, runs the normal
 parser/build/inference workflow, and writes PDF-only recovery figures. By
-default it uses a mildly realistic mock: source families cycle through
-`z=1.5,2.0,3.0`, the BCG is slightly offset from the cluster halo, the image
+default it uses a mildly realistic mock: 20 primary source families are sampled
+inside the largest tangential caustic, accepted only when they produce at least
+three images, the BCG is slightly offset from the cluster halo, the image
 position uncertainty is `0.15"` and the reported source-scatter truth is
 `0.05"`. It uses SVI initialization followed by NumPyro NUTS:
 
 ```bash
 python -m lenscluster.validation \
+  --n-primary-families 20 \
+  --n-subhalo-families 0 \
   --n-subhalos 50
 ```
 
@@ -76,6 +110,9 @@ Useful explicit configuration for the current subhalo validation setup:
 
 ```bash
 python -m lenscluster.validation \
+  --n-primary-families 20 \
+  --n-subhalo-families 0 \
+  --min-images-per-family 3 \
   --n-subhalos 50 \
   --source-redshifts 1.5,2.0,3.0 \
   --pos-sigma-arcsec 0.15 \
@@ -91,6 +128,10 @@ subhalo cutoff from the cumulative-importance curve. The default keeps enough
 ranked subhalos to capture 99.5% of the ranking importance, with at least four
 active subhalos per potfile. The remaining subhalos are retained through the
 refreshing surrogate rather than removed from the model.
+
+`--n-subhalo-families` requests additional sources inside the non-primary
+closed caustics found at each source redshift. These are local caustic-driven
+mock families, not a fit-time likelihood option.
 
 When subhalos are enabled, the mock injects intrinsic log-normal scatter around
 the member-galaxy scaling relations by default:
@@ -111,6 +152,38 @@ python -m lenscluster.validation \
   --svi-steps 1000 \
   --samples 500
 ```
+
+Validation accepts the same sampled-stage controls as the sequential solver. Two values
+require an image-plane mode and map to the sampled stages after stage 1; three
+values additionally control the selected stage-4 image-plane directory:
+
+```bash
+python -m lenscluster.validation \
+  --n-subhalos 50 \
+  --image-plane-mode linearized-forward-beta-image-plane \
+  --image-plane-newton-steps 0 \
+  --fit-method svi+nuts svi+nuts svi \
+  --warmup 1000 1000 0 \
+  --samples 250 100 500
+```
+
+For validation evidence runs, select the one-shot solver mode and provide the
+fixed source prior. The staged fit controls are not required:
+
+```bash
+python -m lenscluster.validation \
+  --n-subhalos 50 \
+  --solver-fit-mode evidence-ns \
+  --evidence-source-prior-sigma-arcsec 20.0 \
+  --ns-num-live-points 1000 \
+  --ns-max-samples 100000 \
+  --ns-dlogz 1e-3
+```
+
+To run the sampled-source image-plane evidence target instead, add
+`--evidence-likelihood-mode linearized-forward-beta-image-plane`; optional
+`--source-position-parameterization` and `--image-plane-newton-steps` controls
+then apply to that one-shot evidence likelihood.
 
 For a smaller NUTS test:
 
@@ -148,6 +221,8 @@ Mock-truth recovery PDFs are additionally written at the seed directory level:
 
 - `parameter_recovery.pdf`
 - `mass_profile_recovery.pdf`
+- `surface_density_recovery.pdf`
+- `critical_caustic_recovery.pdf`
 - `magnification_recovery.pdf`
 - `image_recovery.pdf`
 - `source_recovery.pdf`
@@ -156,11 +231,11 @@ Mock-truth recovery PDFs are additionally written at the seed directory level:
 - `corner.pdf`
 - `potfile_corner.pdf` when potfile scaling parameters are present
 
-The mass-profile validation figure decomposes the recovered deflection profile
-into total, halo, BCG, subhalos, and BCG+subhalos. This is important because
-strong-lensing image positions mostly constrain the total deflection field; the
-halo, BCG, and subhalo components can trade mass unless the priors and image
-configuration break that degeneracy.
+The mass-profile validation figures decompose the recovered deflection profile
+and annular projected surface density into total, halo, BCG, subhalos, and
+BCG+subhalos. This is important because strong-lensing image positions mostly
+constrain the total deflection field; the halo, BCG, and subhalo components can
+trade mass unless the priors and image configuration break that degeneracy.
 
 The posterior artifacts used to make these PDFs are saved under:
 
@@ -251,6 +326,24 @@ full Jacobian covariance while keeping likelihood evaluations scalar and fast.
 The covariance floor for this metric is controlled with
 `--source-plane-covariance-floor`.
 
+When `--image-plane-mode local-jacobian` is selected, the sequential workflow
+adds a third `stage3_image_plane` fit initialized from the source-plane joint
+stage. This stage uses the same SVI/NUTS method as stage 2, but replaces the
+scalar magnification weighting with the full local 2x2 lensing Jacobian
+covariance at each observed image. It is still a differentiable local
+approximation, not a full image-finding likelihood.
+
+When `--image-plane-mode linearized-forward-beta-image-plane` is selected, the
+workflow adds `stage4_linearized_image_plane`. By default it also runs
+`stage3_image_plane` first; pass `--skip-stage3-image-plane-local-jacobian` to
+initialize stage 4 directly from `stage2_joint`. This final stage samples the lens
+parameters plus explicit 2D source positions for each multiply imaged family,
+initialized from the previous sampled stage's source centroids. The sampled likelihood computes one
+local image-plane correction at each observed image even when
+`--image-plane-newton-steps 0`; positive values add that many further Newton
+updates before scoring the image-plane displacement. It uses its own
+`image_sigma_int` scatter parameter in image-plane units.
+
 Nearby source redshifts are grouped by fractional lensing-efficiency
 `D_ls / D_s` tolerance instead of raw redshift. The default
 `--z-bin-efficiency-tol 0.01` keeps each effective source plane within about
@@ -263,12 +356,27 @@ magnification weights are refreshed at the current guide median, then the final
 fixed cache is used for NUTS. This incorporates updated Jacobian information
 without changing the target density inside a NUTS trajectory.
 
+For `--fit-mode evidence-ns`, the solver skips the sequential stages and builds
+one joint evidence target with analytically marginalized source positions under
+the configured Gaussian source prior by default. For correctness checks, pass
+`--evidence-likelihood-mode linearized-forward-beta-image-plane` to sample one
+source position per family from the same evidence source prior and evaluate the
+linearized image-plane residual likelihood. After the full NS run, the saved posterior
+table is always 4096 posterior draws produced by `NestedSampler.get_samples(...)`.
+Those resampled draws are used for log-probability postprocessing, artifact
+writing, plotting, and best-fit selection. This resampling step does not change
+the evidence run or the `--ns-max-samples` termination limit. `run_summary.json`
+records `ns_posterior_samples=4096` and `ns_posterior_resampling` alongside the
+JAXNS evidence diagnostics `ns_log_z_mean` and `ns_log_z_uncert`.
+
 ## Outputs
 
 For `--run-name joint_workflow`, outputs are written to:
 
 - `plots/m0416_original/joint_workflow/stage1_large_only/`
 - `plots/m0416_original/joint_workflow/stage2_joint/`
+- `plots/m0416_original/joint_workflow/stage3_image_plane/` when `--image-plane-mode local-jacobian`, or before stage 4 unless skipped
+- `plots/m0416_original/joint_workflow/stage4_linearized_image_plane/` when `--image-plane-mode linearized-forward-beta-image-plane`
 - `plots/m0416_original/joint_workflow/sequential_summary.json`
 
 Each stage writes:

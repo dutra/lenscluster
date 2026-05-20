@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import resource
 import time
 import traceback
@@ -12,9 +13,75 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 import numpy as np
 
+from .jax_cosmology import kpc_per_arcsec_from_config
+
+try:
+    from rich.console import Console
+    from rich.text import Text
+except ModuleNotFoundError:  # pragma: no cover - exercised only in minimal test environments
+    class _FallbackSpan:
+        def __init__(self, style: str | None) -> None:
+            self.style = style or ""
+
+    class Text:
+        def __init__(self) -> None:
+            self.plain = ""
+            self.spans: list[_FallbackSpan] = []
+
+        def append(self, value: str, style: str | None = None) -> None:
+            self.plain += str(value)
+            if style:
+                self.spans.append(_FallbackSpan(style))
+
+    class Console:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def print(self, value: Any) -> None:
+            print(getattr(value, "plain", value))
+
 _DEBUG_LOG_PATH: Path | None = None
 _DEBUG_LOG_HANDLE = None
 _DEBUG_LOG_STDOUT_ENABLED = True
+_CONSOLE = Console(highlight=False)
+_TAG_STYLES = {
+    "main": "bold cyan",
+    "load": "bold blue",
+    "input": "bold blue",
+    "runtime": "bold cyan",
+    "stage": "bold magenta",
+    "model": "bold green",
+    "parameters": "bold green",
+    "surrogate": "bold yellow",
+    "posterior": "bold cyan",
+    "svi": "bold magenta",
+    "nuts": "bold red",
+    "validation": "bold yellow",
+    "output": "bold green",
+    "plots-only": "bold cyan",
+    "phase": "bold white",
+    "compile": "bold blue",
+    "done": "bold green",
+    "exception": "bold red",
+    "traceback": "red",
+}
+_CONSOLE_VISIBLE_TAGS = {
+    "main",
+    "runtime",
+    "stage",
+    "load",
+    "model",
+    "compile",
+    "svi",
+    "nuts",
+    "validation",
+    "output",
+    "plots-only",
+    "resume",
+    "done",
+    "exception",
+}
+_STAGE_BANNER_RE = re.compile(r"^(\s*)(=+)(\s+)(.*?)(\s+)(=+)$")
 
 
 def parse_bool_env(name: str) -> bool:
@@ -124,11 +191,90 @@ def should_log(args: argparse.Namespace | None) -> bool:
     return args is None or not getattr(args, "quiet", False)
 
 
+def _style_for_tag(tag: str) -> str:
+    normalized = tag.strip("[]").split(":", 1)[0]
+    return _TAG_STYLES.get(normalized, "bold")
+
+
+def _message_tag(message: str) -> tuple[str, str] | None:
+    if not message.startswith("[") or "]" not in message:
+        return None
+    tag = message[1 : message.find("]")]
+    return tag, tag.split(":", 1)[0]
+
+
+def _should_log_to_console(message: str) -> bool:
+    parsed = _message_tag(message)
+    if parsed is None:
+        return True
+    tag, base_tag = parsed
+    if base_tag == "phase":
+        return " error " in message
+    if ":" in tag:
+        return False
+    if base_tag in {"parameters", "posterior"}:
+        return False
+    if base_tag == "input":
+        return message.startswith("[input] dropped singleton")
+    if base_tag == "runtime":
+        return message.startswith("[runtime] python=")
+    if base_tag == "surrogate":
+        return "active_by_potfile" not in message
+    return base_tag in _CONSOLE_VISIBLE_TAGS
+
+
+def _rich_log_text(timestamp: str, message: str) -> Text:
+    text = Text()
+    text.append(timestamp, style="dim")
+    text.append(" ")
+    if message.startswith("[") and "]" in message:
+        tag_end = message.find("]") + 1
+        tag = message[:tag_end]
+        text.append(tag, style=_style_for_tag(tag))
+        remainder = message[tag_end:]
+        if tag == "[stage]":
+            banner_match = _STAGE_BANNER_RE.match(remainder)
+            if banner_match is not None:
+                prefix, left_rule, left_space, title, right_space, right_rule = banner_match.groups()
+                text.append(prefix)
+                text.append(left_rule, style="bold magenta")
+                text.append(left_space)
+                text.append(title, style="bold white on magenta")
+                text.append(right_space)
+                text.append(right_rule, style="bold magenta")
+            else:
+                text.append(remainder)
+        else:
+            text.append(remainder)
+    else:
+        text.append(message)
+    return text
+
+
 def log_message(args: argparse.Namespace | None, message: str) -> None:
-    line = f"{datetime.now().isoformat(timespec='seconds')} {message} {format_memory_snapshot()}"
-    if should_log(args):
-        print(line, flush=True)
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    memory = format_memory_snapshot()
+    line = f"{timestamp} {message} {memory}"
+    if should_log(args) and _should_log_to_console(message):
+        _CONSOLE.print(_rich_log_text(timestamp, message))
     debug_log_line(line)
+
+
+def format_stage_banner(title: str, details: str | None = None, width: int = 78) -> list[str]:
+    title_text = " ".join(str(title or "STAGE").split())
+    core = f" {title_text} "
+    banner_width = max(int(width), len(core) + 8)
+    left = max(4, (banner_width - len(core)) // 2)
+    right = max(4, banner_width - len(core) - left)
+    lines = [f"[stage] {'=' * left}{core}{'=' * right}"]
+    if details:
+        lines.append(f"[stage] {' '.join(str(details).split())}")
+    return lines
+
+
+def log_stage_banner(args: argparse.Namespace | None, title: str, details: str | None = None) -> None:
+    for line in format_stage_banner(title, details):
+        log_message(args, line)
 
 
 def fmt_seconds(value: float) -> str:
@@ -394,7 +540,11 @@ def radec_to_offsets(ra, dec, ra0, dec0, z, cosmo):
     x_arcsec = (dlon.to(u.arcsec)).value    
     y_arcsec = (-dlat.to(u.arcsec)).value    # flip sign so +y is North (Dec increasing)
 
-    arcsec2kpc = cosmo.kpc_proper_per_arcmin(z).to(u.kpc/u.arcsec).value
+    if isinstance(cosmo, dict):
+        z_values = np.asarray(z, dtype=float)
+        arcsec2kpc = np.vectorize(lambda z_item: kpc_per_arcsec_from_config(float(z_item), cosmo))(z_values)
+    else:
+        arcsec2kpc = cosmo.kpc_proper_per_arcmin(z).to(u.kpc/u.arcsec).value
     x_kpc = x_arcsec * arcsec2kpc
     y_kpc = y_arcsec * arcsec2kpc
 

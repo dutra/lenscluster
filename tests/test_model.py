@@ -9,6 +9,7 @@ from lenscluster.model import latent_array_to_physical, latent_to_physical, phys
 class TransformSpec:
     transform_kind: str
     transform_offset: float = 0.0
+    transform_scale: float = 1.0
 
 
 def test_positive_log_transform_round_trip() -> None:
@@ -26,3 +27,13 @@ def test_offset_log_transform_round_trip_array() -> None:
     physical = latent_array_to_physical(latent, spec)
 
     np.testing.assert_allclose(physical, np.asarray([3.0, 6.0]))
+
+
+def test_affine_transform_round_trip_array() -> None:
+    spec = TransformSpec("affine", transform_offset=0.25, transform_scale=0.3)
+    latent = np.asarray([0.0, 1.0, -2.0])
+
+    physical = latent_array_to_physical(latent, spec)
+
+    np.testing.assert_allclose(physical, np.asarray([0.25, 0.55, -0.35]))
+    np.testing.assert_allclose([physical_to_latent(value, spec) for value in physical], latent)

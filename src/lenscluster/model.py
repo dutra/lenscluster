@@ -13,6 +13,7 @@ DEFAULT_SAMPLER = "numpyro_nuts"
 class ParameterTransformSpec(Protocol):
     transform_kind: str
     transform_offset: float
+    transform_scale: float
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class ParameterSpec:
     physical_mean: float | None = None
     physical_std: float | None = None
     transform_offset: float = 0.0
+    transform_scale: float = 1.0
     parent_sample_name: str | None = None
 
 
@@ -79,8 +81,18 @@ class SurrogateBinCache:
     effective_z_source: float
     inactive_alpha_x: np.ndarray
     inactive_alpha_y: np.ndarray
+    # Derivative rows follow the evaluator's surrogate-parameter basis: scaling parameters,
+    # plus sampled cosmology parameters when flat-wCDM cosmology is fitted.
     inactive_alpha_dx_dparams: np.ndarray
     inactive_alpha_dy_dparams: np.ndarray
+    inactive_jacobian_delta_a00: np.ndarray | None = None
+    inactive_jacobian_delta_a01: np.ndarray | None = None
+    inactive_jacobian_delta_a10: np.ndarray | None = None
+    inactive_jacobian_delta_a11: np.ndarray | None = None
+    inactive_jacobian_delta_da00_dparams: np.ndarray | None = None
+    inactive_jacobian_delta_da01_dparams: np.ndarray | None = None
+    inactive_jacobian_delta_da10_dparams: np.ndarray | None = None
+    inactive_jacobian_delta_da11_dparams: np.ndarray | None = None
 
 
 @dataclass
@@ -134,6 +146,13 @@ class GeometryCache:
     dpie_sigma0_factor_by_exact_z: dict[float, float]
     family_redshift_binning_sec: float = 0.0
     geometry_cache_build_sec: float = 0.0
+    flat_wcdm_quadrature_order: int = 64
+    lens_quadrature_z: list[float] | None = None
+    lens_quadrature_weights: list[float] | None = None
+    effective_z_quadrature_z: list[list[float]] | None = None
+    effective_z_quadrature_weights: list[list[float]] | None = None
+    exact_z_quadrature_z: list[list[float]] | None = None
+    exact_z_quadrature_weights: list[list[float]] | None = None
 
 
 @dataclass
@@ -172,6 +191,7 @@ class PosteriorResults:
     temperature_schedule: np.ndarray | None = None
     ess_history: np.ndarray | None = None
     move_acceptance_history: np.ndarray | None = None
+    ns_diagnostics: dict[str, np.ndarray] | None = None
 
 
 @dataclass(frozen=True)
@@ -211,12 +231,12 @@ class BuildState:
     lens_model_list: list[str]
     reference: tuple[int, float, float]
     fit_mode: str
-    profile_variant: str
-    compact_skip_factor: float
     potfiles: list[dict[str, Any]]
     scaling_component_records: list[dict[str, Any]]
     geometry_cache: GeometryCache | None = None
     svi_init_values: dict[str, float] | None = None
+    fit_cosmology_flat_wcdm: bool = False
+    source_position_parameterization: str = "direct"
 
 
 def positive_lognormal_parameters(mean: float, std: float, *, floor: float = 1.0e-6) -> tuple[float, float]:
@@ -231,10 +251,13 @@ def positive_lognormal_parameters(mean: float, std: float, *, floor: float = 1.0
 def physical_to_latent(value: float, spec: ParameterTransformSpec) -> float:
     value = float(value)
     offset = float(spec.transform_offset)
+    scale = float(getattr(spec, "transform_scale", 1.0))
     if spec.transform_kind == "log_positive":
         return float(np.log(max(value, 1.0e-12)))
     if spec.transform_kind == "log_offset_positive":
         return float(np.log(max(value - offset, 1.0e-12)))
+    if spec.transform_kind == "affine":
+        return float((value - offset) / scale)
     return value
 
 
@@ -244,6 +267,8 @@ def latent_to_physical(value: float, spec: ParameterTransformSpec) -> float:
         return float(np.exp(value))
     if spec.transform_kind == "log_offset_positive":
         return float(spec.transform_offset + np.exp(value))
+    if spec.transform_kind == "affine":
+        return float(spec.transform_offset + float(getattr(spec, "transform_scale", 1.0)) * value)
     return value
 
 
@@ -253,6 +278,8 @@ def latent_array_to_physical(values: np.ndarray, spec: ParameterTransformSpec) -
         return np.exp(array)
     if spec.transform_kind == "log_offset_positive":
         return float(spec.transform_offset) + np.exp(array)
+    if spec.transform_kind == "affine":
+        return float(spec.transform_offset) + float(getattr(spec, "transform_scale", 1.0)) * array
     return array
 
 
@@ -262,6 +289,11 @@ def latent_jax_to_physical(values: jnp.ndarray, spec: ParameterTransformSpec) ->
         return jnp.exp(array)
     if spec.transform_kind == "log_offset_positive":
         return jnp.asarray(spec.transform_offset, dtype=jnp.float64) + jnp.exp(array)
+    if spec.transform_kind == "affine":
+        return jnp.asarray(spec.transform_offset, dtype=jnp.float64) + jnp.asarray(
+            getattr(spec, "transform_scale", 1.0),
+            dtype=jnp.float64,
+        ) * array
     return array
 
 
@@ -311,8 +343,14 @@ def apply_parameter_transforms_jax(
     log_positive_mask: jnp.ndarray,
     log_offset_positive_mask: jnp.ndarray,
     transform_offset_array: jnp.ndarray,
+    affine_mask: jnp.ndarray | None = None,
+    transform_scale_array: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     params_array = jnp.asarray(params, dtype=jnp.float64)
+    if affine_mask is None:
+        affine_mask = jnp.zeros_like(log_positive_mask, dtype=bool)
+    if transform_scale_array is None:
+        transform_scale_array = jnp.ones_like(transform_offset_array, dtype=jnp.float64)
     safe_log_positive_params = jnp.where(log_positive_mask, params_array, 0.0)
     physical_params = jnp.where(
         log_positive_mask,
@@ -323,6 +361,11 @@ def apply_parameter_transforms_jax(
     physical_params = jnp.where(
         log_offset_positive_mask,
         transform_offset_array + jnp.exp(safe_log_offset_params),
+        physical_params,
+    )
+    physical_params = jnp.where(
+        affine_mask,
+        transform_offset_array + transform_scale_array * params_array,
         physical_params,
     )
     return physical_params

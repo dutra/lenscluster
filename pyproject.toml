@@ -7,6 +7,11 @@ name = "lenscluster"
 version = "0.1.0"
 description = "Cluster strong-lensing inference utilities."
 requires-python = ">=3.11"
+dependencies = [
+    "jax-cosmo>=0.1.0",
+    "rich>=13",
+    "scikit-image>=0.22",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -7,11 +7,13 @@ import math
 
 import numpy as np
 import pandas as pd
-from astropy.cosmology import FlatLambdaCDM, FlatwCDM, LambdaCDM, wCDM
+
+from .jax_cosmology import cosmology_config_from_parsed, kpc_per_arcsec_from_config
 
 
 DP_IE_PROFILE = 81
 SHEAR_PROFILE = 14
+DEFAULT_POTFILE_SCALING_EXPONENT = 4.0
 
 
 def _coerce_token(token: str) -> Any:
@@ -152,7 +154,7 @@ def _compute_offsets(
     except Exception:
         utils_radec_to_offsets = None
 
-    if utils_radec_to_offsets is not None and cosmo is not None:
+    if utils_radec_to_offsets is not None and cosmo is not None and hasattr(cosmo, "kpc_proper_per_arcmin"):
         z_value = 0.0 if z is None else z
         return utils_radec_to_offsets(ra, dec, ra0, dec0, z_value, cosmo)
 
@@ -160,28 +162,11 @@ def _compute_offsets(
 
 
 def _build_cosmology(parsed: dict[str, Any]):
-    cosmo_block = parsed.get("cosmology")
-    if not isinstance(cosmo_block, dict):
-        cosmo_block = parsed.get("cosmologie")
-    if not isinstance(cosmo_block, dict):
-        return FlatLambdaCDM(H0=70.0, Om0=0.3)
-    h0 = float(cosmo_block.get("H0", 70.0))
-    om0 = float(cosmo_block.get("omegaM", cosmo_block.get("omega", 0.3)))
-    ode0 = float(cosmo_block.get("omegaX", cosmo_block.get("lambda", 0.7)))
-    ok0 = float(cosmo_block.get("omegaK", 0.0))
-    w0 = float(cosmo_block.get("wX", cosmo_block.get("w", -1.0)))
-    wa = float(cosmo_block.get("wa", 0.0))
-    if abs(ok0) < 1.0e-10:
-        if abs(w0 + 1.0) < 1.0e-10 and abs(wa) < 1.0e-10:
-            return FlatLambdaCDM(H0=h0, Om0=om0)
-        return FlatwCDM(H0=h0, Om0=om0, w0=w0)
-    if abs(w0 + 1.0) < 1.0e-10 and abs(wa) < 1.0e-10:
-        return LambdaCDM(H0=h0, Om0=om0, Ode0=ode0)
-    return wCDM(H0=h0, Om0=om0, Ode0=ode0, w0=w0)
+    return cosmology_config_from_parsed(parsed)
 
 
 def _kpc_per_arcsec(cosmo: Any, z_lens: float) -> float:
-    return float(cosmo.kpc_proper_per_arcmin(z_lens).to("kpc/arcsec").value)
+    return kpc_per_arcsec_from_config(float(z_lens), cosmo)
 
 
 def _scale_prior_values(values: Any, scale: float) -> Any:
@@ -508,6 +493,14 @@ def _potfile_nominal_value(value: Any, context: str) -> float:
     return float(value)
 
 
+def _potfile_scaling_exponent_value(potfile: dict[str, Any], field_name: str, potfile_id: str) -> float:
+    value = potfile.get(field_name)
+    if value is None:
+        value = [0, DEFAULT_POTFILE_SCALING_EXPONENT, 0.0]
+        potfile[field_name] = value
+    return _potfile_nominal_value(value, f"{potfile_id}.{field_name}")
+
+
 def _normalize_potfile_blocks(
     parsed: dict[str, Any],
     base_dir: Path,
@@ -559,8 +552,8 @@ def _normalize_potfile_blocks(
             if cut_arcsec_value is not None
             else None
         )
-        potfile["vdslope_nominal"] = _potfile_nominal_value(potfile.get("vdslope"), f"{potfile_id}.vdslope")
-        potfile["slope_nominal"] = _potfile_nominal_value(potfile.get("slope"), f"{potfile_id}.slope")
+        potfile["vdslope_nominal"] = _potfile_scaling_exponent_value(potfile, "vdslope", potfile_id)
+        potfile["slope_nominal"] = _potfile_scaling_exponent_value(potfile, "slope", potfile_id)
         normalized.append(potfile)
     return normalized
 
