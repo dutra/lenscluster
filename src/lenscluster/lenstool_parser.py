@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import math
+import re
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,7 @@ from .jax_cosmology import cosmology_config_from_parsed, kpc_per_arcsec_from_con
 DP_IE_PROFILE = 81
 SHEAR_PROFILE = 14
 DEFAULT_POTFILE_SCALING_EXPONENT = 4.0
+LETTER_SUFFIX_IMAGE_LABEL_RE = re.compile(r"^([A-Za-z]*\d+)([A-Za-z]+)$")
 
 
 def _coerce_token(token: str) -> Any:
@@ -36,6 +38,10 @@ def _coerce_values(tokens: list[str]) -> Any:
     if len(values) == 1:
         return values[0]
     return values
+
+
+def _strip_inline_comment(line: str) -> str:
+    return line.split("#", 1)[0].strip()
 
 
 def _pluralize(name: str) -> str:
@@ -79,7 +85,7 @@ def _normalize_block_id(block_id: Any) -> str | None:
 
 
 def _parse_named_block(lines: list[str], start_index: int) -> tuple[dict[str, Any], int]:
-    header_tokens = lines[start_index].split()
+    header_tokens = _strip_inline_comment(lines[start_index]).split()
     block_name = header_tokens[0]
     block: dict[str, Any] = {}
 
@@ -88,7 +94,10 @@ def _parse_named_block(lines: list[str], start_index: int) -> tuple[dict[str, An
 
     index = start_index + 1
     while index < len(lines):
-        raw_line = lines[index].strip()
+        raw_line = _strip_inline_comment(lines[index])
+        if not raw_line:
+            index += 1
+            continue
         if raw_line == "end":
             return {"name": block_name, "data": block}, index + 1
 
@@ -394,9 +403,12 @@ def _empty_images_df() -> pd.DataFrame:
 def _split_image_label(image_label: str) -> tuple[str, str]:
     label = image_label.strip()
     family_id, separator, image_id = label.partition(".")
-    if not separator:
-        return label, ""
-    return family_id, image_id
+    if separator:
+        return family_id, image_id
+    match = LETTER_SUFFIX_IMAGE_LABEL_RE.fullmatch(label)
+    if match is not None:
+        return match.group(1), match.group(2)
+    return label, ""
 
 
 def _load_multiple_images_catalog(
@@ -767,12 +779,12 @@ def load_best_par(
             parsed.setdefault("potfiles", []).append(potfile_data)
             continue
 
-        if block_name in parsed:
-            plural_name = _pluralize(block_name)
-            if plural_name not in parsed:
-                existing = parsed.pop(block_name)
-                parsed[plural_name] = [existing]
+        plural_name = _pluralize(block_name)
+        if plural_name in parsed:
             parsed[plural_name].append(block_data)
+        elif block_name in parsed:
+            existing = parsed.pop(block_name)
+            parsed[plural_name] = [existing, block_data]
         else:
             parsed[block_name] = block_data
 

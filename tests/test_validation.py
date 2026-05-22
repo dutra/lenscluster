@@ -36,15 +36,17 @@ from lenscluster.cluster_solver import (
     _adaptive_active_scaling_count,
     _build_cosmology,
     _build_parameter_specs,
+    _effective_image_presence_penalty_weight,
     _linearized_image_plane_bin_loglike,
     _linearized_marginal_beta_image_plane_bin_loglike,
     _linearized_image_plane_residual_from_jacobian,
+    _soft_observed_image_presence_loglike,
     _local_jacobian_bin_loglike,
     _normalize_stage_fit_controls,
     _parse_args,
     _validation_metrics_summary,
 )
-from lenscluster.lenstool_parser import load_best_par
+from lenscluster.lenstool_parser import _split_image_label, load_best_par
 from lenscluster.model import (
     BuildState,
     GeometryCache,
@@ -237,6 +239,274 @@ fini
     assert potfile["slope"] == [0, 4.0, 0.0]
     assert potfile["vdslope_nominal"] == pytest.approx(4.0)
     assert potfile["slope_nominal"] == pytest.approx(4.0)
+
+
+def test_load_best_par_strips_inline_comments_in_named_blocks(tmp_path: Path) -> None:
+    catalog_path = tmp_path / "members.cat"
+    catalog_path.write_text(
+        "#REFERENCE 0\n"
+        "1 39.970000 -1.580000 1.0 1.0 0.0 19.5000 1.0\n",
+        encoding="utf-8",
+    )
+    par_path = tmp_path / "inline_comments.par"
+    par_path.write_text(
+        """
+runmode
+    reference 3 39.971340 -1.582260
+    end
+
+potentiel 1 # main halo
+    profil 81
+    x_centre 0 #-0.853
+    y_centre 0 # -1.999
+    ellipticite 0.1
+    angle_pos 12.0
+    core_radius 1.0
+    cut_radius 20.0
+    v_disp 700.0
+    z_lens 0.375000
+    # full-line comment inside a block
+    end
+
+potfile # member scaling
+    filein 3 members.cat # cluster members
+    zlens 0.375000
+    type 81
+    corekpc 0.150000
+    mag0 19.5 # BCG mag
+    sigma 1 10. 200. # real prior list
+    cutkpc 1 1. 40. # real prior list
+    vdslope 0 3.5 0
+    slope 0 3.0 0
+    end
+fini
+""",
+        encoding="utf-8",
+    )
+
+    parsed, potentials_df, _images_df, potentials_with_priors = load_best_par(par_path)
+
+    assert potentials_df.loc[0, "id"] == "1"
+    assert potentials_df.loc[0, "x_centre"] == pytest.approx(0.0)
+    assert potentials_df.loc[0, "y_centre"] == pytest.approx(0.0)
+    assert potentials_with_priors[0]["id"] == "1"
+    potfile = parsed["potfiles"][0]
+    assert potfile["mag0"] == pytest.approx(19.5)
+    assert potfile["sigma"] == [1, 10.0, 200.0]
+    assert potfile["sigma_nominal"] == pytest.approx(105.0)
+    assert potfile["cutkpc_nominal"] == pytest.approx(20.5)
+
+
+def test_load_best_par_preserves_repeated_limit_blocks_after_pluralization(tmp_path: Path) -> None:
+    par_path = tmp_path / "repeated_limits.par"
+    par_path.write_text(
+        """
+runmode
+    reference 3 181.55062 -8.8009361
+    end
+
+cosmology
+    H0 70.0
+    omega 0.3
+    lambda 0.7
+    end
+
+potentiel 1
+    profil 81
+    x_centre 0.0
+    y_centre 0.0
+    ellipticite 0.0
+    angle_pos 0.0
+    core_radius 1.0
+    cut_radius 200.0
+    v_disp 650.0
+    z_lens 0.439
+    end
+
+limit 1
+    v_disp 1 450.0 1200.0 0.1
+    end
+
+potentiel 2
+    profil 81
+    x_centre 10.0
+    y_centre 0.0
+    ellipticite 0.0
+    angle_pos 0.0
+    core_radius 1.0
+    cut_radius 200.0
+    v_disp 650.0
+    z_lens 0.439
+    end
+
+limit 2
+    x_centre 1 0.0 30.0 0.1
+    end
+
+potentiel 3
+    profil 81
+    x_centre -35.0
+    y_centre -12.0
+    ellipticite 0.0
+    angle_pos 0.0
+    core_radius 0.0
+    cut_radius 200.0
+    v_disp 650.0
+    z_lens 0.439
+    end
+
+limit 3
+    core_radius 1 0.0 40.0 0.1
+    end
+
+potentiel 4
+    profil 14
+    gamma 0.1
+    angle_pos 0.0
+    z_lens 0.439
+    end
+
+limit 4
+    gamma 1 0.0 1.0 0.1
+    end
+fini
+""",
+        encoding="utf-8",
+    )
+
+    parsed, _potentials_df, _images_df, potentials_with_priors = load_best_par(par_path)
+
+    assert "limit" not in parsed
+    assert [item["id"] for item in parsed["limits"]] == ["1", "2", "3", "4"]
+    priors_by_id = {item["id"]: item["priors"] for item in potentials_with_priors}
+    assert "v_disp" in priors_by_id["1"]
+    assert "x_centre" in priors_by_id["2"]
+    assert "core_radius_kpc" in priors_by_id["3"]
+    assert "gamma" in priors_by_id["4"]
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("1.1a", ("1", "1a")),
+        ("B200.2a", ("B200", "2a")),
+        ("1a", ("1", "a")),
+        ("10e", ("10", "e")),
+        ("A200a", ("A200", "a")),
+        ("candidate", ("candidate", "")),
+        ("A200", ("A200", "")),
+    ],
+)
+def test_split_image_label_supports_letter_suffixes(label: str, expected: tuple[str, str]) -> None:
+    assert _split_image_label(label) == expected
+
+
+def test_load_best_par_groups_letter_suffixed_image_labels(tmp_path: Path) -> None:
+    image_catalog_path = tmp_path / "obs_arcs.dat"
+    image_catalog_path.write_text(
+        "#REFERENCE 0\n"
+        "1a 10.0000 20.0000 1.0 1.0 0.0 2.0 25.0\n"
+        "1b 10.0002 20.0000 1.0 1.0 0.0 2.0 25.0\n"
+        "1c 10.0004 20.0000 1.0 1.0 0.0 2.0 25.0\n",
+        encoding="utf-8",
+    )
+    par_path = tmp_path / "letter_suffix.par"
+    par_path.write_text(
+        """
+runmode
+    reference 3 10.0 20.0
+    end
+
+image
+    multfile 1 obs_arcs.dat
+    end
+fini
+""",
+        encoding="utf-8",
+    )
+
+    _parsed, _potentials_df, images_df, _potentials_with_priors = load_best_par(par_path)
+
+    assert images_df["image_label"].astype(str).tolist() == ["1a", "1b", "1c"]
+    assert images_df["family_id"].astype(str).tolist() == ["1", "1", "1"]
+    assert images_df["image_id"].astype(str).tolist() == ["a", "b", "c"]
+
+
+def test_filter_non_positive_redshift_families_keeps_singletons_separate() -> None:
+    images = pd.DataFrame(
+        {
+            "family_id": ["valid", "valid", "zero", "zero", "negative", "negative", "single"],
+            "image_label": ["v.1", "v.2", "z.1", "z.2", "n.1", "n.2", "s.1"],
+            "catalog_z": [2.0, 2.0, 0.0, 0.0, -1.0, -1.0, 3.0],
+        }
+    )
+
+    filtered, n_images, n_families, family_ids = cluster_solver._filter_non_positive_redshift_families(images)
+
+    assert n_images == 4
+    assert n_families == 2
+    assert family_ids == ["negative", "zero"]
+    assert filtered["family_id"].astype(str).tolist() == ["valid", "valid", "single"]
+
+    singleton_filtered, n_singleton_images, n_singleton_families = cluster_solver._filter_singleton_families(filtered)
+    assert n_singleton_images == 1
+    assert n_singleton_families == 1
+    assert singleton_filtered["family_id"].astype(str).tolist() == ["valid", "valid"]
+
+
+def test_build_state_ignores_non_positive_redshift_families(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image_catalog_path = tmp_path / "obs_arcs.cat"
+    image_catalog_path.write_text(
+        "#REFERENCE 0\n"
+        "1.1 10.0000 20.0000 1.0 1.0 0.0 2.0 25.0\n"
+        "1.2 10.0002 20.0000 1.0 1.0 0.0 2.0 25.0\n"
+        "2.1 10.0100 20.0000 1.0 1.0 0.0 0.0 25.0\n"
+        "2.2 10.0102 20.0000 1.0 1.0 0.0 0.0 25.0\n"
+        "3.1 10.0200 20.0000 1.0 1.0 0.0 3.0 25.0\n",
+        encoding="utf-8",
+    )
+    par_path = tmp_path / "input.par"
+    par_path.write_text(
+        """
+runmode
+    reference 3 10.0 20.0
+    end
+
+image
+    multfile 1 obs_arcs.cat
+    end
+
+cosmology
+    H0 70.0
+    omega 0.3
+    lambda 0.7
+    end
+
+potentiel 1
+    profil 81
+    x_centre 0.0
+    y_centre 0.0
+    ellipticite 0.0
+    angle_pos 0.0
+    core_radius 1.0
+    cut_radius 100.0
+    v_disp 700.0
+    z_lens 0.3
+    end
+fini
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", str(par_path), "--fit-mode", "large-only"])
+    args = _parse_args()
+
+    state = cluster_solver._build_state_from_inputs(args)
+
+    assert [family.family_id for family in state.family_data] == ["1"]
+    assert [family.n_images for family in state.family_data] == [2]
 
 
 def test_generate_single_bcg_mock_with_subhalos_uses_potfile(tmp_path: Path) -> None:
@@ -1265,6 +1535,11 @@ def test_explicit_beta_surrogate_branch_uses_returned_packed_state() -> None:
         image_plane_newton_steps = 0
         source_plane_covariance_floor = 1.0e-6
         source_plane_outlier_sigma_arcsec = 10.0
+        image_presence_penalty_weight = 0.0
+        image_presence_match_radius_arcsec = 0.30
+        image_presence_temperature_arcsec = 0.10
+        image_presence_count_softness = 0.05
+        image_presence_count_margin = 0.05
         traced_bin_data = [traced_bin]
 
         def __init__(self) -> None:
@@ -1341,6 +1616,139 @@ def test_cluster_solver_accepts_fit_cosmology_flag(monkeypatch: pytest.MonkeyPat
     args = _parse_args()
 
     assert args.fit_cosmology_flat_wcdm is True
+
+
+def test_cluster_solver_accepts_cosmology_init_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--fit-cosmology-flat-wcdm",
+            "--cosmology-init-om0",
+            "0.25",
+            "--cosmology-init-w0",
+            "-0.8",
+        ],
+    )
+
+    args = _parse_args()
+    _normalize_stage_fit_controls(args)
+
+    assert args.cosmology_init_om0 == 0.25
+    assert args.cosmology_init_w0 == -0.8
+
+
+def test_cosmology_init_flags_seed_state_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--fit-mode",
+            "joint",
+            "--fit-cosmology-flat-wcdm",
+            "--cosmology-init-om0",
+            "0.25",
+            "--cosmology-init-w0",
+            "-0.8",
+        ],
+    )
+
+    args = _parse_args()
+    state = cluster_solver._build_state_from_inputs(args)
+
+    assert state.svi_init_values is not None
+    assert state.svi_init_values[cluster_solver.COSMOLOGY_OM0_SAMPLE_NAME] == 0.25
+    assert state.svi_init_values[cluster_solver.COSMOLOGY_W0_SAMPLE_NAME] == -0.8
+
+
+def test_cosmology_init_flags_override_warm_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--fit-mode",
+            "joint",
+            "--fit-cosmology-flat-wcdm",
+            "--cosmology-init-om0",
+            "0.25",
+            "--cosmology-init-w0",
+            "-0.8",
+        ],
+    )
+    warm_values = {
+        cluster_solver.COSMOLOGY_OM0_SAMPLE_NAME: 0.5,
+        cluster_solver.COSMOLOGY_W0_SAMPLE_NAME: -1.8,
+    }
+
+    args = _parse_args()
+    state = cluster_solver._build_state_from_inputs(args, svi_init_physical_values=warm_values)
+
+    assert state.svi_init_values is not None
+    assert state.svi_init_values[cluster_solver.COSMOLOGY_OM0_SAMPLE_NAME] == 0.25
+    assert state.svi_init_values[cluster_solver.COSMOLOGY_W0_SAMPLE_NAME] == -0.8
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "match"),
+    [
+        ("--cosmology-init-om0", "nan", "must be finite"),
+        ("--cosmology-init-om0", "0.01", "within"),
+        ("--cosmology-init-om0", "0.9", "within"),
+        ("--cosmology-init-w0", "-2.5", "within"),
+        ("--cosmology-init-w0", "-0.1", "within"),
+    ],
+)
+def test_cosmology_init_invalid_values_fail(
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+    value: str,
+    match: str,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--fit-cosmology-flat-wcdm",
+            flag,
+            value,
+        ],
+    )
+
+    args = _parse_args()
+
+    with pytest.raises(SystemExit, match=match):
+        _normalize_stage_fit_controls(args)
+
+
+def test_cosmology_init_without_fit_cosmology_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--cosmology-init-om0",
+            "0.25",
+        ],
+    )
+
+    args = _parse_args()
+
+    with pytest.raises(SystemExit, match="require --fit-cosmology-flat-wcdm"):
+        _normalize_stage_fit_controls(args)
 
 
 def test_cluster_solver_defaults_to_prior_whitened_source_positions(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1427,6 +1835,113 @@ def test_cluster_solver_original_profile_maps_dpie_to_dpie_nie() -> None:
     )
 
     assert lens_model_list == ["DPIE_NIE", "SHEAR"]
+
+
+def test_dpie_v_disp_normal_prior_uses_positive_latent_transform() -> None:
+    specs, _assignments, _lens_model_list = _build_parameter_specs(
+        [
+            {
+                "id": "halo",
+                "profil": cluster_solver.DP_IE_PROFILE,
+                "priors": {"v_disp": [3, 900.0, 600.0, 0.1]},
+            },
+        ],
+    )
+
+    spec = specs[0]
+    physical = cluster_solver._convert_sample_matrix_to_physical(
+        np.asarray([[-5.0], [0.0], [float(spec.mean)]], dtype=float),
+        specs,
+    )
+
+    assert spec.name == "halo.v_disp"
+    assert spec.transform_kind == "log_positive"
+    assert spec.physical_mean == pytest.approx(900.0)
+    assert spec.physical_std == pytest.approx(600.0)
+    assert np.all(physical[:, 0] > 0.0)
+
+
+def test_stage2_large_priors_convert_positive_physical_summary_to_latent() -> None:
+    large_specs, _assignments, _lens_model_list = _build_parameter_specs(
+        [
+            {
+                "id": "halo",
+                "profil": cluster_solver.DP_IE_PROFILE,
+                "priors": {"v_disp": [3, 900.0, 600.0, 0.1]},
+            },
+        ],
+    )
+    summary = Stage1PriorSummary(
+        map_values={"halo_v_disp": 920.0},
+        means={"halo_v_disp": 900.0},
+        stds={"halo_v_disp": 90.0},
+    )
+
+    stage2_specs = cluster_solver._build_stage2_large_parameter_specs(large_specs, summary)
+    stage2_spec = stage2_specs[0]
+    physical_center = cluster_solver._convert_theta_to_physical(np.asarray([stage2_spec.mean]), stage2_specs)[0]
+
+    assert stage2_spec.transform_kind == "log_positive"
+    assert stage2_spec.mean < 10.0
+    assert physical_center == pytest.approx(895.533, rel=1.0e-3)
+
+
+def test_packed_lens_validity_rejects_nonpositive_vdisp() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    details = {
+        "is_dpie": jnp.asarray([True, True]),
+        "is_shear": jnp.asarray([False, False]),
+        "is_scaling": jnp.asarray([False, False]),
+        "sigma0": jnp.asarray([1.0, 1.0]),
+        "ra_raw": jnp.asarray([1.0, 1.0]),
+        "rs_raw": jnp.asarray([10.0, 10.0]),
+        "v_disp": jnp.asarray([500.0, -10.0]),
+        "vdslope": jnp.asarray([1.0, 1.0]),
+        "slope": jnp.asarray([1.0, 1.0]),
+        "x_center": jnp.asarray([0.0, 0.0]),
+        "y_center": jnp.asarray([0.0, 0.0]),
+        "gamma1": jnp.asarray([0.0, 0.0]),
+        "gamma2": jnp.asarray([0.0, 0.0]),
+        "e1": jnp.asarray([0.0, 0.0]),
+        "e2": jnp.asarray([0.0, 0.0]),
+        "factor_array": jnp.asarray(1.0),
+    }
+
+    validity = cluster_solver.ClusterJAXEvaluator._packed_lens_validity(evaluator, details)
+    reason_index = cluster_solver.INVALID_STATE_REASON_NAMES.index("nonpositive_vdisp")
+
+    assert bool(validity["is_valid"]) is False
+    assert bool(np.asarray(validity["reason_flags"])[reason_index]) is True
+
+
+def test_nuts_quality_diagnostics_flag_stuck_tree_depth_and_rhat() -> None:
+    grouped = np.stack(
+        [np.full((10, 1), float(chain_index), dtype=float) for chain_index in range(4)],
+        axis=0,
+    )
+    posterior = PosteriorResults(
+        samples=grouped.reshape(-1, 1),
+        log_prob=np.zeros(40, dtype=float),
+        accept_prob=np.ones(40, dtype=float),
+        diverging=np.zeros(40, dtype=bool),
+        num_steps=np.full(40, 255.0, dtype=float),
+        warmup_steps=10,
+        sample_steps=10,
+        num_chains=4,
+        grouped_samples=grouped,
+        sampler="numpyro_nuts",
+    )
+    spec = ParameterSpec("halo.v_disp", "halo_v_disp", "halo", 81, "v_disp", "normal", -np.inf, np.inf, 0.1)
+
+    metrics, warnings = cluster_solver._nuts_quality_diagnostics(
+        argparse.Namespace(max_tree_depth=8),
+        posterior,
+        [spec],
+    )
+
+    assert metrics["max_tree_depth_saturation_fraction"] == pytest.approx(1.0)
+    assert any("max-tree-depth saturation" in warning for warning in warnings)
+    assert any("extreme Rhat" in warning for warning in warnings)
 
 
 def test_cluster_solver_rejects_removed_profile_flags(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1553,6 +2068,99 @@ def test_cluster_solver_accepts_linearized_forward_beta_image_plane_mode(monkeyp
     args = _parse_args()
 
     assert args.image_plane_mode == IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA
+
+
+def test_cluster_solver_accepts_image_presence_penalty_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+            "--image-presence-penalty-weight",
+            "3.5",
+            "--image-presence-match-radius-arcsec",
+            "0.4",
+            "--image-presence-temperature-arcsec",
+            "0.08",
+            "--image-presence-count-softness",
+            "0.03",
+            "--image-presence-count-margin",
+            "0.02",
+        ],
+    )
+
+    args = _parse_args()
+    controls = _normalize_stage_fit_controls(args)
+
+    assert args.image_presence_penalty_weight == pytest.approx(3.5)
+    assert args.image_presence_match_radius_arcsec == pytest.approx(0.4)
+    assert args.image_presence_temperature_arcsec == pytest.approx(0.08)
+    assert args.image_presence_count_softness == pytest.approx(0.03)
+    assert args.image_presence_count_margin == pytest.approx(0.02)
+    assert controls["stage4"].fit_method == "svi+nuts"
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--image-presence-penalty-weight", "-0.1"),
+        ("--image-presence-match-radius-arcsec", "0"),
+        ("--image-presence-temperature-arcsec", "0"),
+        ("--image-presence-count-softness", "0"),
+        ("--image-presence-count-margin", "-0.1"),
+    ],
+)
+def test_cluster_solver_rejects_invalid_image_presence_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+    value: str,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            flag,
+            value,
+        ],
+    )
+
+    args = _parse_args()
+    with pytest.raises(SystemExit):
+        _normalize_stage_fit_controls(args)
+
+
+def test_image_presence_effective_default_weight_only_stage4() -> None:
+    assert _effective_image_presence_penalty_weight(
+        None,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
+        fit_mode="joint",
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+    ) == pytest.approx(2.0)
+    assert _effective_image_presence_penalty_weight(
+        None,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        fit_mode="joint",
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+    ) == pytest.approx(0.0)
+    assert _effective_image_presence_penalty_weight(
+        None,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
+        fit_mode="evidence-ns",
+        image_plane_mode=IMAGE_PLANE_MODE_NONE,
+    ) == pytest.approx(0.0)
+    assert _effective_image_presence_penalty_weight(
+        0.0,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
+        fit_mode="joint",
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+    ) == pytest.approx(0.0)
 
 
 def test_cluster_solver_accepts_evidence_ns_fit_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2166,6 +2774,19 @@ def test_validation_stage_fit_controls_reject_scalar_ns_when_image_plane_stage_e
         _normalize_validation_stage_fit_controls(args)
 
 
+def test_validation_stage_fit_controls_reject_invalid_image_presence_control() -> None:
+    args = argparse.Namespace(
+        fit_method="svi",
+        warmup=1,
+        samples=2,
+        image_plane_mode=IMAGE_PLANE_MODE_NONE,
+        image_presence_temperature_arcsec=0.0,
+    )
+
+    with pytest.raises(SystemExit, match="image-presence-temperature"):
+        _normalize_validation_stage_fit_controls(args)
+
+
 def test_validation_stage_fit_controls_reject_three_values_without_stage4_mode() -> None:
     args = argparse.Namespace(
         fit_method=["svi", "svi", "svi"],
@@ -2527,6 +3148,11 @@ def _validation_solver_args(**updates) -> argparse.Namespace:
         linearized_beta_prior_sigma_arcsec=0.3,
         source_position_parameterization="prior-whitened",
         image_plane_scatter_upper_arcsec=2.0,
+        image_presence_penalty_weight=None,
+        image_presence_match_radius_arcsec=0.30,
+        image_presence_temperature_arcsec=0.10,
+        image_presence_count_softness=0.05,
+        image_presence_count_margin=0.05,
         evidence_likelihood_mode=cluster_solver.DEFAULT_EVIDENCE_LIKELIHOOD_MODE,
         evidence_source_prior_sigma_arcsec=None,
         evidence_source_prior_mean_x_arcsec=0.0,
@@ -2879,6 +3505,11 @@ def test_validation_run_cluster_solver_forwards_three_value_stage_controls(monke
         warmup=[1000, 500, 0],
         samples=[250, 100, 20],
         sampling_engine="full",
+        image_presence_penalty_weight=3.0,
+        image_presence_match_radius_arcsec=0.4,
+        image_presence_temperature_arcsec=0.08,
+        image_presence_count_softness=0.03,
+        image_presence_count_margin=0.02,
     )
 
     run_dir = validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
@@ -2895,6 +3526,11 @@ def test_validation_run_cluster_solver_forwards_three_value_stage_controls(monke
     assert "--ott-sinkhorn-lse-mode" not in cmd
     assert _option_values(cmd, "--image-plane-newton-steps") == ["1"]
     assert _option_values(cmd, "--source-position-parameterization") == ["prior-whitened"]
+    assert _option_values(cmd, "--image-presence-penalty-weight") == ["3.0"]
+    assert _option_values(cmd, "--image-presence-match-radius-arcsec") == ["0.4"]
+    assert _option_values(cmd, "--image-presence-temperature-arcsec") == ["0.08"]
+    assert _option_values(cmd, "--image-presence-count-softness") == ["0.03"]
+    assert _option_values(cmd, "--image-presence-count-margin") == ["0.02"]
     assert run_dir == tmp_path / "solver" / "fit" / "stage4_linearized_image_plane"
 
 
@@ -3702,6 +4338,7 @@ def test_plot_bundle_round_trips_ns_diagnostics(tmp_path: Path) -> None:
         fit_mode="joint",
         potfiles=[],
         scaling_component_records=[],
+        previous_stage_best_values={"halo_v_disp": 1100.0},
         source_position_parameterization="direct",
     )
     results = PosteriorResults(
@@ -3723,8 +4360,9 @@ def test_plot_bundle_round_trips_ns_diagnostics(tmp_path: Path) -> None:
     path = tmp_path / "plot_bundle.h5"
 
     cluster_solver._save_plot_bundle_h5(path, state, argparse.Namespace(foo="bar"), np.empty((0,), dtype=float), results)
-    _state, _args, arrays, _init_diag = cluster_solver._rebuild_state_from_h5(path)
+    loaded_state, _args, arrays, _init_diag = cluster_solver._rebuild_state_from_h5(path)
 
+    assert loaded_state.previous_stage_best_values == {"halo_v_disp": 1100.0}
     assert "ns_diagnostics" in arrays
     np.testing.assert_allclose(arrays["sample_weights"], [0.75, 0.25])
     np.testing.assert_allclose(arrays["ns_diagnostics"]["log_L_samples"], [-5.0, -4.0, -3.0])
@@ -4126,16 +4764,99 @@ def test_linearized_image_plane_loglike_scores_zero_residual() -> None:
     value = _linearized_image_plane_bin_loglike(
         residual_x=jnp.asarray([0.0, 0.0], dtype=jnp.float64),
         residual_y=jnp.asarray([0.0, 0.0], dtype=jnp.float64),
+        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
+        n_families=1,
         sigma_per_image=jnp.asarray([0.1, 0.1], dtype=jnp.float64),
         reliability_per_image=jnp.asarray([0.999, 0.999], dtype=jnp.float64),
         image_has_constraint=jnp.asarray([True, True]),
         image_sigma_int=jnp.asarray(0.01, dtype=jnp.float64),
         covariance_floor=1.0e-6,
         outlier_sigma_arcsec=10.0,
+        image_presence_penalty_weight=2.0,
     )
 
     assert np.isfinite(float(value))
     assert float(value) > 0.0
+
+
+def test_soft_observed_image_presence_penalty_is_near_zero_for_present_images() -> None:
+    value = _soft_observed_image_presence_loglike(
+        residual_x=jnp.asarray([0.0, 0.01, -0.01], dtype=jnp.float64),
+        residual_y=jnp.asarray([0.0, -0.01, 0.01], dtype=jnp.float64),
+        family_idx=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+        n_families=1,
+        reliability_per_image=jnp.ones(3, dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True, True]),
+        penalty_weight=2.0,
+        match_radius_arcsec=0.30,
+        temperature_arcsec=0.10,
+        count_softness=0.05,
+        count_margin=0.05,
+    )
+
+    assert np.isfinite(float(value))
+    assert -1.0e-3 < float(value) <= 0.0
+
+
+def test_soft_observed_image_presence_penalty_detects_missing_observed_anchor() -> None:
+    value = _soft_observed_image_presence_loglike(
+        residual_x=jnp.asarray([0.0, 0.0, 1.0], dtype=jnp.float64),
+        residual_y=jnp.asarray([0.0, 0.0, 0.0], dtype=jnp.float64),
+        family_idx=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+        n_families=1,
+        reliability_per_image=jnp.ones(3, dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True, True]),
+        penalty_weight=2.0,
+        match_radius_arcsec=0.30,
+        temperature_arcsec=0.10,
+        count_softness=0.05,
+        count_margin=0.05,
+    )
+
+    assert float(value) < -0.5
+
+
+def test_soft_observed_image_presence_penalty_respects_reliability() -> None:
+    common = dict(
+        residual_x=jnp.asarray([0.0, 0.0, 1.0], dtype=jnp.float64),
+        residual_y=jnp.asarray([0.0, 0.0, 0.0], dtype=jnp.float64),
+        family_idx=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+        n_families=1,
+        image_has_constraint=jnp.asarray([True, True, True]),
+        penalty_weight=2.0,
+        match_radius_arcsec=0.30,
+        temperature_arcsec=0.10,
+        count_softness=0.05,
+        count_margin=0.05,
+    )
+    high_reliability = _soft_observed_image_presence_loglike(
+        reliability_per_image=jnp.ones(3, dtype=jnp.float64),
+        **common,
+    )
+    low_reliability = _soft_observed_image_presence_loglike(
+        reliability_per_image=jnp.asarray([1.0, 1.0, 0.1], dtype=jnp.float64),
+        **common,
+    )
+
+    assert float(low_reliability) > float(high_reliability)
+
+
+def test_soft_observed_image_presence_penalty_zero_weight_is_neutral() -> None:
+    value = _soft_observed_image_presence_loglike(
+        residual_x=jnp.asarray([0.0, 0.0, 10.0], dtype=jnp.float64),
+        residual_y=jnp.asarray([0.0, 0.0, 0.0], dtype=jnp.float64),
+        family_idx=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+        n_families=1,
+        reliability_per_image=jnp.ones(3, dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True, True]),
+        penalty_weight=0.0,
+        match_radius_arcsec=0.30,
+        temperature_arcsec=0.10,
+        count_softness=0.05,
+        count_margin=0.05,
+    )
+
+    assert float(value) == 0.0
 
 
 def test_linearized_marginal_beta_loglike_matches_numerical_gaussian_integration() -> None:
@@ -4348,6 +5069,100 @@ def test_exact_validation_failure_is_diagnostic_not_loglike_penalty() -> None:
     assert cache.match_failure_count == 0
 
 
+def test_image_match_diagnostics_counts_extra_model_images() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    evaluator.match_tolerance_arcsec = 0.2
+    family = SimpleNamespace(
+        family_id="1",
+        n_images=2,
+        x_obs=np.asarray([0.0, 1.0], dtype=float),
+        y_obs=np.asarray([0.0, 0.0], dtype=float),
+    )
+
+    diagnostics = evaluator._image_match_diagnostics(
+        np.asarray([0.01, 1.02, 5.0], dtype=float),
+        np.asarray([0.01, 0.02, 5.0], dtype=float),
+        family,
+    )
+
+    assert diagnostics["produced_image_count"] == 3
+    assert diagnostics["recovered_image_count"] == 2
+    assert diagnostics["missing_image_count"] == 0
+    assert diagnostics["extra_image_count"] == 1
+    assert diagnostics["multiplicity_failed"] is True
+    assert diagnostics["multiplicity_failure_reason"] == "extra_model_images"
+
+
+def test_image_match_diagnostics_counts_missing_model_images() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    evaluator.match_tolerance_arcsec = 0.2
+    family = SimpleNamespace(
+        family_id="1",
+        n_images=3,
+        x_obs=np.asarray([0.0, 1.0, 2.0], dtype=float),
+        y_obs=np.asarray([0.0, 0.0, 0.0], dtype=float),
+    )
+
+    diagnostics = evaluator._image_match_diagnostics(
+        np.asarray([0.01, 2.02], dtype=float),
+        np.asarray([0.01, 0.02], dtype=float),
+        family,
+    )
+
+    assert diagnostics["produced_image_count"] == 2
+    assert diagnostics["recovered_image_count"] == 2
+    assert diagnostics["missing_image_count"] == 1
+    assert diagnostics["extra_image_count"] == 0
+    assert diagnostics["multiplicity_failed"] is True
+    assert diagnostics["multiplicity_failure_reason"] == "missing_model_images"
+
+
+def test_image_match_diagnostics_counts_partial_same_multiplicity_match_failure() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    evaluator.match_tolerance_arcsec = 0.2
+    family = SimpleNamespace(
+        family_id="1",
+        n_images=2,
+        x_obs=np.asarray([0.0, 1.0], dtype=float),
+        y_obs=np.asarray([0.0, 0.0], dtype=float),
+    )
+
+    diagnostics = evaluator._image_match_diagnostics(
+        np.asarray([0.01, 4.0], dtype=float),
+        np.asarray([0.01, 0.0], dtype=float),
+        family,
+    )
+
+    assert diagnostics["produced_image_count"] == 2
+    assert diagnostics["recovered_image_count"] == 1
+    assert diagnostics["missing_image_count"] == 1
+    assert diagnostics["extra_image_count"] == 1
+    assert diagnostics["multiplicity_failed"] is True
+    assert diagnostics["multiplicity_failure_reason"] == "match_tolerance_exceeded"
+
+
+def test_exact_family_prediction_details_reports_solver_failure_counts() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    family = SimpleNamespace(family_id="1", z_source=2.0, n_images=2)
+    cache = FamilyValidationCache()
+    evaluator.validation_cache = {"1": cache}
+    evaluator._build_packed_lens_state = lambda _params, _z_source: {}
+
+    def fail_ray_shooting(_family, _packed_state):
+        raise RuntimeError("ray shooting failed")
+
+    evaluator._exact_source_ray_shooting = fail_ray_shooting
+
+    diagnostics = evaluator._exact_family_prediction_details(np.asarray([], dtype=float), family)
+
+    assert diagnostics["failed"] is True
+    assert np.isnan(diagnostics["produced_image_count"])
+    assert np.isnan(diagnostics["recovered_image_count"])
+    assert diagnostics["multiplicity_failed"] is True
+    assert diagnostics["multiplicity_failure_reason"] == "source_ray_shooting_failed"
+    assert cache.multiplicity_mismatch_count == 1
+
+
 def test_quick_diagnostics_evaluate_skips_exact_image_prediction() -> None:
     evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
     family = SimpleNamespace(family_id="1", z_source=2.0, n_images=2)
@@ -4371,6 +5186,10 @@ def test_quick_diagnostics_evaluate_skips_exact_image_prediction() -> None:
     assert result.family_predictions["1"]["approx_image_rms_arcsec"] == pytest.approx(0.25)
     assert result.family_predictions["1"]["used_exact_refresh"] is False
     assert result.family_predictions["1"]["refresh_reason"] == "quick_diagnostics"
+    assert result.family_predictions["1"]["x_pred"].shape == (2,)
+    assert np.isnan(result.family_predictions["1"]["x_pred"]).all()
+    assert result.family_predictions["1"]["y_pred"].shape == (2,)
+    assert np.isnan(result.family_predictions["1"]["y_pred"]).all()
 
 
 def test_family_source_summary_handles_zero_measurement_and_source_scatter() -> None:
@@ -5213,10 +6032,18 @@ def test_sequential_skip_stage3_keeps_stage4_exact_diagnostics(
 
 
 def test_sequential_adds_local_jacobian_stage3(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    calls: list[tuple[str, str, str, int, int, str, dict[str, float] | None, bool]] = []
+    calls: list[tuple[str, str, str, int, int, str, dict[str, float] | None, dict[str, float] | None, bool]] = []
     banners: list[tuple[str, str | None]] = []
 
-    def fake_run_single_stage(args, fit_mode, run_name, sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE, svi_init_physical_values=None, **_kwargs):
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        svi_init_physical_values=None,
+        previous_stage_best_values=None,
+        **_kwargs,
+    ):
         calls.append(
             (
                 fit_mode,
@@ -5226,6 +6053,7 @@ def test_sequential_adds_local_jacobian_stage3(monkeypatch: pytest.MonkeyPatch, 
                 args.samples,
                 sample_likelihood_mode,
                 svi_init_physical_values,
+                previous_stage_best_values,
                 bool(args.quick_diagnostics),
             )
         )
@@ -5258,7 +6086,9 @@ def test_sequential_adds_local_jacobian_stage3(monkeypatch: pytest.MonkeyPatch, 
     assert calls[1][2:6] == ("svi+nuts", 2000, 250, SAMPLE_LIKELIHOOD_SOURCE)
     assert calls[2][2:6] == ("svi", 0, 100, SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN)
     assert calls[2][6] == {"halo_v_disp": 1100.0}
-    assert [item[7] for item in calls] == [True, True, False]
+    assert calls[1][7] == {"halo_v_disp": 1000.0}
+    assert calls[2][7] == {"halo_v_disp": 1100.0}
+    assert [item[8] for item in calls] == [True, True, False]
     assert "stage3=enabled" in str(banners[0][1])
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
     assert summary["stage_fit_controls"] == {
@@ -5348,7 +6178,19 @@ def test_sequential_resume_skip_plots_reuses_without_rerendering(monkeypatch: py
 
 
 def test_sequential_adds_linearized_stage4(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    calls: list[tuple[str, str, str, int, int, str, dict[str, float] | None, dict[str, tuple[float, float]] | None]] = []
+    calls: list[
+        tuple[
+            str,
+            str,
+            str,
+            int,
+            int,
+            str,
+            dict[str, float] | None,
+            dict[str, tuple[float, float]] | None,
+            dict[str, float] | None,
+        ]
+    ] = []
     banners: list[tuple[str, str | None]] = []
 
     def fake_run_single_stage(
@@ -5358,6 +6200,7 @@ def test_sequential_adds_linearized_stage4(monkeypatch: pytest.MonkeyPatch, tmp_
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
         svi_init_physical_values=None,
         source_position_prior_values=None,
+        previous_stage_best_values=None,
         **_kwargs,
     ):
         calls.append(
@@ -5370,6 +6213,7 @@ def test_sequential_adds_linearized_stage4(monkeypatch: pytest.MonkeyPatch, tmp_
                 sample_likelihood_mode,
                 svi_init_physical_values,
                 source_position_prior_values,
+                previous_stage_best_values,
             )
         )
         return tmp_path / run_name
@@ -5381,7 +6225,15 @@ def test_sequential_adds_linearized_stage4(monkeypatch: pytest.MonkeyPatch, tmp_
         "_load_stage1_summary",
         lambda _artifacts_dir: Stage1PriorSummary(map_values={"halo_v_disp": 1000.0}, means={}, stds={}),
     )
-    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {"halo_v_disp": 1100.0})
+    def fake_best_fit(artifacts_dir: Path) -> dict[str, float]:
+        text = str(artifacts_dir)
+        if text.endswith("stage2_joint/artifacts"):
+            return {"halo_v_disp": 1100.0}
+        if text.endswith("stage3_image_plane/artifacts"):
+            return {"halo_v_disp": 1200.0}
+        raise AssertionError(f"unexpected artifacts_dir={artifacts_dir}")
+
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", fake_best_fit)
     monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
     args = argparse.Namespace(
         run_name="fit",
@@ -5404,8 +6256,11 @@ def test_sequential_adds_linearized_stage4(monkeypatch: pytest.MonkeyPatch, tmp_
         "fit/stage4_linearized_image_plane",
     ]
     assert calls[3][2:6] == ("svi", 0, 20, SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE)
-    assert calls[3][6] == {"halo_v_disp": 1100.0}
+    assert calls[2][6] == {"halo_v_disp": 1100.0}
+    assert calls[2][8] == {"halo_v_disp": 1100.0}
+    assert calls[3][6] == {"halo_v_disp": 1200.0}
     assert calls[3][7] == {"1": (0.1, -0.2)}
+    assert calls[3][8] == {"halo_v_disp": 1200.0}
     assert "stage4=enabled" in str(banners[0][1])
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
     assert summary["stage4_run_dir"].endswith("stage4_linearized_image_plane")
@@ -5414,7 +6269,9 @@ def test_sequential_adds_linearized_stage4(monkeypatch: pytest.MonkeyPatch, tmp_
 
 
 def test_sequential_linearized_stage4_can_skip_stage3(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    calls: list[tuple[str, str, str, dict[str, float] | None, dict[str, tuple[float, float]] | None]] = []
+    calls: list[
+        tuple[str, str, str, dict[str, float] | None, dict[str, tuple[float, float]] | None, dict[str, float] | None]
+    ] = []
     banners: list[tuple[str, str | None]] = []
 
     def fake_run_single_stage(
@@ -5424,9 +6281,19 @@ def test_sequential_linearized_stage4_can_skip_stage3(monkeypatch: pytest.Monkey
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
         svi_init_physical_values=None,
         source_position_prior_values=None,
+        previous_stage_best_values=None,
         **_kwargs,
     ):
-        calls.append((run_name, sample_likelihood_mode, args.fit_method, svi_init_physical_values, source_position_prior_values))
+        calls.append(
+            (
+                run_name,
+                sample_likelihood_mode,
+                args.fit_method,
+                svi_init_physical_values,
+                source_position_prior_values,
+                previous_stage_best_values,
+            )
+        )
         return tmp_path / run_name
 
     monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
@@ -5470,6 +6337,7 @@ def test_sequential_linearized_stage4_can_skip_stage3(monkeypatch: pytest.Monkey
     assert calls[2][2] == "svi"
     assert calls[2][3] == {"halo_v_disp": 1200.0}
     assert calls[2][4] == {"1": (0.3, 0.4)}
+    assert calls[2][5] == {"halo_v_disp": 1200.0}
     assert "stage3=disabled" in str(banners[0][1])
     assert "stage4=enabled" in str(banners[0][1])
 
@@ -6192,7 +7060,7 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
     monkeypatch.setattr(
         validation,
         "_plot_corner_pdf",
-        lambda output_dir, _samples, _specs, filename="corner.pdf", truth_values=None, best_fit_values=None: touch(
+        lambda output_dir, _samples, _specs, filename="corner.pdf", truth_values=None, best_fit_values=None, **_kwargs: touch(
             Path(output_dir) / filename
         ),
     )
@@ -6329,8 +7197,9 @@ def test_write_recovery_outputs_includes_cosmology_corner_for_cosmology_specs(
         filename="corner.pdf",
         truth_values=None,
         best_fit_values=None,
+        previous_stage_best_values=None,
     ):
-        del truth_values, best_fit_values
+        del truth_values, best_fit_values, previous_stage_best_values
         plot_calls.append((str(filename), [spec.name for spec in plot_specs], np.asarray(plot_samples, dtype=float)))
         touch(Path(output_dir_arg) / str(filename))
 
@@ -6743,7 +7612,7 @@ def test_write_recovery_outputs_filters_recovered_caustics_to_z7_and_logs_phases
     monkeypatch.setattr(
         validation,
         "_plot_corner_pdf",
-        lambda output_dir, _samples, _specs, filename="corner.pdf", truth_values=None, best_fit_values=None: touch(
+        lambda output_dir, _samples, _specs, filename="corner.pdf", truth_values=None, best_fit_values=None, **_kwargs: touch(
             Path(output_dir) / filename
         ),
     )

@@ -344,6 +344,18 @@ local image-plane correction at each observed image even when
 updates before scoring the image-plane displacement. It uses its own
 `image_sigma_int` scatter parameter in image-plane units.
 
+The linearized forward-beta stage also includes a smooth observed-image
+presence penalty by default. For each observed image, the local image-plane
+residual is converted to a soft presence probability with
+`--image-presence-match-radius-arcsec` and
+`--image-presence-temperature-arcsec`; each family then receives a smooth
+penalty when the reliability-weighted number of present observed images falls
+below the catalog count. The effective default
+`--image-presence-penalty-weight` is `2.0` for sequential stage 4 and `0.0`
+for evidence or non-image-plane likelihoods; pass `0.0` to disable it. This is
+a differentiable local surrogate for missing observed-image anchors, not an
+exact predicted-image multiplicity count from the full image solver.
+
 Nearby source redshifts are grouped by fractional lensing-efficiency
 `D_ls / D_s` tolerance instead of raw redshift. The default
 `--z-bin-efficiency-tol 0.01` keeps each effective source plane within about
@@ -394,6 +406,24 @@ repository-root `cluster_solver.py` remains as a compatibility shim, so existing
 `python -m cluster_solver` commands continue to work.
 
 ## HFF Pagul21 Catalogs
+
+Generated HFF master/member/image-family catalogs now default to
+`results/hff_master_catalogs`, while raw catalog inputs remain under `data/`:
+
+```bash
+python scripts/build_hff_master_catalog.py all
+python scripts/build_hff_master_catalog.py plots
+```
+
+The `all` command builds the catalogs and plot products. Use `plots` when you
+only need to regenerate figures from existing CSV outputs.
+
+Rendered HFF `lenscluster.cluster_solver` parameter folders likewise default to
+`results/hff_lenscluster_pars`:
+
+```bash
+python scripts/build_hff_lenscluster_pars.py render
+```
 
 The Pagul21 HFF Zenodo record can be read and split into cluster-specific
 tables with:

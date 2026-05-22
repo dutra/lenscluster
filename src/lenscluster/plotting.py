@@ -44,6 +44,7 @@ CORNER_PLOT_KWARGS = {
 }
 CORNER_PLOT_DPI = 300
 CORNER_BEST_FIT_COLOR = "#d4a017"
+CORNER_PREVIOUS_STAGE_COLOR = "black"
 
 
 def plot_path(root: Path, name: str) -> Path:
@@ -746,6 +747,7 @@ def _run_summary(
     best_loglike: float,
     evaluator: ClusterJAXEvaluator,
     image_fit_quality_df: pd.DataFrame | None = None,
+    image_count_recovery_df: pd.DataFrame | None = None,
     family_df: pd.DataFrame | None = None,
     used_exact_validation: bool | None = None,
 ) -> dict[str, Any]:
@@ -757,6 +759,7 @@ def _run_summary(
     finite_source_redshifts = source_redshifts[np.isfinite(source_redshifts)]
     lens_redshift = getattr(state, "z_lens", None)
     chi_square_summary = _fit_quality_chi_square_summary(image_fit_quality_df, state)
+    image_count_summary = _image_count_recovery_summary(image_count_recovery_df)
     chain_summary = _chain_diagnostics_summary(results, state.parameter_specs)
     exact_family_count = None
     failed_or_missing_exact_count = None
@@ -865,6 +868,8 @@ def _run_summary(
                     init_diagnostics.get("invalid_state_reason_counts", evaluator.invalid_state_reason_counts)
                 ).items()
             },
+            "quality_metrics": dict(init_diagnostics.get("nuts_quality_metrics", {})),
+            "quality_warnings": list(init_diagnostics.get("nuts_quality_warnings", [])),
         },
         "ns_settings": {
             "num_live_points": init_diagnostics.get("ns_num_live_points", getattr(args, "ns_num_live_points", None)),
@@ -930,6 +935,7 @@ def _run_summary(
             if results.num_steps.size
             else None
         ),
+        "nuts_quality_warnings": list(init_diagnostics.get("nuts_quality_warnings", [])),
         "sample_weight_ess": float(_effective_sample_size(results.sample_weights))
         if results.sample_weights is not None and len(results.sample_weights) > 0
         else None,
@@ -937,6 +943,7 @@ def _run_summary(
         "ess_history": results.ess_history.tolist() if results.ess_history is not None else None,
         "move_acceptance_history": results.move_acceptance_history.tolist() if results.move_acceptance_history is not None else None,
         **chi_square_summary,
+        **image_count_summary,
         **chain_summary,
     }
     image_scatter_indices = [
@@ -1006,6 +1013,10 @@ def _format_run_summary_text(summary: dict[str, Any]) -> str:
                     ("AIC", summary.get("aic")),
                     ("BIC", summary.get("bic")),
                     ("valid image count", summary.get("valid_image_count")),
+                    ("model recovered images", summary.get("model_recovered_image_count")),
+                    ("model produced images", summary.get("model_produced_image_count")),
+                    ("model missing images", summary.get("model_missing_image_count")),
+                    ("model extra images", summary.get("model_extra_image_count")),
                     ("diagnostic data points", summary.get("diagnostic_n_data")),
                     ("diagnostic dof", summary.get("diagnostic_dof")),
                     ("effective parameters", summary.get("n_effective_parameters")),
@@ -1023,6 +1034,7 @@ def _format_run_summary_text(summary: dict[str, Any]) -> str:
                     ("accept prob mean", summary.get("accept_prob_mean")),
                     ("divergence count", summary.get("divergence_count")),
                     ("mean num steps", summary.get("mean_num_steps")),
+                    ("NUTS quality warnings", "; ".join(summary.get("nuts_quality_warnings") or [])),
                 ]
             )
         ),
@@ -1136,28 +1148,34 @@ def _plot_corner(
     parameter_specs: list[ParameterSpec],
     truth_values: dict[str, float] | None = None,
     best_fit_values: dict[str, float] | None = None,
+    previous_stage_best_values: dict[str, float] | None = None,
+    *,
+    output_name: str = "corner.pdf",
+    plot_datapoints: bool = False,
 ) -> None:
     if corner is None or not parameter_specs:
         return
-    corner_samples, corner_specs = _corner_without_source_positions(samples, parameter_specs, "corner.pdf")
+    corner_samples, corner_specs = _corner_without_source_positions(samples, parameter_specs, output_name)
     if not corner_specs:
         return
     finite_samples = _finite_sample_rows(corner_samples)
     if finite_samples.shape[0] == 0:
         return
-    subset = _corner_dynamic_subset(finite_samples, corner_specs, "corner.pdf")
+    subset = _corner_dynamic_subset(finite_samples, corner_specs, output_name)
     if subset is None:
         return
     finite_samples, subset_specs = subset
     _log(
         None,
-        f"[plot:corner] path={_plot_path(plot_dir, 'corner.pdf')} ndim={len(subset_specs)} samples_shape={tuple(finite_samples.shape)}",
+        f"[plot:corner] path={_plot_path(plot_dir, output_name)} ndim={len(subset_specs)} samples_shape={tuple(finite_samples.shape)}",
     )
     labels = [spec.name for spec in subset_specs]
     truths = _corner_values_for_specs(subset_specs, truth_values) if truth_values else None
-    fig = corner.corner(finite_samples, labels=labels, truths=truths, **CORNER_PLOT_KWARGS)
+    corner_kwargs = {**CORNER_PLOT_KWARGS, "plot_datapoints": bool(plot_datapoints)}
+    fig = corner.corner(finite_samples, labels=labels, truths=truths, **corner_kwargs)
+    _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
     _overplot_corner_best_fit(fig, subset_specs, best_fit_values)
-    fig.savefig(_plot_path(plot_dir, "corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
+    fig.savefig(_plot_path(plot_dir, output_name), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1212,6 +1230,20 @@ def _overplot_corner_best_fit(
     corner.overplot_points(fig, point_xs, marker="s", color=CORNER_BEST_FIT_COLOR)
 
 
+def _overplot_corner_previous_stage_best_fit(
+    fig: Any,
+    parameter_specs: list[ParameterSpec],
+    previous_stage_best_values: dict[str, float] | None,
+) -> None:
+    if corner is None or not previous_stage_best_values:
+        return
+    xs = _corner_values_for_specs(parameter_specs, previous_stage_best_values)
+    if not xs or not any(np.isfinite(xs)):
+        return
+    line_xs = [float(value) if np.isfinite(value) else None for value in xs]
+    corner.overplot_lines(fig, line_xs, color=CORNER_PREVIOUS_STAGE_COLOR)
+
+
 def _scaling_parameter_subset(
     parameter_specs: list[ParameterSpec],
     samples: np.ndarray,
@@ -1263,6 +1295,7 @@ def _plot_potfile_corner(
     parameter_specs: list[ParameterSpec],
     truth_values: dict[str, float] | None = None,
     best_fit_values: dict[str, float] | None = None,
+    previous_stage_best_values: dict[str, float] | None = None,
 ) -> None:
     if corner is None or samples.size == 0 or not parameter_specs:
         return
@@ -1280,6 +1313,7 @@ def _plot_potfile_corner(
     labels = [spec.name for spec in subset_specs]
     truths = _corner_values_for_specs(subset_specs, truth_values) if truth_values else None
     fig = corner.corner(finite_samples, labels=labels, truths=truths, **CORNER_PLOT_KWARGS)
+    _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
     _overplot_corner_best_fit(fig, subset_specs, best_fit_values)
     fig.savefig(_plot_path(plot_dir, "potfile_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -1291,6 +1325,9 @@ def _plot_cosmology_corner(
     parameter_specs: list[ParameterSpec],
     truth_values: dict[str, float] | None = None,
     best_fit_values: dict[str, float] | None = None,
+    previous_stage_best_values: dict[str, float] | None = None,
+    *,
+    plot_datapoints: bool = False,
 ) -> None:
     if corner is None or samples.size == 0 or not parameter_specs:
         return
@@ -1307,7 +1344,9 @@ def _plot_cosmology_corner(
     )
     labels = [spec.name for spec in subset_specs]
     truths = _corner_values_for_specs(subset_specs, truth_values) if truth_values else None
-    fig = corner.corner(finite_samples, labels=labels, truths=truths, **CORNER_PLOT_KWARGS)
+    corner_kwargs = {**CORNER_PLOT_KWARGS, "plot_datapoints": bool(plot_datapoints)}
+    fig = corner.corner(finite_samples, labels=labels, truths=truths, **corner_kwargs)
+    _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
     _overplot_corner_best_fit(fig, subset_specs, best_fit_values)
     fig.savefig(_plot_path(plot_dir, "cosmology_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -1341,7 +1380,13 @@ def _plot_potfile_histograms(
     plt.close(fig)
 
 
-def _plot_trace(plot_dir: Path, grouped_samples: np.ndarray | None, parameter_specs: list[ParameterSpec]) -> None:
+def _plot_trace(
+    plot_dir: Path,
+    grouped_samples: np.ndarray | None,
+    parameter_specs: list[ParameterSpec],
+    *,
+    output_name: str = "trace_plot.png",
+) -> None:
     if grouped_samples is None or not parameter_specs:
         return
     grouped_array = np.asarray(grouped_samples, dtype=float)
@@ -1376,7 +1421,7 @@ def _plot_trace(plot_dir: Path, grouped_samples: np.ndarray | None, parameter_sp
     if handles:
         fig.legend(handles, labels, loc="upper right")
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "trace_plot.png"), dpi=180, bbox_inches="tight")
+    fig.savefig(_plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1862,11 +1907,26 @@ def _plot_image_plane_fit(plot_dir: Path, state: BuildState, best_eval: Evaluati
     colors = _family_color_map([family.family_id for family in state.family_data])
     for family in state.family_data:
         color = colors[str(family.family_id)]
-        pred = best_eval.family_predictions[family.family_id]
+        pred = best_eval.family_predictions.get(
+            str(family.family_id),
+            best_eval.family_predictions.get(family.family_id, {}),
+        )
+        n_images = int(getattr(family, "n_images", len(family.x_obs)))
+        x_pred = np.asarray(pred.get("x_pred", np.full(n_images, np.nan)), dtype=float).reshape(-1)
+        y_pred = np.asarray(pred.get("y_pred", np.full(n_images, np.nan)), dtype=float).reshape(-1)
+        if x_pred.shape != (n_images,):
+            resized = np.full(n_images, np.nan, dtype=float)
+            resized[: min(n_images, x_pred.size)] = x_pred[: min(n_images, x_pred.size)]
+            x_pred = resized
+        if y_pred.shape != (n_images,):
+            resized = np.full(n_images, np.nan, dtype=float)
+            resized[: min(n_images, y_pred.size)] = y_pred[: min(n_images, y_pred.size)]
+            y_pred = resized
         ax.scatter(family.x_obs, family.y_obs, marker="x", color=color, label=f"{family.family_id} obs")
-        if np.isfinite(pred["x_pred"]).any():
-            ax.scatter(pred["x_pred"], pred["y_pred"], marker="o", color=color, s=36, alpha=0.65)
-            for x0, y0, x1, y1 in zip(family.x_obs, family.y_obs, pred["x_pred"], pred["y_pred"]):
+        finite_model = np.isfinite(x_pred) & np.isfinite(y_pred)
+        if finite_model.any():
+            ax.scatter(x_pred[finite_model], y_pred[finite_model], marker="o", color=color, s=36, alpha=0.65)
+            for x0, y0, x1, y1 in zip(family.x_obs, family.y_obs, x_pred, y_pred):
                 if np.isfinite(x1) and np.isfinite(y1):
                     ax.plot([x0, x1], [y0, y1], color=color, alpha=0.35, linewidth=0.8)
     ax.invert_xaxis()
@@ -1999,6 +2059,147 @@ def _merge_fit_quality_with_magnification(image_df: pd.DataFrame, magnification_
     return image_df.merge(magnification_df[mag_columns], on=merge_keys, how="inner")
 
 
+def _unavailable_image_count_info(family: Any, reason: str) -> dict[str, Any]:
+    return {
+        "produced_image_count": np.nan,
+        "recovered_image_count": np.nan,
+        "missing_image_count": np.nan,
+        "extra_image_count": np.nan,
+        "multiplicity_failed": True,
+        "multiplicity_failure_reason": reason,
+    }
+
+
+def _successful_image_count_info(family: Any) -> dict[str, Any]:
+    n_images = int(getattr(family, "n_images", 0))
+    return {
+        "produced_image_count": n_images,
+        "recovered_image_count": n_images,
+        "missing_image_count": 0,
+        "extra_image_count": 0,
+        "multiplicity_failed": False,
+        "multiplicity_failure_reason": "",
+    }
+
+
+def _image_count_info_from_exact_details(family: Any, details: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(details, dict):
+        return _unavailable_image_count_info(family, "exact_prediction_failed")
+    return {
+        "produced_image_count": details.get("produced_image_count", np.nan),
+        "recovered_image_count": details.get("recovered_image_count", np.nan),
+        "missing_image_count": details.get("missing_image_count", np.nan),
+        "extra_image_count": details.get("extra_image_count", np.nan),
+        "multiplicity_failed": bool(details.get("multiplicity_failed", details.get("failed", True))),
+        "multiplicity_failure_reason": str(details.get("multiplicity_failure_reason", "")),
+    }
+
+
+def _model_count_fields_from_count_info(count_info: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "model_produced_image_count": count_info.get("produced_image_count", np.nan),
+        "model_recovered_image_count": count_info.get("recovered_image_count", np.nan),
+        "model_missing_image_count": count_info.get("missing_image_count", np.nan),
+        "model_extra_image_count": count_info.get("extra_image_count", np.nan),
+        "model_multiplicity_failed": bool(count_info.get("multiplicity_failed", True)),
+        "model_multiplicity_failure_reason": str(count_info.get("multiplicity_failure_reason", "")),
+    }
+
+
+def _image_count_recovery_row(family: Any, count_info: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "family_id": str(getattr(family, "family_id", "")),
+        "z_source": _finite_or(getattr(family, "z_source", np.nan)),
+        "effective_z_source": _finite_or(getattr(family, "effective_z_source", np.nan)),
+        "observed_image_count": int(getattr(family, "n_images", 0)),
+        **count_info,
+    }
+
+
+def _image_count_recovery_table(state: BuildState, image_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "family_id",
+        "z_source",
+        "effective_z_source",
+        "observed_image_count",
+        "recovered_image_count",
+        "produced_image_count",
+        "missing_image_count",
+        "extra_image_count",
+        "multiplicity_failed",
+        "multiplicity_failure_reason",
+    ]
+    rows: list[dict[str, Any]] = []
+    family_by_id = {str(family.family_id): family for family in getattr(state, "family_data", [])}
+    required = {
+        "family_id",
+        "model_produced_image_count",
+        "model_recovered_image_count",
+        "model_missing_image_count",
+        "model_extra_image_count",
+        "model_multiplicity_failed",
+        "model_multiplicity_failure_reason",
+    }
+    if image_df is not None and not image_df.empty and required.issubset(image_df.columns):
+        for family_id, group_df in image_df.groupby("family_id", sort=False):
+            family = family_by_id.get(str(family_id))
+            first = group_df.iloc[0]
+            rows.append(
+                {
+                    "family_id": str(family_id),
+                    "z_source": _finite_or(first.get("z_source", getattr(family, "z_source", np.nan))),
+                    "effective_z_source": _finite_or(getattr(family, "effective_z_source", np.nan)),
+                    "observed_image_count": int(getattr(family, "n_images", len(group_df))),
+                    "recovered_image_count": first.get("model_recovered_image_count", np.nan),
+                    "produced_image_count": first.get("model_produced_image_count", np.nan),
+                    "missing_image_count": first.get("model_missing_image_count", np.nan),
+                    "extra_image_count": first.get("model_extra_image_count", np.nan),
+                    "multiplicity_failed": bool(first.get("model_multiplicity_failed", True)),
+                    "multiplicity_failure_reason": str(first.get("model_multiplicity_failure_reason", "")),
+                }
+            )
+    else:
+        rows = [
+            _image_count_recovery_row(family, _unavailable_image_count_info(family, "not_available"))
+            for family in getattr(state, "family_data", [])
+        ]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    table = pd.DataFrame(rows, columns=columns)
+    missing = pd.to_numeric(table["missing_image_count"], errors="coerce")
+    extra = pd.to_numeric(table["extra_image_count"], errors="coerce")
+    observed = pd.to_numeric(table["observed_image_count"], errors="coerce")
+    table["_mismatch_sort"] = np.nan_to_num(missing + extra, nan=-1.0)
+    table["_observed_sort"] = np.nan_to_num(observed, nan=0.0)
+    table = table.sort_values(
+        ["_mismatch_sort", "_observed_sort", "family_id"],
+        ascending=[False, False, True],
+    ).drop(columns=["_mismatch_sort", "_observed_sort"])
+    return table.reset_index(drop=True)
+
+
+def _image_count_recovery_summary(image_count_df: pd.DataFrame | None) -> dict[str, Any]:
+    empty = {
+        "model_recovered_image_count": None,
+        "model_produced_image_count": None,
+        "model_missing_image_count": None,
+        "model_extra_image_count": None,
+    }
+    if image_count_df is None or image_count_df.empty:
+        return empty
+    summary: dict[str, Any] = {}
+    for summary_key, column in [
+        ("model_recovered_image_count", "recovered_image_count"),
+        ("model_produced_image_count", "produced_image_count"),
+        ("model_missing_image_count", "missing_image_count"),
+        ("model_extra_image_count", "extra_image_count"),
+    ]:
+        values = pd.to_numeric(image_count_df[column], errors="coerce") if column in image_count_df.columns else pd.Series(dtype=float)
+        finite = values[np.isfinite(values)]
+        summary[summary_key] = int(np.sum(finite)) if len(finite) else None
+    return {**empty, **summary}
+
+
 def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> Any:
     from .cluster_solver import (  # local import avoids a module import cycle at plotting import time
         ClusterJAXEvaluator,
@@ -2088,19 +2289,35 @@ def _fit_quality_prediction_for_family_latent(
     x_pred = np.full(n_images, np.nan, dtype=float)
     y_pred = np.full(n_images, np.nan, dtype=float)
     image_failed = True
+    count_info = _unavailable_image_count_info(family, "quick_diagnostics" if quick_diagnostics else "not_run")
     if not quick_diagnostics:
         try:
-            exact_prediction = evaluator._exact_family_prediction(params_latent, family)
-            if exact_prediction is not None:
-                x_exact, y_exact, _exact_rms = exact_prediction
-                x_exact = np.asarray(x_exact, dtype=float)
-                y_exact = np.asarray(y_exact, dtype=float)
-                if x_exact.shape == (n_images,) and y_exact.shape == (n_images,):
-                    x_pred = x_exact
-                    y_pred = y_exact
-                    image_failed = False
+            if hasattr(evaluator, "_exact_family_prediction_details"):
+                exact_details = evaluator._exact_family_prediction_details(params_latent, family)
+                count_info = _image_count_info_from_exact_details(family, exact_details)
+                if not bool(exact_details.get("failed", True)):
+                    x_exact = np.asarray(exact_details.get("x_pred"), dtype=float)
+                    y_exact = np.asarray(exact_details.get("y_pred"), dtype=float)
+                    if x_exact.shape == (n_images,) and y_exact.shape == (n_images,):
+                        x_pred = x_exact
+                        y_pred = y_exact
+                        image_failed = False
+            else:
+                exact_prediction = evaluator._exact_family_prediction(params_latent, family)
+                if exact_prediction is not None:
+                    x_exact, y_exact, _exact_rms = exact_prediction
+                    count_info = _successful_image_count_info(family)
+                    x_exact = np.asarray(x_exact, dtype=float)
+                    y_exact = np.asarray(y_exact, dtype=float)
+                    if x_exact.shape == (n_images,) and y_exact.shape == (n_images,):
+                        x_pred = x_exact
+                        y_pred = y_exact
+                        image_failed = False
+                else:
+                    count_info = _unavailable_image_count_info(family, "exact_prediction_failed")
         except Exception:
             image_failed = True
+            count_info = _unavailable_image_count_info(family, "exact_prediction_exception")
 
     mu = np.full(n_images, np.nan, dtype=float)
     magnification_failed = True
@@ -2122,6 +2339,7 @@ def _fit_quality_prediction_for_family_latent(
     except Exception:
         magnification_failed = True
 
+    model_count_fields = _model_count_fields_from_count_info(count_info)
     sigma_arcsec = _finite_or(getattr(family, "sigma_arcsec", np.nan))
     sigma_eff = _fit_quality_image_sigma_eff(sigma_arcsec, image_sigma_int, covariance_floor)
     for label, x_obs, y_obs, x_model, y_model, mu_value in zip(
@@ -2148,6 +2366,7 @@ def _fit_quality_prediction_for_family_latent(
             "image_sigma_eff_arcsec": sigma_eff,
             "radius_arcsec": float(math.hypot(float(x_obs), float(y_obs))),
             "angle_deg": float(np.degrees(np.arctan2(float(y_obs), float(x_obs)))),
+            **model_count_fields,
         }
         image_rows.append(
             {
@@ -2165,7 +2384,11 @@ def _fit_quality_prediction_for_family_latent(
                 "magnification_prediction_failed": bool(magnification_failed),
             }
         )
-    return {"image_rows": image_rows, "magnification_rows": magnification_rows}
+    return {
+        "image_rows": image_rows,
+        "magnification_rows": magnification_rows,
+        "image_count_rows": [_image_count_recovery_row(family, count_info)],
+    }
 
 
 def _fit_quality_prediction_for_latent(
@@ -2177,7 +2400,7 @@ def _fit_quality_prediction_for_latent(
     params_latent = np.asarray(params_latent, dtype=float)
     image_sigma_int = _fit_quality_image_sigma_int(evaluator, params_latent)
     covariance_floor = _finite_or(getattr(evaluator, "source_plane_covariance_floor", 0.0), 0.0)
-    prediction: dict[str, list[dict[str, Any]]] = {"image_rows": [], "magnification_rows": []}
+    prediction: dict[str, list[dict[str, Any]]] = {"image_rows": [], "magnification_rows": [], "image_count_rows": []}
     for family in state.family_data:
         family_prediction = _fit_quality_prediction_for_family_latent(
             evaluator,
@@ -2189,6 +2412,7 @@ def _fit_quality_prediction_for_latent(
         )
         prediction["image_rows"].extend(family_prediction["image_rows"])
         prediction["magnification_rows"].extend(family_prediction["magnification_rows"])
+        prediction["image_count_rows"].extend(family_prediction.get("image_count_rows", []))
     return prediction
 
 
@@ -2326,12 +2550,13 @@ def _posterior_fit_quality_predictions(
     def combine_predictions() -> list[dict[str, list[dict[str, Any]]]]:
         predictions: list[dict[str, list[dict[str, Any]]]] = []
         for sample_predictions in family_predictions:
-            combined = {"image_rows": [], "magnification_rows": []}
+            combined = {"image_rows": [], "magnification_rows": [], "image_count_rows": []}
             for family_prediction in sample_predictions:
                 if family_prediction is None:
                     continue
                 combined["image_rows"].extend(family_prediction["image_rows"])
                 combined["magnification_rows"].extend(family_prediction["magnification_rows"])
+                combined["image_count_rows"].extend(family_prediction.get("image_count_rows", []))
             predictions.append(combined)
         return predictions
 
@@ -2450,7 +2675,7 @@ def _fit_quality_tables(
         for sample in posterior_samples
     ]
     all_predictions = _posterior_fit_quality_predictions(evaluator, state, [best_fit_latent, *sample_latents], args)
-    best_prediction = all_predictions[0] if all_predictions else {"image_rows": [], "magnification_rows": []}
+    best_prediction = all_predictions[0] if all_predictions else {"image_rows": [], "magnification_rows": [], "image_count_rows": []}
     posterior_predictions = all_predictions[1:]
 
     image_draws_by_label: dict[str, list[dict[str, Any]]] = {}
@@ -2628,6 +2853,48 @@ def _plot_image_recovery_fit_quality(image_df: pd.DataFrame, path: Path) -> None
     if len(image_df) <= 40:
         axes[1].set_xticks(x_index)
         axes[1].set_xticklabels(image_df["image_label"].astype(str), rotation=90, fontsize=7)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_image_count_recovery(image_count_df: pd.DataFrame, path: Path) -> None:
+    if image_count_df.empty:
+        return
+    required = {"family_id", "observed_image_count", "recovered_image_count", "produced_image_count"}
+    if not required.issubset(image_count_df.columns):
+        return
+    observed = pd.to_numeric(image_count_df["observed_image_count"], errors="coerce").to_numpy(dtype=float)
+    recovered = pd.to_numeric(image_count_df["recovered_image_count"], errors="coerce").to_numpy(dtype=float)
+    produced = pd.to_numeric(image_count_df["produced_image_count"], errors="coerce").to_numpy(dtype=float)
+    if not (np.isfinite(recovered).any() or np.isfinite(produced).any()):
+        return
+    labels = image_count_df["family_id"].astype(str).to_numpy()
+    y_index = np.arange(len(image_count_df))
+    height = 0.24
+    fig, ax = plt.subplots(figsize=(9.5, max(4.2, 0.32 * len(image_count_df))))
+    finite_observed = np.isfinite(observed)
+    finite_recovered = np.isfinite(recovered)
+    finite_produced = np.isfinite(produced)
+    if finite_observed.any():
+        ax.barh(y_index[finite_observed] - height, observed[finite_observed], height=height, color="0.65", label="observed")
+    if finite_recovered.any():
+        ax.barh(y_index[finite_recovered], recovered[finite_recovered], height=height, color="tab:green", label="recovered")
+    if finite_produced.any():
+        ax.barh(y_index[finite_produced] + height, produced[finite_produced], height=height, color="tab:blue", label="produced")
+    total_observed = int(np.nansum(observed))
+    total_recovered = int(np.nansum(recovered)) if finite_recovered.any() else 0
+    total_produced = int(np.nansum(produced)) if finite_produced.any() else 0
+    ax.set_yticks(y_index)
+    ax.set_yticklabels(labels)
+    ax.invert_yaxis()
+    ax.set_xlabel("image count")
+    ax.set_ylabel("family")
+    ax.set_title(
+        f"Image Count Recovery: observed={total_observed} recovered={total_recovered} produced={total_produced}"
+    )
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(axis="x", alpha=0.25)
     fig.tight_layout()
     fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -3078,6 +3345,11 @@ def _generate_plots_and_tables(
         "plots.fit_quality_tables",
         lambda: _fit_quality_tables(state, evaluator, best_fit, results, args),
     )
+    image_count_recovery_df = _run_logged_phase(
+        args,
+        "plots.image_count_recovery_table",
+        lambda: _image_count_recovery_table(state, image_fit_quality_df),
+    )
     run_summary = _run_logged_phase(
         args,
         "plots.run_summary",
@@ -3089,6 +3361,7 @@ def _generate_plots_and_tables(
             best_eval.loglike,
             evaluator,
             image_fit_quality_df=image_fit_quality_df,
+            image_count_recovery_df=image_count_recovery_df,
             family_df=family_df,
             used_exact_validation=getattr(best_eval, "used_exact_validation", None),
         ),
@@ -3107,6 +3380,7 @@ def _generate_plots_and_tables(
     best_fit_values = _best_fit_values_for_specs(state.parameter_specs, best_fit)
     scaling_best_fit_values = _best_fit_values_for_specs(scaling_specs, scaling_best_fit)
     cosmology_best_fit_values = _best_fit_values_for_specs(cosmology_specs, cosmology_best_fit)
+    previous_stage_best_values = getattr(state, "previous_stage_best_values", None)
     potfile_constraint_df = _run_logged_phase(
         args,
         "plots.potfile_constraint_table",
@@ -3130,6 +3404,11 @@ def _generate_plots_and_tables(
         args,
         "plots.write_image_fit_quality_csv",
         lambda: image_fit_quality_df.to_csv(tables_dir / "image_fit_quality.csv", index=False),
+    )
+    _run_logged_phase(
+        args,
+        "plots.write_image_count_recovery_csv",
+        lambda: image_count_recovery_df.to_csv(tables_dir / "image_count_recovery.csv", index=False),
     )
     _run_logged_phase(
         args,
@@ -3169,7 +3448,13 @@ def _generate_plots_and_tables(
         (
             "corner",
             "plots.corner",
-            lambda: _plot_corner(run_dir, results.samples, state.parameter_specs, best_fit_values=best_fit_values),
+            lambda: _plot_corner(
+                run_dir,
+                results.samples,
+                state.parameter_specs,
+                best_fit_values=best_fit_values,
+                previous_stage_best_values=previous_stage_best_values,
+            ),
         ),
         (
             "potfile_corner",
@@ -3179,6 +3464,7 @@ def _generate_plots_and_tables(
                 scaling_samples,
                 scaling_specs,
                 best_fit_values=scaling_best_fit_values,
+                previous_stage_best_values=previous_stage_best_values,
             ),
         ),
         (
@@ -3221,6 +3507,11 @@ def _generate_plots_and_tables(
             "image_recovery",
             "plots.image_recovery",
             lambda: _plot_image_recovery_fit_quality(image_fit_quality_df, _plot_path(run_dir, "image_recovery.pdf")),
+        ),
+        (
+            "image_count_recovery",
+            "plots.image_count_recovery",
+            lambda: _plot_image_count_recovery(image_count_recovery_df, _plot_path(run_dir, "image_count_recovery.pdf")),
         ),
         (
             "model_magnification",
@@ -3279,6 +3570,7 @@ def _generate_plots_and_tables(
                     cosmology_samples,
                     cosmology_specs,
                     best_fit_values=cosmology_best_fit_values,
+                    previous_stage_best_values=previous_stage_best_values,
                 ),
             )
         )

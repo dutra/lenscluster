@@ -221,12 +221,14 @@ def test_corner_overlays_gold_best_fit_and_preserves_truths(tmp_path: Path, monk
         _corner_test_specs(),
         truth_values={"x": 0.5, "y": 2.5},
         best_fit_values={"x": 1.5, "y": 3.5},
+        previous_stage_best_values={"x": 1.25, "y": 3.25},
     )
 
     assert calls[0][0] == "corner"
     assert calls[0][2]["truths"] == [0.5, 2.5]
-    assert calls[1] == ("lines", [1.5, 3.5], {"color": plotting.CORNER_BEST_FIT_COLOR})
-    assert calls[2] == (
+    assert calls[1] == ("lines", [1.25, 3.25], {"color": plotting.CORNER_PREVIOUS_STAGE_COLOR})
+    assert calls[2] == ("lines", [1.5, 3.5], {"color": plotting.CORNER_BEST_FIT_COLOR})
+    assert calls[3] == (
         "points",
         [[1.5, 3.5]],
         {"marker": "s", "color": plotting.CORNER_BEST_FIT_COLOR},
@@ -358,11 +360,13 @@ def test_potfile_corner_uses_scaling_best_fit_values(tmp_path: Path, monkeypatch
         _corner_test_specs(component_family="scaling"),
         truth_values={"x": 10.5, "y": 22.5},
         best_fit_values={"x": 12.0, "y": 23.0},
+        previous_stage_best_values={"x": 11.5, "y": 22.0},
     )
 
     assert calls[0][2]["truths"] == [10.5, 22.5]
-    assert calls[1] == ("lines", [12.0, 23.0], {"color": plotting.CORNER_BEST_FIT_COLOR})
-    assert calls[2] == (
+    assert calls[1] == ("lines", [11.5, 22.0], {"color": plotting.CORNER_PREVIOUS_STAGE_COLOR})
+    assert calls[2] == ("lines", [12.0, 23.0], {"color": plotting.CORNER_BEST_FIT_COLOR})
+    assert calls[3] == (
         "points",
         [[12.0, 23.0]],
         {"marker": "s", "color": plotting.CORNER_BEST_FIT_COLOR},
@@ -410,14 +414,16 @@ def test_cosmology_corner_uses_sample_name_truths_and_best_fit(tmp_path: Path, m
         cosmology_specs,
         truth_values={"cosmology_Om0": 0.3, "cosmology_w0": -1.0},
         best_fit_values=plotting._best_fit_values_for_specs(cosmology_specs, cosmology_best_fit),
+        previous_stage_best_values={"cosmology_Om0": 0.29, "cosmology_w0": -1.05},
     )
 
     assert calls[0][0] == "corner"
     np.testing.assert_allclose(calls[0][1], samples[:, [1, 2]])
     assert calls[0][2]["labels"] == ["cosmology.Om0", "cosmology.w0"]
     assert calls[0][2]["truths"] == [0.3, -1.0]
-    assert calls[1] == ("lines", [0.31, -0.95], {"color": plotting.CORNER_BEST_FIT_COLOR})
-    assert calls[2] == (
+    assert calls[1] == ("lines", [0.29, -1.05], {"color": plotting.CORNER_PREVIOUS_STAGE_COLOR})
+    assert calls[2] == ("lines", [0.31, -0.95], {"color": plotting.CORNER_BEST_FIT_COLOR})
+    assert calls[3] == (
         "points",
         [[0.31, -0.95]],
         {"marker": "s", "color": plotting.CORNER_BEST_FIT_COLOR},
@@ -503,6 +509,11 @@ def test_fit_quality_tables_cap_draws_convert_physical_and_quantile() -> None:
     assert bool(row["covered_y_1sigma"]) is True
     assert bool(row["covered_xy_1sigma"]) is True
     assert int(row["posterior_valid_draws"]) == 2
+    assert int(row["model_produced_image_count"]) == 2
+    assert int(row["model_recovered_image_count"]) == 2
+    assert int(row["model_missing_image_count"]) == 0
+    assert int(row["model_extra_image_count"]) == 0
+    assert bool(row["model_multiplicity_failed"]) is False
 
     mag_row = magnification_df.set_index("image_label").loc["1.2"]
     assert mag_row["magnification_model"] == pytest.approx(9.0)
@@ -641,6 +652,8 @@ def test_fit_quality_tables_quick_diagnostics_skips_exact_and_uses_median_std() 
     assert bool(image_row["exact_image_prediction_failed"]) is True
     assert np.isnan(image_row["x_model_arcsec"])
     assert np.isnan(image_row["image_residual_arcsec"])
+    assert np.isnan(image_row["model_produced_image_count"])
+    assert image_row["model_multiplicity_failure_reason"] == "quick_diagnostics"
 
     mag_row = magnification_df.set_index("image_label").loc["1.1"]
     mag_values = np.asarray([3.0, 5.0, 7.0], dtype=float)
@@ -1050,9 +1063,11 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     )
 
     assert (tmp_path / "tables" / "image_fit_quality.csv").exists()
+    assert (tmp_path / "tables" / "image_count_recovery.csv").exists()
     assert (tmp_path / "tables" / "model_magnification.csv").exists()
     assert (tmp_path / "tables" / "run_summary.txt").exists()
     assert "image_recovery" in captured_tasks
+    assert "image_count_recovery" in captured_tasks
     assert "model_magnification" in captured_tasks
     assert "normalized_image_residuals" in captured_tasks
     assert "residual_vs_magnification" in captured_tasks
@@ -1139,6 +1154,40 @@ def test_run_summary_quality_metrics_from_image_fit_quality() -> None:
     assert summary["aic"] == pytest.approx(13.0)
     assert summary["bic"] == pytest.approx(7.0 + 3.0 * math.log(8.0))
     assert summary["covered_xy_1sigma_fraction"] == pytest.approx(2.0 / 3.0)
+
+
+def test_image_count_recovery_table_and_plot_write_pdf(tmp_path: Path) -> None:
+    state = SimpleNamespace(
+        family_data=[
+            SimpleNamespace(family_id="1", n_images=3, z_source=2.0, effective_z_source=2.0),
+            SimpleNamespace(family_id="2", n_images=2, z_source=3.0, effective_z_source=3.0),
+        ]
+    )
+    image_df = pd.DataFrame(
+        {
+            "family_id": ["1", "1", "1", "2", "2"],
+            "z_source": [2.0, 2.0, 2.0, 3.0, 3.0],
+            "model_produced_image_count": [4, 4, 4, 1, 1],
+            "model_recovered_image_count": [3, 3, 3, 1, 1],
+            "model_missing_image_count": [0, 0, 0, 1, 1],
+            "model_extra_image_count": [1, 1, 1, 0, 0],
+            "model_multiplicity_failed": [True, True, True, True, True],
+            "model_multiplicity_failure_reason": ["extra_model_images"] * 3 + ["missing_model_images"] * 2,
+        }
+    )
+
+    count_df = plotting._image_count_recovery_table(state, image_df)
+    plotting._plot_image_count_recovery(count_df, tmp_path / "image_count_recovery.pdf")
+    summary = plotting._image_count_recovery_summary(count_df)
+
+    assert count_df["family_id"].tolist() == ["1", "2"]
+    assert count_df.set_index("family_id").loc["1", "produced_image_count"] == 4
+    assert count_df.set_index("family_id").loc["2", "missing_image_count"] == 1
+    assert summary["model_recovered_image_count"] == 4
+    assert summary["model_produced_image_count"] == 5
+    assert summary["model_missing_image_count"] == 1
+    assert summary["model_extra_image_count"] == 1
+    assert (tmp_path / "image_count_recovery.pdf").exists()
 
 
 def test_chain_diagnostics_summary_uses_grouped_samples() -> None:
@@ -1444,6 +1493,61 @@ def test_image_plane_fit_uses_family_colored_observed_cross_and_model_point(monk
     assert model_kwargs["marker"] == "o"
     assert model_kwargs["alpha"] < 1.0
     assert observed_kwargs["color"] == model_kwargs["color"]
+
+
+def test_image_plane_fit_handles_missing_model_predictions(monkeypatch: Any, tmp_path: Path) -> None:
+    class FakeAxis:
+        def __init__(self) -> None:
+            self.scatters: list[tuple[Any, Any, dict[str, Any]]] = []
+            self.plots: list[tuple[Any, Any, dict[str, Any]]] = []
+
+        def scatter(self, x: Any, y: Any, **kwargs: Any) -> None:
+            self.scatters.append((x, y, kwargs))
+
+        def plot(self, x: Any, y: Any, **kwargs: Any) -> None:
+            self.plots.append((x, y, kwargs))
+
+        def invert_xaxis(self) -> None:
+            return None
+
+        def set_xlabel(self, _label: str) -> None:
+            return None
+
+        def set_ylabel(self, _label: str) -> None:
+            return None
+
+        def set_title(self, _title: str) -> None:
+            return None
+
+        def legend(self, **_kwargs: Any) -> None:
+            return None
+
+    class FakeFig:
+        def tight_layout(self) -> None:
+            return None
+
+        def savefig(self, path: Path, **_kwargs: Any) -> None:
+            Path(path).touch()
+
+    axis = FakeAxis()
+    monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: (FakeFig(), axis))
+    monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
+
+    family = SimpleNamespace(
+        family_id="1",
+        n_images=2,
+        x_obs=np.asarray([0.0, 1.0], dtype=float),
+        y_obs=np.asarray([2.0, 3.0], dtype=float),
+    )
+    state = SimpleNamespace(family_data=[family])
+    best_eval = SimpleNamespace(family_predictions={"1": {"failed": True}})
+
+    plotting._plot_image_plane_fit(tmp_path, state, best_eval)
+
+    assert (tmp_path / "image_plane_fit.pdf").exists()
+    assert len(axis.scatters) == 1
+    assert axis.scatters[0][2]["marker"] == "x"
+    assert axis.plots == []
 
 
 def test_image_recovery_uses_family_colored_observed_cross_and_model_point(monkeypatch: Any, tmp_path: Path) -> None:

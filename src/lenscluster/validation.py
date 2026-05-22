@@ -105,6 +105,10 @@ EVIDENCE_LIKELIHOOD_MODES = (
 DEFAULT_EVIDENCE_LIKELIHOOD_MODE = EVIDENCE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE
 DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC = 0.3
 DEFAULT_IMAGE_SIGMA_INT_UPPER_ARCSEC = 2.0
+DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC = 0.30
+DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC = 0.10
+DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS = 0.05
+DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN = 0.05
 DEFAULT_CAUSTIC_COMPUTE_WINDOW_ARCSEC = 160.0
 DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC = 0.2
 DEFAULT_CAUSTIC_MIN_AREA_ARCSEC2 = 1.0e-5
@@ -2473,6 +2477,7 @@ def write_recovery_outputs(
         parameter_names = _artifact_parameter_names(state)
         truth_values = _parameter_truth_with_source_positions(truth)
         best_fit_values = _best_fit_values_for_specs(state.parameter_specs, best_fit)
+        previous_stage_best_values = getattr(state, "previous_stage_best_values", None)
         parameter_df = run_recovery_phase(
             "parameter table",
             "validation.recovery.parameter_table",
@@ -2635,6 +2640,7 @@ def write_recovery_outputs(
                 "corner.pdf",
                 truth_values=truth_values,
                 best_fit_values=best_fit_values,
+                previous_stage_best_values=previous_stage_best_values,
             ),
         )
         scaling_specs, scaling_samples, scaling_best_fit = run_recovery_phase(
@@ -2657,6 +2663,7 @@ def write_recovery_outputs(
                 "potfile_corner.pdf",
                 truth_values=truth_values,
                 best_fit_values=scaling_best_fit_values,
+                previous_stage_best_values=previous_stage_best_values,
             ),
         )
         if any(getattr(spec, "component_family", None) == "cosmology" for spec in state.parameter_specs):
@@ -2682,6 +2689,7 @@ def write_recovery_outputs(
                         "cosmology_corner.pdf",
                         truth_values=truth_values,
                         best_fit_values=cosmology_best_fit_values,
+                        previous_stage_best_values=previous_stage_best_values,
                     ),
                 )
         run_recovery_phase(
@@ -2881,6 +2889,7 @@ def _plot_corner_pdf(
     filename: str = "corner.pdf",
     truth_values: dict[str, float] | None = None,
     best_fit_values: dict[str, float] | None = None,
+    previous_stage_best_values: dict[str, float] | None = None,
 ) -> None:
     path = output_dir / filename
     if path.exists():
@@ -2893,6 +2902,7 @@ def _plot_corner_pdf(
                 parameter_specs,
                 truth_values=truth_values,
                 best_fit_values=best_fit_values,
+                previous_stage_best_values=previous_stage_best_values,
             )
         elif filename == "cosmology_corner.pdf":
             _plot_cosmology_corner(
@@ -2901,6 +2911,7 @@ def _plot_corner_pdf(
                 parameter_specs,
                 truth_values=truth_values,
                 best_fit_values=best_fit_values,
+                previous_stage_best_values=previous_stage_best_values,
             )
         else:
             _plot_potfile_corner(
@@ -2909,6 +2920,7 @@ def _plot_corner_pdf(
                 parameter_specs,
                 truth_values=truth_values,
                 best_fit_values=best_fit_values,
+                previous_stage_best_values=previous_stage_best_values,
             )
     except Exception as exc:  # pragma: no cover - defensive plotting fallback
         placeholder_samples, placeholder_specs = (
@@ -3596,6 +3608,31 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         )
     if float(getattr(args, "image_plane_scatter_upper_arcsec", DEFAULT_IMAGE_SIGMA_INT_UPPER_ARCSEC)) <= 0.0:
         raise SystemExit("--image-plane-scatter-upper-arcsec must be positive.")
+    image_presence_penalty_weight = getattr(args, "image_presence_penalty_weight", None)
+    if image_presence_penalty_weight is not None and (
+        not np.isfinite(float(image_presence_penalty_weight)) or float(image_presence_penalty_weight) < 0.0
+    ):
+        raise SystemExit("--image-presence-penalty-weight must be non-negative when provided.")
+    if (
+        not np.isfinite(float(getattr(args, "image_presence_match_radius_arcsec", DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC)))
+        or float(getattr(args, "image_presence_match_radius_arcsec", DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC)) <= 0.0
+    ):
+        raise SystemExit("--image-presence-match-radius-arcsec must be positive.")
+    if (
+        not np.isfinite(float(getattr(args, "image_presence_temperature_arcsec", DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC)))
+        or float(getattr(args, "image_presence_temperature_arcsec", DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC)) <= 0.0
+    ):
+        raise SystemExit("--image-presence-temperature-arcsec must be positive.")
+    if (
+        not np.isfinite(float(getattr(args, "image_presence_count_softness", DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS)))
+        or float(getattr(args, "image_presence_count_softness", DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS)) <= 0.0
+    ):
+        raise SystemExit("--image-presence-count-softness must be positive.")
+    if (
+        not np.isfinite(float(getattr(args, "image_presence_count_margin", DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN)))
+        or float(getattr(args, "image_presence_count_margin", DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN)) < 0.0
+    ):
+        raise SystemExit("--image-presence-count-margin must be non-negative.")
     if solver_fit_mode == SOLVER_FIT_MODE_EVIDENCE_NS:
         sampled_source_evidence = (
             evidence_likelihood_mode == EVIDENCE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
@@ -3953,6 +3990,14 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(args.chains),
         "--image-plane-scatter-upper-arcsec",
         str(getattr(args, "image_plane_scatter_upper_arcsec", DEFAULT_IMAGE_SIGMA_INT_UPPER_ARCSEC)),
+        "--image-presence-match-radius-arcsec",
+        str(getattr(args, "image_presence_match_radius_arcsec", DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC)),
+        "--image-presence-temperature-arcsec",
+        str(getattr(args, "image_presence_temperature_arcsec", DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC)),
+        "--image-presence-count-softness",
+        str(getattr(args, "image_presence_count_softness", DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS)),
+        "--image-presence-count-margin",
+        str(getattr(args, "image_presence_count_margin", DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN)),
         "--sampling-engine",
         str(args.sampling_engine),
         "--source-plane-covariance-floor",
@@ -3978,6 +4023,8 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         "--max-tree-depth",
         str(args.max_tree_depth),
     ]
+    if getattr(args, "image_presence_penalty_weight", None) is not None:
+        cmd.extend(["--image-presence-penalty-weight", str(args.image_presence_penalty_weight)])
     if solver_fit_mode == SOLVER_FIT_MODE_SEQUENTIAL:
         _append_stage_option(cmd, "--fit-method", args.fit_method)
         _append_stage_option(cmd, "--warmup", args.warmup)
@@ -4325,6 +4372,27 @@ def _build_parser() -> argparse.ArgumentParser:
         "--image-plane-scatter-upper-arcsec",
         type=float,
         default=DEFAULT_IMAGE_SIGMA_INT_UPPER_ARCSEC,
+    )
+    parser.add_argument("--image-presence-penalty-weight", type=float, default=None)
+    parser.add_argument(
+        "--image-presence-match-radius-arcsec",
+        type=float,
+        default=DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC,
+    )
+    parser.add_argument(
+        "--image-presence-temperature-arcsec",
+        type=float,
+        default=DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC,
+    )
+    parser.add_argument(
+        "--image-presence-count-softness",
+        type=float,
+        default=DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS,
+    )
+    parser.add_argument(
+        "--image-presence-count-margin",
+        type=float,
+        default=DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN,
     )
     parser.add_argument(
         "--evidence-source-prior-sigma-arcsec",

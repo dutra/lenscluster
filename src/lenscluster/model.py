@@ -235,6 +235,7 @@ class BuildState:
     scaling_component_records: list[dict[str, Any]]
     geometry_cache: GeometryCache | None = None
     svi_init_values: dict[str, float] | None = None
+    previous_stage_best_values: dict[str, float] | None = None
     fit_cosmology_flat_wcdm: bool = False
     source_position_parameterization: str = "direct"
 
