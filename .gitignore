@@ -19,3 +19,6 @@ plots/
 *.pkl
 *.egg-info/
 *.xsh
+*.par
+data/*
+results/*
