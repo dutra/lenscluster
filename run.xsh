@@ -1,134 +1,166 @@
 $XONSH_SHOW_TRACEBACK = True
 
 import time
+import sys
+from pathlib import Path
 
 $JAX_NUM_CPU_DEVICES = "30"
 
 PYTHON = "/home/dutra/.conda/envs/lenstronomy/bin/python"
-OUTPUT_DIR = f"plots/clustersim"
-PAR_PATH = "data/clustersim/input.par"
-TRUTH_PATH = "data/clustersim/truth.json"
-active_scaling_galaxies = [-1]
+output_dir = f"bergamini_may30a"
 
-# The sequential solver runs:
-# 1. large-scale SVI
-# 2. joint source-plane large+small fit
-# 3. optional local-Jacobian image-plane fit
-# 4. optional explicit-beta image-plane fit
-OUTPUT_DIR = "runs_noscatter_may18_cosmology"
+VALID_CLUSTERS = "A2744, M0416, M1206, AS1063, A307"
+BERGAMINI_CLUSTERS = {
+    "A2744": {
+        "cluster_key": "a2744",
+        "par_path": "data/Bergamini/A2744_Bergamini23/Bergamini23_A2744_Normal.par",
+        "output_dir": f"results/{output_dir}/a2744_bergamini23",
+    },
+    "A2744_CATS": {
+        "cluster_key": "a2744_cats",
+        "par_path": "data/a2744_cats_v31/input.par",
+        "output_dir": f"results/{output_dir}/a2744_cats_v31",
+    },
+    "M0416": {
+        "cluster_key": "m0416",
+        "par_path": "data/Bergamini/M0416_Bergamini22/Bergamini22_MACS0416_Normal.par",
+        "output_dir": f"results/{output_dir}/m0416_bergamini22",
+    },
+    "M1206": {
+        "cluster_key": "m1206",
+        "par_path": "data/Bergamini/M1206_Bergamini19/Bergamini19_MACSJ1206_lenstool_Normal.par",
+        "output_dir": f"results/{output_dir}/m1206_bergamini19",
+    },
+    "AS1063": {
+        "cluster_key": "as1063",
+        "par_path": "data/Bergamini/RXJ2248_Bergamini19/Bergamini_RXCJ2248_lenstool_Normal.par",
+        "output_dir": f"results/{output_dir}/as1063_bergamini19",
+    },
+    "A307": {
+        "cluster_key": "a307",
+        "par_path": "data/a370_niemiec/a_sl_normal.par",
+        "output_dir": f"results/{output_dir}/a307_niemiec",
+    },
+}
+CLUSTER_ALIASES = {}
 
-workflow = "nuts_sequential"
+
+def _usage() -> str:
+    return f"Usage: xonsh run_as1063.xsh <cluster>\nValid clusters: {VALID_CLUSTERS}"
+
+
+if len(sys.argv) != 2:
+    print(_usage())
+    raise SystemExit(2)
+
+requested_cluster = sys.argv[1].strip().upper()
+canonical_cluster = CLUSTER_ALIASES.get(requested_cluster, requested_cluster)
+if canonical_cluster not in BERGAMINI_CLUSTERS:
+    print(f"Unknown Bergamini cluster: {sys.argv[1]!r}\n{_usage()}")
+    raise SystemExit(2)
+
+cluster_config = BERGAMINI_CLUSTERS[canonical_cluster]
+PAR_PATH = cluster_config["par_path"]
+OUTPUT_DIR = cluster_config["output_dir"]
+if not Path(PAR_PATH).is_file():
+    raise SystemExit(f"Bergamini par file does not exist: {PAR_PATH}")
+BAYES_PATH = Path(PAR_PATH).with_name("bayes.dat")
+bayes_overlay_args = ["--corner-overlay-bayes-dat", str(BAYES_PATH)] if BAYES_PATH.is_file() else []
+BEST_PAR_PATH = Path(PAR_PATH).with_name("best.par")
+best_par_overlay_args = ["--corner-overlay-best-par", str(BEST_PAR_PATH)] if BEST_PAR_PATH.is_file() else []
+
+# Mirrors the active nuts_sequential fitting settings in run.xsh, but runs the
+# real-data cluster solver directly instead of the mock validation wrapper.
+run_name = f"{cluster_config['cluster_key']}_linearizedforwardbeta_refreshing_surrogate"
+fit_mode = "sequential"
+image_plane_mode = "linearized-forward-beta-image-plane"
+fit_method = ["svi+nuts", "svi+nuts", "svi+nuts"]
+warmup = [500, 1000, 1000]
+samples = [150, 250, 250]
+skip_stage3_image_plane_local_jacobian = False
 quick_diagnostics = False
+image_plane_newton_steps = 0
+linearized_beta_prior_sigma_arcsec = 0.5
+source_position_parameterization = "conditional-whitened"
+target_accept = 0.85
+max_tree_depth = [8, 8, 8]
+active_scaling_galaxies = [50]
+cosmology_init_om0 = 0.4
+cosmology_init_w0 = -0.9
 
-if workflow == "evidence_ns":
-    solver_fit_mode = "evidence-ns"
-    image_plane_mode = "none"
-    run_name = "single_bcg_recovery_evidence_ns_marginal_beta"
-    evidence_source_prior_sigma_arcsec = 20.0
-    evidence_source_prior_mean_x_arcsec = 0.0
-    evidence_source_prior_mean_y_arcsec = 0.0
-    evidence_likelihood_mode = "linearized-forward-beta-image-plane"
-    image_plane_newton_steps = 0 # use 1 or 2 for accuracy, but slower
-    source_position_parameterization = "prior-whitened" # or "direct"
-    ns_num_live_points = 2000
-    ns_max_samples = "none"
-    ns_dlogz = 0.01
-    workflow_args = [
-        "--solver-fit-mode", solver_fit_mode,
-        "--image-plane-mode", image_plane_mode,
-        "--evidence-likelihood-mode", evidence_likelihood_mode,
-        "--image-plane-newton-steps", image_plane_newton_steps,
-        "--source-position-parameterization", source_position_parameterization,
-        "--evidence-source-prior-sigma-arcsec", evidence_source_prior_sigma_arcsec,
-        "--evidence-source-prior-mean-x-arcsec", evidence_source_prior_mean_x_arcsec,
-        "--evidence-source-prior-mean-y-arcsec", evidence_source_prior_mean_y_arcsec,
-        "--ns-num-live-points", ns_num_live_points,
-        "--ns-max-samples", ns_max_samples,
-        "--ns-dlogz", ns_dlogz,
-        *(["--quick-diagnostics"] if quick_diagnostics else []),
-    ]
+cosmology_init_args = [
+    *(["--cosmology-init-om0", cosmology_init_om0] if cosmology_init_om0 is not None else []),
+    *(["--cosmology-init-w0", cosmology_init_w0] if cosmology_init_w0 is not None else []),
+]
 
-elif workflow == "nuts_sequential":
-    solver_fit_mode = "sequential"
-    image_plane_mode = "linearized-forward-beta-image-plane"
-    run_name = "single_bcg_recovery_nuts_sequential_conditionalwhitened_refreshsurrogate_approximate"
-    fit_method = ["svi+nuts", "svi+nuts", "svi+nuts"]
-    warmup = [500, 1000, 2000]
-    samples = [250, 250, 250]
-    skip_stage3_image_plane_local_jacobian = False
-    image_plane_newton_steps = 0 # use 1 or 2 for accuracy, but slower
-    linearized_beta_prior_sigma_arcsec = 0.3
-    source_position_parameterization = "conditional-whitened" # options: "prior-whitened" (safer), "conditional-whitened" (experimental, faster)
-    target_accept = 0.9
-    max_tree_depth = 8
-    workflow_args = [
-        "--solver-fit-mode", solver_fit_mode,
-        "--image-plane-mode", image_plane_mode,
-        *(["--skip-stage3-image-plane-local-jacobian"] if skip_stage3_image_plane_local_jacobian else []),
-        *(["--quick-diagnostics"] if quick_diagnostics else []),
-        "--image-plane-newton-steps", image_plane_newton_steps,
-        "--linearized-beta-prior-sigma-arcsec", linearized_beta_prior_sigma_arcsec,
-        "--source-position-parameterization", source_position_parameterization,
-        "--fit-method", *fit_method,
-        "--warmup", *warmup,
-        "--samples", *samples,
-        "--svi-steps", 250,
-        "--target-accept", target_accept,
-        "--max-tree-depth", max_tree_depth,
-    ]
-else:
-    raise ValueError(f"Unknown workflow={workflow!r}")
-
-active_scaling_galaxies = [-1]
-subhalo_sigma_scatter_dex = 0.0
-subhalo_cut_scatter_dex = 0.0
-source_sigma_int_arcsec = 0.0
-
-n_primary_families = 20
-n_subhalo_families = 5
-nfamilies_total = n_primary_families + n_subhalo_families
-min_images_per_family = 3
-caustic_compute_window_arcsec = 160
-caustic_grid_scale_arcsec = 0.2
-caustic_min_area_arcsec2 = 1e-5
-caustic_boundary_margin_arcsec = 0.5
-if nfamilies_total <= 1:
-    source_redshifts = "2.0"
-else:
-    source_redshifts = ",".join(str(1.5 + idx * (7.0 - 1.5) / (nfamilies_total - 1)) for idx in range(nfamilies_total))
+workflow_args = [
+    "--fit-mode", fit_mode,
+    "--image-plane-mode", image_plane_mode,
+    *(["--skip-stage3-image-plane-local-jacobian"] if skip_stage3_image_plane_local_jacobian else []),
+    *(["--quick-diagnostics"] if quick_diagnostics else []),
+    "--image-plane-newton-steps", image_plane_newton_steps,
+    "--linearized-beta-prior-sigma-arcsec", linearized_beta_prior_sigma_arcsec,
+    "--source-position-parameterization", source_position_parameterization,
+    "--fit-method", *fit_method,
+    "--warmup", *warmup,
+    "--samples", *samples,
+    "--svi-steps", 1000,
+    "--target-accept", target_accept,
+    "--max-tree-depth", *max_tree_depth,
+    *cosmology_init_args,
+]
 
 _run_start_monotonic = time.monotonic()
 try:
-    @(PYTHON) -m lenscluster.validation --resume \
+    @(PYTHON) -m lenscluster.cluster_solver --resume \
+      --par-path @(PAR_PATH) \
       --output-dir @(OUTPUT_DIR) \
       --run-name @(run_name) \
-      --realizations 1 \
-      --n-primary-families @(n_primary_families) \
-      --n-subhalo-families @(n_subhalo_families) \
-      --min-images-per-family @(min_images_per_family) \
-      --caustic-compute-window-arcsec @(caustic_compute_window_arcsec) \
-      --caustic-grid-scale-arcsec @(caustic_grid_scale_arcsec) \
-      --caustic-min-area-arcsec2 @(caustic_min_area_arcsec2) \
-      --caustic-boundary-margin-arcsec @(caustic_boundary_margin_arcsec) \
-      --n-subhalos 50 \
-      --subhalo-sigma-scatter-dex @(subhalo_sigma_scatter_dex) \
-      --subhalo-cut-scatter-dex @(subhalo_cut_scatter_dex) \
-      --source-redshifts @(source_redshifts) \
-      --pos-sigma-arcsec 0 \
-      --source-sigma-int-arcsec @(source_sigma_int_arcsec) \
-      --no-fit-scaling-scatter \
       @(workflow_args) \
+      @(bayes_overlay_args) \
+      @(best_par_overlay_args) \
+      --corner-suppress-fit-markers \
       --chains 4 \
       --sampling-engine refreshing_surrogate \
       --active-scaling-galaxies @(active_scaling_galaxies) \
       --active-scaling-selection adaptive \
       --active-scaling-cumulative-fraction 0.995 \
       --active-scaling-min 4 \
-      --posterior-diagnostic-workers 30 \
-      --posterior-diagnostic-mode approximate \
-      --z-bin-efficiency-tol 0.01 \
-      --image-plane-scatter-upper-arcsec 0.2
-    #   --posterior-diagnostic-mode approximate \
-    #   --fit-cosmology-flat-wcdm
+      --scaling-scatter \
+      --scaling-scatter-fields sigma,cut \
+      --scaling-scatter-max 0.5 \
+      --z-bin-efficiency-tol 0.02 \
+      --plot-caustics \
+      --fit-quality-workers 32 \
+      --fov-limit-radius 200 \
+      --likelihood-stabilizer-residual-loss student-t \
+      --likelihood-stabilizer-max-gain 100 \
+      --image-plane-scatter-upper-arcsec 2.0 \
+      --image-plane-scatter-floor-arcsec 0.20 \
+      --image-plane-scatter-prior lognormal \
+      --image-plane-scatter-prior-median-arcsec 0.5 \
+      --image-plane-scatter-prior-log-sigma 0.5 \
+    --image-presence-penalty-weight 1.0 \
+    --image-presence-match-radius-arcsec 0.7 \
+    --image-presence-temperature-arcsec 0.35
+#     --fit-cosmology-flat-wcdm
+
+ #   --jax-default-device cpu --smc-device gpu \
+
+# --quick-diagnostics \
+
+# --smc-particles 4096 \
+# --smc-mcmc-kernel rmh \
+# --smc-rmh-scale 0.05 \
+# --smc-mcmc-steps 32 \
+# --smc-target-ess-frac 0.95 \
+# --smc-max-temperature-steps 1024 \
+#rmh or mala
+    #   --quick-diagnostics
+    #   --likelihood-stabilizer-max-gain 50 \
+    #   --likelihood-stabilizer-max-residual-arcsec 3 \
+    #   --likelihood-stabilizer-residual-loss student-t \
+    #   --likelihood-stabilizer-student-t-nu 4 \
+
 finally:
-    print(f"[timing] run.xsh elapsed={time.monotonic() - _run_start_monotonic:.2f}s")
+    print(f"[timing] elapsed={time.monotonic() - _run_start_monotonic:.2f}s")

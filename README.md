@@ -6,9 +6,9 @@ This repository now has two public fitting workflows: the sequential optimizer/s
 2. Fit the joint large+small model with SVI, initialized from the large-scale SVI solution.
 3. Optionally run NUTS on the joint model with `--fit-method svi+nuts`.
 4. Optionally run an image-plane refinement stage with `--image-plane-mode local-jacobian`.
-5. Optionally run a final explicit-source image-plane stage using `--image-plane-mode linearized-forward-beta-image-plane`.
+5. Optionally run a final image-plane stage using `--image-plane-mode linearized-forward-beta-image-plane` or `--image-plane-mode marginal-image-plane`.
 
-Use `--fit-method svi` for a fast variational result or `--fit-method svi+nuts` for SVI initialization followed by joint posterior sampling. In the optional sequential image-plane workflow, `--fit-method`, `--warmup`, and `--samples` may each take one value for all sampled stages, two values mapping to `stage2_joint` and `stage3_image_plane`, or three values when a stage-4 explicit-source image-plane mode is enabled. Nested sampling is reserved for the one-shot evidence workflow: use `--fit-mode evidence-ns` with an explicit `--evidence-source-prior-sigma-arcsec`; `--fit-method`, `--warmup`, and `--samples` are ignored in that mode.
+Use `--fit-method svi` for a fast variational result or `--fit-method svi+nuts` for SVI initialization followed by joint posterior sampling. In the optional sequential image-plane workflow, `--fit-method`, `--warmup`, `--samples`, and `--max-tree-depth` may each take one value for all sampled stages, two values mapping to `stage2_joint` and `stage3_image_plane`, or three values when a final stage-4 image-plane mode is enabled. Nested sampling is reserved for the one-shot evidence workflow: use `--fit-mode evidence-ns` with an explicit `--evidence-source-prior-sigma-arcsec`; `--fit-method`, `--warmup`, and `--samples` are ignored in that mode.
 
 ## Run
 
@@ -28,7 +28,6 @@ python -m cluster_solver \
   --active-scaling-galaxies 32 \
   --target-accept 0.75 \
   --max-tree-depth 5 \
-  --validate-top-k-families 0 \
   --z-bin-efficiency-tol 0.01 \
   --profile-variant original
 ```
@@ -41,7 +40,7 @@ python -m cluster_solver \
   --output-dir plots/m0416_original \
   --run-name joint_workflow \
   --fit-method svi+nuts svi+nuts svi \
-  --image-plane-mode linearized-forward-beta-image-plane \
+  --image-plane-mode marginal-image-plane \
   --image-plane-newton-steps 0 \
   --warmup 1000 1000 0 \
   --samples 250 250 100 \
@@ -50,15 +49,13 @@ python -m cluster_solver \
   --active-scaling-galaxies -1 \
   --refresh-param-drift-frac 0.08 \
   --target-accept 0.9 \
-  --max-tree-depth 8 \
-  --validate-top-k-families 0 \
-  --validation-approx adaptive \
+  --max-tree-depth 8 8 6 \
   --z-bin-efficiency-tol 0.01 \
   --profile-variant original \
   --plot-caustics
 ```
 
-The same command with scalar `--fit-method svi` skips NUTS in every sampled stage and writes the AutoNormal guide posterior. A mixed command such as `--fit-method svi+nuts svi --warmup 1000 0 --samples 250 100` runs NUTS in stage 2 and an SVI-only image-plane stage 3; with stage 4 enabled, a third value controls the final stage-4 directory.
+The same command with scalar `--fit-method svi` skips NUTS in every sampled stage and writes the AutoNormal guide posterior. A mixed command such as `--fit-method svi+nuts svi --warmup 1000 0 --samples 250 100 --max-tree-depth 8 6` runs NUTS in stage 2 and an SVI-only image-plane stage 3; with stage 4 enabled, a third value controls the final stage-4 directory.
 
 One-shot evidence nested sampling example:
 
@@ -122,6 +119,10 @@ python -m lenscluster.validation \
   --active-scaling-min 4
 ```
 
+Use `--max-images-per-family N` to reject sampled mock sources with more than
+`N` images; omit it, or pass `--max-images-per-family none`, to keep the
+default unlimited upper multiplicity.
+
 The adaptive subhalo selection ranks potfile galaxies by brightness and
 proximity to the observed multiple images, then chooses the active exact
 subhalo cutoff from the cumulative-importance curve. The default keeps enough
@@ -164,7 +165,8 @@ python -m lenscluster.validation \
   --image-plane-newton-steps 0 \
   --fit-method svi+nuts svi+nuts svi \
   --warmup 1000 1000 0 \
-  --samples 250 100 500
+  --samples 250 100 500 \
+  --max-tree-depth 8 8 6
 ```
 
 For validation evidence runs, select the one-shot solver mode and provide the
@@ -315,7 +317,7 @@ When scaling scatter is enabled, the likelihood uses separate diagonal
 `x`/`y` variances with the linearized scaling-scatter contribution added on top
 of `sigma_eff_i^2`. Single-image families are excluded from this source-plane
 scatter likelihood because their source-plane residual is zero by construction.
-Exact image-plane solving is used for validation, diagnostics, and plots; it is
+Exact image-plane solving is used for fit-quality diagnostics and plots; it is
 not currently the sampled posterior likelihood.
 
 The sampled likelihood uses a cached magnification-weighted source-plane
@@ -343,6 +345,14 @@ local image-plane correction at each observed image even when
 `--image-plane-newton-steps 0`; positive values add that many further Newton
 updates before scoring the image-plane displacement. It uses its own
 `image_sigma_int` scatter parameter in image-plane units.
+
+When `--image-plane-mode marginal-image-plane` is selected, the workflow adds
+`stage4_marginal_image_plane`. It uses the Gaussian linearized image-plane
+likelihood with source positions analytically marginalized, centered on the
+previous sampled stage's source centroids with sigma
+`--linearized-beta-prior-sigma-arcsec`. If `--fit-cosmology-flat-wcdm` is
+enabled, this final stage samples cosmology by default; `--fit-cosmology-all-stages`
+still samples cosmology in every executed fitting stage.
 
 The linearized forward-beta stage also includes a smooth observed-image
 presence penalty by default. For each observed image, the local image-plane
@@ -389,6 +399,7 @@ For `--run-name joint_workflow`, outputs are written to:
 - `plots/m0416_original/joint_workflow/stage2_joint/`
 - `plots/m0416_original/joint_workflow/stage3_image_plane/` when `--image-plane-mode local-jacobian`, or before stage 4 unless skipped
 - `plots/m0416_original/joint_workflow/stage4_linearized_image_plane/` when `--image-plane-mode linearized-forward-beta-image-plane`
+- `plots/m0416_original/joint_workflow/stage4_marginal_image_plane/` when `--image-plane-mode marginal-image-plane`
 - `plots/m0416_original/joint_workflow/sequential_summary.json`
 
 Each stage writes:

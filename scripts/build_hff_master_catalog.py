@@ -57,7 +57,7 @@ DEFAULT_OUTPUT_DIR = Path("results") / "hff_master_catalogs"
 DEFAULT_IMAGE_DIR = Path("data") / "BUFFALO_Images"
 DEFAULT_IMAGE_SCALE = "auto"
 IMAGE_SCALE_CHOICES = ("auto", "30mas", "60mas")
-DEFAULT_MAX_FAMILY_SPAN_KPC = 500.0
+DEFAULT_MAX_FAMILY_SPAN_KPC = 600.0
 DEFAULT_MIN_PAIR_SEPARATION_ARCSEC = 1.0
 DEFAULT_MIN_COMMON_BANDS = 8
 DEFAULT_PAIR_SCORE_THRESHOLD = 0.70
@@ -66,7 +66,7 @@ DEFAULT_FAMILY_PROBABILITY_THRESHOLD = 0.25
 DEFAULT_MAX_FAMILIES_PER_OBJECT = 3
 DEFAULT_FAMILY_PAIR_BATCH_SIZE = 262_144
 DEFAULT_FAMILY_PAIR_DIAGNOSTICS = "scored"
-DEFAULT_IMAGE_FAMILY_FOV_KPC = 700.0
+DEFAULT_IMAGE_FAMILY_FOV_KPC = 1000.0
 DEFAULT_FAMILY_COLOR_RMS_MAX = 1.25
 DEFAULT_FAMILY_PHOTOZ_DELTA_MAX = 1.0
 DEFAULT_CONFLICT_COLOR_FAMILY_RMS_MAX = 0.75
@@ -119,13 +119,12 @@ PLOT_IMAGE_MAX_PIXELS = 2500
 DEFAULT_FAMILY_CUTOUT_SIZE_ARCSEC = 5.0
 DEFAULT_FAMILY_CUTOUT_CIRCLE_RADIUS_ARCSEC = 0.6
 DEFAULT_FAMILY_CUTOUT_FAMILIES_PER_PAGE = 6
-DEFAULT_FAMILY_CUTOUT_MAX_IMAGES_PER_FAMILY = 5
-DEFAULT_FAMILY_CUTOUT_MAX_FAMILIES = 200
 DEFAULT_FAMILY_CUTOUT_BANDS = PLOT_RGB_BANDS
 INVALID_SENTINELS = {-999.0, -99.0, 99.0, -1.0, 1.0e9}
 ZSPEC_CONFLICT_TOL = 0.005
 ZSPEC_EXCELLENT_TOL = 0.005
 ZSPEC_HARD_CONFLICT_TOL = 0.01
+ZSPEC_HARD_CONFLICT_NORM_TOL = 0.005
 MEMBER_Z_TOL = 0.12
 C_KMS = 299792.458
 BACKGROUND_Z_MARGIN = 0.1
@@ -229,6 +228,19 @@ class PlotBandImage:
     shape: tuple[int, int]
     wcs: WCS
     pixel_scale_arcsec: float
+
+
+@dataclass(frozen=True)
+class OverlayCrop:
+    data: np.ndarray
+    extent: tuple[float, float, float, float]
+    wcs: WCS
+    x_min: int
+    y_min: int
+    stride: int
+    center_ra: float
+    center_dec: float
+    z_lens: float
 
 
 @dataclass
@@ -2519,7 +2531,9 @@ def _family_redshift_evidence_array(
         left_spec_photo_consistent,
         xp.where(one_spec_right, right_spec_photo_consistent, False),
     )
-    specz_conflict = both_specz & (spec_dz > ZSPEC_HARD_CONFLICT_TOL)
+    spec_mid = 0.5 * (zspec_left + zspec_right)
+    spec_dz_norm = spec_dz / xp.maximum(1.0 + spec_mid, 1.0e-6)
+    specz_conflict = both_specz & (spec_dz > ZSPEC_HARD_CONFLICT_TOL) & (spec_dz_norm > ZSPEC_HARD_CONFLICT_NORM_TOL)
     both_have_photoz = xp.isfinite(zphot_left) & xp.isfinite(zphot_right)
     photoz_only_pair = ~usable_spec_left & ~usable_spec_right & both_have_photoz
     photoz_pair_score = _photo_pair_score_array(xp, zphot_left, zphot_right, zlow_left, zhigh_left, zlow_right, zhigh_right)
@@ -4069,7 +4083,9 @@ def build_families_from_pairs(
             family_z_method = "photoz_median"
             min_spec_rank = float("nan")
         else:
-            if usable_spec_values.size > 1 and float(np.nanmax(usable_spec_values) - np.nanmin(usable_spec_values)) > ZSPEC_HARD_CONFLICT_TOL:
+            spec_spread = float(np.nanmax(usable_spec_values) - np.nanmin(usable_spec_values)) if usable_spec_values.size > 1 else 0.0
+            spec_spread_norm = spec_spread / max(1.0 + float(np.nanmedian(usable_spec_values)), 1.0e-6)
+            if usable_spec_values.size > 1 and spec_spread > ZSPEC_HARD_CONFLICT_TOL and spec_spread_norm > ZSPEC_HARD_CONFLICT_NORM_TOL:
                 color_guided_spec_conflict = bool(
                     np.any(conflict_values)
                     and sed_rms.size > 0
@@ -4422,6 +4438,7 @@ def build_cluster_image_families(
         "photoz_only_family_probability_cap": float(DEFAULT_PHOTOZ_ONLY_FAMILY_PROBABILITY_CAP),
         "zspec_excellent_tol": float(ZSPEC_EXCELLENT_TOL),
         "zspec_hard_conflict_tol": float(ZSPEC_HARD_CONFLICT_TOL),
+        "zspec_hard_conflict_norm_tol": float(ZSPEC_HARD_CONFLICT_NORM_TOL),
         "family_color_rms_strong": float(FAMILY_COLOR_RMS_STRONG),
         "family_color_rms_acceptable": float(FAMILY_COLOR_RMS_ACCEPTABLE),
         "n_spatial_pairs": int(pair_score_metrics.get("n_spatial_pairs", len(pairs))),
@@ -5004,7 +5021,7 @@ def _write_diagnostic_png(fig: plt.Figure, path: Path) -> list[Path]:
     return [path]
 
 
-def _write_publication_fig(fig: plt.Figure, stem: Path) -> list[Path]:
+def _write_publication_fig(fig: plt.Figure, stem: Path, *, dpi: int = 300) -> list[Path]:
     stem.parent.mkdir(parents=True, exist_ok=True)
     png = stem.with_suffix(".png")
     pdf = stem.with_suffix(".pdf")
@@ -5012,8 +5029,8 @@ def _write_publication_fig(fig: plt.Figure, stem: Path) -> list[Path]:
         fig.tight_layout()
     except Exception:
         pass
-    fig.savefig(png, dpi=300, bbox_inches="tight")
-    fig.savefig(pdf, dpi=300, bbox_inches="tight")
+    fig.savefig(png, dpi=dpi, bbox_inches="tight")
+    fig.savefig(pdf, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return [png, pdf]
 
@@ -5373,7 +5390,7 @@ def _load_fits_crop_for_overlay(
     center_ra: float,
     center_dec: float,
     spec: ClusterSpec,
-) -> np.ndarray:
+) -> OverlayCrop:
     with fits.open(path, memmap=True) as hdul:
         for hdu in hdul:
             if hdu.data is None:
@@ -5404,8 +5421,99 @@ def _load_fits_crop_for_overlay(
             if x_min >= x_max or y_min >= y_max:
                 raise ValueError(f"Requested 1 Mpc crop is outside {path}")
             crop = hdu.section[y_min:y_max:stride, x_min:x_max:stride]
-            return np.nan_to_num(np.asarray(crop, dtype=np.float32), nan=0.0)
+            data = np.nan_to_num(np.asarray(crop, dtype=np.float32), nan=0.0)
+            return OverlayCrop(
+                data=data,
+                extent=_overlay_crop_extent(
+                    wcs,
+                    data.shape,
+                    x_min=x_min,
+                    y_min=y_min,
+                    stride=stride,
+                    center_ra=center_ra,
+                    center_dec=center_dec,
+                    z_lens=spec.z_lens,
+                ),
+                wcs=wcs,
+                x_min=int(x_min),
+                y_min=int(y_min),
+                stride=int(stride),
+                center_ra=float(center_ra),
+                center_dec=float(center_dec),
+                z_lens=float(spec.z_lens),
+            )
     raise ValueError(f"No 2D celestial WCS image found in {path}")
+
+
+def _overlay_crop_extent(
+    wcs: WCS,
+    shape: tuple[int, int],
+    *,
+    x_min: int,
+    y_min: int,
+    stride: int,
+    center_ra: float,
+    center_dec: float,
+    z_lens: float,
+) -> tuple[float, float, float, float]:
+    n_y, n_x = int(shape[0]), int(shape[1])
+    x0 = float(x_min) - 0.5 * float(stride)
+    x1 = float(x_min) + (float(n_x) - 0.5) * float(stride)
+    y0 = float(y_min) - 0.5 * float(stride)
+    y1 = float(y_min) + (float(n_y) - 0.5) * float(stride)
+    x_mid = 0.5 * (x0 + x1)
+    y_mid = 0.5 * (y0 + y1)
+    left_ra, left_dec = wcs.wcs_pix2world(x0, y_mid, 0)
+    right_ra, right_dec = wcs.wcs_pix2world(x1, y_mid, 0)
+    bottom_ra, bottom_dec = wcs.wcs_pix2world(x_mid, y0, 0)
+    top_ra, top_dec = wcs.wcs_pix2world(x_mid, y1, 0)
+    center = SkyCoord(float(center_ra) * u.deg, float(center_dec) * u.deg)
+    scale = kpc_per_arcsec(float(z_lens))
+
+    def _offset(ra: float, dec: float) -> tuple[float, float]:
+        coord = SkyCoord(float(ra) * u.deg, float(dec) * u.deg)
+        dlon, dlat = center.spherical_offsets_to(coord)
+        return float(dlon.to(u.arcsec).value * scale), float(-dlat.to(u.arcsec).value * scale)
+
+    left_x, _left_y = _offset(left_ra, left_dec)
+    right_x, _right_y = _offset(right_ra, right_dec)
+    _bottom_x, bottom_y = _offset(bottom_ra, bottom_dec)
+    _top_x, top_y = _offset(top_ra, top_dec)
+    return (left_x, right_x, bottom_y, top_y)
+
+
+def _overlay_crop_with_shape(crop: OverlayCrop, shape: tuple[int, int]) -> OverlayCrop:
+    n_y, n_x = int(shape[0]), int(shape[1])
+    data = crop.data[:n_y, :n_x]
+    return OverlayCrop(
+        data=data,
+        extent=_overlay_crop_extent(
+            crop.wcs,
+            data.shape,
+            x_min=crop.x_min,
+            y_min=crop.y_min,
+            stride=crop.stride,
+            center_ra=crop.center_ra,
+            center_dec=crop.center_dec,
+            z_lens=crop.z_lens,
+        ),
+        wcs=crop.wcs,
+        x_min=crop.x_min,
+        y_min=crop.y_min,
+        stride=crop.stride,
+        center_ra=crop.center_ra,
+        center_dec=crop.center_dec,
+        z_lens=crop.z_lens,
+    )
+
+
+def _trim_overlay_crops(crops: Iterable[OverlayCrop]) -> list[OverlayCrop]:
+    valid = [crop for crop in crops if np.asarray(crop.data).ndim == 2]
+    if not valid:
+        return []
+    min_y = min(crop.data.shape[0] for crop in valid)
+    min_x = min(crop.data.shape[1] for crop in valid)
+    return [_overlay_crop_with_shape(crop, (min_y, min_x)) for crop in valid]
 
 
 def _trim_to_common_shape(arrays: Iterable[np.ndarray]) -> list[np.ndarray]:
@@ -5592,13 +5700,14 @@ def _load_cluster_overlay_background(
     rgb_paths = [paths_by_band.get(band) for band in PLOT_RGB_BANDS]
     if all(path is not None for path in rgb_paths):
         try:
-            b_data, g_data, r_data = _trim_to_common_shape(
+            b_crop, g_crop, r_crop = _trim_overlay_crops(
                 [
                     _load_fits_crop_for_overlay(rgb_paths[0], center_ra=center_ra, center_dec=center_dec, spec=spec),
                     _load_fits_crop_for_overlay(rgb_paths[1], center_ra=center_ra, center_dec=center_dec, spec=spec),
                     _load_fits_crop_for_overlay(rgb_paths[2], center_ra=center_ra, center_dec=center_dec, spec=spec),
                 ]
             )
+            b_data, g_data, r_data = b_crop.data, g_crop.data, r_crop.data
             _, r_med, r_std = sigma_clipped_stats(r_data, sigma=3.0, maxiters=5)
             _, g_med, g_std = sigma_clipped_stats(g_data, sigma=3.0, maxiters=5)
             _, b_med, b_std = sigma_clipped_stats(b_data, sigma=3.0, maxiters=5)
@@ -5611,6 +5720,7 @@ def _load_cluster_overlay_background(
             return {
                 "mode": "rgb",
                 "image": rgb,
+                "extent": b_crop.extent,
                 "paths": [path for path in rgb_paths if path is not None],
                 "reason": "",
                 "image_scale": image_scale,
@@ -5623,7 +5733,14 @@ def _load_cluster_overlay_background(
     if grayscale_path is not None:
         try:
             grayscale = _load_fits_crop_for_overlay(grayscale_path, center_ra=center_ra, center_dec=center_dec, spec=spec)
-            return {"mode": "grayscale", "image": grayscale, "paths": [grayscale_path], "reason": "", "image_scale": image_scale}
+            return {
+                "mode": "grayscale",
+                "image": grayscale.data,
+                "extent": grayscale.extent,
+                "paths": [grayscale_path],
+                "reason": "",
+                "image_scale": image_scale,
+            }
         except Exception as exc:
             if mode == "required":
                 raise MissingCatalogError(f"Could not render grayscale background for {spec.key}: {exc}") from exc
@@ -5637,7 +5754,10 @@ def _load_cluster_overlay_background(
 
 def _draw_overlay_background(ax: plt.Axes, image_background: dict[str, Any]) -> None:
     render_mode = str(image_background.get("mode", "catalog_only"))
-    extent = [-PLOT_FOV_HALF_WIDTH_KPC, PLOT_FOV_HALF_WIDTH_KPC, -PLOT_FOV_HALF_WIDTH_KPC, PLOT_FOV_HALF_WIDTH_KPC]
+    extent = image_background.get(
+        "extent",
+        [-PLOT_FOV_HALF_WIDTH_KPC, PLOT_FOV_HALF_WIDTH_KPC, -PLOT_FOV_HALF_WIDTH_KPC, PLOT_FOV_HALF_WIDTH_KPC],
+    )
     if render_mode == "rgb":
         ax.imshow(image_background["image"], origin="lower", extent=extent, interpolation="bilinear", zorder=0)
     elif render_mode == "grayscale":
@@ -6074,7 +6194,7 @@ def _plot_cluster_image_overlay(
                 marker="o",
                 facecolors="none",
                 edgecolors="white",
-                linewidths=1.5,
+                linewidths=0.7,
                 alpha=0.95,
                 zorder=4,
             )
@@ -6110,14 +6230,15 @@ def _plot_cluster_image_overlay(
                     subset["x_kpc"],
                     subset["y_kpc"],
                     s=46,
-                    c=[color],
-                    edgecolors="black",
-                    linewidths=0.45,
+                    marker="o",
+                    facecolors="none",
+                    edgecolors=[color],
+                    linewidths=0.8,
                     zorder=8,
                 )
                 if len(subset) > 1:
                     ordered = subset.sort_values(["x_kpc", "y_kpc"])
-                    ax.plot(ordered["x_kpc"], ordered["y_kpc"], color=color, linewidth=1.0, alpha=0.75, zorder=7)
+                    ax.plot(ordered["x_kpc"], ordered["y_kpc"], color=color, linewidth=0.45, alpha=0.55, zorder=7)
 
     circle = Circle(
         (0, 0),
@@ -6139,7 +6260,7 @@ def _plot_cluster_image_overlay(
     family_count = int(fam_sky["candidate_family_id"].nunique()) if not fam_sky.empty and "candidate_family_id" in fam_sky.columns else 0
     legend_handles = [
         Line2D([], [], marker="o", color="white", markerfacecolor="none", linestyle="None", markersize=6, alpha=1, label=f"Members (N={member_count:,})"),
-        Line2D([], [], marker="o", color="#1f77b4", linestyle="None", markersize=7, markeredgecolor="black", label=f"Image families (N={family_count:,})"),
+        Line2D([], [], marker="o", color="#1f77b4", markerfacecolor="none", linestyle="None", markersize=7, markeredgewidth=0.8, label=f"Image families (N={family_count:,})"),
         Line2D([], [], color="white", linestyle="--", linewidth=1.5, label="500 kpc"),
         Line2D([], [], marker="+", color="white", linestyle="None", markersize=10, label="plot center"),
     ]
@@ -6154,7 +6275,7 @@ def _plot_cluster_image_overlay(
         image_render_mode=render_mode,
     )
     metadata["image_scale"] = str(image_background.get("image_scale", ""))
-    return _write_publication_fig(fig, out_dir / f"{spec.key}_cluster_image_overlay"), metadata
+    return _write_publication_fig(fig, out_dir / f"{spec.key}_cluster_image_overlay", dpi=600), metadata
 
 
 def _plot_publication_red_sequence(member_scores: pd.DataFrame, red_sequence: pd.DataFrame, spec: ClusterSpec, out_dir: Path) -> list[Path]:
@@ -6271,14 +6392,7 @@ def _family_cutout_member_crms(
 def _select_family_cutout_rows(
     families: pd.DataFrame,
     family_members: pd.DataFrame,
-    *,
-    max_families: int,
-    max_images_per_family: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if max_families <= 0:
-        raise ValueError("family_cutout_max_families must be positive.")
-    if max_images_per_family <= 0:
-        raise ValueError("family_cutout_max_images_per_family must be positive.")
     if families.empty or family_members.empty:
         return pd.DataFrame(), pd.DataFrame()
     if "candidate_family_id" not in families.columns or "candidate_family_id" not in family_members.columns:
@@ -6291,7 +6405,7 @@ def _select_family_cutout_rows(
         ["_family_probability_sort", "_family_id_sort"],
         ascending=[False, True],
         kind="mergesort",
-    ).head(int(max_families))
+    )
 
     family_ids = list(ranked_families["candidate_family_id"].astype(str))
     members = _finite_sky(family_members)
@@ -6305,8 +6419,6 @@ def _select_family_cutout_rows(
     members["_object_id_sort"] = members["object_id"].astype(str) if "object_id" in members.columns else members.index.astype(str)
     selected = (
         members.sort_values(["_family_order", "_membership_sort", "_object_id_sort"], ascending=[True, False, True], kind="mergesort")
-        .groupby("candidate_family_id", sort=False)
-        .head(int(max_images_per_family))
         .drop(columns=["_family_order", "_membership_sort", "_object_id_sort"], errors="ignore")
     )
     ranked_families = ranked_families.loc[
@@ -6329,8 +6441,6 @@ def _plot_candidate_family_cutouts(
     circle_radius_arcsec: float,
     image_scale: str,
     families_per_page: int,
-    max_images_per_family: int,
-    max_families: int,
 ) -> tuple[list[Path], dict[str, Any]]:
     if len(tuple(bands)) != 3:
         raise ValueError("--family-cutout-bands must provide exactly three bands in blue green red order.")
@@ -6338,12 +6448,7 @@ def _plot_candidate_family_cutouts(
         raise ValueError("family_cutout_families_per_page must be positive.")
     if circle_radius_arcsec < 0.0:
         raise ValueError("family_cutout_circle_radius_arcsec must be non-negative.")
-    selected_families, selected_members = _select_family_cutout_rows(
-        families,
-        family_members,
-        max_families=max_families,
-        max_images_per_family=max_images_per_family,
-    )
+    selected_families, selected_members = _select_family_cutout_rows(families, family_members)
     if selected_families.empty or selected_members.empty:
         raise ValueError("No candidate families with finite image coordinates are available for cutouts.")
 
@@ -6359,10 +6464,13 @@ def _plot_candidate_family_cutouts(
         for page_index in range(n_pages):
             page_family_ids = family_ids[page_index * families_per_page : (page_index + 1) * families_per_page]
             n_rows = len(page_family_ids)
+            page_members = selected_members.loc[selected_members["candidate_family_id"].astype(str).isin(page_family_ids)]
+            page_member_counts = page_members.groupby(page_members["candidate_family_id"].astype(str), sort=False).size()
+            n_columns = max(1, int(page_member_counts.max()))
             fig, axes = plt.subplots(
                 n_rows,
-                max_images_per_family,
-                figsize=(2.7 * max_images_per_family, 2.55 * n_rows),
+                n_columns,
+                figsize=(2.7 * n_columns, 2.55 * n_rows),
                 squeeze=False,
                 constrained_layout=True,
             )
@@ -6379,7 +6487,7 @@ def _plot_candidate_family_cutouts(
                 family_probability = _to_float(family_info.get("family_probability", np.nan))
                 if not np.isfinite(family_probability):
                     family_probability = 0.0
-                for col_index in range(max_images_per_family):
+                for col_index in range(n_columns):
                     ax = axes[row_index, col_index]
                     ax.set_facecolor("black")
                     ax.set_xticks([])
@@ -6446,8 +6554,6 @@ def _plot_candidate_family_cutouts(
                             f"{family_id}  P={family_probability:.2f}  N={n_family_images}\n"
                             f"{_format_cutout_crms(family_crms)}  minpair={min_pair_label}"
                         )
-                        if n_family_images > max_images_per_family:
-                            family_label += f" (first {max_images_per_family})"
                         ax.text(
                             0.04,
                             0.06,
@@ -6803,8 +6909,6 @@ def _add_plot_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_FAMILY_CUTOUT_CIRCLE_RADIUS_ARCSEC,
     )
     parser.add_argument("--family-cutout-families-per-page", type=int, default=DEFAULT_FAMILY_CUTOUT_FAMILIES_PER_PAGE)
-    parser.add_argument("--family-cutout-max-images-per-family", type=int, default=DEFAULT_FAMILY_CUTOUT_MAX_IMAGES_PER_FAMILY)
-    parser.add_argument("--family-cutout-max-families", type=int, default=DEFAULT_FAMILY_CUTOUT_MAX_FAMILIES)
     parser.add_argument(
         "--family-cutout-bands",
         nargs=3,
@@ -7677,8 +7781,6 @@ def run_plots_stage(
                                 circle_radius_arcsec=float(args.family_cutout_circle_radius_arcsec),
                                 image_scale=args.image_scale,
                                 families_per_page=int(args.family_cutout_families_per_page),
-                                max_images_per_family=int(args.family_cutout_max_images_per_family),
-                                max_families=int(args.family_cutout_max_families),
                             ),
                             n_master_rows=n_master_rows,
                             n_member_rows=n_member_rows,

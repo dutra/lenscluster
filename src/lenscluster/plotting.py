@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import threading
 from pathlib import Path
 from typing import Any, Callable
@@ -10,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgba
 import numpy as np
 import pandas as pd
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
@@ -21,6 +23,8 @@ try:
 except ImportError:  # pragma: no cover
     corner = None
 
+from .jax_cosmology import kpc_per_arcsec_from_config as _kpc_per_arcsec_from_config
+from .lenstool_parser import load_best_par
 from .model import BuildState, EvaluationResult, ParameterSpec, PosteriorResults
 from .model import convert_theta_to_latent as _convert_theta_to_latent
 from .model import display_lower as _display_lower
@@ -45,6 +49,16 @@ CORNER_PLOT_KWARGS = {
 CORNER_PLOT_DPI = 300
 CORNER_BEST_FIT_COLOR = "#d4a017"
 CORNER_PREVIOUS_STAGE_COLOR = "black"
+CORNER_BAYES_OVERLAY_COLOR = "tab:red"
+SMC_CORNER_MAX_PARAMS = 8
+
+
+def _first_int_value(value: Any, default: int) -> int:
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return int(default)
+        return int(value[0])
+    return int(value)
 
 
 def plot_path(root: Path, name: str) -> Path:
@@ -108,6 +122,20 @@ def _normalized_weights(weights: np.ndarray | None, n_samples: int) -> np.ndarra
     return weight_array / total
 
 
+def _valid_normalized_sample_weights(weights: np.ndarray | None, n_samples: int) -> np.ndarray | None:
+    if weights is None or n_samples <= 0:
+        return None
+    weight_array = np.asarray(weights, dtype=float).reshape(-1)
+    if weight_array.size != n_samples:
+        return None
+    if not np.all(np.isfinite(weight_array)) or np.any(weight_array < 0.0):
+        return None
+    total = float(np.sum(weight_array))
+    if not np.isfinite(total) or total <= 0.0:
+        return None
+    return weight_array / total
+
+
 def _effective_sample_size(weights: np.ndarray) -> float:
     normalized = _normalized_weights(weights, len(weights))
     if normalized.size == 0:
@@ -122,7 +150,10 @@ def _family_color_map(family_ids: list[str] | np.ndarray | pd.Series) -> dict[st
 
 
 def _color_with_alpha(color: Any, alpha: float) -> tuple[float, float, float, float]:
-    rgba = np.asarray(color, dtype=float).reshape(-1)
+    try:
+        rgba = np.asarray(to_rgba(color), dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        rgba = np.asarray(color, dtype=float).reshape(-1)
     if rgba.size < 3:
         return (0.0, 0.0, 0.0, float(alpha))
     return (float(rgba[0]), float(rgba[1]), float(rgba[2]), float(alpha))
@@ -748,8 +779,6 @@ def _run_summary(
     evaluator: ClusterJAXEvaluator,
     image_fit_quality_df: pd.DataFrame | None = None,
     image_count_recovery_df: pd.DataFrame | None = None,
-    family_df: pd.DataFrame | None = None,
-    used_exact_validation: bool | None = None,
 ) -> dict[str, Any]:
     init_diagnostics = dict(results.init_diagnostics or {})
     run_name = str(getattr(args, "run_name", None) or state.run_name)
@@ -761,13 +790,6 @@ def _run_summary(
     chi_square_summary = _fit_quality_chi_square_summary(image_fit_quality_df, state)
     image_count_summary = _image_count_recovery_summary(image_count_recovery_df)
     chain_summary = _chain_diagnostics_summary(results, state.parameter_specs)
-    exact_family_count = None
-    failed_or_missing_exact_count = None
-    if family_df is not None and not family_df.empty and "exact_image_rms_arcsec" in family_df.columns:
-        exact_values = pd.to_numeric(family_df["exact_image_rms_arcsec"], errors="coerce").to_numpy(dtype=float)
-        exact_family_count = int(np.sum(np.isfinite(exact_values)))
-        failed_or_missing_exact_count = int(len(exact_values) - exact_family_count)
-
     def _cosmology_summary_fields() -> dict[str, Any]:
         fields: dict[str, Any] = {
             "fit_cosmology_flat_wcdm": bool(getattr(state, "fit_cosmology_flat_wcdm", False)),
@@ -801,6 +823,7 @@ def _run_summary(
                 fields[f"{prefix}_q84"] = None
         return fields
 
+    max_tree_depth = _first_int_value(getattr(args, "max_tree_depth", 10), 10)
     summary = {
         "run_name": run_name,
         "par_path": state.par_path,
@@ -824,6 +847,20 @@ def _run_summary(
         "skip_stage3_image_plane_local_jacobian": bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)),
         "quick_diagnostics": bool(getattr(args, "quick_diagnostics", False)),
         "image_plane_newton_steps": int(getattr(args, "image_plane_newton_steps", 0)),
+        "image_plane_scatter_floor_arcsec": float(getattr(args, "image_plane_scatter_floor_arcsec", 0.0)),
+        "image_plane_scatter_prior": str(getattr(args, "image_plane_scatter_prior", "log-uniform")),
+        "image_plane_scatter_prior_median_arcsec": float(
+            getattr(args, "image_plane_scatter_prior_median_arcsec", 0.3)
+        ),
+        "image_plane_scatter_prior_log_sigma": float(
+            getattr(args, "image_plane_scatter_prior_log_sigma", 0.5)
+        ),
+        "likelihood_stabilizer_max_gain": float(getattr(args, "likelihood_stabilizer_max_gain", 0.0)),
+        "likelihood_stabilizer_max_residual_arcsec": float(
+            getattr(args, "likelihood_stabilizer_max_residual_arcsec", 0.0)
+        ),
+        "likelihood_stabilizer_residual_loss": str(getattr(args, "likelihood_stabilizer_residual_loss", "gaussian")),
+        "likelihood_stabilizer_student_t_nu": float(getattr(args, "likelihood_stabilizer_student_t_nu", 4.0)),
         "source_position_parameterization": str(getattr(args, "source_position_parameterization", "prior-whitened")),
         "evidence_source_prior_sigma_arcsec": (
             None
@@ -834,7 +871,24 @@ def _run_summary(
         "evidence_source_prior_mean_y_arcsec": float(getattr(args, "evidence_source_prior_mean_y_arcsec", 0.0)),
         **_cosmology_summary_fields(),
         "sampling_engine": args.sampling_engine,
-        "validation_approx": args.validation_approx,
+        "fit_sampling_engine": init_diagnostics.get(
+            "fit_sampling_engine",
+            str(getattr(args, "sampling_engine", getattr(evaluator, "sampling_engine", "full"))),
+        ),
+        "final_validation_sampling_engine": init_diagnostics.get(
+            "final_validation_sampling_engine",
+            str(getattr(evaluator, "final_validation_sampling_engine", getattr(evaluator, "sampling_engine", "full"))),
+        ),
+        "fit_active_subset_loglike": init_diagnostics.get("fit_active_subset_loglike"),
+        "full_model_validation_loglike": best_loglike
+        if str(
+            init_diagnostics.get(
+                "fit_sampling_engine",
+                getattr(args, "sampling_engine", getattr(evaluator, "sampling_engine", "full")),
+            )
+        )
+        == "active_subset"
+        else None,
         "active_scaling_galaxies": list(evaluator.active_scaling_galaxies_by_potfile),
         "active_scaling_components": int(len(evaluator.active_scaling_component_indices)),
         "inactive_scaling_components": int(len(evaluator.inactive_scaling_component_indices)),
@@ -870,6 +924,8 @@ def _run_summary(
             },
             "quality_metrics": dict(init_diagnostics.get("nuts_quality_metrics", {})),
             "quality_warnings": list(init_diagnostics.get("nuts_quality_warnings", [])),
+            "svi_health_metrics": dict(init_diagnostics.get("svi_health_metrics") or {}),
+            "svi_health_warnings": list(init_diagnostics.get("svi_health_warnings") or []),
         },
         "ns_settings": {
             "num_live_points": init_diagnostics.get("ns_num_live_points", getattr(args, "ns_num_live_points", None)),
@@ -889,26 +945,24 @@ def _run_summary(
         "chains": results.num_chains,
         "requested_chains": int(init_diagnostics.get("requested_chains", args.chains)),
         "thin": args.thin,
-        "max_tree_depth": args.max_tree_depth,
+        "max_tree_depth": max_tree_depth,
         "target_accept": args.target_accept,
         "runtime_sec": runtime_sec,
         "best_loglike": best_loglike,
-        "used_exact_validation": bool(used_exact_validation) if used_exact_validation is not None else None,
-        "exact_family_count": exact_family_count,
-        "failed_or_missing_exact": failed_or_missing_exact_count,
         "seed": args.seed,
         "packed_fast_path": True,
         "uses_potfile_scaling": bool(state.potfiles and state.fit_mode in {"small-only", "joint"}),
         "surrogate_enabled": bool(evaluator.surrogate_enabled),
         "approximate_eval_count": int(evaluator.approximate_eval_count),
         "full_refresh_count": int(evaluator.full_refresh_count),
-        "validation_fallback_count": int(evaluator.validation_fallback_count),
         "invalid_state_rejection_count": int(evaluator.invalid_state_rejection_count),
         "invalid_state_reason_counts": {key: int(value) for key, value in evaluator.invalid_state_reason_counts.items()},
         "stage2_large_scale_priors": {
             spec.sample_name: {"mean": spec.mean, "std": spec.std}
             for spec in state.parameter_specs
-            if state.fit_mode == "small-only" and spec.component_family == "large" and spec.prior_kind == "normal"
+            if state.fit_mode == "small-only"
+            and spec.component_family == "large"
+            and spec.prior_kind in {"normal", "truncated_normal"}
         },
         "geometry_setup_timing_sec": {
             "family_redshift_binning": float(geometry_cache.family_redshift_binning_sec)
@@ -929,12 +983,14 @@ def _run_summary(
             float(
                 np.mean(
                     np.asarray(results.num_steps, dtype=float)
-                    >= (2 ** int(getattr(args, "max_tree_depth", 10)) - 1)
+                    >= (2**max_tree_depth - 1)
                 )
             )
             if results.num_steps.size
             else None
         ),
+        "svi_health_metrics": dict(init_diagnostics.get("svi_health_metrics") or {}),
+        "svi_health_warnings": list(init_diagnostics.get("svi_health_warnings") or []),
         "nuts_quality_warnings": list(init_diagnostics.get("nuts_quality_warnings", [])),
         "sample_weight_ess": float(_effective_sample_size(results.sample_weights))
         if results.sample_weights is not None and len(results.sample_weights) > 0
@@ -959,13 +1015,36 @@ def _run_summary(
                 upper_value = getattr(spec, "upper", np.nan)
             upper = float(upper_value)
             q16, q50, q84 = np.quantile(finite, [0.16, 0.5, 0.84])
+            lower_value = getattr(spec, "physical_lower", None)
+            lower = float(lower_value) if lower_value is not None else float("nan")
+            scatter_floor = float(getattr(args, "image_plane_scatter_floor_arcsec", 0.0))
+            near_lower = bool(np.isfinite(lower) and q16 <= max(1.1 * lower, lower + 1.0e-9))
+            floor_dominated = bool(scatter_floor > 0.0 and q50 <= scatter_floor)
             summary["image_sigma_int_posterior"] = {
                 "q16": float(q16),
                 "median": float(q50),
                 "q84": float(q84),
+                "lower_arcsec": lower,
                 "upper_arcsec": upper,
+                "scatter_floor_arcsec": scatter_floor,
+                "near_lower_bound": near_lower,
+                "floor_dominated": floor_dominated,
                 "near_upper_bound": bool(np.isfinite(upper) and q84 >= 0.9 * upper),
             }
+            sigma_values = []
+            for bin_item in getattr(state, "bin_data", []):
+                if hasattr(bin_item, "sigma_per_image"):
+                    sigma_values.extend(np.asarray(bin_item.sigma_per_image, dtype=float).reshape(-1).tolist())
+            sigma_array = np.asarray(sigma_values, dtype=float)
+            finite_sigma = sigma_array[np.isfinite(sigma_array)]
+            if finite_sigma.size:
+                covariance_floor = float(getattr(args, "source_plane_covariance_floor", 0.0))
+                sigma_eff2 = finite_sigma**2 + scatter_floor**2 + float(q50) ** 2 + covariance_floor
+                summary["image_sigma_eff_variance_arcsec2"] = {
+                    "min": float(np.min(sigma_eff2)),
+                    "median": float(np.median(sigma_eff2)),
+                    "max": float(np.max(sigma_eff2)),
+                }
     return summary
 
 
@@ -983,6 +1062,8 @@ def _format_run_summary_text(summary: dict[str, Any]) -> str:
                 [
                     ("fit mode", summary.get("fit_mode")),
                     ("likelihood mode", summary.get("sample_likelihood_mode")),
+                    ("fit sampling engine", summary.get("fit_sampling_engine", summary.get("sampling_engine"))),
+                    ("final validation sampling engine", summary.get("final_validation_sampling_engine")),
                     ("sampler", summary.get("sampler")),
                     ("runtime seconds", summary.get("runtime_sec")),
                     ("families", summary.get("n_families")),
@@ -993,11 +1074,15 @@ def _format_run_summary_text(summary: dict[str, Any]) -> str:
                     ("lens redshift", summary.get("z_lens")),
                     ("source redshift range", source_range),
                     ("effective source planes", summary.get("distinct_effective_source_planes")),
-                    ("validation mode", summary.get("validation_approx")),
                     ("quick diagnostics", summary.get("quick_diagnostics")),
-                    ("used exact validation", summary.get("used_exact_validation")),
-                    ("exact families", summary.get("exact_family_count")),
-                    ("missing exact families", summary.get("failed_or_missing_exact")),
+                    ("image scatter floor arcsec", summary.get("image_plane_scatter_floor_arcsec")),
+                    ("image scatter prior", summary.get("image_plane_scatter_prior")),
+                    ("likelihood max gain", summary.get("likelihood_stabilizer_max_gain")),
+                    ("likelihood max residual arcsec", summary.get("likelihood_stabilizer_max_residual_arcsec")),
+                    ("likelihood residual loss", summary.get("likelihood_stabilizer_residual_loss")),
+                    ("likelihood Student-t nu", summary.get("likelihood_stabilizer_student_t_nu")),
+                    ("fit active-subset log likelihood", summary.get("fit_active_subset_loglike")),
+                    ("full-model validation log likelihood", summary.get("full_model_validation_loglike")),
                     ("best log likelihood", summary.get("best_loglike")),
                 ]
             )
@@ -1034,6 +1119,7 @@ def _format_run_summary_text(summary: dict[str, Any]) -> str:
                     ("accept prob mean", summary.get("accept_prob_mean")),
                     ("divergence count", summary.get("divergence_count")),
                     ("mean num steps", summary.get("mean_num_steps")),
+                    ("SVI health warnings", "; ".join(summary.get("svi_health_warnings") or [])),
                     ("NUTS quality warnings", "; ".join(summary.get("nuts_quality_warnings") or [])),
                 ]
             )
@@ -1149,6 +1235,8 @@ def _plot_corner(
     truth_values: dict[str, float] | None = None,
     best_fit_values: dict[str, float] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
+    bayes_corner_overlay: BayesCornerOverlay | None = None,
+    best_par_marker_values: dict[str, float] | None = None,
     *,
     output_name: str = "corner.pdf",
     plot_datapoints: bool = False,
@@ -1173,8 +1261,10 @@ def _plot_corner(
     truths = _corner_values_for_specs(subset_specs, truth_values) if truth_values else None
     corner_kwargs = {**CORNER_PLOT_KWARGS, "plot_datapoints": bool(plot_datapoints)}
     fig = corner.corner(finite_samples, labels=labels, truths=truths, **corner_kwargs)
+    _overplot_bayes_corner_contours(fig, subset_specs, bayes_corner_overlay, output_name)
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
     _overplot_corner_best_fit(fig, subset_specs, best_fit_values)
+    _overplot_corner_best_par_marker(fig, subset_specs, best_par_marker_values, output_name)
     fig.savefig(_plot_path(plot_dir, output_name), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -1212,6 +1302,385 @@ def _corner_values_for_specs(
                 break
         values.append(value)
     return values
+
+
+BayesCornerOverlay = dict[str, np.ndarray]
+
+
+def _bayes_dat_headers(path: Path) -> list[str]:
+    headers: list[str] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if not stripped.startswith("#"):
+                break
+            header = stripped[1:].strip()
+            if header:
+                headers.append(header)
+    return headers
+
+
+def _bayes_kpc_per_arcsec(state: BuildState) -> float:
+    try:
+        z_lens = float(getattr(state, "z_lens"))
+        cosmo_config = dict(getattr(state, "cosmo_config", {}) or {})
+    except (TypeError, ValueError):
+        return 1.0
+    if not np.isfinite(z_lens) or z_lens <= 0.0 or not cosmo_config:
+        return 1.0
+    try:
+        return float(_kpc_per_arcsec_from_config(z_lens, cosmo_config))
+    except Exception as exc:  # pragma: no cover - defensive fallback for malformed old artifacts
+        _log(None, f"[plot:corner] bayes.dat radius conversion unavailable; using arcsec values: {exc}")
+        return 1.0
+
+
+def _bayes_potfile_id(state: BuildState, index: int) -> str | None:
+    potfiles = list(getattr(state, "potfiles", []) or [])
+    if index < 0 or index >= len(potfiles):
+        return None
+    potfile = potfiles[index]
+    return str(potfile.get("id", f"potfile{index}")) if isinstance(potfile, dict) else f"potfile{index}"
+
+
+def _bayes_dat_column_key(
+    header: str,
+    state: BuildState,
+    *,
+    kpc_per_arcsec: float,
+) -> tuple[str, float] | None:
+    base_header = re.sub(r"\s+", " ", str(header).split("(", 1)[0].strip())
+    if not base_header:
+        return None
+    ignored = {"nsample", "ln(lhood)", "ln likelihood", "ln_lhood", "chi2"}
+    if base_header.lower() in ignored:
+        return None
+
+    object_match = re.match(r"^O(\d+)\s*:\s*(.+)$", base_header, flags=re.IGNORECASE)
+    if object_match:
+        potential_id = str(int(object_match.group(1)))
+        raw_field = object_match.group(2).strip().lower()
+        field_map = {
+            "x": ("x_centre", 1.0),
+            "y": ("y_centre", 1.0),
+            "emass": ("ellipticite", 1.0),
+            "ellipticity": ("ellipticite", 1.0),
+            "ellipticite": ("ellipticite", 1.0),
+            "theta": ("angle_pos", 1.0),
+            "angle": ("angle_pos", 1.0),
+            "angle_pos": ("angle_pos", 1.0),
+            "rc": ("core_radius_kpc", kpc_per_arcsec),
+            "core": ("core_radius_kpc", kpc_per_arcsec),
+            "core_radius": ("core_radius_kpc", kpc_per_arcsec),
+            "rcut": ("cut_radius_kpc", kpc_per_arcsec),
+            "cut": ("cut_radius_kpc", kpc_per_arcsec),
+            "cut_radius": ("cut_radius_kpc", kpc_per_arcsec),
+            "sigma": ("v_disp", 1.0),
+            "v_disp": ("v_disp", 1.0),
+        }
+        mapped = field_map.get(raw_field)
+        if mapped is None:
+            return None
+        field_name, scale = mapped
+        return f"{potential_id}.{field_name}", float(scale)
+
+    potfile_match = re.match(r"^Pot(\d+)\s+(.+)$", base_header, flags=re.IGNORECASE)
+    if potfile_match:
+        potfile_id = _bayes_potfile_id(state, int(potfile_match.group(1)))
+        if potfile_id is None:
+            return None
+        raw_field = potfile_match.group(2).strip().lower()
+        field_map = {
+            "sigma": ("sigma", 1.0),
+            "rcut": ("cutkpc", kpc_per_arcsec),
+            "cut": ("cutkpc", kpc_per_arcsec),
+            "cut_radius": ("cutkpc", kpc_per_arcsec),
+            "rc": ("corekpc", kpc_per_arcsec),
+            "core": ("corekpc", kpc_per_arcsec),
+            "core_radius": ("corekpc", kpc_per_arcsec),
+            "vdslope": ("vdslope", 1.0),
+            "slope": ("slope", 1.0),
+        }
+        mapped = field_map.get(raw_field)
+        if mapped is None:
+            return None
+        field_name, scale = mapped
+        return f"{potfile_id}.{field_name}", float(scale)
+
+    return None
+
+
+def _load_bayes_corner_overlay(path: str | Path | None, state: BuildState) -> BayesCornerOverlay | None:
+    if path is None:
+        return None
+    bayes_path = Path(path)
+    if not bayes_path.exists():
+        _log(None, f"[plot:corner] bayes.dat overlay skipped; missing file: {bayes_path}")
+        return None
+    try:
+        headers = _bayes_dat_headers(bayes_path)
+        data = np.loadtxt(bayes_path, comments="#", dtype=float)
+    except Exception as exc:
+        _log(None, f"[plot:corner] bayes.dat overlay skipped; failed to read {bayes_path}: {exc}")
+        return None
+    if data.size == 0:
+        _log(None, f"[plot:corner] bayes.dat overlay skipped; no samples in {bayes_path}")
+        return None
+    data_array = np.asarray(data, dtype=float)
+    if data_array.ndim == 1:
+        data_array = data_array.reshape(1, -1)
+    if not headers:
+        _log(None, f"[plot:corner] bayes.dat overlay skipped; no column headers in {bayes_path}")
+        return None
+    kpc_per_arcsec = _bayes_kpc_per_arcsec(state)
+    overlay: BayesCornerOverlay = {}
+    for column_idx, header in enumerate(headers[: data_array.shape[1]]):
+        mapping = _bayes_dat_column_key(header, state, kpc_per_arcsec=kpc_per_arcsec)
+        if mapping is None:
+            continue
+        key, scale = mapping
+        if key in overlay:
+            continue
+        values = np.asarray(data_array[:, column_idx], dtype=float) * float(scale)
+        if np.isfinite(values).any():
+            overlay[key] = values
+    if not overlay:
+        _log(None, f"[plot:corner] bayes.dat overlay skipped; no recognized parameter columns in {bayes_path}")
+        return None
+    _log(None, f"[plot:corner] bayes.dat overlay loaded path={bayes_path} columns={len(overlay)} samples={data_array.shape[0]}")
+    return overlay
+
+
+def _bayes_overlay_column_for_spec(
+    spec: ParameterSpec,
+    overlay: BayesCornerOverlay,
+) -> np.ndarray | None:
+    keys = [
+        str(getattr(spec, "name", "")),
+        str(getattr(spec, "sample_name", "")),
+        f"{getattr(spec, 'potential_id', '')}.{getattr(spec, 'field', '')}",
+    ]
+    for key in keys:
+        if key and key in overlay:
+            return np.asarray(overlay[key], dtype=float)
+    return None
+
+
+def _bayes_overlay_samples_for_specs(
+    parameter_specs: list[ParameterSpec],
+    overlay: BayesCornerOverlay | None,
+    plot_name: str,
+) -> np.ndarray | None:
+    if not overlay or not parameter_specs:
+        return None
+    columns: list[np.ndarray] = []
+    missing: list[str] = []
+    expected_rows: int | None = None
+    for spec in parameter_specs:
+        values = _bayes_overlay_column_for_spec(spec, overlay)
+        if values is None:
+            missing.append(str(getattr(spec, "name", spec)))
+            continue
+        if expected_rows is None:
+            expected_rows = int(values.shape[0])
+        if values.shape[0] != expected_rows:
+            missing.append(str(getattr(spec, "name", spec)))
+            continue
+        columns.append(values)
+    if missing:
+        _log(None, f"[plot:corner] {plot_name}: bayes.dat overlay skipped; unmatched parameters={', '.join(missing)}")
+        return None
+    if not columns:
+        _log(None, f"[plot:corner] {plot_name}: bayes.dat overlay skipped; no matching columns")
+        return None
+    samples = _finite_sample_rows(np.column_stack(columns))
+    if samples.shape[0] == 0:
+        _log(None, f"[plot:corner] {plot_name}: bayes.dat overlay skipped; no finite matching samples")
+        return None
+    return samples
+
+
+def _overplot_bayes_corner_contours(
+    fig: Any,
+    parameter_specs: list[ParameterSpec],
+    overlay: BayesCornerOverlay | None,
+    plot_name: str,
+) -> None:
+    if corner is None or overlay is None:
+        return
+    bayes_samples = _bayes_overlay_samples_for_specs(parameter_specs, overlay, plot_name)
+    if bayes_samples is None:
+        return
+    kwargs = {
+        **CORNER_PLOT_KWARGS,
+        "fig": fig,
+        "color": CORNER_BAYES_OVERLAY_COLOR,
+        "fill_contours": False,
+        "plot_datapoints": False,
+        "plot_density": False,
+        "show_titles": False,
+        "quantiles": [],
+    }
+    corner.corner(bayes_samples, labels=[spec.name for spec in parameter_specs], **kwargs)
+
+
+def _normalized_best_par_potential_id(potential_id: Any) -> str:
+    text = str(potential_id).strip()
+    match = re.fullmatch(r"O(\d+)", text, flags=re.IGNORECASE)
+    if match:
+        return str(int(match.group(1)))
+    return text
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if np.isfinite(result) else None
+
+
+def _finite_median(values: list[float]) -> float | None:
+    array = np.asarray(values, dtype=float)
+    finite = array[np.isfinite(array)]
+    if finite.size == 0:
+        return None
+    return float(np.median(finite))
+
+
+def _state_potfiles_with_catalogs(state: BuildState) -> list[dict[str, Any]]:
+    potfiles = [dict(item) for item in list(getattr(state, "potfiles", []) or [])]
+    if any(isinstance(potfile.get("catalog_df"), pd.DataFrame) for potfile in potfiles):
+        return potfiles
+    par_path = getattr(state, "par_path", None)
+    if not par_path:
+        return potfiles
+    try:
+        parsed, _potentials_df, _images_df, _potentials_with_priors = load_best_par(par_path)
+    except Exception as exc:
+        _log(None, f"[plot:corner] best.par potfile catalog fallback unavailable from {par_path}: {exc}")
+        return potfiles
+    return [dict(item) for item in list(parsed.get("potfiles", []) or [])]
+
+
+def _best_par_large_component_values(potentials_df: pd.DataFrame) -> dict[str, float]:
+    if potentials_df.empty or "id" not in potentials_df.columns:
+        return {}
+    fields = (
+        "x_centre",
+        "y_centre",
+        "ellipticite",
+        "angle_pos",
+        "core_radius_kpc",
+        "cut_radius_kpc",
+        "v_disp",
+        "gamma",
+    )
+    values: dict[str, float] = {}
+    for row in potentials_df.to_dict(orient="records"):
+        potential_id = _normalized_best_par_potential_id(row.get("id"))
+        for field in fields:
+            value = _finite_float_or_none(row.get(field))
+            if value is not None:
+                values[f"{potential_id}.{field}"] = value
+    return values
+
+
+def _best_par_potfile_values(
+    potentials_df: pd.DataFrame,
+    state: BuildState,
+) -> dict[str, float]:
+    if potentials_df.empty or "id" not in potentials_df.columns:
+        return {}
+    best_by_id = {
+        str(row["id"]): row
+        for row in potentials_df.to_dict(orient="records")
+        if row.get("id") is not None
+    }
+    values: dict[str, float] = {}
+    for potfile_order, potfile in enumerate(_state_potfiles_with_catalogs(state)):
+        potfile_id = str(potfile.get("id", f"potfile{potfile_order}"))
+        catalog_df = potfile.get("catalog_df")
+        if not isinstance(catalog_df, pd.DataFrame) or catalog_df.empty:
+            continue
+        mag0 = _finite_float_or_none(potfile.get("mag0"))
+        vdslope = _finite_float_or_none(potfile.get("vdslope_nominal", potfile.get("vdslope")))
+        slope = _finite_float_or_none(potfile.get("slope_nominal", potfile.get("slope")))
+        if mag0 is None:
+            continue
+        sigma_refs: list[float] = []
+        cut_refs: list[float] = []
+        core_refs: list[float] = []
+        for catalog_row in catalog_df.to_dict(orient="records"):
+            catalog_id = str(catalog_row.get("id"))
+            best_row = best_by_id.get(catalog_id)
+            if best_row is None:
+                continue
+            mag = _finite_float_or_none(catalog_row.get("catalog_mag"))
+            if mag is None:
+                continue
+            luminosity_ratio = float(10.0 ** (-0.4 * (mag - mag0)))
+            if not np.isfinite(luminosity_ratio) or luminosity_ratio <= 0.0:
+                continue
+            v_disp = _finite_float_or_none(best_row.get("v_disp"))
+            if v_disp is not None and vdslope is not None and abs(vdslope) > 1.0e-12:
+                sigma_refs.append(float(v_disp / (luminosity_ratio ** (1.0 / vdslope))))
+            cut_radius_kpc = _finite_float_or_none(best_row.get("cut_radius_kpc"))
+            if cut_radius_kpc is not None and slope is not None and abs(slope) > 1.0e-12:
+                cut_refs.append(float(cut_radius_kpc / (luminosity_ratio ** (2.0 / slope))))
+            core_radius_kpc = _finite_float_or_none(best_row.get("core_radius_kpc"))
+            if core_radius_kpc is not None:
+                core_refs.append(float(core_radius_kpc / np.sqrt(luminosity_ratio)))
+        for field, field_values in (("sigma", sigma_refs), ("cutkpc", cut_refs), ("corekpc", core_refs)):
+            median = _finite_median(field_values)
+            if median is not None:
+                values[f"{potfile_id}.{field}"] = median
+        if vdslope is not None:
+            values[f"{potfile_id}.vdslope"] = vdslope
+        if slope is not None:
+            values[f"{potfile_id}.slope"] = slope
+    return values
+
+
+def _load_best_par_marker_values(path: str | Path | None, state: BuildState) -> dict[str, float] | None:
+    if path is None:
+        return None
+    best_par_path = Path(path)
+    if not best_par_path.exists():
+        _log(None, f"[plot:corner] best.par marker skipped; missing file: {best_par_path}")
+        return None
+    try:
+        _parsed, potentials_df, _images_df, _potentials_with_priors = load_best_par(best_par_path)
+    except Exception as exc:
+        _log(None, f"[plot:corner] best.par marker skipped; failed to read {best_par_path}: {exc}")
+        return None
+    values = _best_par_large_component_values(potentials_df)
+    values.update(_best_par_potfile_values(potentials_df, state))
+    if not values:
+        _log(None, f"[plot:corner] best.par marker skipped; no recognized parameter values in {best_par_path}")
+        return None
+    _log(None, f"[plot:corner] best.par marker loaded path={best_par_path} values={len(values)}")
+    return values
+
+
+def _overplot_corner_best_par_marker(
+    fig: Any,
+    parameter_specs: list[ParameterSpec],
+    marker_values: dict[str, float] | None,
+    plot_name: str,
+) -> None:
+    if corner is None or not marker_values:
+        return
+    xs = _corner_values_for_specs(parameter_specs, marker_values)
+    if not xs or not any(np.isfinite(xs)):
+        _log(None, f"[plot:corner] {plot_name}: best.par marker skipped; no matching finite parameters")
+        return
+    line_xs = [float(value) if np.isfinite(value) else None for value in xs]
+    point_xs = [[float(value) if np.isfinite(value) else np.nan for value in xs]]
+    corner.overplot_lines(fig, line_xs, color=CORNER_BEST_FIT_COLOR)
+    corner.overplot_points(fig, point_xs, marker="s", color=CORNER_BEST_FIT_COLOR)
 
 
 def _overplot_corner_best_fit(
@@ -1296,6 +1765,8 @@ def _plot_potfile_corner(
     truth_values: dict[str, float] | None = None,
     best_fit_values: dict[str, float] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
+    bayes_corner_overlay: BayesCornerOverlay | None = None,
+    best_par_marker_values: dict[str, float] | None = None,
 ) -> None:
     if corner is None or samples.size == 0 or not parameter_specs:
         return
@@ -1313,8 +1784,10 @@ def _plot_potfile_corner(
     labels = [spec.name for spec in subset_specs]
     truths = _corner_values_for_specs(subset_specs, truth_values) if truth_values else None
     fig = corner.corner(finite_samples, labels=labels, truths=truths, **CORNER_PLOT_KWARGS)
+    _overplot_bayes_corner_contours(fig, subset_specs, bayes_corner_overlay, "potfile_corner.pdf")
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
     _overplot_corner_best_fit(fig, subset_specs, best_fit_values)
+    _overplot_corner_best_par_marker(fig, subset_specs, best_par_marker_values, "potfile_corner.pdf")
     fig.savefig(_plot_path(plot_dir, "potfile_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -1326,6 +1799,8 @@ def _plot_cosmology_corner(
     truth_values: dict[str, float] | None = None,
     best_fit_values: dict[str, float] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
+    bayes_corner_overlay: BayesCornerOverlay | None = None,
+    best_par_marker_values: dict[str, float] | None = None,
     *,
     plot_datapoints: bool = False,
 ) -> None:
@@ -1346,37 +1821,11 @@ def _plot_cosmology_corner(
     truths = _corner_values_for_specs(subset_specs, truth_values) if truth_values else None
     corner_kwargs = {**CORNER_PLOT_KWARGS, "plot_datapoints": bool(plot_datapoints)}
     fig = corner.corner(finite_samples, labels=labels, truths=truths, **corner_kwargs)
+    _overplot_bayes_corner_contours(fig, subset_specs, bayes_corner_overlay, "cosmology_corner.pdf")
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
     _overplot_corner_best_fit(fig, subset_specs, best_fit_values)
+    _overplot_corner_best_par_marker(fig, subset_specs, best_par_marker_values, "cosmology_corner.pdf")
     fig.savefig(_plot_path(plot_dir, "cosmology_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_potfile_histograms(
-    plot_dir: Path,
-    samples: np.ndarray,
-    best_fit: np.ndarray,
-    parameter_specs: list[ParameterSpec],
-) -> None:
-    if samples.size == 0 or not parameter_specs:
-        return
-    nrows = len(parameter_specs)
-    fig, axes = plt.subplots(nrows, 1, figsize=(10, max(4, 2.0 * nrows)), sharex=False)
-    if nrows == 1:
-        axes = [axes]
-    for idx, (ax, spec) in enumerate(zip(axes, parameter_specs)):
-        values = np.asarray(samples[:, idx], dtype=float)
-        ax.hist(values, bins=min(40, max(10, int(np.sqrt(len(values))))), color="tab:blue", alpha=0.75)
-        ax.axvline(float(np.median(values)), color="tab:orange", linewidth=1.5, label="median")
-        ax.axvline(float(best_fit[idx]), color="tab:red", linewidth=1.5, linestyle="--", label="best fit")
-        ax.set_title(spec.name)
-        ax.set_ylabel("count")
-    axes[-1].set_xlabel("parameter value")
-    handles, labels = axes[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="upper right")
-    fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "potfile_histograms.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1758,6 +2207,255 @@ def _plot_weights_logl(plot_dir: Path, results: PosteriorResults) -> None:
     axes[1].set_title("NUTS Integrator Steps")
     fig.tight_layout()
     fig.savefig(_plot_path(plot_dir, "weights_logl.png"), dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _finite_1d_array(value: np.ndarray | None) -> np.ndarray | None:
+    if value is None:
+        return None
+    array = np.asarray(value, dtype=float).reshape(-1)
+    if array.size == 0:
+        return None
+    finite = np.isfinite(array)
+    if not np.any(finite):
+        return None
+    return array[finite]
+
+
+def _has_smc_plot_data(results: PosteriorResults) -> bool:
+    return (
+        str(getattr(results, "sampler", "")) == "blackjax_smc"
+        or results.temperature_schedule is not None
+        or results.ess_history is not None
+        or results.move_acceptance_history is not None
+        or results.sample_weights is not None
+    )
+
+
+def _plot_smc_diagnostics(plot_dir: Path, results: PosteriorResults) -> None:
+    temperature = _finite_1d_array(results.temperature_schedule)
+    ess = _finite_1d_array(results.ess_history)
+    acceptance = _finite_1d_array(results.move_acceptance_history)
+    if temperature is None and ess is None and acceptance is None:
+        return
+
+    init_diag = results.init_diagnostics or {}
+    n_particles = int(init_diag.get("smc_particles", 0) or 0)
+    if n_particles <= 0 and results.sample_weights is not None:
+        n_particles = int(np.asarray(results.sample_weights).size)
+    target_ess_frac = init_diag.get("smc_target_ess_frac")
+    try:
+        target_ess_frac_value = float(target_ess_frac)
+    except (TypeError, ValueError):
+        target_ess_frac_value = float("nan")
+    mean_acceptance = init_diag.get("smc_mean_move_acceptance")
+    try:
+        mean_acceptance_value = float(mean_acceptance)
+    except (TypeError, ValueError):
+        mean_acceptance_value = float("nan")
+
+    fig, axes = plt.subplots(4, 1, figsize=(10, 11), sharex=False)
+    if temperature is not None:
+        steps = np.arange(temperature.size, dtype=int)
+        axes[0].plot(steps, temperature, marker="o", markersize=3, color="tab:blue", linewidth=1.1)
+        axes[0].set_ylabel("temperature")
+        axes[0].set_xlabel("SMC step")
+        axes[0].set_ylim(min(-0.02, float(np.nanmin(temperature)) - 0.02), max(1.02, float(np.nanmax(temperature)) + 0.02))
+        axes[0].set_title("SMC Adaptive Tempering")
+        if temperature.size > 1:
+            axes[1].plot(
+                np.arange(1, temperature.size, dtype=int),
+                np.diff(temperature),
+                marker="o",
+                markersize=3,
+                color="tab:purple",
+                linewidth=1.1,
+            )
+            axes[1].set_ylabel("delta temperature")
+            axes[1].set_xlabel("SMC step")
+        else:
+            axes[1].axis("off")
+    else:
+        axes[0].axis("off")
+        axes[1].axis("off")
+
+    if ess is not None:
+        ess_steps = np.arange(ess.size, dtype=int)
+        if n_particles > 0:
+            ess_values = ess / float(n_particles)
+            axes[2].set_ylabel("ESS fraction")
+            if np.isfinite(target_ess_frac_value) and target_ess_frac_value > 0.0:
+                axes[2].axhline(
+                    target_ess_frac_value,
+                    color="tab:red",
+                    linestyle="--",
+                    linewidth=1.0,
+                    label=f"target={target_ess_frac_value:.3g}",
+                )
+                axes[2].legend(loc="best", fontsize=8)
+            axes[2].set_ylim(0.0, max(1.02, float(np.nanmax(ess_values)) * 1.05))
+        else:
+            ess_values = ess
+            axes[2].set_ylabel("ESS")
+        axes[2].plot(ess_steps, ess_values, marker="o", markersize=3, color="tab:green", linewidth=1.1)
+        axes[2].set_xlabel("SMC step")
+    else:
+        axes[2].axis("off")
+
+    if acceptance is not None:
+        acceptance_steps = np.arange(1, acceptance.size + 1, dtype=int)
+        axes[3].plot(acceptance_steps, acceptance, marker="o", markersize=3, color="tab:orange", linewidth=1.1)
+        if np.isfinite(mean_acceptance_value):
+            axes[3].axhline(
+                mean_acceptance_value,
+                color="black",
+                linestyle="--",
+                linewidth=1.0,
+                label=f"mean={mean_acceptance_value:.3g}",
+            )
+            axes[3].legend(loc="best", fontsize=8)
+        axes[3].set_ylim(-0.02, max(1.02, float(np.nanmax(acceptance)) * 1.05))
+        axes[3].set_ylabel("move acceptance")
+        axes[3].set_xlabel("SMC mutation step")
+    else:
+        axes[3].axis("off")
+
+    fig.tight_layout()
+    fig.savefig(_plot_path(plot_dir, "smc_diagnostics.pdf"), dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_smc_weight_diagnostics(plot_dir: Path, results: PosteriorResults) -> None:
+    n_samples = int(np.asarray(results.samples).shape[0]) if np.asarray(results.samples).ndim >= 1 else 0
+    weights = _valid_normalized_sample_weights(results.sample_weights, n_samples)
+    if weights is None:
+        return
+    positive = weights[np.isfinite(weights) & (weights > 0.0)]
+    if positive.size == 0:
+        return
+    log_prob = np.asarray(results.log_prob, dtype=float).reshape(-1)
+    log_prob = log_prob if log_prob.size == n_samples else None
+
+    sorted_weights = np.sort(positive)[::-1]
+    cumulative = np.cumsum(sorted_weights)
+    ess = 1.0 / float(np.sum(np.square(weights)))
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8.5))
+    axes[0, 0].hist(np.log10(positive), bins=min(60, max(12, int(np.sqrt(positive.size)))), color="tab:blue", alpha=0.8)
+    axes[0, 0].set_xlabel(r"$\log_{10}$ normalized weight")
+    axes[0, 0].set_ylabel("particle count")
+    axes[0, 0].set_title(f"Final SMC weights; ESS={ess:.3g}")
+
+    axes[0, 1].plot(np.arange(1, sorted_weights.size + 1), cumulative, color="black", linewidth=1.2)
+    axes[0, 1].set_xlabel("particles sorted by descending weight")
+    axes[0, 1].set_ylabel("cumulative weight")
+    axes[0, 1].set_ylim(-0.02, 1.02)
+    axes[0, 1].set_xscale("log")
+
+    if log_prob is not None and np.isfinite(log_prob).any():
+        finite_log_prob = np.isfinite(log_prob)
+        ranked = np.sort(log_prob[finite_log_prob])[::-1]
+        axes[1, 0].plot(np.arange(1, ranked.size + 1), ranked, color="tab:red", linewidth=1.0)
+        axes[1, 0].set_xlabel("particles sorted by descending log posterior")
+        axes[1, 0].set_ylabel("log posterior")
+        positive_mask = (weights > 0.0) & finite_log_prob
+        axes[1, 1].scatter(
+            np.log10(weights[positive_mask]),
+            log_prob[positive_mask],
+            s=10,
+            alpha=0.75,
+            color="tab:purple",
+            linewidths=0.0,
+            rasterized=True,
+        )
+        axes[1, 1].set_xlabel(r"$\log_{10}$ normalized weight")
+        axes[1, 1].set_ylabel("log posterior")
+    else:
+        axes[1, 0].axis("off")
+        axes[1, 1].axis("off")
+
+    fig.tight_layout()
+    fig.savefig(_plot_path(plot_dir, "smc_weight_diagnostics.pdf"), dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _weighted_variance(samples: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    means = np.sum(samples * weights[:, None], axis=0)
+    return np.sum(np.square(samples - means[None, :]) * weights[:, None], axis=0)
+
+
+def _smc_corner_subset(
+    samples: np.ndarray,
+    parameter_specs: list[ParameterSpec],
+    sample_weights: np.ndarray | None,
+    *,
+    max_params: int = SMC_CORNER_MAX_PARAMS,
+) -> tuple[np.ndarray, list[ParameterSpec], np.ndarray] | None:
+    sample_array = np.asarray(samples, dtype=float)
+    if sample_array.ndim != 2 or sample_array.shape[0] < 2 or sample_array.shape[1] == 0 or not parameter_specs:
+        return None
+    weights = _valid_normalized_sample_weights(sample_weights, sample_array.shape[0])
+    if weights is None:
+        return None
+    corner_samples, corner_specs = _corner_without_source_positions(sample_array, parameter_specs, "smc_corner.pdf")
+    if corner_samples.ndim != 2 or not corner_specs:
+        return None
+    n_params = min(corner_samples.shape[1], len(corner_specs))
+    corner_samples = np.asarray(corner_samples[:, :n_params], dtype=float)
+    corner_specs = corner_specs[:n_params]
+    finite_rows = np.isfinite(corner_samples).all(axis=1) & np.isfinite(weights)
+    if int(np.sum(finite_rows)) < 2:
+        return None
+    corner_samples = corner_samples[finite_rows]
+    weights = _valid_normalized_sample_weights(weights[finite_rows], int(np.sum(finite_rows)))
+    if weights is None:
+        return None
+
+    spans = np.nanmax(corner_samples, axis=0) - np.nanmin(corner_samples, axis=0)
+    variances = _weighted_variance(corner_samples, weights)
+    dynamic = np.isfinite(spans) & (spans > 0.0) & np.isfinite(variances) & (variances > 0.0)
+    if int(np.sum(dynamic)) < 2:
+        return None
+    cosmology_indices = [
+        idx
+        for idx, spec in enumerate(corner_specs)
+        if dynamic[idx] and getattr(spec, "component_family", None) == "cosmology"
+    ]
+    other_indices = [
+        idx
+        for idx in np.argsort(-variances).tolist()
+        if dynamic[idx] and idx not in set(cosmology_indices)
+    ]
+    selected = (cosmology_indices + other_indices)[: max(2, int(max_params))]
+    if len(selected) < 2:
+        return None
+    return corner_samples[:, selected], [corner_specs[idx] for idx in selected], weights
+
+
+def _plot_smc_corner(
+    plot_dir: Path,
+    samples: np.ndarray,
+    parameter_specs: list[ParameterSpec],
+    sample_weights: np.ndarray | None,
+    best_fit_values: dict[str, float] | None = None,
+    previous_stage_best_values: dict[str, float] | None = None,
+) -> None:
+    if corner is None:
+        return
+    subset = _smc_corner_subset(samples, parameter_specs, sample_weights)
+    if subset is None:
+        return
+    subset_samples, subset_specs, subset_weights = subset
+    _log(
+        None,
+        f"[plot:corner] path={_plot_path(plot_dir, 'smc_corner.pdf')} ndim={len(subset_specs)} samples_shape={tuple(subset_samples.shape)}",
+    )
+    labels = [spec.name for spec in subset_specs]
+    corner_kwargs = {**CORNER_PLOT_KWARGS, "plot_datapoints": True}
+    fig = corner.corner(subset_samples, labels=labels, weights=subset_weights, **corner_kwargs)
+    _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
+    _overplot_corner_best_fit(fig, subset_specs, best_fit_values)
+    fig.savefig(_plot_path(plot_dir, "smc_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -2217,7 +2915,6 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
         match_tolerance_arcsec=float(
             getattr(args, "match_tolerance_arcsec", getattr(evaluator, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE))
         ),
-        validate_top_k_families=0,
         sampling_engine=str(getattr(args, "sampling_engine", getattr(evaluator, "sampling_engine", "full"))),
         active_scaling_galaxies=getattr(args, "active_scaling_galaxies", None),
         active_scaling_selection=str(
@@ -2235,7 +2932,6 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
         refresh_param_drift_frac=float(
             getattr(args, "refresh_param_drift_frac", getattr(evaluator, "refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC))
         ),
-        validation_approx=str(getattr(args, "validation_approx", getattr(evaluator, "validation_approx", "exact"))),
         source_plane_covariance_floor=float(
             getattr(args, "source_plane_covariance_floor", getattr(evaluator, "source_plane_covariance_floor", 1.0e-6))
         ),
@@ -2269,9 +2965,49 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
                 getattr(evaluator, "evidence_source_prior_mean_y_arcsec", 0.0),
             )
         ),
-        exact_image_solver=str(getattr(args, "exact_image_solver", getattr(evaluator, "exact_image_solver", "auto"))),
         quick_diagnostics=bool(getattr(args, "quick_diagnostics", getattr(evaluator, "quick_diagnostics", False))),
     )
+
+
+def _fit_quality_detail_array(details: dict[str, Any], key: str, size: int, dtype: Any = float) -> np.ndarray | None:
+    if key not in details:
+        return None
+    try:
+        values = np.asarray(details[key], dtype=dtype).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if values.shape != (size,):
+        return None
+    return values
+
+
+def _fit_quality_extra_image_rows(
+    family: Any,
+    details: dict[str, Any],
+    model_count_fields: dict[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        x_extra = np.asarray(details.get("extra_model_x_arcsec", []), dtype=float).reshape(-1)
+        y_extra = np.asarray(details.get("extra_model_y_arcsec", []), dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return []
+    if x_extra.shape != y_extra.shape:
+        return []
+    rows: list[dict[str, Any]] = []
+    for index, (x_model, y_model) in enumerate(zip(x_extra, y_extra), start=1):
+        rows.append(
+            {
+                "family_id": str(family.family_id),
+                "extra_image_index": int(index),
+                "image_recovery_status": "extra",
+                "x_model_arcsec": float(x_model),
+                "y_model_arcsec": float(y_model),
+                "z_source": _finite_or(getattr(family, "z_source", np.nan)),
+                "effective_z_source": _finite_or(getattr(family, "effective_z_source", np.nan)),
+                **model_count_fields,
+            }
+        )
+    return rows
 
 
 def _fit_quality_prediction_for_family_latent(
@@ -2284,24 +3020,39 @@ def _fit_quality_prediction_for_family_latent(
 ) -> dict[str, list[dict[str, Any]]]:
     image_rows: list[dict[str, Any]] = []
     magnification_rows: list[dict[str, Any]] = []
+    extra_image_rows: list[dict[str, Any]] = []
     params_latent = np.asarray(params_latent, dtype=float)
     n_images = int(family.n_images)
     x_pred = np.full(n_images, np.nan, dtype=float)
     y_pred = np.full(n_images, np.nan, dtype=float)
-    image_failed = True
+    image_failed = np.ones(n_images, dtype=bool)
+    image_recovery_status = np.full(n_images, "unknown", dtype=object)
     count_info = _unavailable_image_count_info(family, "quick_diagnostics" if quick_diagnostics else "not_run")
     if not quick_diagnostics:
         try:
             if hasattr(evaluator, "_exact_family_prediction_details"):
                 exact_details = evaluator._exact_family_prediction_details(params_latent, family)
                 count_info = _image_count_info_from_exact_details(family, exact_details)
-                if not bool(exact_details.get("failed", True)):
+                model_count_fields = _model_count_fields_from_count_info(count_info)
+                extra_image_rows = _fit_quality_extra_image_rows(family, exact_details, model_count_fields)
+                recovered_mask = _fit_quality_detail_array(exact_details, "recovered_image_mask", n_images, bool)
+                matched_x = _fit_quality_detail_array(exact_details, "matched_model_x_arcsec", n_images, float)
+                matched_y = _fit_quality_detail_array(exact_details, "matched_model_y_arcsec", n_images, float)
+                if recovered_mask is not None and matched_x is not None and matched_y is not None:
+                    x_pred = matched_x
+                    y_pred = matched_y
+                    image_recovery_status = np.where(recovered_mask, "recovered", "not_recovered")
+                    image_failed = ~recovered_mask
+                elif not bool(exact_details.get("failed", True)):
                     x_exact = np.asarray(exact_details.get("x_pred"), dtype=float)
                     y_exact = np.asarray(exact_details.get("y_pred"), dtype=float)
                     if x_exact.shape == (n_images,) and y_exact.shape == (n_images,):
                         x_pred = x_exact
                         y_pred = y_exact
-                        image_failed = False
+                        image_recovery_status = np.full(n_images, "recovered", dtype=object)
+                        image_failed = np.zeros(n_images, dtype=bool)
+                else:
+                    image_recovery_status = np.full(n_images, "not_recovered", dtype=object)
             else:
                 exact_prediction = evaluator._exact_family_prediction(params_latent, family)
                 if exact_prediction is not None:
@@ -2312,11 +3063,14 @@ def _fit_quality_prediction_for_family_latent(
                     if x_exact.shape == (n_images,) and y_exact.shape == (n_images,):
                         x_pred = x_exact
                         y_pred = y_exact
-                        image_failed = False
+                        image_recovery_status = np.full(n_images, "recovered", dtype=object)
+                        image_failed = np.zeros(n_images, dtype=bool)
                 else:
                     count_info = _unavailable_image_count_info(family, "exact_prediction_failed")
+                    image_recovery_status = np.full(n_images, "not_recovered", dtype=object)
         except Exception:
-            image_failed = True
+            image_failed = np.ones(n_images, dtype=bool)
+            image_recovery_status = np.full(n_images, "unknown", dtype=object)
             count_info = _unavailable_image_count_info(family, "exact_prediction_exception")
 
     mu = np.full(n_images, np.nan, dtype=float)
@@ -2342,13 +3096,15 @@ def _fit_quality_prediction_for_family_latent(
     model_count_fields = _model_count_fields_from_count_info(count_info)
     sigma_arcsec = _finite_or(getattr(family, "sigma_arcsec", np.nan))
     sigma_eff = _fit_quality_image_sigma_eff(sigma_arcsec, image_sigma_int, covariance_floor)
-    for label, x_obs, y_obs, x_model, y_model, mu_value in zip(
+    for label, x_obs, y_obs, x_model, y_model, mu_value, status, failed in zip(
         family.image_labels,
         family.x_obs,
         family.y_obs,
         x_pred,
         y_pred,
         mu,
+        image_recovery_status,
+        image_failed,
     ):
         residual = (
             math.hypot(float(x_model) - float(x_obs), float(y_model) - float(y_obs))
@@ -2366,6 +3122,7 @@ def _fit_quality_prediction_for_family_latent(
             "image_sigma_eff_arcsec": sigma_eff,
             "radius_arcsec": float(math.hypot(float(x_obs), float(y_obs))),
             "angle_deg": float(np.degrees(np.arctan2(float(y_obs), float(x_obs)))),
+            "image_recovery_status": str(status),
             **model_count_fields,
         }
         image_rows.append(
@@ -2374,7 +3131,7 @@ def _fit_quality_prediction_for_family_latent(
                 "x_model_arcsec": float(x_model),
                 "y_model_arcsec": float(y_model),
                 "image_residual_arcsec": float(residual),
-                "exact_image_prediction_failed": bool(image_failed),
+                "exact_image_prediction_failed": bool(failed),
             }
         )
         magnification_rows.append(
@@ -2388,6 +3145,7 @@ def _fit_quality_prediction_for_family_latent(
         "image_rows": image_rows,
         "magnification_rows": magnification_rows,
         "image_count_rows": [_image_count_recovery_row(family, count_info)],
+        "extra_image_rows": extra_image_rows,
     }
 
 
@@ -2400,7 +3158,12 @@ def _fit_quality_prediction_for_latent(
     params_latent = np.asarray(params_latent, dtype=float)
     image_sigma_int = _fit_quality_image_sigma_int(evaluator, params_latent)
     covariance_floor = _finite_or(getattr(evaluator, "source_plane_covariance_floor", 0.0), 0.0)
-    prediction: dict[str, list[dict[str, Any]]] = {"image_rows": [], "magnification_rows": [], "image_count_rows": []}
+    prediction: dict[str, list[dict[str, Any]]] = {
+        "image_rows": [],
+        "magnification_rows": [],
+        "image_count_rows": [],
+        "extra_image_rows": [],
+    }
     for family in state.family_data:
         family_prediction = _fit_quality_prediction_for_family_latent(
             evaluator,
@@ -2413,6 +3176,7 @@ def _fit_quality_prediction_for_latent(
         prediction["image_rows"].extend(family_prediction["image_rows"])
         prediction["magnification_rows"].extend(family_prediction["magnification_rows"])
         prediction["image_count_rows"].extend(family_prediction.get("image_count_rows", []))
+        prediction["extra_image_rows"].extend(family_prediction.get("extra_image_rows", []))
     return prediction
 
 
@@ -2550,13 +3314,19 @@ def _posterior_fit_quality_predictions(
     def combine_predictions() -> list[dict[str, list[dict[str, Any]]]]:
         predictions: list[dict[str, list[dict[str, Any]]]] = []
         for sample_predictions in family_predictions:
-            combined = {"image_rows": [], "magnification_rows": [], "image_count_rows": []}
+            combined = {
+                "image_rows": [],
+                "magnification_rows": [],
+                "image_count_rows": [],
+                "extra_image_rows": [],
+            }
             for family_prediction in sample_predictions:
                 if family_prediction is None:
                     continue
                 combined["image_rows"].extend(family_prediction["image_rows"])
                 combined["magnification_rows"].extend(family_prediction["magnification_rows"])
                 combined["image_count_rows"].extend(family_prediction.get("image_count_rows", []))
+                combined["extra_image_rows"].extend(family_prediction.get("extra_image_rows", []))
             predictions.append(combined)
         return predictions
 
@@ -2663,7 +3433,7 @@ def _fit_quality_tables(
     best_fit: np.ndarray,
     results: PosteriorResults,
     args: argparse.Namespace,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     best_fit_latent = _reported_physical_to_latent_vector(evaluator, np.asarray(best_fit, dtype=float))
     quick_diagnostics = bool(getattr(args, "quick_diagnostics", getattr(evaluator, "quick_diagnostics", False)))
     summary_fn = _fit_quality_median_std if quick_diagnostics else _fit_quality_quantiles
@@ -2675,7 +3445,11 @@ def _fit_quality_tables(
         for sample in posterior_samples
     ]
     all_predictions = _posterior_fit_quality_predictions(evaluator, state, [best_fit_latent, *sample_latents], args)
-    best_prediction = all_predictions[0] if all_predictions else {"image_rows": [], "magnification_rows": [], "image_count_rows": []}
+    best_prediction = (
+        all_predictions[0]
+        if all_predictions
+        else {"image_rows": [], "magnification_rows": [], "image_count_rows": [], "extra_image_rows": []}
+    )
     posterior_predictions = all_predictions[1:]
 
     image_draws_by_label: dict[str, list[dict[str, Any]]] = {}
@@ -2756,71 +3530,102 @@ def _fit_quality_tables(
                 "posterior_failed_draws": int(len(draws) - valid_draws),
             }
         )
-    return pd.DataFrame(image_rows), pd.DataFrame(magnification_rows)
+    return pd.DataFrame(image_rows), pd.DataFrame(magnification_rows), pd.DataFrame(best_prediction.get("extra_image_rows", []))
 
 
-def _plot_image_recovery_fit_quality(image_df: pd.DataFrame, path: Path) -> None:
+def _plot_image_recovery_fit_quality(
+    image_df: pd.DataFrame,
+    path: Path,
+    extra_image_df: pd.DataFrame | None = None,
+) -> None:
     if image_df.empty:
         return
     fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
     ax = axes[0]
-    family_ids = (
-        image_df["family_id"].astype(str).to_numpy()
-        if "family_id" in image_df.columns
-        else np.full(len(image_df), "", dtype=object)
-    )
-    colors = _family_color_map(family_ids)
-    for family_index, family_id in enumerate(colors):
-        family_mask = family_ids == family_id
-        ax.scatter(
-            image_df.loc[family_mask, "x_obs_arcsec"],
-            image_df.loc[family_mask, "y_obs_arcsec"],
-            marker="x",
-            color=colors[family_id],
-            s=30,
-            label="observed" if family_index == 0 else None,
-        )
-    x_best = image_df["x_model_arcsec"].to_numpy(dtype=float)
-    y_best = image_df["y_model_arcsec"].to_numpy(dtype=float)
-    x_model = image_df["x_model_q50"].to_numpy(dtype=float)
-    y_model = image_df["y_model_q50"].to_numpy(dtype=float)
+    x_obs = image_df["x_obs_arcsec"].to_numpy(dtype=float)
+    y_obs = image_df["y_obs_arcsec"].to_numpy(dtype=float)
+    x_best = _fit_quality_value(image_df, "x_model_arcsec")
+    y_best = _fit_quality_value(image_df, "y_model_arcsec")
+    x_model = _fit_quality_value(image_df, "x_model_q50", "x_model_arcsec")
+    y_model = _fit_quality_value(image_df, "y_model_q50", "y_model_arcsec")
     x_model = np.where(np.isfinite(x_model), x_model, x_best)
     y_model = np.where(np.isfinite(y_model), y_model, y_best)
+
+    if "image_recovery_status" in image_df.columns:
+        status = image_df["image_recovery_status"].fillna("unknown").astype(str).to_numpy()
+    elif "exact_image_prediction_failed" in image_df.columns:
+        failed = image_df["exact_image_prediction_failed"].astype(bool).to_numpy()
+        status = np.where(failed, "not_recovered", "recovered")
+    else:
+        status = np.where(np.isfinite(x_model) & np.isfinite(y_model), "recovered", "not_recovered")
+    recovered = status == "recovered"
+    not_recovered = ~recovered
     finite_model = np.isfinite(x_model) & np.isfinite(y_model)
-    if finite_model.any():
-        x16 = image_df["x_model_q16"].to_numpy(dtype=float)
-        x84 = image_df["x_model_q84"].to_numpy(dtype=float)
-        y16 = image_df["y_model_q16"].to_numpy(dtype=float)
-        y84 = image_df["y_model_q84"].to_numpy(dtype=float)
+    finite_recovered_model = recovered & finite_model
+
+    if recovered.any():
+        ax.scatter(
+            x_obs[recovered],
+            y_obs[recovered],
+            marker="x",
+            color="tab:green",
+            s=18,
+            linewidths=0.9,
+            label="recovered",
+        )
+    if not_recovered.any():
+        ax.scatter(
+            x_obs[not_recovered],
+            y_obs[not_recovered],
+            marker="x",
+            color="tab:red",
+            s=18,
+            linewidths=0.9,
+            label="not recovered",
+        )
+    if finite_recovered_model.any():
+        x16 = _fit_quality_value(image_df, "x_model_q16")
+        x84 = _fit_quality_value(image_df, "x_model_q84")
+        y16 = _fit_quality_value(image_df, "y_model_q16")
+        y84 = _fit_quality_value(image_df, "y_model_q84")
         xerr = [
-            np.where(np.isfinite(x16), np.maximum(0.0, x_model - x16), 0.0)[finite_model],
-            np.where(np.isfinite(x84), np.maximum(0.0, x84 - x_model), 0.0)[finite_model],
+            np.where(np.isfinite(x16), np.maximum(0.0, x_model - x16), 0.0)[finite_recovered_model],
+            np.where(np.isfinite(x84), np.maximum(0.0, x84 - x_model), 0.0)[finite_recovered_model],
         ]
         yerr = [
-            np.where(np.isfinite(y16), np.maximum(0.0, y_model - y16), 0.0)[finite_model],
-            np.where(np.isfinite(y84), np.maximum(0.0, y84 - y_model), 0.0)[finite_model],
+            np.where(np.isfinite(y16), np.maximum(0.0, y_model - y16), 0.0)[finite_recovered_model],
+            np.where(np.isfinite(y84), np.maximum(0.0, y84 - y_model), 0.0)[finite_recovered_model],
         ]
-        model_label_added = False
-        for family_id in colors:
-            family_finite = family_ids[finite_model] == family_id
-            if not np.any(family_finite):
-                continue
-            color = colors[family_id]
-            ax.errorbar(
-                x_model[finite_model][family_finite],
-                y_model[finite_model][family_finite],
-                xerr=[xerr[0][family_finite], xerr[1][family_finite]],
-                yerr=[yerr[0][family_finite], yerr[1][family_finite]],
-                fmt="o",
-                color=_color_with_alpha(color, 0.65),
-                ecolor=_color_with_alpha(color, 0.35),
-                markersize=4,
-                label="model posterior" if not model_label_added else None,
+        ax.errorbar(
+            x_model[finite_recovered_model],
+            y_model[finite_recovered_model],
+            xerr=xerr,
+            yerr=yerr,
+            fmt="o",
+            color=_color_with_alpha("tab:green", 0.75),
+            ecolor=_color_with_alpha("tab:green", 0.35),
+            markersize=3,
+            elinewidth=0.8,
+            capsize=1.5,
+            label=None,
+        )
+    if extra_image_df is not None and not extra_image_df.empty:
+        x_extra = _fit_quality_value(extra_image_df, "x_model_arcsec")
+        y_extra = _fit_quality_value(extra_image_df, "y_model_arcsec")
+        finite_extra = np.isfinite(x_extra) & np.isfinite(y_extra)
+        if finite_extra.any():
+            ax.scatter(
+                x_extra[finite_extra],
+                y_extra[finite_extra],
+                marker="o",
+                color="tab:blue",
+                s=16,
+                linewidths=0.0,
+                label="extra",
             )
-            model_label_added = True
-    for row, x_fit, y_fit in zip(image_df.itertuples(index=False), x_model, y_model):
-        if np.isfinite(x_fit) and np.isfinite(y_fit):
-            ax.plot([row.x_obs_arcsec, x_fit], [row.y_obs_arcsec, y_fit], color="0.6", lw=0.8)
+    for row, x_fit, y_fit, is_recovered in zip(image_df.itertuples(index=False), x_model, y_model, recovered):
+        if is_recovered and np.isfinite(x_fit) and np.isfinite(y_fit):
+            ax.plot([row.x_obs_arcsec, x_fit], [row.y_obs_arcsec, y_fit], color="0.6", lw=0.7)
     ax.invert_xaxis()
     ax.set_xlabel("x [arcsec]")
     ax.set_ylabel("y [arcsec]")
@@ -2846,6 +3651,7 @@ def _plot_image_recovery_fit_quality(image_df: pd.DataFrame, path: Path) -> None
             fmt="o",
             color="tab:blue",
             ecolor="tab:blue",
+            markersize=3,
         )
     axes[1].set_xlabel("image index")
     axes[1].set_ylabel("image residual [arcsec]")
@@ -3340,7 +4146,7 @@ def _generate_plots_and_tables(
         ),
     )
     family_df = _run_logged_phase(args, "plots.family_diagnostics_table", lambda: _family_diagnostics_table(evaluator, best_eval))
-    image_fit_quality_df, model_magnification_df = _run_logged_phase(
+    image_fit_quality_df, model_magnification_df, image_recovery_extra_df = _run_logged_phase(
         args,
         "plots.fit_quality_tables",
         lambda: _fit_quality_tables(state, evaluator, best_fit, results, args),
@@ -3362,8 +4168,6 @@ def _generate_plots_and_tables(
             evaluator,
             image_fit_quality_df=image_fit_quality_df,
             image_count_recovery_df=image_count_recovery_df,
-            family_df=family_df,
-            used_exact_validation=getattr(best_eval, "used_exact_validation", None),
         ),
     )
     run_summary_text = _format_run_summary_text(run_summary)
@@ -3377,10 +4181,25 @@ def _generate_plots_and_tables(
         "plots.cosmology_subset",
         lambda: _cosmology_parameter_subset(state.parameter_specs, results.samples, best_fit),
     )
+    bayes_corner_overlay = _run_logged_phase(
+        args,
+        "plots.load_bayes_corner_overlay",
+        lambda: _load_bayes_corner_overlay(getattr(args, "corner_overlay_bayes_dat", None), state),
+    )
+    best_par_marker_values = _run_logged_phase(
+        args,
+        "plots.load_best_par_corner_marker",
+        lambda: _load_best_par_marker_values(getattr(args, "corner_overlay_best_par", None), state),
+    )
     best_fit_values = _best_fit_values_for_specs(state.parameter_specs, best_fit)
     scaling_best_fit_values = _best_fit_values_for_specs(scaling_specs, scaling_best_fit)
     cosmology_best_fit_values = _best_fit_values_for_specs(cosmology_specs, cosmology_best_fit)
     previous_stage_best_values = getattr(state, "previous_stage_best_values", None)
+    suppress_fit_markers = bool(getattr(args, "corner_suppress_fit_markers", False))
+    plot_best_fit_values = None if suppress_fit_markers else best_fit_values
+    plot_scaling_best_fit_values = None if suppress_fit_markers else scaling_best_fit_values
+    plot_cosmology_best_fit_values = None if suppress_fit_markers else cosmology_best_fit_values
+    plot_previous_stage_best_values = None if suppress_fit_markers else previous_stage_best_values
     potfile_constraint_df = _run_logged_phase(
         args,
         "plots.potfile_constraint_table",
@@ -3409,6 +4228,11 @@ def _generate_plots_and_tables(
         args,
         "plots.write_image_count_recovery_csv",
         lambda: image_count_recovery_df.to_csv(tables_dir / "image_count_recovery.csv", index=False),
+    )
+    _run_logged_phase(
+        args,
+        "plots.write_image_recovery_extra_images_csv",
+        lambda: image_recovery_extra_df.to_csv(tables_dir / "image_recovery_extra_images.csv", index=False),
     )
     _run_logged_phase(
         args,
@@ -3452,8 +4276,10 @@ def _generate_plots_and_tables(
                 run_dir,
                 results.samples,
                 state.parameter_specs,
-                best_fit_values=best_fit_values,
-                previous_stage_best_values=previous_stage_best_values,
+                best_fit_values=plot_best_fit_values,
+                previous_stage_best_values=plot_previous_stage_best_values,
+                bayes_corner_overlay=bayes_corner_overlay,
+                best_par_marker_values=best_par_marker_values,
             ),
         ),
         (
@@ -3463,14 +4289,11 @@ def _generate_plots_and_tables(
                 run_dir,
                 scaling_samples,
                 scaling_specs,
-                best_fit_values=scaling_best_fit_values,
-                previous_stage_best_values=previous_stage_best_values,
+                best_fit_values=plot_scaling_best_fit_values,
+                previous_stage_best_values=plot_previous_stage_best_values,
+                bayes_corner_overlay=bayes_corner_overlay,
+                best_par_marker_values=best_par_marker_values,
             ),
-        ),
-        (
-            "potfile_histograms",
-            "plots.potfile_histograms",
-            lambda: _plot_potfile_histograms(run_dir, scaling_samples, scaling_best_fit, scaling_specs),
         ),
         (
             "potfile_prior_posterior",
@@ -3506,7 +4329,11 @@ def _generate_plots_and_tables(
         (
             "image_recovery",
             "plots.image_recovery",
-            lambda: _plot_image_recovery_fit_quality(image_fit_quality_df, _plot_path(run_dir, "image_recovery.pdf")),
+            lambda: _plot_image_recovery_fit_quality(
+                image_fit_quality_df,
+                _plot_path(run_dir, "image_recovery.pdf"),
+                image_recovery_extra_df,
+            ),
         ),
         (
             "image_count_recovery",
@@ -3545,14 +4372,6 @@ def _generate_plots_and_tables(
                 _plot_path(run_dir, "posterior_predictive_coverage.pdf"),
             ),
         ),
-        (
-            "exact_vs_approx_prediction_error",
-            "plots.exact_vs_approx_prediction_error",
-            lambda: _plot_exact_vs_approx_prediction_error(
-                family_df,
-                _plot_path(run_dir, "exact_vs_approx_prediction_error.pdf"),
-            ),
-        ),
         ("image_plane_fit", "plots.image_plane_fit", lambda: _plot_image_plane_fit(run_dir, state, best_eval)),
         ("source_plane_scatter", "plots.source_plane_scatter", lambda: _plot_source_plane_scatter(run_dir, state, best_eval)),
         ("per_potential_summary", "plots.per_potential_summary", lambda: _plot_per_potential_summary(run_dir, summary_df)),
@@ -3569,8 +4388,10 @@ def _generate_plots_and_tables(
                     run_dir,
                     cosmology_samples,
                     cosmology_specs,
-                    best_fit_values=cosmology_best_fit_values,
-                    previous_stage_best_values=previous_stage_best_values,
+                    best_fit_values=plot_cosmology_best_fit_values,
+                    previous_stage_best_values=plot_previous_stage_best_values,
+                    bayes_corner_overlay=bayes_corner_overlay,
+                    best_par_marker_values=best_par_marker_values,
                 ),
             )
         )
@@ -3580,6 +4401,25 @@ def _generate_plots_and_tables(
                 ("ns_diagnostics", "plots.ns_diagnostics", lambda: _plot_ns_diagnostics(run_dir, results.ns_diagnostics)),
                 ("ns_trace", "plots.ns_trace", lambda: _plot_ns_trace(run_dir, results.ns_diagnostics, state.parameter_specs)),
                 ("ns_weight_diagnostics", "plots.ns_weight_diagnostics", lambda: _plot_ns_weight_diagnostics(run_dir, results.ns_diagnostics)),
+            ]
+        )
+    if _has_smc_plot_data(results):
+        plot_tasks.extend(
+            [
+                ("smc_diagnostics", "plots.smc_diagnostics", lambda: _plot_smc_diagnostics(run_dir, results)),
+                ("smc_weight_diagnostics", "plots.smc_weight_diagnostics", lambda: _plot_smc_weight_diagnostics(run_dir, results)),
+                (
+                    "smc_corner",
+                    "plots.smc_corner",
+                    lambda: _plot_smc_corner(
+                        run_dir,
+                        results.samples,
+                        state.parameter_specs,
+                        results.sample_weights,
+                        best_fit_values=best_fit_values,
+                        previous_stage_best_values=previous_stage_best_values,
+                    ),
+                ),
             ]
         )
     if bool(getattr(args, "plot_caustics", False)) and not bool(getattr(args, "quick_diagnostics", False)):

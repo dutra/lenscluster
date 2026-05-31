@@ -125,7 +125,7 @@ def _write_minimal_plot_bundle(
         )
 
 
-def test_parse_args_accepts_repeated_cluster_triples() -> None:
+def test_parse_args_accepts_repeated_cluster_triples_and_cosmology_init() -> None:
     args = multi._parse_args(
         [
             "--cluster",
@@ -144,6 +144,16 @@ def test_parse_args_accepts_repeated_cluster_triples() -> None:
             "0.25",
             "--cosmology-init-w0",
             "-0.8",
+            "--image-plane-scatter-floor-arcsec",
+            "0.05",
+            "--image-plane-scatter-prior",
+            "lognormal",
+            "--image-plane-scatter-prior-median-arcsec",
+            "0.25",
+            "--image-plane-scatter-prior-log-sigma",
+            "0.4",
+            "--sampling-engine",
+            "active_subset",
         ]
     )
 
@@ -153,6 +163,59 @@ def test_parse_args_accepts_repeated_cluster_triples() -> None:
     assert args.sample_likelihood_mode == "linearized-forward-beta-image-plane"
     assert args.cosmology_init_om0 == 0.25
     assert args.cosmology_init_w0 == -0.8
+    assert args.image_plane_scatter_floor_arcsec == pytest.approx(0.05)
+    assert args.image_plane_scatter_prior == "lognormal"
+    assert args.image_plane_scatter_prior_median_arcsec == pytest.approx(0.25)
+    assert args.image_plane_scatter_prior_log_sigma == pytest.approx(0.4)
+    assert args.sampling_engine == "active_subset"
+    assert not hasattr(args, "validate_top_k_families")
+    assert not hasattr(args, "validation_approx")
+
+
+@pytest.mark.parametrize("flag", ["--validate-top-k-families", "--validation-approx"])
+def test_parse_args_rejects_removed_main_validation_flags(flag: str) -> None:
+    with pytest.raises(SystemExit):
+        multi._parse_args(
+            [
+                "--cluster",
+                "a2744",
+                "a2744.par",
+                "runs/a2744",
+                flag,
+                "1",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    [
+        ("--image-plane-scatter-floor-arcsec", "-0.1", "image-plane-scatter-floor"),
+        ("--image-plane-scatter-floor-arcsec", "nan", "image-plane-scatter-floor"),
+        ("--image-plane-scatter-prior-median-arcsec", "0", "image-plane-scatter-prior-median"),
+        ("--image-plane-scatter-prior-median-arcsec", "nan", "image-plane-scatter-prior-median"),
+        ("--image-plane-scatter-prior-log-sigma", "0", "image-plane-scatter-prior-log-sigma"),
+        ("--image-plane-scatter-prior-log-sigma", "nan", "image-plane-scatter-prior-log-sigma"),
+    ],
+)
+def test_parse_args_rejects_invalid_image_plane_scatter_controls(
+    flag: str,
+    value: str,
+    message: str,
+) -> None:
+    with pytest.raises(SystemExit, match=message):
+        multi._parse_args(
+            [
+                "--cluster",
+                "a2744",
+                "a2744.par",
+                "runs/a2744",
+                "--output-dir",
+                "joint",
+                flag,
+                value,
+            ]
+        )
 
 
 def test_resolve_warm_stage_auto_prefers_stage3(tmp_path: Path) -> None:

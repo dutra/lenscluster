@@ -250,7 +250,7 @@ def kpc_per_arcsec_from_config(
 def dpie_sigma0_factor_from_lensing_efficiency(efficiency: float | jnp.ndarray) -> jnp.ndarray:
     return (
         (1.0 / jnp.asarray(C_LIGHT_KM_S, dtype=jnp.float64)) ** 2
-        * 2.0
+        * 3.0
         * jnp.pi
         * jnp.asarray(efficiency, dtype=jnp.float64)
         / jnp.asarray(ARCSEC_TO_RAD, dtype=jnp.float64)
@@ -302,14 +302,10 @@ def dpie_sigma0_from_vel_disp(
     *,
     steps: int = DEFAULT_JAX_COSMO_DISTANCE_STEPS,
 ) -> float:
-    if float(rs_arcsec) <= float(ra_arcsec):
+    if float(ra_arcsec) <= 0.0 or float(rs_arcsec) <= float(ra_arcsec):
         return float("nan")
     factor = dpie_sigma0_factor_from_config(z_lens, z_source, cosmo_config, steps=steps)
-    sigma0 = (
-        float(vel_disp) ** 2
-        * factor
-        * ((float(rs_arcsec) - float(ra_arcsec)) / (float(rs_arcsec) * float(ra_arcsec)))
-    )
+    sigma0 = float(vel_disp) ** 2 * factor / float(ra_arcsec)
     return float(sigma0)
 
 

@@ -172,6 +172,231 @@ def _mixed_cosmology_test_specs() -> list[ParameterSpec]:
     ]
 
 
+def test_load_bayes_corner_overlay_maps_object_and_potfile_columns(tmp_path: Path, monkeypatch: Any) -> None:
+    bayes_path = tmp_path / "bayes.dat"
+    bayes_path.write_text(
+        "\n".join(
+            [
+                "#Nsample",
+                "#ln(Lhood)",
+                "#O1 : x (arcsec)",
+                "#O1 : rc (arcsec)",
+                "#O2 : sigma (km/s)",
+                "#Pot0 rcut (arcsec)",
+                "#Pot0 sigma (km/s)",
+                "#Chi2",
+                "1 -10 1.5 2.0 300 4.0 200 9",
+                "2 -11 1.7 2.5 310 5.0 220 8",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = SimpleNamespace(z_lens=0.4, cosmo_config={}, potfiles=[{"id": "potfile"}])
+    monkeypatch.setattr(plotting, "_bayes_kpc_per_arcsec", lambda _state: 6.0)
+
+    overlay = plotting._load_bayes_corner_overlay(bayes_path, state)
+
+    assert overlay is not None
+    np.testing.assert_allclose(overlay["1.x_centre"], [1.5, 1.7])
+    np.testing.assert_allclose(overlay["1.core_radius_kpc"], [12.0, 15.0])
+    np.testing.assert_allclose(overlay["2.v_disp"], [300.0, 310.0])
+    np.testing.assert_allclose(overlay["potfile.cutkpc"], [24.0, 30.0])
+    np.testing.assert_allclose(overlay["potfile.sigma"], [200.0, 220.0])
+    assert "Chi2" not in overlay
+
+
+def test_bayes_corner_overlay_uses_existing_corner_figure(tmp_path: Path, monkeypatch: Any) -> None:
+    calls: list[tuple[str, Any, dict[str, Any]]] = []
+    specs = [
+        ParameterSpec(
+            name="potfile.cutkpc",
+            sample_name="potfile_cutkpc",
+            potential_id="potfile",
+            profile_type=81,
+            field="cutkpc",
+            prior_kind="uniform",
+            lower=1.0,
+            upper=50.0,
+            step=0.1,
+            component_family="scaling",
+        ),
+        ParameterSpec(
+            name="potfile.sigma",
+            sample_name="potfile_sigma",
+            potential_id="potfile",
+            profile_type=81,
+            field="sigma",
+            prior_kind="uniform",
+            lower=100.0,
+            upper=400.0,
+            step=1.0,
+            component_family="scaling",
+        ),
+    ]
+
+    class FakeFig:
+        def savefig(self, path: Path, **_kwargs: Any) -> None:
+            Path(path).write_text("pdf", encoding="utf-8")
+
+    class FakeCorner:
+        def corner(self, samples: np.ndarray, **kwargs: Any) -> FakeFig:
+            calls.append(("corner", np.asarray(samples), kwargs))
+            return kwargs.get("fig") or FakeFig()
+
+        def overplot_lines(self, _fig: FakeFig, xs: list[float | None], **kwargs: Any) -> None:
+            calls.append(("lines", xs, kwargs))
+
+        def overplot_points(self, _fig: FakeFig, xs: list[list[float]], **kwargs: Any) -> None:
+            calls.append(("points", xs, kwargs))
+
+    monkeypatch.setattr(plotting, "corner", FakeCorner())
+    monkeypatch.setattr(plotting.plt, "close", lambda _fig: None)
+
+    plotting._plot_potfile_corner(
+        tmp_path,
+        np.asarray([[20.0, 180.0], [25.0, 200.0], [30.0, 220.0]], dtype=float),
+        specs,
+        bayes_corner_overlay={
+            "potfile.cutkpc": np.asarray([21.0, 26.0, 31.0], dtype=float),
+            "potfile.sigma": np.asarray([190.0, 210.0, 230.0], dtype=float),
+        },
+    )
+
+    assert calls[0][0] == "corner"
+    assert calls[1][0] == "corner"
+    np.testing.assert_allclose(calls[1][1], np.asarray([[21.0, 190.0], [26.0, 210.0], [31.0, 230.0]]))
+    assert calls[1][2]["fig"] is not None
+    assert calls[1][2]["color"] == plotting.CORNER_BAYES_OVERLAY_COLOR
+    assert calls[1][2]["fill_contours"] is False
+    assert calls[1][2]["plot_datapoints"] is False
+
+
+def test_load_best_par_marker_values_maps_large_and_potfile_values(tmp_path: Path) -> None:
+    lum2 = 10.0 ** (-0.4)
+    best_path = tmp_path / "best.par"
+    best_path.write_text(
+        f"""
+runmode
+    reference 3 342.0 -44.0
+    end
+cosmology
+    H0 70
+    omega 0.3
+    lambda 0.7
+    end
+potentiel O1
+    profil 81
+    x_centre 1.5
+    y_centre -0.5
+    ellipticite 0.6
+    angle_pos -40
+    core_radius 10
+    core_radius_kpc 50
+    cut_radius 2000
+    cut_radius_kpc 10000
+    v_disp 1100
+    z_lens 0.35
+    end
+potentiel 101
+    profil 81
+    x_centre 0
+    y_centre 0
+    ellipticite 0
+    angle_pos 0
+    core_radius 0.1
+    core_radius_kpc 2
+    cut_radius 10
+    cut_radius_kpc 50
+    v_disp 300
+    z_lens 0.35
+    end
+potentiel 102
+    profil 81
+    x_centre 0
+    y_centre 0
+    ellipticite 0
+    angle_pos 0
+    core_radius 0.1
+    core_radius_kpc {2 * np.sqrt(lum2):.12g}
+    cut_radius 10
+    cut_radius_kpc {50 * lum2:.12g}
+    v_disp {300 * lum2 ** 0.25:.12g}
+    z_lens 0.35
+    end
+fini
+""",
+        encoding="utf-8",
+    )
+    state = SimpleNamespace(
+        par_path=None,
+        potfiles=[
+            {
+                "id": "potfile",
+                "mag0": 20.0,
+                "vdslope_nominal": 4.0,
+                "slope_nominal": 2.0,
+                "catalog_df": pd.DataFrame(
+                    {
+                        "id": ["101", "102"],
+                        "catalog_mag": [20.0, 21.0],
+                    }
+                ),
+            }
+        ],
+    )
+
+    values = plotting._load_best_par_marker_values(best_path, state)
+
+    assert values is not None
+    assert values["1.x_centre"] == pytest.approx(1.5)
+    assert values["1.core_radius_kpc"] == pytest.approx(50.0)
+    assert values["1.v_disp"] == pytest.approx(1100.0)
+    assert values["potfile.sigma"] == pytest.approx(300.0)
+    assert values["potfile.cutkpc"] == pytest.approx(50.0)
+    assert values["potfile.corekpc"] == pytest.approx(2.0)
+
+
+def test_best_par_marker_draws_without_fit_markers(tmp_path: Path, monkeypatch: Any) -> None:
+    calls: list[tuple[str, Any, dict[str, Any]]] = []
+
+    class FakeFig:
+        def savefig(self, path: Path, **_kwargs: Any) -> None:
+            Path(path).write_text("pdf", encoding="utf-8")
+
+    class FakeCorner:
+        def corner(self, samples: np.ndarray, **kwargs: Any) -> FakeFig:
+            calls.append(("corner", np.asarray(samples), kwargs))
+            return FakeFig()
+
+        def overplot_lines(self, _fig: FakeFig, xs: list[float | None], **kwargs: Any) -> None:
+            calls.append(("lines", xs, kwargs))
+
+        def overplot_points(self, _fig: FakeFig, xs: list[list[float]], **kwargs: Any) -> None:
+            calls.append(("points", xs, kwargs))
+
+    monkeypatch.setattr(plotting, "corner", FakeCorner())
+    monkeypatch.setattr(plotting.plt, "close", lambda _fig: None)
+
+    plotting._plot_corner(
+        tmp_path,
+        np.asarray([[0.0, 1.0], [1.0, 2.0], [2.0, 4.0]], dtype=float),
+        _corner_test_specs(),
+        best_fit_values=None,
+        previous_stage_best_values=None,
+        best_par_marker_values={"x": 1.5, "y": 3.5},
+    )
+
+    assert calls[0][0] == "corner"
+    assert calls[1] == ("lines", [1.5, 3.5], {"color": plotting.CORNER_BEST_FIT_COLOR})
+    assert calls[2] == (
+        "points",
+        [[1.5, 3.5]],
+        {"marker": "s", "color": plotting.CORNER_BEST_FIT_COLOR},
+    )
+    assert len(calls) == 3
+
+
 def test_cosmology_parameter_subset_keeps_only_cosmology_columns() -> None:
     samples = np.asarray(
         [
@@ -479,7 +704,7 @@ def test_fit_quality_tables_cap_draws_convert_physical_and_quantile() -> None:
     evaluator = FakeEvaluator()
     results = SimpleNamespace(samples=np.asarray([[0.0], [10.0], [20.0], [30.0]], dtype=float))
 
-    image_df, magnification_df = plotting._fit_quality_tables(
+    image_df, magnification_df, extra_image_df = plotting._fit_quality_tables(
         state,
         evaluator,
         np.asarray([5.0], dtype=float),
@@ -514,6 +739,8 @@ def test_fit_quality_tables_cap_draws_convert_physical_and_quantile() -> None:
     assert int(row["model_missing_image_count"]) == 0
     assert int(row["model_extra_image_count"]) == 0
     assert bool(row["model_multiplicity_failed"]) is False
+    assert row["image_recovery_status"] == "recovered"
+    assert extra_image_df.empty
 
     mag_row = magnification_df.set_index("image_label").loc["1.2"]
     assert mag_row["magnification_model"] == pytest.approx(9.0)
@@ -570,7 +797,7 @@ def test_fit_quality_tables_defaults_to_best_fit_only() -> None:
     evaluator = FakeEvaluator()
     results = SimpleNamespace(samples=np.asarray([[0.0], [10.0], [20.0]], dtype=float))
 
-    image_df, magnification_df = plotting._fit_quality_tables(
+    image_df, magnification_df, extra_image_df = plotting._fit_quality_tables(
         state,
         evaluator,
         np.asarray([5.0], dtype=float),
@@ -586,6 +813,8 @@ def test_fit_quality_tables_defaults_to_best_fit_only() -> None:
     assert np.isnan(image_row["x_model_q50"])
     assert np.isnan(image_row["image_residual_q50"])
     assert int(image_row["posterior_valid_draws"]) == 0
+    assert image_row["image_recovery_status"] == "recovered"
+    assert extra_image_df.empty
 
     mag_row = magnification_df.set_index("image_label").loc["1.1"]
     assert mag_row["magnification_model"] == pytest.approx(6.0)
@@ -639,7 +868,7 @@ def test_fit_quality_tables_quick_diagnostics_skips_exact_and_uses_median_std() 
     evaluator = FakeEvaluator()
     results = SimpleNamespace(samples=np.asarray([[0.0], [2.0], [4.0]], dtype=float))
 
-    image_df, magnification_df = plotting._fit_quality_tables(
+    image_df, magnification_df, extra_image_df = plotting._fit_quality_tables(
         state,
         evaluator,
         np.asarray([10.0], dtype=float),
@@ -654,6 +883,8 @@ def test_fit_quality_tables_quick_diagnostics_skips_exact_and_uses_median_std() 
     assert np.isnan(image_row["image_residual_arcsec"])
     assert np.isnan(image_row["model_produced_image_count"])
     assert image_row["model_multiplicity_failure_reason"] == "quick_diagnostics"
+    assert image_row["image_recovery_status"] == "unknown"
+    assert extra_image_df.empty
 
     mag_row = magnification_df.set_index("image_label").loc["1.1"]
     mag_values = np.asarray([3.0, 5.0, 7.0], dtype=float)
@@ -661,6 +892,79 @@ def test_fit_quality_tables_quick_diagnostics_skips_exact_and_uses_median_std() 
     assert mag_row["magnification_model_q16"] == pytest.approx(float(np.median(mag_values) - np.std(mag_values)))
     assert mag_row["magnification_model_q50"] == pytest.approx(float(np.median(mag_values)))
     assert mag_row["magnification_model_q84"] == pytest.approx(float(np.median(mag_values) + np.std(mag_values)))
+
+
+def test_fit_quality_tables_tracks_partial_recovery_and_extra_images() -> None:
+    family = SimpleNamespace(
+        family_id="1",
+        z_source=2.0,
+        effective_z_source=2.0,
+        sigma_arcsec=1.0,
+        n_images=3,
+        image_labels=["1.1", "1.2", "1.3"],
+        x_obs=np.asarray([0.0, 1.0, 2.0], dtype=float),
+        y_obs=np.asarray([0.0, 0.0, 0.0], dtype=float),
+    )
+    state = SimpleNamespace(parameter_specs=[], family_data=[family])
+
+    class FakeModel:
+        def magnification(self, x: Any, y: Any, _kwargs_lens: list[dict[str, float]]) -> np.ndarray:
+            return np.asarray(x, dtype=float) + np.asarray(y, dtype=float)
+
+    class FakeEvaluator:
+        source_plane_covariance_floor = 0.0
+
+        def reported_physical_to_latent_parameter_vector(self, theta: np.ndarray) -> np.ndarray:
+            return np.asarray(theta, dtype=float)
+
+        def _image_sigma_int_numpy(self, _sample_latent: np.ndarray) -> float:
+            return 0.0
+
+        def _exact_family_prediction_details(self, _sample_latent: np.ndarray, _family_data: Any) -> dict[str, Any]:
+            return {
+                "produced_image_count": 3,
+                "recovered_image_count": 2,
+                "missing_image_count": 1,
+                "extra_image_count": 1,
+                "multiplicity_failed": True,
+                "multiplicity_failure_reason": "match_tolerance_exceeded",
+                "matched_model_x_arcsec": np.asarray([0.05, np.nan, 2.05], dtype=float),
+                "matched_model_y_arcsec": np.asarray([0.0, np.nan, 0.0], dtype=float),
+                "recovered_image_mask": np.asarray([True, False, True], dtype=bool),
+                "extra_model_x_arcsec": np.asarray([8.0], dtype=float),
+                "extra_model_y_arcsec": np.asarray([-3.0], dtype=float),
+                "failed": True,
+            }
+
+        def _get_exact_model_solver(self, _z_source: float) -> tuple[FakeModel, None]:
+            return FakeModel(), None
+
+        def _build_packed_lens_state(self, _sample_latent: np.ndarray, _z_source: float) -> dict[str, float]:
+            return {}
+
+        def _packed_to_kwargs_lens(self, _packed_state: dict[str, float]) -> list[dict[str, float]]:
+            return [{}]
+
+    image_df, _magnification_df, extra_image_df = plotting._fit_quality_tables(
+        state,
+        FakeEvaluator(),
+        np.asarray([0.0], dtype=float),
+        SimpleNamespace(samples=np.empty((0, 1), dtype=float)),
+        argparse.Namespace(fit_quality_draws=0, fit_quality_workers=1),
+    )
+
+    indexed = image_df.set_index("image_label")
+    assert indexed["image_recovery_status"].tolist() == ["recovered", "not_recovered", "recovered"]
+    assert indexed["exact_image_prediction_failed"].tolist() == [False, True, False]
+    assert indexed.loc["1.1", "x_model_arcsec"] == pytest.approx(0.05)
+    assert np.isnan(indexed.loc["1.2", "x_model_arcsec"])
+    assert indexed.loc["1.3", "image_residual_arcsec"] == pytest.approx(0.05)
+
+    assert extra_image_df["family_id"].tolist() == ["1"]
+    assert extra_image_df.loc[0, "image_recovery_status"] == "extra"
+    assert extra_image_df.loc[0, "x_model_arcsec"] == pytest.approx(8.0)
+    assert extra_image_df.loc[0, "y_model_arcsec"] == pytest.approx(-3.0)
+    assert int(extra_image_df.loc[0, "model_extra_image_count"]) == 1
 
 
 def test_posterior_fit_quality_predictions_parallelizes_per_sample_family(monkeypatch: Any) -> None:
@@ -1021,11 +1325,20 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
             "posterior_failed_draws": [0],
         }
     )
+    extra_image_df = pd.DataFrame(
+        {
+            "family_id": ["1"],
+            "extra_image_index": [1],
+            "image_recovery_status": ["extra"],
+            "x_model_arcsec": [3.0],
+            "y_model_arcsec": [4.0],
+        }
+    )
     captured_tasks: list[str] = []
 
     monkeypatch.setattr(plotting, "_summary_table", lambda *_args, **_kwargs: pd.DataFrame({"label": ["mock"]}))
     monkeypatch.setattr(plotting, "_family_diagnostics_table", lambda *_args, **_kwargs: pd.DataFrame({"family_id": ["1"]}))
-    monkeypatch.setattr(plotting, "_fit_quality_tables", lambda *_args, **_kwargs: (image_df, magnification_df))
+    monkeypatch.setattr(plotting, "_fit_quality_tables", lambda *_args, **_kwargs: (image_df, magnification_df, extra_image_df))
     monkeypatch.setattr(plotting, "_run_summary", lambda *_args, **_kwargs: {"ok": True})
     monkeypatch.setattr(plotting, "_potfile_constraint_diagnostics_table", lambda *_args, **_kwargs: pd.DataFrame())
     monkeypatch.setattr(plotting, "_scaling_parameter_subset", lambda *_args, **_kwargs: ([], np.empty((1, 0)), np.empty((0,))))
@@ -1064,6 +1377,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
 
     assert (tmp_path / "tables" / "image_fit_quality.csv").exists()
     assert (tmp_path / "tables" / "image_count_recovery.csv").exists()
+    assert (tmp_path / "tables" / "image_recovery_extra_images.csv").exists()
     assert (tmp_path / "tables" / "model_magnification.csv").exists()
     assert (tmp_path / "tables" / "run_summary.txt").exists()
     assert "image_recovery" in captured_tasks
@@ -1073,7 +1387,6 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert "residual_vs_magnification" in captured_tasks
     assert "residual_geometry_trends" in captured_tasks
     assert "posterior_predictive_coverage" in captured_tasks
-    assert "exact_vs_approx_prediction_error" in captured_tasks
     assert "caustic_overlay" not in captured_tasks
 
     captured_tasks.clear()
@@ -1240,6 +1553,7 @@ def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None
             "bic": 21.0,
             "ess_min": 10.0,
             "rhat_max": 1.02,
+            "svi_health_warnings": ["near-zero SVI guide spread"],
         }
     )
 
@@ -1249,6 +1563,8 @@ def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None
     assert "diagnostic data points" in text
     assert "diagnostic dof" in text
     assert "Rhat max" in text
+    assert "SVI health warnings" in text
+    assert "near-zero SVI guide spread" in text
 
 
 def test_parse_args_caustic_source_redshift_default_and_explicit(monkeypatch: Any) -> None:
@@ -1257,10 +1573,24 @@ def test_parse_args_caustic_source_redshift_default_and_explicit(monkeypatch: An
     monkeypatch.setattr(sys, "argv", ["cluster_solver"])
     args = cluster_solver._parse_args()
     assert args.caustic_source_redshift == pytest.approx(7.0)
+    assert not hasattr(args, "validate_top_k_families")
+    assert not hasattr(args, "validation_approx")
 
     monkeypatch.setattr(sys, "argv", ["cluster_solver", "--caustic-source-redshift", "9.5"])
     args = cluster_solver._parse_args()
     assert args.caustic_source_redshift == pytest.approx(9.5)
+
+
+def test_parse_args_rejects_removed_main_validation_flags(monkeypatch: Any) -> None:
+    from lenscluster import cluster_solver
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--validate-top-k-families", "1"])
+    with pytest.raises(SystemExit):
+        cluster_solver._parse_args()
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--validation-approx", "exact"])
+    with pytest.raises(SystemExit):
+        cluster_solver._parse_args()
 
 
 def test_tangential_critical_curve_caustics_converts_and_rayshoots(monkeypatch: Any) -> None:
@@ -1550,7 +1880,7 @@ def test_image_plane_fit_handles_missing_model_predictions(monkeypatch: Any, tmp
     assert axis.plots == []
 
 
-def test_image_recovery_uses_family_colored_observed_cross_and_model_point(monkeypatch: Any, tmp_path: Path) -> None:
+def test_image_recovery_uses_status_colors_and_small_points(monkeypatch: Any, tmp_path: Path) -> None:
     class FakeAxis:
         def __init__(self) -> None:
             self.scatters: list[tuple[Any, Any, dict[str, Any]]] = []
@@ -1602,6 +1932,7 @@ def test_image_recovery_uses_family_colored_observed_cross_and_model_point(monke
         {
             "family_id": ["1", "1", "2"],
             "image_label": ["1.1", "1.2", "2.1"],
+            "image_recovery_status": ["recovered", "not_recovered", "recovered"],
             "x_obs_arcsec": [0.0, 2.0, 5.0],
             "y_obs_arcsec": [0.0, 1.0, -1.0],
             "x_model_arcsec": [0.1, 2.2, 4.8],
@@ -1618,16 +1949,35 @@ def test_image_recovery_uses_family_colored_observed_cross_and_model_point(monke
             "image_residual_q84": [0.3, 0.4, 0.5],
         }
     )
+    extra_df = pd.DataFrame(
+        {
+            "family_id": ["1"],
+            "extra_image_index": [1],
+            "image_recovery_status": ["extra"],
+            "x_model_arcsec": [8.0],
+            "y_model_arcsec": [-3.0],
+        }
+    )
 
-    plotting._plot_image_recovery_fit_quality(image_df, tmp_path / "image_recovery.pdf")
+    plotting._plot_image_recovery_fit_quality(image_df, tmp_path / "image_recovery.pdf", extra_df)
 
     assert (tmp_path / "image_recovery.pdf").exists()
     assert image_axis.scatters[0][2]["marker"] == "x"
+    assert image_axis.scatters[0][2]["color"] == "tab:green"
+    assert image_axis.scatters[0][2]["s"] < 30
+    assert image_axis.scatters[0][2]["label"] == "recovered"
+    assert image_axis.scatters[1][2]["marker"] == "x"
+    assert image_axis.scatters[1][2]["color"] == "tab:red"
+    assert image_axis.scatters[1][2]["label"] == "not recovered"
+    assert image_axis.scatters[2][2]["marker"] == "o"
+    assert image_axis.scatters[2][2]["color"] == "tab:blue"
+    assert image_axis.scatters[2][2]["s"] < 20
+    assert image_axis.scatters[2][2]["label"] == "extra"
     assert image_axis.errorbars[0][2]["fmt"] == "o"
-    assert image_axis.errorbars[0][2]["color"][3] < 1.0
+    np.testing.assert_allclose(image_axis.errorbars[0][2]["color"], plotting._color_with_alpha("tab:green", 0.75))
     assert image_axis.errorbars[0][2]["ecolor"][3] < image_axis.errorbars[0][2]["color"][3]
-    np.testing.assert_allclose(image_axis.scatters[0][2]["color"][:3], image_axis.errorbars[0][2]["color"][:3])
-    np.testing.assert_allclose(image_axis.scatters[1][2]["color"][:3], image_axis.errorbars[1][2]["color"][:3])
+    assert image_axis.errorbars[0][2]["markersize"] < 4
+    assert len(image_axis.plots) == 2
 
 
 def test_fit_quality_diagnostic_plots_write_pdfs_and_merge_tables(tmp_path: Path) -> None:
@@ -1744,3 +2094,153 @@ def test_ns_diagnostic_plots_skip_missing_inputs(tmp_path: Path) -> None:
     plotting._plot_ns_weight_diagnostics(tmp_path, {"log_dp_mean": np.asarray([])})
 
     assert not any(tmp_path.iterdir())
+
+
+def _smc_plot_posterior() -> PosteriorResults:
+    samples = np.asarray(
+        [
+            [10.0, 0.28, -1.10],
+            [11.0, 0.30, -1.00],
+            [13.0, 0.33, -0.90],
+            [16.0, 0.36, -0.75],
+        ],
+        dtype=float,
+    )
+    return PosteriorResults(
+        samples=samples,
+        log_prob=np.asarray([-12.0, -7.5, -5.0, -6.0], dtype=float),
+        accept_prob=np.zeros(samples.shape[0], dtype=float),
+        diverging=np.zeros(samples.shape[0], dtype=bool),
+        num_steps=np.zeros(samples.shape[0], dtype=float),
+        warmup_steps=0,
+        sample_steps=samples.shape[0],
+        num_chains=1,
+        sampler="blackjax_smc",
+        sample_weights=np.asarray([0.10, 0.20, 0.45, 0.25], dtype=float),
+        temperature_schedule=np.asarray([0.0, 0.15, 0.55, 1.0], dtype=float),
+        ess_history=np.asarray([4.0, 3.4, 3.0, 4.0], dtype=float),
+        move_acceptance_history=np.asarray([0.72, 0.61, 0.58], dtype=float),
+        init_diagnostics={
+            "smc_particles": 4,
+            "smc_target_ess_frac": 0.8,
+            "smc_mean_move_acceptance": 0.6367,
+        },
+    )
+
+
+def test_smc_diagnostic_plots_write_pdfs(tmp_path: Path) -> None:
+    posterior = _smc_plot_posterior()
+
+    plotting._plot_smc_diagnostics(tmp_path, posterior)
+    plotting._plot_smc_weight_diagnostics(tmp_path, posterior)
+
+    for filename in ["smc_diagnostics.pdf", "smc_weight_diagnostics.pdf"]:
+        path = tmp_path / filename
+        assert path.exists()
+        assert path.stat().st_size > 0
+
+
+def test_smc_plots_skip_missing_or_invalid_inputs(tmp_path: Path, monkeypatch: Any) -> None:
+    empty = PosteriorResults(
+        samples=np.empty((0, 2), dtype=float),
+        log_prob=np.empty((0,), dtype=float),
+        accept_prob=np.empty((0,), dtype=float),
+        diverging=np.empty((0,), dtype=bool),
+        num_steps=np.empty((0,), dtype=float),
+        warmup_steps=0,
+        sample_steps=0,
+        num_chains=1,
+        sampler="blackjax_smc",
+    )
+
+    class RaisingCorner:
+        def corner(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("SMC corner should skip invalid weights")
+
+    plotting._plot_smc_diagnostics(tmp_path, empty)
+    plotting._plot_smc_weight_diagnostics(tmp_path, empty)
+    monkeypatch.setattr(plotting, "corner", RaisingCorner())
+    plotting._plot_smc_corner(
+        tmp_path,
+        _smc_plot_posterior().samples,
+        _mixed_cosmology_test_specs(),
+        np.asarray([0.5, np.nan, 0.25, 0.25], dtype=float),
+    )
+
+    assert not any(tmp_path.iterdir())
+
+
+def test_smc_corner_uses_particle_weights_and_overlays(tmp_path: Path, monkeypatch: Any) -> None:
+    calls: list[tuple[str, Any, dict[str, Any]]] = []
+    posterior = _smc_plot_posterior()
+
+    class FakeFig:
+        def savefig(self, path: Path, **_kwargs: Any) -> None:
+            Path(path).write_text("pdf", encoding="utf-8")
+
+    class FakeCorner:
+        def corner(self, samples: np.ndarray, **kwargs: Any) -> FakeFig:
+            calls.append(("corner", np.asarray(samples), kwargs))
+            return FakeFig()
+
+        def overplot_lines(self, _fig: FakeFig, xs: list[float | None], **kwargs: Any) -> None:
+            calls.append(("lines", xs, kwargs))
+
+        def overplot_points(self, _fig: FakeFig, xs: list[list[float]], **kwargs: Any) -> None:
+            calls.append(("points", xs, kwargs))
+
+    monkeypatch.setattr(plotting, "corner", FakeCorner())
+    monkeypatch.setattr(plotting.plt, "close", lambda _fig: None)
+
+    plotting._plot_smc_corner(
+        tmp_path,
+        posterior.samples,
+        _mixed_cosmology_test_specs(),
+        posterior.sample_weights,
+        best_fit_values={"halo.x": 13.0, "cosmology.Om0": 0.33, "cosmology.w0": -0.9},
+        previous_stage_best_values={"halo.x": 11.0, "cosmology.Om0": 0.30, "cosmology.w0": -1.0},
+    )
+
+    assert calls[0][0] == "corner"
+    np.testing.assert_allclose(calls[0][1], posterior.samples[:, [1, 2, 0]])
+    assert calls[0][2]["labels"] == ["cosmology.Om0", "cosmology.w0", "halo.x"]
+    np.testing.assert_allclose(calls[0][2]["weights"], posterior.sample_weights)
+    assert calls[0][2]["plot_datapoints"] is True
+    assert calls[1] == ("lines", [0.30, -1.0, 11.0], {"color": plotting.CORNER_PREVIOUS_STAGE_COLOR})
+    assert calls[2] == ("lines", [0.33, -0.9, 13.0], {"color": plotting.CORNER_BEST_FIT_COLOR})
+    assert calls[3] == (
+        "points",
+        [[0.33, -0.9, 13.0]],
+        {"marker": "s", "color": plotting.CORNER_BEST_FIT_COLOR},
+    )
+    assert (tmp_path / "smc_corner.pdf").exists()
+
+
+def test_smc_corner_subset_prefers_cosmology_and_caps_dimensions() -> None:
+    specs = [
+        ParameterSpec("large.low", "large_low", "mock", 81, "x", "uniform", -5.0, 5.0, 0.1, component_family="large"),
+        ParameterSpec("cosmology.Om0", "cosmology_Om0", "cosmology", 0, "Om0", "uniform", 0.05, 0.6, 0.01, component_family="cosmology"),
+        ParameterSpec("source.1.beta_x", "source_1_beta_x", "1", 0, "beta_x", "normal", -np.inf, np.inf, 0.1, component_family="source_position"),
+        ParameterSpec("large.high", "large_high", "mock", 81, "y", "uniform", -50.0, 50.0, 0.1, component_family="large"),
+        ParameterSpec("cosmology.w0", "cosmology_w0", "cosmology", 0, "w0", "uniform", -2.0, -0.3, 0.05, component_family="cosmology"),
+        ParameterSpec("large.mid", "large_mid", "mock", 81, "angle", "uniform", -10.0, 10.0, 0.1, component_family="large"),
+    ]
+    base = np.asarray([0.0, 1.0, 2.0, 3.0, 4.0], dtype=float)
+    samples = np.column_stack(
+        [
+            base,
+            0.28 + 0.01 * base,
+            100.0 * base,
+            20.0 * base,
+            -1.1 + 0.05 * base,
+            5.0 * base,
+        ]
+    )
+
+    subset = plotting._smc_corner_subset(samples, specs, np.ones(samples.shape[0], dtype=float), max_params=3)
+
+    assert subset is not None
+    subset_samples, subset_specs, subset_weights = subset
+    assert [spec.name for spec in subset_specs] == ["cosmology.Om0", "cosmology.w0", "large.high"]
+    assert subset_samples.shape == (5, 3)
+    np.testing.assert_allclose(subset_weights, np.full(5, 0.2))

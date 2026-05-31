@@ -170,7 +170,6 @@ class FamilyValidationCache:
 class EvaluationResult:
     loglike: float
     family_predictions: dict[str, dict[str, Any]]
-    used_exact_validation: bool
 
 
 @dataclass
@@ -238,6 +237,7 @@ class BuildState:
     previous_stage_best_values: dict[str, float] | None = None
     fit_cosmology_flat_wcdm: bool = False
     source_position_parameterization: str = "direct"
+    marginal_source_prior_values: dict[str, tuple[float, float]] | None = None
 
 
 def positive_lognormal_parameters(mean: float, std: float, *, floor: float = 1.0e-6) -> tuple[float, float]:

@@ -863,7 +863,7 @@ def test_complete_linkage_does_not_add_incompatible_third_image() -> None:
     assert families.empty or int(families["n_images"].max()) < 3
 
 
-def test_reported_family_spans_are_limited_to_500_kpc() -> None:
+def test_reported_family_spans_are_limited_to_default_max_span() -> None:
     spec = builder.CLUSTER_BY_KEY["a370"]
     catalog = pd.DataFrame(
         [
@@ -877,11 +877,11 @@ def test_reported_family_spans_are_limited_to_500_kpc() -> None:
     families, members, pairs, manifest = builder.build_cluster_image_families(catalog, spec)
 
     assert not families.empty
-    assert families["max_separation_kpc"].max() <= 500.0
+    assert families["max_separation_kpc"].max() <= builder.DEFAULT_MAX_FAMILY_SPAN_KPC
     assert "too_far" not in set(members["object_id"])
     rejected = pairs.loc[pairs["right_object_id"].eq("too_far") | pairs["left_object_id"].eq("too_far")]
     assert rejected.empty
-    assert manifest["max_family_span_kpc"] == 500.0
+    assert manifest["max_family_span_kpc"] == builder.DEFAULT_MAX_FAMILY_SPAN_KPC
     assert manifest["family_growth_backend"] == "jax_dense"
     assert manifest["n_family_growth_objects"] >= 3
     assert manifest["n_family_growth_seed_edges"] >= 3
@@ -890,11 +890,11 @@ def test_reported_family_spans_are_limited_to_500_kpc() -> None:
     assert manifest["family_growth_packed_mask_bytes"] > 0
 
 
-def test_image_family_candidates_are_limited_to_circular_700_kpc_fov() -> None:
+def test_image_family_candidates_are_limited_to_circular_default_fov() -> None:
     spec = builder.CLUSTER_BY_KEY["a370"]
     scale = builder.kpc_per_arcsec(spec.z_lens)
-    inside_offset = 300.0 / scale
-    diagonal_offset = 300.0 / scale
+    inside_offset = 450.0 / scale
+    diagonal_offset = 400.0 / scale
     center_member = _row("center-member", offset_arcsec=0.0, zspec=spec.z_lens, rank=3, confidence="secure")
     center_member["member_probability"] = 0.95
     center_member["member_for_lensing"] = True
@@ -1113,7 +1113,7 @@ def test_single_specz_anchor_rejects_inconsistent_photoz_companion() -> None:
 
 def test_single_specz_anchor_family_preserves_max_span() -> None:
     spec = builder.CLUSTER_BY_KEY["a370"]
-    offset = 300.0 / builder.kpc_per_arcsec(spec.z_lens)
+    offset = 350.0 / builder.kpc_per_arcsec(spec.z_lens)
     catalog = pd.DataFrame(
         [
             _row("spec", offset_arcsec=0.0, zspec=2.0, rank=3, confidence="secure"),

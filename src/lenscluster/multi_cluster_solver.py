@@ -116,9 +116,32 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--pos-sigma-arcsec", type=float, default=None)
     parser.add_argument(
+        "--fov-limit-radius",
+        type=float,
+        default=None,
+        metavar="ARCSEC",
+        help="Inclusive circular FOV radius in arcsec for catalog image/member filtering.",
+    )
+    parser.add_argument(
+        "--fov-limit-x",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("X_LEFT", "X_RIGHT"),
+        help="Inclusive x arcsec bounds for catalog image/member filtering; values are order-insensitive.",
+    )
+    parser.add_argument(
+        "--fov-limit-y",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("Y_BOTTOM", "Y_TOP"),
+        help="Inclusive y arcsec bounds for catalog image/member filtering; values are order-insensitive.",
+    )
+    parser.add_argument(
         "--sampling-engine",
-        choices=("full", "refreshing_surrogate"),
-        default="refreshing_surrogate",
+        choices=single.SAMPLING_ENGINES,
+        default=single.SAMPLING_ENGINE_REFRESHING_SURROGATE,
     )
     parser.add_argument("--source-plane-covariance-floor", type=float, default=1.0e-6)
     parser.add_argument(
@@ -169,6 +192,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=single.DEFAULT_IMAGE_SIGMA_INT_UPPER_ARCSEC,
     )
+    parser.add_argument(
+        "--image-plane-scatter-floor-arcsec",
+        type=float,
+        default=single.DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
+    )
+    parser.add_argument(
+        "--image-plane-scatter-prior",
+        choices=single.IMAGE_PLANE_SCATTER_PRIORS,
+        default=single.DEFAULT_IMAGE_PLANE_SCATTER_PRIOR,
+    )
+    parser.add_argument(
+        "--image-plane-scatter-prior-median-arcsec",
+        type=float,
+        default=single.DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_MEDIAN_ARCSEC,
+    )
+    parser.add_argument(
+        "--image-plane-scatter-prior-log-sigma",
+        type=float,
+        default=single.DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_LOG_SIGMA,
+    )
     parser.add_argument("--image-presence-penalty-weight", type=float, default=None)
     parser.add_argument(
         "--image-presence-match-radius-arcsec",
@@ -191,16 +234,30 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=single.DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN,
     )
     parser.add_argument(
-        "--validation-approx",
-        choices=("exact", "adaptive"),
-        default="adaptive",
+        "--likelihood-stabilizer-max-gain",
+        type=float,
+        default=single.DEFAULT_LIKELIHOOD_STABILIZER_MAX_GAIN,
+    )
+    parser.add_argument(
+        "--likelihood-stabilizer-max-residual-arcsec",
+        type=float,
+        default=single.DEFAULT_LIKELIHOOD_STABILIZER_MAX_RESIDUAL_ARCSEC,
+    )
+    parser.add_argument(
+        "--likelihood-stabilizer-residual-loss",
+        choices=single.LIKELIHOOD_STABILIZER_RESIDUAL_LOSSES,
+        default=single.DEFAULT_LIKELIHOOD_STABILIZER_RESIDUAL_LOSS,
+    )
+    parser.add_argument(
+        "--likelihood-stabilizer-student-t-nu",
+        type=float,
+        default=single.DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU,
     )
     parser.add_argument(
         "--source-plane-outlier-sigma-arcsec",
         type=float,
         default=single.DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
     )
-    parser.add_argument("--validate-top-k-families", type=int, default=0)
     parser.add_argument("--match-tolerance-arcsec", type=float, default=single.DEFAULT_MATCH_TOLERANCE)
     parser.add_argument("--max-tree-depth", type=int, default=single.DEFAULT_MAX_TREE_DEPTH)
     parser.add_argument("--target-accept", type=float, default=single.DEFAULT_TARGET_ACCEPT)
@@ -209,11 +266,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--nuts-init-jitter-frac", type=float, default=single.DEFAULT_NUTS_INIT_JITTER_FRAC)
     parser.add_argument("--svi-steps", type=int, default=single.DEFAULT_SVI_STEPS)
     parser.add_argument("--svi-learning-rate", type=float, default=single.DEFAULT_SVI_LEARNING_RATE)
-    parser.add_argument(
-        "--exact-image-solver",
-        choices=single.EXACT_IMAGE_SOLVERS,
-        default=single.DEFAULT_EXACT_IMAGE_SOLVER,
-    )
     parser.add_argument("--quick-diagnostics", action="store_true")
     parser.set_defaults(
         fit_mode=single.FIT_MODE_JOINT,
@@ -230,6 +282,30 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         truth=None,
     )
     args = parser.parse_args(argv)
+    if not np.isfinite(float(args.likelihood_stabilizer_max_gain)) or float(args.likelihood_stabilizer_max_gain) < 0.0:
+        raise SystemExit("--likelihood-stabilizer-max-gain must be non-negative.")
+    if (
+        not np.isfinite(float(args.image_plane_scatter_floor_arcsec))
+        or float(args.image_plane_scatter_floor_arcsec) < 0.0
+    ):
+        raise SystemExit("--image-plane-scatter-floor-arcsec must be non-negative.")
+    if (
+        not np.isfinite(float(args.image_plane_scatter_prior_median_arcsec))
+        or float(args.image_plane_scatter_prior_median_arcsec) <= 0.0
+    ):
+        raise SystemExit("--image-plane-scatter-prior-median-arcsec must be positive.")
+    if (
+        not np.isfinite(float(args.image_plane_scatter_prior_log_sigma))
+        or float(args.image_plane_scatter_prior_log_sigma) <= 0.0
+    ):
+        raise SystemExit("--image-plane-scatter-prior-log-sigma must be positive.")
+    if (
+        not np.isfinite(float(args.likelihood_stabilizer_max_residual_arcsec))
+        or float(args.likelihood_stabilizer_max_residual_arcsec) < 0.0
+    ):
+        raise SystemExit("--likelihood-stabilizer-max-residual-arcsec must be non-negative.")
+    if not np.isfinite(float(args.likelihood_stabilizer_student_t_nu)) or float(args.likelihood_stabilizer_student_t_nu) <= 0.0:
+        raise SystemExit("--likelihood-stabilizer-student-t-nu must be positive.")
     try:
         single._cosmology_init_overrides_from_args(args)
     except ValueError as exc:
@@ -579,7 +655,21 @@ def _run_joint_inference(
         best_fit, posterior, _diagnostics = single._run_svi_fit(args, state, evaluator, sample_model)
     else:
         best_fit, svi_posterior, svi_diagnostics = single._run_svi_fit(args, state, evaluator, sample_model)
-        nuts_init = single._nuts_initialization_from_svi_center(args, state.parameter_specs, best_fit, svi_diagnostics)
+        svi_chain_seeds = single._prepare_svi_health_for_nuts(
+            args,
+            state.parameter_specs,
+            evaluator,
+            best_fit,
+            svi_posterior,
+            svi_diagnostics,
+        )
+        nuts_init = single._nuts_initialization_from_svi_center(
+            args,
+            state.parameter_specs,
+            best_fit,
+            svi_diagnostics,
+            chain_seeds=svi_chain_seeds,
+        )
         posterior = single._run_numpyro_nuts_sampler(args, state, evaluator, sample_model, nuts_init)
         usable, reason = single._nuts_posterior_is_usable(posterior)
         log_prob = np.asarray(posterior.log_prob, dtype=float)

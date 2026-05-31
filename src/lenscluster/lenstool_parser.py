@@ -15,7 +15,8 @@ from .jax_cosmology import cosmology_config_from_parsed, kpc_per_arcsec_from_con
 DP_IE_PROFILE = 81
 SHEAR_PROFILE = 14
 DEFAULT_POTFILE_SCALING_EXPONENT = 4.0
-LETTER_SUFFIX_IMAGE_LABEL_RE = re.compile(r"^([A-Za-z]*\d+)([A-Za-z]+)$")
+STRICT_IMAGE_LABEL_RE = re.compile(r"^([A-Z0-9]+)\.([a-z]+)$")
+STRICT_IMAGE_LABEL_FORMAT = "FAMILY.image with FAMILY matching [A-Z0-9]+ and image matching [a-z]+"
 
 
 def _coerce_token(token: str) -> Any:
@@ -402,13 +403,49 @@ def _empty_images_df() -> pd.DataFrame:
 
 def _split_image_label(image_label: str) -> tuple[str, str]:
     label = image_label.strip()
-    family_id, separator, image_id = label.partition(".")
-    if separator:
-        return family_id, image_id
-    match = LETTER_SUFFIX_IMAGE_LABEL_RE.fullmatch(label)
-    if match is not None:
-        return match.group(1), match.group(2)
-    return label, ""
+    match = STRICT_IMAGE_LABEL_RE.fullmatch(label)
+    if match is None:
+        raise ValueError(f"Invalid image label {label!r}; expected {STRICT_IMAGE_LABEL_FORMAT}")
+    return match.group(1), match.group(2)
+
+
+def _image_catalog_source_label(images_df: pd.DataFrame, fallback: str | Path | None = None) -> str:
+    if "catalog_source" in images_df.columns:
+        sources = sorted(images_df["catalog_source"].dropna().astype(str).unique().tolist())
+        if len(sources) == 1:
+            return sources[0]
+        if sources:
+            return str(sources)
+    return str(fallback) if fallback is not None else "unknown"
+
+
+def _validate_image_family_redshifts(
+    images_df: pd.DataFrame,
+    source_label: str | Path | None = None,
+) -> None:
+    if images_df.empty:
+        return
+    if "family_id" not in images_df.columns:
+        raise ValueError(f"Image catalog is missing required family_id column in image catalog {source_label}.")
+    if "catalog_z" not in images_df.columns:
+        raise ValueError(f"Image catalog is missing required catalog_z column in image catalog {source_label}.")
+    label = _image_catalog_source_label(images_df, source_label)
+    for family_id in sorted(images_df["family_id"].astype(str).unique().tolist()):
+        family_df = images_df[images_df["family_id"].astype(str) == family_id].copy()
+        z_values = pd.to_numeric(family_df["catalog_z"], errors="coerce")
+        finite_mask = z_values.notna().to_numpy(dtype=bool) & np.isfinite(z_values.to_numpy(dtype=float))
+        if not np.all(finite_mask):
+            bad_labels = family_df.loc[~finite_mask, "image_label"].astype(str).tolist()
+            raise ValueError(
+                f"Family {family_id} has missing or invalid catalog_z values for images {bad_labels} "
+                f"in image catalog {label}."
+            )
+        unique_z = np.unique(np.round(z_values.to_numpy(dtype=float), 8))
+        if len(unique_z) != 1:
+            raise ValueError(
+                f"Family {family_id} has inconsistent catalog_z values {unique_z.tolist()} "
+                f"in image catalog {label}."
+            )
 
 
 def _load_multiple_images_catalog(
@@ -420,13 +457,18 @@ def _load_multiple_images_catalog(
         return _empty_images_df()
 
     image_labels = catalog_df["id"].astype(str)
-    family_and_image = image_labels.apply(_split_image_label)
+    family_and_image: list[tuple[str, str]] = []
+    for image_label in image_labels:
+        try:
+            family_and_image.append(_split_image_label(image_label))
+        except ValueError as exc:
+            raise ValueError(f"{exc} in image catalog {filepath}.") from exc
 
     result = pd.DataFrame(
         {
             "image_label": image_labels,
-            "family_id": family_and_image.str[0],
-            "image_id": family_and_image.str[1],
+            "family_id": [item[0] for item in family_and_image],
+            "image_id": [item[1] for item in family_and_image],
             "catalog_reference": catalog_df["catalog_reference"].to_numpy(),
             "catalog_source": catalog_df["catalog_source"].to_numpy(),
             "ra": catalog_df["ra"].to_numpy(),
@@ -440,7 +482,9 @@ def _load_multiple_images_catalog(
             "family_reliability": catalog_df["family_reliability"].to_numpy(),
         }
     )
-    return result.reset_index(drop=True)
+    result = result.reset_index(drop=True)
+    _validate_image_family_redshifts(result, filepath)
+    return result
 
 
 def _resolve_catalog_path(path_value: Any, base_dir: Path) -> Path | None:
@@ -501,6 +545,8 @@ def _potfile_nominal_value(value: Any, context: str) -> float:
         if flag == 1 and len(value) >= 3:
             return 0.5 * (float(value[1]) + float(value[2]))
         if flag == 3 and len(value) >= 3:
+            return float(value[1])
+        if flag == 9 and len(value) >= 2:
             return float(value[1])
     return float(value)
 
@@ -814,6 +860,7 @@ def load_best_par(
     if images_frames:
         images_df = pd.concat(images_frames, axis=0, ignore_index=True)
         images_df = images_df.drop_duplicates(subset=["image_label"], keep="first").reset_index(drop=True)
+        _validate_image_family_redshifts(images_df, image_catalog_paths)
     else:
         images_df = _empty_images_df()
 

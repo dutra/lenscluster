@@ -1332,10 +1332,6 @@ def test_cli_subcommands_parse_stage_specific_options(tmp_path: Path) -> None:
             "0.8",
             "--family-cutout-families-per-page",
             "2",
-            "--family-cutout-max-images-per-family",
-            "3",
-            "--family-cutout-max-families",
-            "7",
             "--family-cutout-bands",
             "F475W",
             "F625W",
@@ -1368,6 +1364,8 @@ def test_cli_subcommands_parse_stage_specific_options(tmp_path: Path) -> None:
     assert members_args.member_probability_threshold == builder.DEFAULT_MEMBER_PROBABILITY_THRESHOLD
     assert members_args.member_faint_mag_f814w == builder.DEFAULT_MEMBER_FAINT_MAG_F814W
     assert families_args.command == "families"
+    assert builder.DEFAULT_MAX_FAMILY_SPAN_KPC == 600.0
+    assert builder.DEFAULT_IMAGE_FAMILY_FOV_KPC == 1000.0
     assert families_args.max_family_span_kpc == builder.DEFAULT_MAX_FAMILY_SPAN_KPC
     assert families_args.family_pair_batch_size == 8
     assert families_args.family_pair_diagnostics == "accepted"
@@ -1411,8 +1409,8 @@ def test_cli_subcommands_parse_stage_specific_options(tmp_path: Path) -> None:
     assert all_args.family_cutout_size_arcsec == builder.DEFAULT_FAMILY_CUTOUT_SIZE_ARCSEC
     assert all_args.family_cutout_circle_radius_arcsec == builder.DEFAULT_FAMILY_CUTOUT_CIRCLE_RADIUS_ARCSEC
     assert all_args.family_cutout_families_per_page == builder.DEFAULT_FAMILY_CUTOUT_FAMILIES_PER_PAGE
-    assert all_args.family_cutout_max_images_per_family == builder.DEFAULT_FAMILY_CUTOUT_MAX_IMAGES_PER_FAMILY
-    assert all_args.family_cutout_max_families == builder.DEFAULT_FAMILY_CUTOUT_MAX_FAMILIES
+    assert not hasattr(all_args, "family_cutout_max_images_per_family")
+    assert not hasattr(all_args, "family_cutout_max_families")
     assert tuple(all_args.family_cutout_bands) == builder.DEFAULT_FAMILY_CUTOUT_BANDS
     assert all_plot_args.command == "all"
     assert all_plot_args.plot_kind == "publication"
@@ -1422,8 +1420,8 @@ def test_cli_subcommands_parse_stage_specific_options(tmp_path: Path) -> None:
     assert all_plot_args.family_cutout_size_arcsec == 8.0
     assert all_plot_args.family_cutout_circle_radius_arcsec == 0.8
     assert all_plot_args.family_cutout_families_per_page == 2
-    assert all_plot_args.family_cutout_max_images_per_family == 3
-    assert all_plot_args.family_cutout_max_families == 7
+    assert not hasattr(all_plot_args, "family_cutout_max_images_per_family")
+    assert not hasattr(all_plot_args, "family_cutout_max_families")
     assert all_plot_args.family_cutout_bands == ["F475W", "F625W", "F160W"]
     assert plots_args.command == "plots"
     assert plots_args.plot_kind == "diagnostic"
@@ -1733,6 +1731,35 @@ def _write_test_wcs_fits(path: Path, *, center_ra: float, center_dec: float, val
     fits.PrimaryHDU(data.astype(np.float32), header=wcs.to_header()).writeto(path, overwrite=True)
 
 
+def test_overlay_crop_extent_matches_catalog_offset_convention(tmp_path: Path) -> None:
+    spec = builder.CLUSTER_BY_KEY["a370"]
+    path = tmp_path / "hlsp_buffalo_abell370_f814w_test.fits"
+    _write_test_wcs_fits(path, center_ra=10.0, center_dec=0.0, value=1.0)
+
+    crop = builder._load_fits_crop_for_overlay(path, center_ra=10.0, center_dec=0.0, spec=spec)
+    pixel_x = 32.0
+    pixel_y = 31.0
+    ra, dec = crop.wcs.wcs_pix2world(pixel_x, pixel_y, 0)
+    ra = float(np.asarray(ra))
+    dec = float(np.asarray(dec))
+    projected = builder._add_projected_offsets(
+        pd.DataFrame([{"ra": ra, "dec": dec}]),
+        spec,
+        center_ra=10.0,
+        center_dec=0.0,
+    )
+
+    x0 = crop.x_min - 0.5 * crop.stride
+    x1 = crop.x_min + (crop.data.shape[1] - 0.5) * crop.stride
+    y0 = crop.y_min - 0.5 * crop.stride
+    y1 = crop.y_min + (crop.data.shape[0] - 0.5) * crop.stride
+    plot_x = crop.extent[0] + ((pixel_x - x0) / (x1 - x0)) * (crop.extent[1] - crop.extent[0])
+    plot_y = crop.extent[2] + ((pixel_y - y0) / (y1 - y0)) * (crop.extent[3] - crop.extent[2])
+
+    np.testing.assert_allclose(plot_x, projected["x_kpc"].iloc[0], atol=1.0e-3)
+    np.testing.assert_allclose(plot_y, projected["y_kpc"].iloc[0], atol=1.0e-3)
+
+
 def test_image_scale_prefers_matching_background_and_cutout_paths(tmp_path: Path) -> None:
     spec = builder.CLUSTER_BY_KEY["a370"]
     image_dir = tmp_path / "images"
@@ -2001,6 +2028,18 @@ def test_cluster_image_overlay_uses_grayscale_and_rgb_fits(tmp_path: Path) -> No
     manifest = pd.read_csv(builder.catalog_plot_manifest_path(tmp_path))
     overlay = manifest.loc[manifest["plot_name"].eq("cluster_image_overlay")].iloc[0]
     assert overlay["image_render_mode"] == "rgb"
+    background = builder._load_cluster_overlay_background(
+        spec,
+        image_dir,
+        "required",
+        center_ra=10.0,
+        center_dec=0.0,
+        image_scale=builder.DEFAULT_IMAGE_SCALE,
+    )
+    assert background["mode"] == "rgb"
+    assert "extent" in background
+    assert background["extent"][0] > background["extent"][1]
+    assert background["extent"][2] > background["extent"][3]
     assert (tmp_path / "a370" / "plots" / "publication" / "a370_cluster_image_overlay.png").exists()
     cutouts = manifest.loc[manifest["plot_name"].eq("family_cutouts")].iloc[0]
     assert cutouts["status"] == "generated"
@@ -2062,7 +2101,7 @@ def test_family_cutouts_required_rgb_missing_fails(tmp_path: Path) -> None:
         builder.run_plots_stage(args, builder.Console(record=True), [spec])
 
 
-def test_family_cutout_caps_are_recorded_in_manifest(tmp_path: Path) -> None:
+def test_family_cutouts_render_all_finite_members(tmp_path: Path) -> None:
     spec = builder.CLUSTER_BY_KEY["a370"]
     _write_plot_fixture(tmp_path, spec, optional=True)
     family_path, family_member_path, _pair_path = builder.family_catalog_paths(tmp_path, spec)
@@ -2127,10 +2166,6 @@ def test_family_cutout_caps_are_recorded_in_manifest(tmp_path: Path) -> None:
             "auto",
             "--image-scale",
             "30mas",
-            "--family-cutout-max-families",
-            "2",
-            "--family-cutout-max-images-per-family",
-            "1",
             "--family-cutout-families-per-page",
             "1",
             "--family-cutout-size-arcsec",
@@ -2143,8 +2178,8 @@ def test_family_cutout_caps_are_recorded_in_manifest(tmp_path: Path) -> None:
     cutouts = manifest.loc[manifest["plot_name"].eq("family_cutouts")].iloc[0]
 
     assert cutouts["status"] == "generated"
-    assert cutouts["n_cutout_families"] == 2
-    assert cutouts["n_cutout_images"] == 2
+    assert cutouts["n_cutout_families"] == 3
+    assert cutouts["n_cutout_images"] == 9
     assert cutouts["family_cutout_size_arcsec"] == 6.0
     assert cutouts["family_cutout_circle_radius_arcsec"] == builder.DEFAULT_FAMILY_CUTOUT_CIRCLE_RADIUS_ARCSEC
     assert bool(cutouts["family_cutout_color_rms_label"])
