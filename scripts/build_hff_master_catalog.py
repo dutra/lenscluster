@@ -6,6 +6,7 @@ from functools import partial
 import itertools
 import math
 import os
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -24,8 +25,6 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
-from astropy.stats import sigma_clipped_stats
-from astropy.visualization import make_lupton_rgb
 from astropy.coordinates import SkyCoord
 from astropy.cosmology import FlatLambdaCDM
 from astropy.io import fits
@@ -40,6 +39,14 @@ from rich.console import Console
 from rich.table import Table as RichTable
 from scipy.spatial import cKDTree
 from tqdm import tqdm
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+for import_path in (REPO_ROOT / "src",):
+    if str(import_path) not in sys.path:
+        sys.path.insert(0, str(import_path))
+
+from lenscluster.rgb import RGBDisplayConfig, build_rgb_display_from_band_images, make_natural_rgb  # noqa: E402
 
 
 PAGUL2024_SOURCE = "pagul2024"
@@ -5641,42 +5648,12 @@ def _extract_family_cutout(image: PlotBandImage, coord: SkyCoord, *, cutout_size
     return cutout
 
 
-def _cutout_channel_stats(data: np.ndarray) -> tuple[float, float]:
-    finite = np.asarray(data, dtype=float)
-    finite = finite[np.isfinite(finite)]
-    if finite.size == 0:
-        return 0.0, 1.0
-    _mean, median, std = sigma_clipped_stats(finite, sigma=3.0, maxiters=5)
-    std = float(std) if np.isfinite(std) and float(std) > 0.0 else float(np.nanstd(finite))
-    if not np.isfinite(std) or std <= 0.0:
-        std = 1.0
-    return float(median), std
-
-
-def _make_family_rgb_cutout(cutouts_by_band: dict[str, np.ndarray], bands: Sequence[str]) -> np.ndarray:
-    blue, green, red = _trim_to_common_shape(
-        [
-            cutouts_by_band[str(bands[0])],
-            cutouts_by_band[str(bands[1])],
-            cutouts_by_band[str(bands[2])],
-        ]
-    )
-    r_med, r_std = _cutout_channel_stats(red)
-    g_med, g_std = _cutout_channel_stats(green)
-    b_med, b_std = _cutout_channel_stats(blue)
-    r_scaled = (red - r_med) * (g_std / max(r_std, 1.0e-12))
-    g_scaled = green - g_med
-    b_scaled = (blue - b_med) * (g_std / max(b_std, 1.0e-12)) * 1.2
-    stretch = max(g_std * 6.0, 1.0e-8)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        return make_lupton_rgb(
-            np.nan_to_num(r_scaled, nan=0.0),
-            np.nan_to_num(g_scaled, nan=0.0),
-            np.nan_to_num(b_scaled, nan=0.0),
-            minimum=0.0,
-            stretch=stretch,
-            Q=10,
-        )
+def _make_family_rgb_cutout(
+    cutouts_by_band: dict[str, np.ndarray],
+    bands: Sequence[str],
+    rgb_display: RGBDisplayConfig,
+) -> np.ndarray:
+    return make_natural_rgb(cutouts_by_band, bands=bands, display=rgb_display)
 
 
 def _load_cluster_overlay_background(
@@ -5700,6 +5677,11 @@ def _load_cluster_overlay_background(
     rgb_paths = [paths_by_band.get(band) for band in PLOT_RGB_BANDS]
     if all(path is not None for path in rgb_paths):
         try:
+            rgb_path_by_band = {str(band): Path(path) for band, path in zip(PLOT_RGB_BANDS, rgb_paths, strict=True) if path is not None}
+            rgb_display = build_rgb_display_from_band_images(
+                _load_family_cutout_band_images(rgb_path_by_band, PLOT_RGB_BANDS),
+                PLOT_RGB_BANDS,
+            )
             b_crop, g_crop, r_crop = _trim_overlay_crops(
                 [
                     _load_fits_crop_for_overlay(rgb_paths[0], center_ra=center_ra, center_dec=center_dec, spec=spec),
@@ -5707,16 +5689,11 @@ def _load_cluster_overlay_background(
                     _load_fits_crop_for_overlay(rgb_paths[2], center_ra=center_ra, center_dec=center_dec, spec=spec),
                 ]
             )
-            b_data, g_data, r_data = b_crop.data, g_crop.data, r_crop.data
-            _, r_med, r_std = sigma_clipped_stats(r_data, sigma=3.0, maxiters=5)
-            _, g_med, g_std = sigma_clipped_stats(g_data, sigma=3.0, maxiters=5)
-            _, b_med, b_std = sigma_clipped_stats(b_data, sigma=3.0, maxiters=5)
-            stretch = max(float(g_std) * 6.0, 1.0e-8)
-            r_scaled = (r_data - r_med) * (g_std / max(float(r_std), 1.0e-12))
-            g_scaled = g_data - g_med
-            b_scaled = (b_data - b_med) * (g_std / max(float(b_std), 1.0e-12)) * 1.2
-            with np.errstate(invalid="ignore", divide="ignore"):
-                rgb = make_lupton_rgb(r_scaled, g_scaled, b_scaled, minimum=0.0, stretch=stretch, Q=10)
+            rgb = make_natural_rgb(
+                {str(PLOT_RGB_BANDS[0]): b_crop.data, str(PLOT_RGB_BANDS[1]): g_crop.data, str(PLOT_RGB_BANDS[2]): r_crop.data},
+                bands=PLOT_RGB_BANDS,
+                display=rgb_display,
+            )
             return {
                 "mode": "rgb",
                 "image": rgb,
@@ -6459,6 +6436,7 @@ def _plot_candidate_family_cutouts(
     member_crms = _family_cutout_member_crms(selected_members, pairs)
     n_pages = int(math.ceil(len(family_ids) / int(families_per_page)))
     rendered_images = 0
+    rgb_display = build_rgb_display_from_band_images(band_images, bands)
 
     with PdfPages(output) as pdf:
         for page_index in range(n_pages):
@@ -6508,7 +6486,7 @@ def _plot_candidate_family_cutouts(
                         )
                         for band in bands
                     }
-                    rgb = _make_family_rgb_cutout(cutouts, bands)
+                    rgb = _make_family_rgb_cutout(cutouts, bands, rgb_display)
                     ax.imshow(rgb, origin="lower", interpolation="nearest")
                     if circle_radius_arcsec > 0.0:
                         circle_radius_pix = float(circle_radius_arcsec) / float(cutout_size_arcsec) * float(rgb.shape[1])

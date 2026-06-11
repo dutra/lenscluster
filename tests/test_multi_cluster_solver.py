@@ -152,6 +152,8 @@ def test_parse_args_accepts_repeated_cluster_triples_and_cosmology_init() -> Non
             "0.25",
             "--image-plane-scatter-prior-log-sigma",
             "0.4",
+            "--fix-image-sigma-int-arcsec",
+            "0.35",
             "--sampling-engine",
             "active_subset",
         ]
@@ -167,9 +169,64 @@ def test_parse_args_accepts_repeated_cluster_triples_and_cosmology_init() -> Non
     assert args.image_plane_scatter_prior == "lognormal"
     assert args.image_plane_scatter_prior_median_arcsec == pytest.approx(0.25)
     assert args.image_plane_scatter_prior_log_sigma == pytest.approx(0.4)
+    assert args.fix_image_sigma_int_arcsec == pytest.approx(0.35)
     assert args.sampling_engine == "active_subset"
+    assert args.dense_mass is True
     assert not hasattr(args, "validate_top_k_families")
     assert not hasattr(args, "validation_approx")
+
+
+def test_parse_args_dense_mass_boolean_optional() -> None:
+    base = [
+        "--cluster",
+        "a2744",
+        "a2744.par",
+        "runs/a2744",
+        "--cluster",
+        "m0416",
+        "m0416.par",
+        "runs/m0416",
+    ]
+
+    assert multi._parse_args(base).dense_mass is True
+    assert multi._parse_args([*base, "--no-dense-mass"]).dense_mass is False
+    assert multi._parse_args([*base, "--dense-mass"]).dense_mass is True
+
+
+def test_parse_args_potfile_mass_size_reparam_flag() -> None:
+    base = [
+        "--cluster",
+        "a2744",
+        "a2744.par",
+        "runs/a2744",
+        "--cluster",
+        "m0416",
+        "m0416.par",
+        "runs/m0416",
+    ]
+
+    assert multi._parse_args(base).potfile_mass_size_reparam is False
+    assert multi._parse_args([*base, "--potfile-mass-size-reparam"]).potfile_mass_size_reparam is True
+
+
+def test_parse_args_maps_blocked_linearized_mode_to_explicit_likelihood() -> None:
+    args = multi._parse_args(
+        [
+            "--cluster",
+            "a2744",
+            "a2744.par",
+            "runs/a2744",
+            "--cluster",
+            "m0416",
+            "m0416.par",
+            "runs/m0416",
+            "--image-plane-mode",
+            "linearized-forward-beta-blocked-image-plane",
+        ]
+    )
+
+    assert args.image_plane_mode == "linearized-forward-beta-blocked-image-plane"
+    assert args.sample_likelihood_mode == "linearized-forward-beta-image-plane"
 
 
 @pytest.mark.parametrize("flag", ["--validate-top-k-families", "--validation-approx"])
@@ -190,12 +247,15 @@ def test_parse_args_rejects_removed_main_validation_flags(flag: str) -> None:
 @pytest.mark.parametrize(
     ("flag", "value", "message"),
     [
+        ("--image-plane-scatter-floor-arcsec", "0", "image-plane-scatter-floor"),
         ("--image-plane-scatter-floor-arcsec", "-0.1", "image-plane-scatter-floor"),
         ("--image-plane-scatter-floor-arcsec", "nan", "image-plane-scatter-floor"),
         ("--image-plane-scatter-prior-median-arcsec", "0", "image-plane-scatter-prior-median"),
         ("--image-plane-scatter-prior-median-arcsec", "nan", "image-plane-scatter-prior-median"),
         ("--image-plane-scatter-prior-log-sigma", "0", "image-plane-scatter-prior-log-sigma"),
         ("--image-plane-scatter-prior-log-sigma", "nan", "image-plane-scatter-prior-log-sigma"),
+        ("--fix-image-sigma-int-arcsec", "-0.1", "fix-image-sigma-int"),
+        ("--fix-image-sigma-int-arcsec", "nan", "fix-image-sigma-int"),
     ],
 )
 def test_parse_args_rejects_invalid_image_plane_scatter_controls(
@@ -214,6 +274,59 @@ def test_parse_args_rejects_invalid_image_plane_scatter_controls(
                 "joint",
                 flag,
                 value,
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        (
+            ["--image-plane-scatter-floor-arcsec", "0.5", "--image-plane-scatter-upper-arcsec", "0.5"],
+            "image-plane-scatter-upper",
+        ),
+        (
+            [
+                "--image-plane-scatter-prior",
+                "lognormal",
+                "--image-plane-scatter-floor-arcsec",
+                "0.1",
+                "--image-plane-scatter-upper-arcsec",
+                "0.5",
+                "--image-plane-scatter-prior-median-arcsec",
+                "0.05",
+            ],
+            "image-plane-scatter-prior-median",
+        ),
+        (
+            [
+                "--image-plane-scatter-prior",
+                "lognormal",
+                "--image-plane-scatter-floor-arcsec",
+                "0.1",
+                "--image-plane-scatter-upper-arcsec",
+                "0.5",
+                "--image-plane-scatter-prior-median-arcsec",
+                "0.6",
+            ],
+            "image-plane-scatter-prior-median",
+        ),
+    ],
+)
+def test_parse_args_rejects_invalid_image_plane_scatter_support(
+    extra_args: list[str],
+    message: str,
+) -> None:
+    with pytest.raises(SystemExit, match=message):
+        multi._parse_args(
+            [
+                "--cluster",
+                "a2744",
+                "a2744.par",
+                "runs/a2744",
+                "--output-dir",
+                "joint",
+                *extra_args,
             ]
         )
 

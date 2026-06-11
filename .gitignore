@@ -22,3 +22,6 @@ plots/
 *.par
 data/*
 results/*
+notebooks/*
+*.zip
+paper/*

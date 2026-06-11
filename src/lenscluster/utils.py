@@ -91,6 +91,24 @@ def parse_bool_env(name: str) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def jax_cpu_worker_count() -> int:
+    try:
+        import jax
+
+        devices = jax.devices("cpu")
+        if devices:
+            return max(1, int(len(devices)))
+    except Exception:
+        pass
+    try:
+        env_count = int(os.environ.get("JAX_NUM_CPU_DEVICES", ""))
+        if env_count > 0:
+            return env_count
+    except (TypeError, ValueError):
+        pass
+    return max(1, int(os.cpu_count() or 1))
+
+
 def process_memory_snapshot() -> dict[str, float | None]:
     rss_mb: float | None = None
     vms_mb: float | None = None

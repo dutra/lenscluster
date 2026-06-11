@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -17,6 +18,8 @@ import jax.numpy as jnp
 from astropy.cosmology import FlatwCDM
 
 import lenscluster.cluster_solver as cluster_solver
+import lenscluster.image_diagnostics as image_diagnostics
+import lenscluster.mock_cluster as mock_cluster
 import lenscluster.multi_cluster_solver as multi_cluster_solver
 import lenscluster.validation as validation
 from lenscluster.jax_cosmology import (
@@ -31,23 +34,41 @@ from lenscluster.jax_cosmology import (
     flat_wcdm_lensing_efficiency,
 )
 from lenscluster.cluster_solver import (
+    IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+    IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+    IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+    IMAGE_PLANE_MODE_FORWARD_METRIC,
     IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+    IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
     IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
-    IMAGE_PLANE_MODE_MARGINAL,
     IMAGE_PLANE_MODE_NONE,
+    SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
+    SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+    SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
     SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
-    SAMPLE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE,
+    SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
     SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
     SAMPLE_LIKELIHOOD_SOURCE,
     _adaptive_active_scaling_count,
+    _anchored_solved_image_plane_step_from_jacobian,
     _build_cosmology,
     _build_parameter_specs,
+    _critical_arc_branch_probability,
+    _critical_arc_geometry_from_jacobian,
+    _critical_arc_lm_step_from_jacobian,
+    _critical_arc_lm_geometry_from_jacobian,
+    _critical_arc_mixture_image_plane_bin_loglike,
+    _critical_arc_projected_quadratics,
     _effective_image_presence_penalty_weight,
+    _fold_regularized_image_plane_bin_loglike,
+    _forward_metric_image_plane_bin_loglike,
+    _forward_metric_image_presence_residual2,
+    _jittered_2x2_covariance_det,
     _linearized_image_plane_bin_loglike,
-    _linearized_marginal_beta_image_plane_bin_loglike,
     _linearized_image_plane_residual_from_jacobian,
     _smooth_residual_cap,
     _source_plane_bin_loglike,
+    _soft_observed_image_presence_loglike_from_residual2,
     _soft_observed_image_presence_loglike,
     _local_jacobian_bin_loglike,
     _normalize_stage_fit_controls,
@@ -64,6 +85,7 @@ from lenscluster.model import (
     FamilyValidationCache,
     PackedLensSpec,
     ParameterSpec,
+    NUTSInitialization,
     PosteriorResults,
     Stage1PriorSummary,
     SurrogateBinCache,
@@ -212,6 +234,9 @@ def test_generate_single_bcg_mock_parses_and_has_finite_magnifications(tmp_path:
     assert (images.groupby("family_id").size() >= config.min_images_per_family).all()
     assert {source["caustic_class"] for source in truth["sources"]} == {"primary"}
     assert all(int(source["n_images"]) >= 3 for source in truth["sources"])
+    assert truth["config"]["primary_source_redshifts"] == [1.5, 2.0, 3.0]
+    assert truth["config"]["subhalo_source_redshifts"] == [1.5, 2.0, 3.0]
+    assert "source_redshifts" not in truth["config"]
     assert np.isfinite(images["magnification_true"].to_numpy(dtype=float)).all()
     assert set(truth["parameter_truth"]) >= {"halo.v_disp", "bcg.v_disp", "source.sigma_int"}
     assert truth["parameter_truth"]["source.sigma_int"] == config.source_sigma_int_arcsec
@@ -225,6 +250,34 @@ def test_generate_single_bcg_mock_parses_and_has_finite_magnifications(tmp_path:
         assert values.ndim == 1
         assert values.size >= 3
         assert np.isfinite(values).all()
+
+
+def test_write_single_bcg_mock_par_can_tighten_bcg_position_prior(tmp_path: Path) -> None:
+    config = SingleBCGMockConfig(bcg_position_prior_half_width_arcsec=2.0)
+    path = tmp_path / "single_bcg_mock.par"
+    images = pd.DataFrame({"x_obs_arcsec": [0.0], "y_obs_arcsec": [0.0]})
+
+    mock_cluster._write_single_bcg_par(path, config, images)
+    par_lines = path.read_text(encoding="utf-8").splitlines()
+
+    def position_bounds(component_id: str, field_name: str) -> tuple[float, float]:
+        in_limit_block = False
+        for line in par_lines:
+            stripped = line.strip()
+            if stripped == f"limit {component_id}":
+                in_limit_block = True
+                continue
+            if in_limit_block and stripped == "end":
+                break
+            if in_limit_block and stripped.startswith(field_name):
+                parts = stripped.split()
+                return float(parts[2]), float(parts[3])
+        raise AssertionError(f"missing {field_name} limit for {component_id}")
+
+    assert position_bounds("halo", "x_centre") == pytest.approx((-8.0, 8.0))
+    assert position_bounds("halo", "y_centre") == pytest.approx((-8.0, 8.0))
+    assert position_bounds("bcg", "x_centre") == pytest.approx((-1.65, 2.35))
+    assert position_bounds("bcg", "y_centre") == pytest.approx((-2.22, 1.78))
 
 
 def test_generate_single_bcg_mock_respects_max_images_per_family(tmp_path: Path) -> None:
@@ -248,6 +301,578 @@ def test_generate_single_bcg_mock_respects_max_images_per_family(tmp_path: Path)
     assert truth["config"]["max_images_per_family"] == config.max_images_per_family
     restored_config = validation._caustic_config_from_truth(truth)
     assert restored_config.max_images_per_family == config.max_images_per_family
+
+
+def test_caustic_config_from_truth_maps_legacy_source_redshifts_to_split_lists() -> None:
+    restored_config = validation._caustic_config_from_truth(
+        {
+            "config": {
+                "source_redshift": 2.0,
+                "source_redshifts": [2.0, 4.0],
+            }
+        }
+    )
+
+    assert restored_config.primary_source_redshifts == (2.0, 4.0)
+    assert restored_config.subhalo_source_redshifts == (2.0, 4.0)
+
+
+def test_caustic_config_from_truth_restores_mock_image_min_distances() -> None:
+    restored_config = validation._caustic_config_from_truth(
+        {
+            "config": {
+                "primary_image_min_distance_arcsec": 2.5,
+                "subhalo_image_min_distance_arcsec": 0.75,
+            }
+        }
+    )
+
+    assert restored_config.primary_image_min_distance_arcsec == pytest.approx(2.5)
+    assert restored_config.subhalo_image_min_distance_arcsec == pytest.approx(0.75)
+
+
+def test_generate_single_bcg_mock_emits_progress_events(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_min_distances: list[float] = []
+
+    class FakeModel:
+        def magnification(self, x, _y, _kwargs_lens):
+            return np.ones_like(np.asarray(x, dtype=float))
+
+    class FakeSolver:
+        def __init__(self, _model) -> None:
+            pass
+
+        def image_position_from_source(self, _source_x, _source_y, _kwargs_lens, **kwargs):
+            captured_min_distances.append(float(kwargs["min_distance"]))
+            return np.asarray([0.0, 1.0, 2.0], dtype=float), np.asarray([0.0, 0.1, 0.0], dtype=float)
+
+    contour = mock_cluster.CausticContour(
+        caustic_index=0,
+        caustic_class="primary",
+        beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
+        beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
+        critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
+        critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
+        caustic_area_arcsec2=0.01,
+        critical_area_arcsec2=1.0,
+    )
+
+    monkeypatch.setattr(
+        mock_cluster,
+        "_mock_model_and_kwargs",
+        lambda _config, _subhalo_components, _z_source, _cosmo, _cosmo_config: (FakeModel(), []),
+    )
+    monkeypatch.setattr(mock_cluster, "LensEquationSolver", FakeSolver)
+    monkeypatch.setattr(
+        mock_cluster,
+        "_compute_tangential_caustic_contours",
+        lambda _model, _kwargs_lens, _config: [contour],
+    )
+    monkeypatch.setattr(
+        mock_cluster,
+        "_sample_caustic_source_candidate",
+        lambda contours, _caustic_class, _rng, *, inside_caustic=True: (0.01, 0.02, contours[0]),
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    config = SingleBCGMockConfig(
+        seed=7,
+        n_primary_families=1,
+        source_redshift=2.0,
+        primary_source_redshifts=(2.0,),
+        pos_sigma_arcsec=0.0,
+        n_subhalos=0,
+    )
+
+    generate_single_bcg_mock(tmp_path, config, progress_callback=lambda event, payload: events.append((event, payload)))
+
+    event_names = [event for event, _payload in events]
+    assert event_names[:2] == ["subhalos_start", "subhalos_complete"]
+    assert "redshift_start" in event_names
+    assert "redshift_complete" in event_names
+    assert "family_attempt" in event_names
+    assert "family_accept" in event_names
+    assert event_names[-1] == "outputs_complete"
+    assert next(payload for event, payload in events if event == "redshift_complete")["caustic_count"] == 1
+    accepted_payload = next(payload for event, payload in events if event == "family_accept")
+    assert accepted_payload["family_index"] == 1
+    assert accepted_payload["image_count"] == 3
+    assert accepted_payload["image_min_distance_arcsec"] == pytest.approx(
+        mock_cluster.DEFAULT_PRIMARY_IMAGE_MIN_DISTANCE_ARCSEC
+    )
+    assert captured_min_distances == [pytest.approx(mock_cluster.DEFAULT_PRIMARY_IMAGE_MIN_DISTANCE_ARCSEC)]
+
+
+def test_generate_single_bcg_mock_uses_family_class_image_min_distances(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_min_distances: list[tuple[float, float]] = []
+
+    class FakeModel:
+        def magnification(self, x, _y, _kwargs_lens):
+            return np.ones_like(np.asarray(x, dtype=float))
+
+    class FakeSolver:
+        def __init__(self, _model) -> None:
+            pass
+
+        def image_position_from_source(self, source_x, _source_y, _kwargs_lens, **kwargs):
+            captured_min_distances.append((float(source_x), float(kwargs["min_distance"])))
+            return np.asarray([0.0, 1.0, 2.0], dtype=float), np.asarray([0.0, 0.1, 0.0], dtype=float)
+
+    primary_contour = mock_cluster.CausticContour(
+        caustic_index=0,
+        caustic_class="primary",
+        beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
+        beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
+        critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
+        critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
+        caustic_area_arcsec2=0.02,
+        critical_area_arcsec2=1.0,
+    )
+    subhalo_contour = mock_cluster.CausticContour(
+        caustic_index=1,
+        caustic_class="subhalo",
+        beta_x=np.asarray([0.2, 0.3, 0.2, 0.2], dtype=float),
+        beta_y=np.asarray([0.2, 0.2, 0.3, 0.2], dtype=float),
+        critical_x=np.asarray([2.0, 3.0, 2.0, 2.0], dtype=float),
+        critical_y=np.asarray([2.0, 2.0, 3.0, 2.0], dtype=float),
+        caustic_area_arcsec2=0.01,
+        critical_area_arcsec2=0.5,
+    )
+
+    monkeypatch.setattr(
+        mock_cluster,
+        "_mock_model_and_kwargs",
+        lambda _config, _subhalo_components, _z_source, _cosmo, _cosmo_config: (FakeModel(), []),
+    )
+    monkeypatch.setattr(mock_cluster, "LensEquationSolver", FakeSolver)
+    monkeypatch.setattr(
+        mock_cluster,
+        "_compute_tangential_caustic_contours",
+        lambda _model, _kwargs_lens, _config: [primary_contour, subhalo_contour],
+    )
+
+    def sample_candidate(contours, caustic_class, _rng, *, inside_caustic=True):
+        del inside_caustic
+        contour = next(contour for contour in contours if contour.caustic_class == caustic_class)
+        beta_x = 0.01 if caustic_class == "primary" else 0.02
+        return beta_x, 0.03, contour
+
+    monkeypatch.setattr(mock_cluster, "_sample_caustic_source_candidate", sample_candidate)
+    config = SingleBCGMockConfig(
+        seed=7,
+        n_primary_families=1,
+        n_subhalo_families=1,
+        primary_source_redshifts=(2.0,),
+        subhalo_source_redshifts=(5.0,),
+        primary_image_min_distance_arcsec=2.5,
+        subhalo_image_min_distance_arcsec=0.75,
+        pos_sigma_arcsec=0.0,
+    )
+
+    _paths, _images, truth = generate_single_bcg_mock(tmp_path, config)
+
+    distances_by_source_x = {round(source_x, 2): min_distance for source_x, min_distance in captured_min_distances}
+    assert distances_by_source_x[0.01] == pytest.approx(2.5)
+    assert distances_by_source_x[0.02] == pytest.approx(0.75)
+    assert truth["config"]["primary_image_min_distance_arcsec"] == pytest.approx(2.5)
+    assert truth["config"]["subhalo_image_min_distance_arcsec"] == pytest.approx(0.75)
+
+
+def test_generate_single_bcg_mock_caps_workers_and_accepts_first_valid_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeModel:
+        def magnification(self, x, _y, _kwargs_lens):
+            return np.ones_like(np.asarray(x, dtype=float))
+
+    class FakeSolver:
+        def __init__(self, _model) -> None:
+            pass
+
+        def image_position_from_source(self, source_x, _source_y, _kwargs_lens, **_kwargs):
+            image_count_by_source = {0.01: 2, 0.02: 4, 0.03: 3, 0.04: 3}
+            n_images = image_count_by_source[round(float(source_x), 2)]
+            return np.arange(n_images, dtype=float), np.zeros(n_images, dtype=float)
+
+    executor_worker_counts: list[int] = []
+    submitted_sources: list[float] = []
+
+    class InlineExecutor:
+        def __init__(self, *, max_workers: int) -> None:
+            executor_worker_counts.append(int(max_workers))
+
+        def __enter__(self) -> "InlineExecutor":
+            return self
+
+        def __exit__(self, *_exc: Any) -> bool:
+            return False
+
+        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+            pass
+
+        def submit(
+            self,
+            fn: Any,
+            z_source: float,
+            attempt_index: int,
+            beta_x: float,
+            beta_y: float,
+            contour: Any,
+            image_min_distance_arcsec: float,
+        ) -> Future[Any]:
+            submitted_sources.append(float(beta_x))
+            future: Future[Any] = Future()
+            try:
+                future.set_result(fn(z_source, attempt_index, beta_x, beta_y, contour, image_min_distance_arcsec))
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+    contour = mock_cluster.CausticContour(
+        caustic_index=0,
+        caustic_class="primary",
+        beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
+        beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
+        critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
+        critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
+        caustic_area_arcsec2=0.01,
+        critical_area_arcsec2=1.0,
+    )
+    candidates = iter((0.01, 0.02, 0.03, 0.04))
+
+    monkeypatch.setattr(mock_cluster, "jax_cpu_worker_count", lambda: 3)
+    monkeypatch.setattr(mock_cluster, "ThreadPoolExecutor", InlineExecutor)
+    monkeypatch.setattr(
+        mock_cluster,
+        "_mock_model_and_kwargs",
+        lambda _config, _subhalo_components, _z_source, _cosmo, _cosmo_config: (FakeModel(), []),
+    )
+    monkeypatch.setattr(mock_cluster, "LensEquationSolver", FakeSolver)
+    monkeypatch.setattr(
+        mock_cluster,
+        "_compute_tangential_caustic_contours",
+        lambda _model, _kwargs_lens, _config: [contour],
+    )
+    monkeypatch.setattr(
+        mock_cluster,
+        "_sample_caustic_source_candidate",
+        lambda contours, _caustic_class, _rng, *, inside_caustic=True: (next(candidates), 0.02, contours[0]),
+    )
+
+    config = SingleBCGMockConfig(
+        seed=7,
+        n_primary_families=1,
+        primary_source_redshifts=(2.0,),
+        pos_sigma_arcsec=0.0,
+        max_sources_to_try=4,
+    )
+
+    _paths, _images, truth = generate_single_bcg_mock(tmp_path, config)
+
+    assert executor_worker_counts == [1]
+    assert submitted_sources == [0.01, 0.02]
+    assert truth["sources"][0]["beta_x"] == pytest.approx(0.02)
+    assert truth["sources"][0]["n_images"] == 4
+
+
+def test_generate_single_bcg_mock_queues_first_attempts_across_families(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeModel:
+        def __init__(self, z_source: float) -> None:
+            self.z_source = float(z_source)
+
+        def magnification(self, x, _y, _kwargs_lens):
+            return np.ones_like(np.asarray(x, dtype=float))
+
+    class FakeSolver:
+        def __init__(self, _model) -> None:
+            pass
+
+        def image_position_from_source(self, source_x, _source_y, _kwargs_lens, **_kwargs):
+            marker = int(float(source_x))
+            attempt = int(round((float(source_x) - marker) * 100.0))
+            n_images = 2 if marker == 20 and attempt == 1 else 3
+            return np.arange(n_images, dtype=float), np.zeros(n_images, dtype=float)
+
+    executor_worker_counts: list[int] = []
+    submitted: list[tuple[float, int]] = []
+
+    class InlineExecutor:
+        def __init__(self, *, max_workers: int) -> None:
+            executor_worker_counts.append(int(max_workers))
+
+        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+            pass
+
+        def submit(
+            self,
+            fn: Any,
+            z_source: float,
+            attempt_index: int,
+            beta_x: float,
+            beta_y: float,
+            contour: Any,
+            image_min_distance_arcsec: float,
+        ) -> Future[Any]:
+            submitted.append((float(z_source), int(attempt_index)))
+            future: Future[Any] = Future()
+            try:
+                future.set_result(fn(z_source, attempt_index, beta_x, beta_y, contour, image_min_distance_arcsec))
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+    def fake_model_and_kwargs(_config, _subhalo_components, z_source, _cosmo, _cosmo_config):
+        return FakeModel(float(z_source)), []
+
+    def fake_contours(model, _kwargs_lens, _config):
+        marker = int(round(float(model.z_source) * 10.0))
+        return [
+            mock_cluster.CausticContour(
+                caustic_index=marker,
+                caustic_class="primary",
+                beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
+                beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
+                critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
+                critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
+                caustic_area_arcsec2=0.01,
+                critical_area_arcsec2=1.0,
+            )
+        ]
+
+    attempt_by_marker: dict[int, int] = {}
+
+    def fake_sample(contours, _caustic_class, _rng, *, inside_caustic=True):
+        marker = int(contours[0].caustic_index)
+        attempt_by_marker[marker] = attempt_by_marker.get(marker, 0) + 1
+        return float(marker) + 0.01 * attempt_by_marker[marker], 0.02, contours[0]
+
+    monkeypatch.setattr(mock_cluster, "jax_cpu_worker_count", lambda: 2)
+    monkeypatch.setattr(mock_cluster, "ThreadPoolExecutor", InlineExecutor)
+    monkeypatch.setattr(mock_cluster, "_mock_model_and_kwargs", fake_model_and_kwargs)
+    monkeypatch.setattr(mock_cluster, "LensEquationSolver", FakeSolver)
+    monkeypatch.setattr(mock_cluster, "_compute_tangential_caustic_contours", fake_contours)
+    monkeypatch.setattr(mock_cluster, "_sample_caustic_source_candidate", fake_sample)
+
+    config = SingleBCGMockConfig(
+        seed=7,
+        n_primary_families=3,
+        primary_source_redshifts=(2.0, 3.0, 4.0),
+        pos_sigma_arcsec=0.0,
+        n_subhalos=0,
+        max_sources_to_try=2,
+    )
+
+    _paths, _images, truth = generate_single_bcg_mock(tmp_path, config)
+
+    assert executor_worker_counts == [2]
+    assert submitted == [(2.0, 1), (3.0, 1), (4.0, 1), (2.0, 2)]
+    assert [source["family_id"] for source in truth["sources"]] == ["1", "2", "3"]
+    assert [source["n_images"] for source in truth["sources"]] == [3, 3, 3]
+
+
+def test_generate_single_bcg_mock_queue_is_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeModel:
+        def magnification(self, x, _y, _kwargs_lens):
+            return np.ones_like(np.asarray(x, dtype=float))
+
+    class FakeSolver:
+        def __init__(self, _model) -> None:
+            pass
+
+        def image_position_from_source(self, _source_x, _source_y, _kwargs_lens, **_kwargs):
+            return np.asarray([0.0, 1.0, 2.0], dtype=float), np.asarray([0.0, 0.1, 0.0], dtype=float)
+
+    contour = mock_cluster.CausticContour(
+        caustic_index=0,
+        caustic_class="primary",
+        beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
+        beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
+        critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
+        critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
+        caustic_area_arcsec2=0.01,
+        critical_area_arcsec2=1.0,
+    )
+
+    monkeypatch.setattr(mock_cluster, "jax_cpu_worker_count", lambda: 3)
+    monkeypatch.setattr(
+        mock_cluster,
+        "_mock_model_and_kwargs",
+        lambda _config, _subhalo_components, _z_source, _cosmo, _cosmo_config: (FakeModel(), []),
+    )
+    monkeypatch.setattr(mock_cluster, "LensEquationSolver", FakeSolver)
+    monkeypatch.setattr(
+        mock_cluster,
+        "_compute_tangential_caustic_contours",
+        lambda _model, _kwargs_lens, _config: [contour],
+    )
+    monkeypatch.setattr(
+        mock_cluster,
+        "_sample_caustic_source_candidate",
+        lambda contours, _caustic_class, rng, *, inside_caustic=True: (
+            float(rng.uniform(-0.1, 0.1)),
+            float(rng.uniform(-0.1, 0.1)),
+            contours[0],
+        ),
+    )
+
+    config = SingleBCGMockConfig(
+        seed=17,
+        n_primary_families=4,
+        primary_source_redshifts=(2.0, 3.0),
+        pos_sigma_arcsec=0.05,
+        n_subhalos=0,
+    )
+
+    _paths_a, images_a, truth_a = generate_single_bcg_mock(tmp_path / "a", config)
+    _paths_b, images_b, truth_b = generate_single_bcg_mock(tmp_path / "b", config)
+
+    assert images_a.to_dict("records") == images_b.to_dict("records")
+    assert truth_a["sources"] == truth_b["sources"]
+    assert truth_a["images"] == truth_b["images"]
+
+
+def test_generate_single_bcg_mock_queue_raises_when_family_exhausts_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeModel:
+        def magnification(self, x, _y, _kwargs_lens):
+            return np.ones_like(np.asarray(x, dtype=float))
+
+    class FakeSolver:
+        def __init__(self, _model) -> None:
+            pass
+
+        def image_position_from_source(self, _source_x, _source_y, _kwargs_lens, **_kwargs):
+            return np.asarray([0.0, 1.0], dtype=float), np.asarray([0.0, 0.1], dtype=float)
+
+    contour = mock_cluster.CausticContour(
+        caustic_index=0,
+        caustic_class="primary",
+        beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
+        beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
+        critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
+        critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
+        caustic_area_arcsec2=0.01,
+        critical_area_arcsec2=1.0,
+    )
+
+    monkeypatch.setattr(mock_cluster, "jax_cpu_worker_count", lambda: 2)
+    monkeypatch.setattr(
+        mock_cluster,
+        "_mock_model_and_kwargs",
+        lambda _config, _subhalo_components, _z_source, _cosmo, _cosmo_config: (FakeModel(), []),
+    )
+    monkeypatch.setattr(mock_cluster, "LensEquationSolver", FakeSolver)
+    monkeypatch.setattr(
+        mock_cluster,
+        "_compute_tangential_caustic_contours",
+        lambda _model, _kwargs_lens, _config: [contour],
+    )
+    monkeypatch.setattr(
+        mock_cluster,
+        "_sample_caustic_source_candidate",
+        lambda contours, _caustic_class, rng, *, inside_caustic=True: (
+            float(rng.uniform(-0.1, 0.1)),
+            float(rng.uniform(-0.1, 0.1)),
+            contours[0],
+        ),
+    )
+    config = SingleBCGMockConfig(
+        seed=19,
+        n_primary_families=2,
+        primary_source_redshifts=(2.0,),
+        n_subhalos=0,
+        max_sources_to_try=2,
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to generate a primary source"):
+        generate_single_bcg_mock(tmp_path, config)
+
+
+def test_generate_single_bcg_mock_cycles_primary_and_subhalo_redshifts_independently(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeModel:
+        def magnification(self, x, _y, _kwargs_lens):
+            return np.ones_like(np.asarray(x, dtype=float))
+
+    class FakeSolver:
+        def __init__(self, _model) -> None:
+            pass
+
+        def image_position_from_source(self, _source_x, _source_y, _kwargs_lens, **_kwargs):
+            return np.asarray([0.0, 1.0, 2.0], dtype=float), np.asarray([0.0, 0.1, 0.0], dtype=float)
+
+    primary_contour = mock_cluster.CausticContour(
+        caustic_index=0,
+        caustic_class="primary",
+        beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
+        beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
+        critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
+        critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
+        caustic_area_arcsec2=0.02,
+        critical_area_arcsec2=1.0,
+    )
+    subhalo_contour = mock_cluster.CausticContour(
+        caustic_index=1,
+        caustic_class="subhalo",
+        beta_x=np.asarray([0.2, 0.3, 0.2, 0.2], dtype=float),
+        beta_y=np.asarray([0.2, 0.2, 0.3, 0.2], dtype=float),
+        critical_x=np.asarray([2.0, 3.0, 2.0, 2.0], dtype=float),
+        critical_y=np.asarray([2.0, 2.0, 3.0, 2.0], dtype=float),
+        caustic_area_arcsec2=0.01,
+        critical_area_arcsec2=0.5,
+    )
+
+    monkeypatch.setattr(
+        mock_cluster,
+        "_mock_model_and_kwargs",
+        lambda _config, _subhalo_components, _z_source, _cosmo, _cosmo_config: (FakeModel(), []),
+    )
+    monkeypatch.setattr(mock_cluster, "LensEquationSolver", FakeSolver)
+    monkeypatch.setattr(
+        mock_cluster,
+        "_compute_tangential_caustic_contours",
+        lambda _model, _kwargs_lens, _config: [primary_contour, subhalo_contour],
+    )
+
+    def sample_candidate(contours, caustic_class, _rng, *, inside_caustic=True):
+        contour = next(contour for contour in contours if contour.caustic_class == caustic_class)
+        return 0.01, 0.02, contour
+
+    monkeypatch.setattr(mock_cluster, "_sample_caustic_source_candidate", sample_candidate)
+    config = SingleBCGMockConfig(
+        seed=7,
+        n_primary_families=3,
+        n_subhalo_families=2,
+        primary_source_redshifts=(2.0, 3.0),
+        subhalo_source_redshifts=(5.0,),
+        pos_sigma_arcsec=0.0,
+    )
+
+    _paths, images, truth = generate_single_bcg_mock(tmp_path, config)
+
+    primary_sources = [source for source in truth["sources"] if source["caustic_class"] == "primary"]
+    subhalo_sources = [source for source in truth["sources"] if source["caustic_class"] == "subhalo"]
+    assert [source["z_source"] for source in primary_sources] == [2.0, 3.0, 2.0]
+    assert [source["z_source"] for source in subhalo_sources] == [5.0, 5.0]
+    assert images["family_id"].nunique() == 5
+    assert sorted(truth["caustics_by_source_redshift"]) == ["2.00000000", "3.00000000", "5.00000000"]
 
 
 def test_load_best_par_defaults_missing_potfile_slopes_to_four(tmp_path: Path) -> None:
@@ -516,6 +1141,206 @@ fini
     assert images_df["image_id"].astype(str).tolist() == ["a", "b", "c"]
 
 
+def test_load_best_par_arcfile_reference3_merges_constraints(tmp_path: Path) -> None:
+    image_catalog_path = tmp_path / "obs_arcs.dat"
+    image_catalog_path.write_text(
+        "#REFERENCE 3\n"
+        "1.a 0.0 0.0 1.0 1.0 0.0 2.0 25.0\n"
+        "1.b 1.0 0.0 1.0 1.0 0.0 2.0 25.0\n",
+        encoding="utf-8",
+    )
+    arc_catalog_path = tmp_path / "arc_constraints.dat"
+    arc_catalog_path.write_text(
+        "#REFERENCE 3\n"
+        "1.a 0.25 -0.50 0.82 0.09 0.05 0.02 0.7\n",
+        encoding="utf-8",
+    )
+    par_path = tmp_path / "with_arcs.par"
+    par_path.write_text(
+        """
+runmode
+    reference 3 10.0 20.0
+    end
+
+image
+    multfile 1 obs_arcs.dat
+    arcfile 1 arc_constraints.dat
+    end
+fini
+""",
+        encoding="utf-8",
+    )
+
+    _parsed, _potentials_df, images_df, _potentials_with_priors = load_best_par(par_path)
+
+    assert images_df["arc_has_constraint"].astype(bool).tolist() == [True, False]
+    first = images_df.iloc[0]
+    x_anchor, y_anchor = cluster_solver._radec_to_offsets_arcsec(
+        np.asarray([first["arc_anchor_ra"]], dtype=float),
+        np.asarray([first["arc_anchor_dec"]], dtype=float),
+        10.0,
+        20.0,
+    )
+    assert float(x_anchor[0]) == pytest.approx(0.25)
+    assert float(y_anchor[0]) == pytest.approx(-0.50)
+    assert float(first["arc_tangent_angle_rad"]) == pytest.approx(0.82)
+    assert float(first["arc_curvature_arcsec_inv"]) == pytest.approx(0.09)
+    assert float(first["arc_sigma_tangent_angle_rad"]) == pytest.approx(0.05)
+    assert float(first["arc_sigma_curvature_arcsec_inv"]) == pytest.approx(0.02)
+    assert float(first["arc_reliability"]) == pytest.approx(0.7)
+
+
+def test_load_best_par_arcfile_rejects_unknown_image_label(tmp_path: Path) -> None:
+    image_catalog_path = tmp_path / "obs_arcs.dat"
+    image_catalog_path.write_text(
+        "#REFERENCE 0\n"
+        "1.a 10.0000 20.0000 1.0 1.0 0.0 2.0 25.0\n"
+        "1.b 10.0002 20.0000 1.0 1.0 0.0 2.0 25.0\n",
+        encoding="utf-8",
+    )
+    arc_catalog_path = tmp_path / "arc_constraints.dat"
+    arc_catalog_path.write_text(
+        "#REFERENCE 0\n"
+        "2.a 10.0000 20.0000 0.82 0.09 0.05 0.02 1.0\n",
+        encoding="utf-8",
+    )
+    par_path = tmp_path / "unknown_arc.par"
+    par_path.write_text(
+        """
+runmode
+    reference 3 10.0 20.0
+    end
+
+image
+    multfile 1 obs_arcs.dat
+    arcfile 1 arc_constraints.dat
+    end
+fini
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unknown image_label"):
+        load_best_par(par_path)
+
+
+def test_cab_tangent_angle_residual_wraps_modulo_pi() -> None:
+    residual = cluster_solver._cab_tangent_angle_residual(
+        jnp.asarray(0.0, dtype=jnp.float64),
+        jnp.asarray(np.pi - 0.05, dtype=jnp.float64),
+    )
+
+    assert float(residual) == pytest.approx(0.05)
+
+
+def test_cab_morphology_loglike_rewards_matching_constraints_and_masks_rows() -> None:
+    observed_angle = jnp.asarray([0.25, 1.0], dtype=jnp.float64)
+    observed_curvature = jnp.asarray([0.08, 0.9], dtype=jnp.float64)
+    sigma_angle = jnp.asarray([0.05, 0.05], dtype=jnp.float64)
+    sigma_curvature = jnp.asarray([0.02, 0.02], dtype=jnp.float64)
+    reliability = jnp.asarray([1.0, 1.0], dtype=jnp.float64)
+    mask = jnp.asarray([True, False])
+    exact = cluster_solver._cab_morphology_bin_loglike(
+        predicted_tangent_angle_rad=observed_angle,
+        predicted_curvature_arcsec_inv=observed_curvature,
+        prediction_finite=jnp.asarray([True, True]),
+        observed_tangent_angle_rad=observed_angle,
+        observed_curvature_arcsec_inv=observed_curvature,
+        sigma_tangent_angle_rad=sigma_angle,
+        sigma_curvature_arcsec_inv=sigma_curvature,
+        reliability=reliability,
+        arc_has_constraint=mask,
+    )
+    perturbed = cluster_solver._cab_morphology_bin_loglike(
+        predicted_tangent_angle_rad=observed_angle + jnp.asarray([0.10, 10.0], dtype=jnp.float64),
+        predicted_curvature_arcsec_inv=observed_curvature + jnp.asarray([0.04, 10.0], dtype=jnp.float64),
+        prediction_finite=jnp.asarray([True, True]),
+        observed_tangent_angle_rad=observed_angle,
+        observed_curvature_arcsec_inv=observed_curvature,
+        sigma_tangent_angle_rad=sigma_angle,
+        sigma_curvature_arcsec_inv=sigma_curvature,
+        reliability=reliability,
+        arc_has_constraint=mask,
+    )
+    no_constraints = cluster_solver._cab_morphology_bin_loglike(
+        predicted_tangent_angle_rad=observed_angle + 10.0,
+        predicted_curvature_arcsec_inv=observed_curvature + 10.0,
+        prediction_finite=jnp.asarray([False, False]),
+        observed_tangent_angle_rad=observed_angle,
+        observed_curvature_arcsec_inv=observed_curvature,
+        sigma_tangent_angle_rad=sigma_angle,
+        sigma_curvature_arcsec_inv=sigma_curvature,
+        reliability=reliability,
+        arc_has_constraint=jnp.asarray([False, False]),
+    )
+
+    assert float(exact) > float(perturbed)
+    assert float(no_constraints) == pytest.approx(0.0)
+
+
+def test_cab_likelihood_weight_defaults_to_one_when_arcfile_is_declared() -> None:
+    state_with_arcfile = SimpleNamespace(parsed={"image": {"arcfile": [1, "arcs.dat"]}}, family_data=[], bin_data=[])
+    state_without_arcfile = SimpleNamespace(parsed={"image": {}}, family_data=[], bin_data=[])
+
+    assert cluster_solver._effective_cab_likelihood_weight(None, state_with_arcfile) == pytest.approx(1.0)
+    assert cluster_solver._effective_cab_likelihood_weight(None, state_without_arcfile) == pytest.approx(0.0)
+    assert cluster_solver._effective_cab_likelihood_weight(0.25, state_with_arcfile) == pytest.approx(0.25)
+
+
+def test_cab_arc_arrays_survive_family_bin_and_traced_conversion(tmp_path: Path) -> None:
+    image_catalog_path = tmp_path / "obs_arcs.dat"
+    image_catalog_path.write_text(
+        "#REFERENCE 3\n"
+        "1.a 0.0 0.0 1.0 1.0 0.0 2.0 25.0\n"
+        "1.b 1.0 0.0 1.0 1.0 0.0 2.0 25.0\n",
+        encoding="utf-8",
+    )
+    arc_catalog_path = tmp_path / "arc_constraints.dat"
+    arc_catalog_path.write_text(
+        "#REFERENCE 3\n"
+        "1.a 0.25 -0.50 0.82 0.09 0.05 0.02 0.7\n",
+        encoding="utf-8",
+    )
+    par_path = tmp_path / "with_arcs.par"
+    par_path.write_text(
+        """
+runmode
+    reference 3 10.0 20.0
+    end
+
+image
+    multfile 1 obs_arcs.dat
+    arcfile 1 arc_constraints.dat
+    end
+fini
+""",
+        encoding="utf-8",
+    )
+    parsed, _potentials_df, images_df, _potentials_with_priors = load_best_par(par_path)
+    reference = cluster_solver._extract_reference(parsed)
+    families, _elapsed = cluster_solver._prepare_family_data(
+        images_df,
+        0.2,
+        reference,
+        z_lens=0.4,
+        cosmo_config=cluster_solver._build_cosmology(parsed),
+        z_bin_efficiency_tol=0.0,
+    )
+    bins = cluster_solver._build_bin_data(families)
+    fake = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    fake.cosmology_effective_z_to_index = {}
+
+    traced = cluster_solver.ClusterJAXEvaluator._prepare_traced_bin_data(fake, bins[0])
+
+    assert families[0].arc_has_constraint.tolist() == [True, False]
+    np.testing.assert_allclose(families[0].arc_anchor_x, [0.25, 1.0])
+    np.testing.assert_allclose(families[0].arc_anchor_y, [-0.5, 0.0])
+    assert bins[0].arc_has_constraint.tolist() == [True, False]
+    assert traced.arc_constraint_count == 1
+    np.testing.assert_allclose(np.asarray(traced.arc_tangent_angle_rad), [0.82, 0.0])
+    np.testing.assert_allclose(np.asarray(traced.arc_curvature_arcsec_inv), [0.09, 0.0])
+
+
 def test_load_best_par_rejects_invalid_image_label(tmp_path: Path) -> None:
     image_catalog_path = tmp_path / "obs_arcs.dat"
     image_catalog_path.write_text(
@@ -721,6 +1546,75 @@ def test_cluster_solver_parses_fov_limit_args(monkeypatch: pytest.MonkeyPatch) -
     assert args.fov_limit_y == [-5.0, 5.0]
 
 
+def test_cluster_solver_parses_sampler_debug_diagnostics_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par"])
+    default_args = _parse_args()
+    assert default_args.debug_sampler_diagnostics is False
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cluster_solver", "--par-path", "input.par", "--debug-sampler-diagnostics"],
+    )
+    debug_args = _parse_args()
+    assert debug_args.debug_sampler_diagnostics is True
+
+
+def test_cluster_solver_parses_fixed_image_sigma_int(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par"])
+    default_args = _parse_args()
+    assert default_args.fix_image_sigma_int_arcsec is None
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cluster_solver", "--par-path", "input.par", "--fix-image-sigma-int-arcsec", "0.35"],
+    )
+    fixed_args = _parse_args()
+    assert fixed_args.fix_image_sigma_int_arcsec == pytest.approx(0.35)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cluster_solver", "--par-path", "input.par", "--fix-image-sigma-int-arcsec", "0.0"],
+    )
+    zero_args = _parse_args()
+    assert zero_args.fix_image_sigma_int_arcsec == pytest.approx(0.0)
+
+    for invalid_value in ("-0.1", "nan"):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["cluster_solver", "--par-path", "input.par", "--fix-image-sigma-int-arcsec", invalid_value],
+        )
+        with pytest.raises(SystemExit):
+            _parse_args()
+
+
+def test_cluster_solver_parses_dense_mass_boolean_optional(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par"])
+    default_args = _parse_args()
+    assert default_args.dense_mass is True
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par", "--no-dense-mass"])
+    diagonal_args = _parse_args()
+    assert diagonal_args.dense_mass is False
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par", "--dense-mass"])
+    dense_args = _parse_args()
+    assert dense_args.dense_mass is True
+
+
+def test_cluster_solver_parses_potfile_mass_size_reparam_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par"])
+    default_args = _parse_args()
+    assert default_args.potfile_mass_size_reparam is False
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par", "--potfile-mass-size-reparam"])
+    reparam_args = _parse_args()
+    assert reparam_args.potfile_mass_size_reparam is True
+
+
 def test_multi_cluster_solver_parses_fov_limit_args() -> None:
     args = multi_cluster_solver._parse_args(
         [
@@ -912,10 +1806,941 @@ def test_generate_single_bcg_mock_with_subhalos_uses_potfile(tmp_path: Path) -> 
     assert parsed["champ"]["dmax"] == int(np.ceil(max(image_radii.max(), subhalo_radii.max()) + 10.0))
     assert len(potentials_with_priors) == 2
     assert images_df["family_id"].nunique() == 1
+    par_text = paths.par_path.read_text(encoding="utf-8")
+    assert "vdslope 0 4.00000000 0" in par_text
+    assert "slope 0 4.00000000 0" in par_text
     assert len(truth["subhalos"]) == config.n_subhalos
     assert len(truth["subhalo_components"]) == config.n_subhalos
+    assert all(float(row["catalog_mag"]) <= config.subhalo_mag_faint_limit for row in truth["subhalos"])
+    assert all("subhalo_mass_msun" in row for row in truth["subhalos"])
+    assert all("subhalo_parent_rank" in row for row in truth["subhalos"])
+    assert all(row["selected_by_mag_cut"] is True for row in truth["subhalos"])
+    selection = truth["subhalo_selection"]
+    assert selection["schechter_alpha"] == pytest.approx(config.subhalo_schechter_alpha)
+    assert selection["luminosity_star"] == pytest.approx(1.0)
+    assert selection["luminosity_peak"] == pytest.approx(config.subhalo_schechter_alpha + 1.0)
+    assert selection["mass_luminosity_exponent"] == pytest.approx(1.0)
+    assert selection["mass_peak"] == pytest.approx(
+        config.subhalo_mass_ref * (config.subhalo_schechter_alpha + 1.0) ** selection["mass_luminosity_exponent"]
+    )
+    assert selection["mass_peak"] == pytest.approx(3.0e11)
+    assert selection["parent_count"] >= config.n_subhalos
+    assert selection["selected_count"] == config.n_subhalos
+    candidates = selection["candidates"]
+    selected_candidates = [row for row in candidates if row["selected"]]
+    assert len(selected_candidates) == config.n_subhalos
+    assert all(row["passes_mag_cut"] for row in selected_candidates)
+    candidate_indices = {row["subhalo_candidate_index"] for row in candidates}
+    selected_indices = {row["subhalo_candidate_index"] for row in selected_candidates}
+    assert {row["subhalo_candidate_index"] for row in truth["subhalos"]} == selected_indices
+    assert selected_indices <= candidate_indices
     assert {source["caustic_class"] for source in truth["sources"]} == {"primary"}
     assert np.isfinite(images["magnification_true"].to_numpy(dtype=float)).all()
+
+
+def test_subhalo_schechter_sampler_has_log_space_peak_and_high_mass_tail() -> None:
+    config = SingleBCGMockConfig()
+    rng = np.random.default_rng(123)
+    luminosity_min, luminosity_max = mock_cluster._subhalo_schechter_luminosity_bounds(config)
+
+    luminosities = mock_cluster._sample_truncated_schechter_luminosities(
+        rng,
+        180_000,
+        luminosity_min=luminosity_min,
+        luminosity_max=luminosity_max,
+        alpha=config.subhalo_schechter_alpha,
+    )
+    masses = mock_cluster._subhalo_mass_from_luminosity_ratio(luminosities, config)
+
+    assert np.isfinite(luminosities).all()
+    assert luminosities.min() >= luminosity_min
+    assert luminosities.max() <= luminosity_max
+    assert np.isfinite(masses).all()
+    assert masses.min() >= config.subhalo_mass_min
+    assert masses.max() <= config.subhalo_mass_max
+    log_edges = np.linspace(np.log10(luminosity_min), np.log10(luminosity_max), 40)
+    counts, edges = np.histogram(np.log10(luminosities), bins=log_edges)
+    peak_center = 10.0 ** (0.5 * (edges[np.argmax(counts)] + edges[np.argmax(counts) + 1]))
+
+    assert peak_center == pytest.approx(config.subhalo_schechter_alpha + 1.0, rel=0.25)
+    assert np.count_nonzero(masses > config.subhalo_mass_ref) > 0
+
+
+def test_subhalo_schechter_selection_draws_from_observable_distribution() -> None:
+    config = SingleBCGMockConfig(n_subhalos=8, subhalo_parent_factor=5)
+
+    subhalos, selection = mock_cluster._generate_schechter_subhalo_candidates(config, np.random.default_rng(0))
+
+    assert len(subhalos) == config.n_subhalos
+    assert selection is not None
+    candidates = selection["candidates"]
+    selected = [row for row in candidates if row["selected"]]
+    unselected_observable = [row for row in candidates if not row["selected"] and row["passes_mag_cut"]]
+    assert len(selected) == config.n_subhalos
+    assert all(row["catalog_mag"] <= config.subhalo_mag_faint_limit for row in selected)
+    assert all(row["passes_mag_cut"] for row in selected)
+    assert unselected_observable
+
+    faintest_selected_mag = max(float(row["catalog_mag"]) for row in selected)
+    brightest_unselected_mag = min(float(row["catalog_mag"]) for row in unselected_observable)
+    assert brightest_unselected_mag < faintest_selected_mag
+
+
+def test_subhalo_schechter_luminosity_to_mass_conversion_uses_dpie_scaling() -> None:
+    config = SingleBCGMockConfig()
+    exponent = mock_cluster._subhalo_mass_luminosity_exponent(config)
+    luminosity_peak = config.subhalo_schechter_alpha + 1.0
+    one_mag_fainter_luminosity = 10.0**-0.4
+    luminosities = np.asarray([1.0, luminosity_peak, 10.0, one_mag_fainter_luminosity])
+
+    masses = mock_cluster._subhalo_mass_from_luminosity_ratio(luminosities, config)
+    mags = mock_cluster._subhalo_magnitude_from_luminosity_ratio(luminosities, config)
+
+    assert config.subhalo_vdslope == pytest.approx(4.0)
+    assert config.subhalo_slope == pytest.approx(4.0)
+    assert exponent == pytest.approx(1.0)
+    assert masses[0] == pytest.approx(config.subhalo_mass_ref)
+    assert mags[0] == pytest.approx(config.subhalo_mag0)
+    assert masses[1] == pytest.approx(config.subhalo_mass_ref * luminosity_peak**exponent)
+    assert masses[2] > masses[0]
+    assert mags[2] < mags[0]
+    assert masses[3] / masses[0] == pytest.approx(10.0**-0.4)
+    assert mags[3] == pytest.approx(config.subhalo_mag0 + 1.0)
+
+
+def test_subhalo_schechter_selection_raises_when_mag_cut_rejects_candidates() -> None:
+    config = SingleBCGMockConfig(
+        n_primary_families=1,
+        n_subhalos=3,
+        subhalo_mag_faint_limit=-100.0,
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to select 3 Schechter subhalos"):
+        mock_cluster._generate_subhalo_catalog(config, np.random.default_rng(5))
+
+
+def test_plot_subhalo_shmf_writes_pdf(tmp_path: Path) -> None:
+    truth = {
+        "subhalo_selection": {
+            "schechter_alpha": -0.7,
+            "mass_ref": 1.0e12,
+            "mass_luminosity_exponent": 1.2,
+            "mag_faint_limit": 24.0,
+            "candidates": [
+                {
+                    "subhalo_candidate_index": 0,
+                    "subhalo_mass_msun": 1.0e12,
+                    "catalog_mag": 17.0,
+                    "luminosity_ratio": 1.0,
+                    "subhalo_parent_rank": 1,
+                    "passes_mag_cut": True,
+                    "selected": True,
+                    "selected_member_id": "member001",
+                },
+                {
+                    "subhalo_candidate_index": 1,
+                    "subhalo_mass_msun": 2.4e11,
+                    "catalog_mag": 18.3,
+                    "luminosity_ratio": 0.3,
+                    "subhalo_parent_rank": 2,
+                    "passes_mag_cut": True,
+                    "selected": False,
+                },
+                {
+                    "subhalo_candidate_index": 2,
+                    "subhalo_mass_msun": 1.0e9,
+                    "catalog_mag": 25.4,
+                    "luminosity_ratio": 0.003,
+                    "subhalo_parent_rank": 3,
+                    "passes_mag_cut": False,
+                    "selected": False,
+                },
+            ],
+        }
+    }
+    path = tmp_path / "subhalo_shmf.pdf"
+
+    validation._plot_subhalo_selection(truth, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+
+
+def test_plot_subhalo_shmf_writes_placeholder_without_data(tmp_path: Path) -> None:
+    path = tmp_path / "subhalo_shmf.pdf"
+
+    validation._plot_subhalo_selection({}, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+
+
+def test_recovered_subhalo_mass_table_uses_recovered_scaling_parameters() -> None:
+    packed = SimpleNamespace(
+        component_family=np.asarray([0, 1, 1], dtype=int),
+        x_center_base=np.asarray([0.0, -3.0, 6.0], dtype=float),
+        y_center_base=np.asarray([0.0, 4.0, 8.0], dtype=float),
+        luminosity_ratio=np.asarray([1.0, 1.0, 0.25], dtype=float),
+        sigma_ref_base=np.asarray([0.0, 245.0, 245.0], dtype=float),
+        cut_ref_base=np.asarray([0.0, 40.0, 40.0], dtype=float),
+        vdslope_base=np.asarray([0.0, 4.0, 4.0], dtype=float),
+        slope_base=np.asarray([0.0, 4.0, 4.0], dtype=float),
+        sigma_ref_param_index=np.asarray([-1, 0, 0], dtype=int),
+        cut_ref_param_index=np.asarray([-1, 1, 1], dtype=int),
+        vdslope_param_index=np.asarray([-1, 2, 2], dtype=int),
+        slope_param_index=np.asarray([-1, 3, 3], dtype=int),
+    )
+    state = SimpleNamespace(
+        packed_lens_spec=packed,
+        scaling_component_records=[
+            {
+                "component_index": 1,
+                "potfile_id": "potfile",
+                "catalog_id": "member001",
+                "x_centre": 3.0,
+                "y_centre": 4.0,
+            },
+            {"component_index": 2, "potfile_id": "potfile", "catalog_id": "member002"},
+        ],
+    )
+    best_fit = np.asarray([300.0, 60.0, 5.0, 4.0], dtype=float)
+    truth = {
+        "parameter_truth": {"potfile.sigma": 245.0, "potfile.cutkpc": 40.0},
+        "subhalo_selection": {"mass_ref": 1.0e12},
+    }
+
+    table = validation._recovered_subhalo_mass_table(state, best_fit, truth)
+
+    normalization = (300.0 / 245.0) ** 2 * (60.0 / 40.0)
+    exponent = 2.0 / 5.0 + 2.0 / 4.0
+    assert table["catalog_id"].tolist() == ["member001", "member002"]
+    assert table["recovered_subhalo_mass_msun"].tolist() == pytest.approx(
+        [
+            1.0e12 * normalization,
+            1.0e12 * normalization * 0.25**exponent,
+        ]
+    )
+    assert table["x_arcsec"].tolist() == pytest.approx([3.0, 6.0])
+    assert table["y_arcsec"].tolist() == pytest.approx([4.0, 8.0])
+    assert table["recovered_radius_arcsec"].tolist() == pytest.approx([5.0, 10.0])
+
+
+def test_plot_absolute_magnification_recovery_writes_pdf(tmp_path: Path) -> None:
+    truth_abs_mu_raw = np.abs(
+        np.asarray(
+            [
+                [1.0, -8.0, 120.0],
+                [3.0, 12.0, 25.0],
+                [np.nan, 45.0, 70.0],
+            ]
+        )
+    )
+    recovered_abs_mu_raw = np.abs(
+        np.asarray(
+            [
+                [2.0, -10.0, 100.0],
+                [5.0, 8.0, 20.0],
+                [4.0, np.inf, 60.0],
+            ]
+        )
+    )
+    truth_abs_mu = np.minimum(truth_abs_mu_raw, 25.0)
+    recovered_abs_mu = np.minimum(recovered_abs_mu_raw, 25.0)
+    grid = validation._AbsoluteMagnificationRecoveryGrid(
+        x_axis_arcsec=np.asarray([-1.0, 0.0, 1.0]),
+        y_axis_arcsec=np.asarray([-1.0, 0.0, 1.0]),
+        truth_abs_mu_raw=truth_abs_mu_raw,
+        recovered_abs_mu_raw=recovered_abs_mu_raw,
+        truth_abs_mu=truth_abs_mu,
+        recovered_abs_mu=recovered_abs_mu,
+        residual_abs_mu=recovered_abs_mu_raw - truth_abs_mu_raw,
+        z_source=7.0,
+        cap=25.0,
+    )
+    path = tmp_path / "absolute_magnification_recovery.pdf"
+
+    validation._plot_absolute_magnification_recovery(grid, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+
+
+def test_plot_absolute_magnification_recovery_uses_capped_viridis_and_centered_residual(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from matplotlib.axes import Axes
+    from matplotlib.colorbar import Colorbar
+    from matplotlib.colors import TwoSlopeNorm
+
+    truth_abs_mu_raw = np.abs(np.asarray([[5.0, -80.0], [20.0, np.nan]]))
+    recovered_abs_mu_raw = np.abs(np.asarray([[10.0, 100.0], [-5.0, np.inf]]))
+    truth_abs_mu = np.minimum(truth_abs_mu_raw, 25.0)
+    recovered_abs_mu = np.minimum(recovered_abs_mu_raw, 25.0)
+    residual_abs_mu = recovered_abs_mu_raw - truth_abs_mu_raw
+    grid = validation._AbsoluteMagnificationRecoveryGrid(
+        x_axis_arcsec=np.asarray([-1.0, 1.0]),
+        y_axis_arcsec=np.asarray([-1.0, 1.0]),
+        truth_abs_mu_raw=truth_abs_mu_raw,
+        recovered_abs_mu_raw=recovered_abs_mu_raw,
+        truth_abs_mu=truth_abs_mu,
+        recovered_abs_mu=recovered_abs_mu,
+        residual_abs_mu=residual_abs_mu,
+        z_source=7.0,
+        cap=25.0,
+    )
+    imshow_calls: list[tuple[np.ndarray, dict[str, Any]]] = []
+    colorbar_labels: list[str] = []
+    subplot_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    layout_axes: list[Axes] = []
+    xlabels: list[tuple[Axes, str]] = []
+    ylabels: list[tuple[Axes, str]] = []
+    tick_params_calls: list[tuple[Axes, dict[str, Any]]] = []
+    original_subplots = validation.plt.subplots
+    original_imshow = Axes.imshow
+    original_colorbar_set_label = Colorbar.set_label
+    original_set_xlabel = Axes.set_xlabel
+    original_set_ylabel = Axes.set_ylabel
+    original_tick_params = Axes.tick_params
+
+    def record_subplots(*args: Any, **kwargs: Any) -> Any:
+        subplot_calls.append((args, dict(kwargs)))
+        fig, axes = original_subplots(*args, **kwargs)
+        layout_axes.extend(np.ravel(axes).tolist())
+        return fig, axes
+
+    def record_imshow(self: Axes, data: Any, *args: Any, **kwargs: Any) -> Any:
+        imshow_calls.append((np.ma.asarray(data).filled(np.nan), dict(kwargs)))
+        return original_imshow(self, data, *args, **kwargs)
+
+    def fail_set_title(self: Axes, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("absolute magnification recovery plot should not draw panel titles")
+
+    def record_colorbar_label(self: Colorbar, label: str, *args: Any, **kwargs: Any) -> Any:
+        colorbar_labels.append(str(label))
+        return original_colorbar_set_label(self, label, *args, **kwargs)
+
+    def record_set_xlabel(self: Axes, label: str, *args: Any, **kwargs: Any) -> Any:
+        xlabels.append((self, str(label)))
+        return original_set_xlabel(self, label, *args, **kwargs)
+
+    def record_set_ylabel(self: Axes, label: str, *args: Any, **kwargs: Any) -> Any:
+        ylabels.append((self, str(label)))
+        return original_set_ylabel(self, label, *args, **kwargs)
+
+    def record_tick_params(self: Axes, *args: Any, **kwargs: Any) -> Any:
+        tick_params_calls.append((self, dict(kwargs)))
+        return original_tick_params(self, *args, **kwargs)
+
+    monkeypatch.setattr(validation.plt, "subplots", record_subplots)
+    monkeypatch.setattr(Axes, "imshow", record_imshow)
+    monkeypatch.setattr(Axes, "set_title", fail_set_title)
+    monkeypatch.setattr(Colorbar, "set_label", record_colorbar_label)
+    monkeypatch.setattr(Axes, "set_xlabel", record_set_xlabel)
+    monkeypatch.setattr(Axes, "set_ylabel", record_set_ylabel)
+    monkeypatch.setattr(Axes, "tick_params", record_tick_params)
+
+    validation._plot_absolute_magnification_recovery(grid, tmp_path / "absolute_magnification_recovery.pdf")
+
+    assert subplot_calls == [((2, 1), {"sharex": True, "figsize": (6.2, 8.6)})]
+    assert len(layout_axes) == 2
+    assert len(imshow_calls) == 2
+    left_data, left_kwargs = imshow_calls[0]
+    right_data, right_kwargs = imshow_calls[1]
+    assert np.nanmax(left_data) <= 25.0
+    assert left_kwargs["cmap"] == "viridis"
+    assert left_kwargs["vmin"] == 0.0
+    assert left_kwargs["vmax"] == 25.0
+    np.testing.assert_allclose(right_data, residual_abs_mu, equal_nan=True)
+    assert right_kwargs["cmap"] == "RdBu"
+    assert isinstance(right_kwargs["norm"], TwoSlopeNorm)
+    assert right_kwargs["norm"].vmin == pytest.approx(-25.0)
+    assert right_kwargs["norm"].vcenter == pytest.approx(0.0)
+    assert right_kwargs["norm"].vmax == pytest.approx(25.0)
+    nonempty_colorbar_labels = [label for label in colorbar_labels if label]
+    assert nonempty_colorbar_labels == [
+        r"$|\mu_{\rm rec}|$",
+        r"$|\mu_{\rm rec}| - |\mu_{\rm truth}|$",
+    ]
+    assert not any("capped at" in label for label in nonempty_colorbar_labels)
+    assert not any("min(" in label for label in nonempty_colorbar_labels)
+    panel_xlabels = [(ax, label) for ax, label in xlabels if ax in layout_axes]
+    panel_ylabels = [(ax, label) for ax, label in ylabels if ax in layout_axes]
+    assert layout_axes[0].get_xlabel() == ""
+    assert layout_axes[1].get_xlabel() == "x [arcsec]"
+    assert not any(ax is layout_axes[0] and label == "x [arcsec]" for ax, label in panel_xlabels)
+    assert any(ax is layout_axes[1] and label == "x [arcsec]" for ax, label in panel_xlabels)
+    assert panel_ylabels == [(layout_axes[0], "y [arcsec]"), (layout_axes[1], "y [arcsec]")]
+    assert any(
+        ax is layout_axes[0]
+        and kwargs.get("axis") == "x"
+        and kwargs.get("labelbottom") is False
+        for ax, kwargs in tick_params_calls
+    )
+
+
+def test_absolute_magnification_grid_source_redshift_prefers_z9_then_highest() -> None:
+    assert validation._absolute_magnification_grid_source_redshift(
+        {"kwargs_lens_by_source_redshift": {"2.00000000": [], "9.00000000": []}}
+    ) == pytest.approx(9.0)
+    assert validation._absolute_magnification_grid_source_redshift(
+        {"kwargs_lens_by_source_redshift": {"2.00000000": [], "5.00000000": []}}
+    ) == pytest.approx(5.0)
+    assert validation._absolute_magnification_grid_source_redshift(
+        {"config": {"source_redshift": 3.0}}
+    ) == pytest.approx(3.0)
+
+
+def test_plot_image_residual_histogram_writes_pdf(tmp_path: Path) -> None:
+    image_df = pd.DataFrame({"image_residual_arcsec": [0.02, 0.05, 0.08, 0.13]})
+    path = tmp_path / "image_residual_histogram.pdf"
+
+    validation._plot_image_residual_histogram(image_df, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+
+
+def test_plot_image_residual_histogram_uses_q50_and_filters_nonfinite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from matplotlib.axes import Axes
+
+    image_df = pd.DataFrame(
+        {
+            "image_residual_arcsec": [9.0, 9.0, 9.0, 9.0, 9.0],
+            "image_residual_q50": [0.04, np.nan, 0.08, np.inf, 0.12],
+        }
+    )
+    hist_values: list[np.ndarray] = []
+    hist_bins: list[Any] = []
+    axvline_values: list[float] = []
+    xlabels: list[str] = []
+    ylabels: list[str] = []
+    original_hist = Axes.hist
+    original_axvline = Axes.axvline
+    original_set_xlabel = Axes.set_xlabel
+    original_set_ylabel = Axes.set_ylabel
+
+    def record_hist(self: Axes, values: Any, *args: Any, **kwargs: Any) -> Any:
+        hist_values.append(np.asarray(values, dtype=float))
+        hist_bins.append(kwargs.get("bins"))
+        return original_hist(self, values, *args, **kwargs)
+
+    def record_axvline(self: Axes, x: Any = 0, *args: Any, **kwargs: Any) -> Any:
+        axvline_values.append(float(x))
+        return original_axvline(self, x, *args, **kwargs)
+
+    def record_set_xlabel(self: Axes, label: str, *args: Any, **kwargs: Any) -> Any:
+        xlabels.append(str(label))
+        return original_set_xlabel(self, label, *args, **kwargs)
+
+    def record_set_ylabel(self: Axes, label: str, *args: Any, **kwargs: Any) -> Any:
+        ylabels.append(str(label))
+        return original_set_ylabel(self, label, *args, **kwargs)
+
+    def fail_set_title(self: Axes, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("image residual histogram should not draw a title")
+
+    monkeypatch.setattr(Axes, "hist", record_hist)
+    monkeypatch.setattr(Axes, "axvline", record_axvline)
+    monkeypatch.setattr(Axes, "set_xlabel", record_set_xlabel)
+    monkeypatch.setattr(Axes, "set_ylabel", record_set_ylabel)
+    monkeypatch.setattr(Axes, "set_title", fail_set_title)
+
+    validation._plot_image_residual_histogram(image_df, tmp_path / "image_residual_histogram.pdf")
+
+    assert len(hist_values) == 1
+    np.testing.assert_allclose(hist_values[0], [0.04, 9.0, 0.08, 9.0, 0.12])
+    assert hist_bins == [30]
+    assert any(value == pytest.approx(0.12) for value in axvline_values)
+    assert any(value == pytest.approx(float(np.sqrt(np.mean(np.square(hist_values[0]))))) for value in axvline_values)
+    assert xlabels == ["image residual [arcsec]"]
+    assert ylabels == ["N images"]
+
+
+def test_plot_image_recovery_value_fallback_uses_best_fit_for_nan_q50() -> None:
+    image_df = pd.DataFrame(
+        {
+            "x_model_arcsec": [1.0, 2.0, 3.0],
+            "x_model_q50": [np.nan, 20.0, np.inf],
+        }
+    )
+
+    values = validation._plot_value_with_fallback(image_df, "x_model_q50", "x_model_arcsec")
+
+    np.testing.assert_allclose(values, [1.0, 20.0, 3.0])
+
+
+def test_plot_image_residual_histogram_writes_placeholder_without_finite_values(tmp_path: Path) -> None:
+    image_df = pd.DataFrame({"image_residual_arcsec": [np.nan, np.inf, -np.inf]})
+    path = tmp_path / "image_residual_histogram.pdf"
+
+    validation._plot_image_residual_histogram(image_df, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+
+
+def test_plot_critical_arc_support_histogram_uses_q50_and_thresholds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from matplotlib.axes import Axes
+
+    image_df = pd.DataFrame(
+        {
+            "image_residual_arcsec": [9.0, 9.0],
+            "image_residual_q50": [0.4, 0.8],
+            "arc_aware_image_residual_arcsec": [0.3, 0.2],
+            "arc_aware_image_residual_q50": [0.02, np.nan],
+            "arc_curve_distance_arcsec": [0.04, 0.45],
+            "arc_noncritical_direction_residual_arcsec": [0.01, 0.25],
+            "arc_critical_direction_residual_arcsec": [4.0, 0.5],
+            "arc_s_min": [0.04, 0.5],
+            "arc_prior_probability": [0.75, 0.12],
+            "arc_recovery_status": ["arc_supported", "not_recovered"],
+        }
+    )
+    hist_values: list[np.ndarray] = []
+    axvline_values: list[float] = []
+    original_hist = Axes.hist
+    original_axvline = Axes.axvline
+
+    def record_hist(self: Axes, values: Any, *args: Any, **kwargs: Any) -> Any:
+        hist_values.append(np.asarray(values, dtype=float))
+        return original_hist(self, values, *args, **kwargs)
+
+    def record_axvline(self: Axes, x: Any = 0, *args: Any, **kwargs: Any) -> Any:
+        axvline_values.append(float(x))
+        return original_axvline(self, x, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "hist", record_hist)
+    monkeypatch.setattr(Axes, "axvline", record_axvline)
+
+    validation._plot_critical_arc_support_histogram(
+        image_df,
+        tmp_path / "critical_arc_support_histogram.pdf",
+    )
+
+    assert any(np.allclose(values, [0.02, 0.2]) for values in hist_values)
+    assert any(np.allclose(values, [0.04, 0.45]) for values in hist_values)
+    assert any(value == pytest.approx(0.5) for value in axvline_values)
+    assert any(value == pytest.approx(0.2) for value in axvline_values)
+
+
+def test_plot_critical_arc_support_phase_space_draws_support_lines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from matplotlib.axes import Axes
+
+    image_df = pd.DataFrame(
+        {
+            "arc_s_min": [0.04, 0.5, np.nan],
+            "arc_curve_distance_arcsec": [0.04, 0.45, 0.1],
+            "arc_noncritical_direction_residual_arcsec": [0.03, 0.6, 0.1],
+            "arc_critical_direction_residual_arcsec": [5.0, 0.1, 1.0],
+            "arc_recovery_status": ["arc_supported", "not_recovered", "point_recovered"],
+        }
+    )
+    scatter_xy: list[tuple[np.ndarray, np.ndarray]] = []
+    axvline_values: list[float] = []
+    axhline_values: list[float] = []
+    original_scatter = Axes.scatter
+    original_axvline = Axes.axvline
+    original_axhline = Axes.axhline
+
+    def record_scatter(self: Axes, x: Any, y: Any, *args: Any, **kwargs: Any) -> Any:
+        scatter_xy.append((np.asarray(x, dtype=float), np.asarray(y, dtype=float)))
+        return original_scatter(self, x, y, *args, **kwargs)
+
+    def record_axvline(self: Axes, x: Any = 0, *args: Any, **kwargs: Any) -> Any:
+        axvline_values.append(float(x))
+        return original_axvline(self, x, *args, **kwargs)
+
+    def record_axhline(self: Axes, y: Any = 0, *args: Any, **kwargs: Any) -> Any:
+        axhline_values.append(float(y))
+        return original_axhline(self, y, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "scatter", record_scatter)
+    monkeypatch.setattr(Axes, "axvline", record_axvline)
+    monkeypatch.setattr(Axes, "axhline", record_axhline)
+
+    validation._plot_critical_arc_support_phase_space(
+        image_df,
+        tmp_path / "critical_arc_support_phase_space.pdf",
+    )
+
+    all_x = np.concatenate([item[0] for item in scatter_xy])
+    all_y = np.concatenate([item[1] for item in scatter_xy])
+    np.testing.assert_allclose(np.sort(all_x), [0.04, 0.5])
+    np.testing.assert_allclose(np.sort(all_y), [0.04, 0.45])
+    assert axvline_values == [pytest.approx(0.2)]
+    assert axhline_values == [pytest.approx(0.5)]
+
+
+def test_plot_critical_arc_support_placeholder_without_finite_values(tmp_path: Path) -> None:
+    image_df = pd.DataFrame({"image_residual_arcsec": [0.1], "arc_s_min": [np.nan]})
+    path = tmp_path / "critical_arc_support_histogram.pdf"
+
+    validation._plot_critical_arc_support_histogram(image_df, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+
+
+def test_plot_subhalo_recovery_shmf_writes_pdf(tmp_path: Path) -> None:
+    truth = {
+        "subhalos": [
+            {"subhalo_mass_msun": 1.0e11},
+            {"subhalo_mass_msun": 3.0e11},
+            {"subhalo_mass_msun": 1.2e12},
+        ]
+    }
+    recovered = pd.DataFrame(
+        {
+            "recovered_subhalo_mass_msun": [1.2e11, 2.5e11, 9.0e11],
+        }
+    )
+    path = tmp_path / "subhalo_recovery_shmf.pdf"
+
+    validation._plot_subhalo_recovery_shmf(truth, recovered, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+
+
+def test_plot_subhalo_recovery_shmf_uses_truth_schechter_without_parent_or_rugs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    truth = {
+        "subhalos": [
+            {"subhalo_mass_msun": 1.0e11},
+            {"subhalo_mass_msun": 3.0e11},
+            {"subhalo_mass_msun": 1.2e12},
+        ],
+        "subhalo_selection": {
+            "schechter_alpha": -0.7,
+            "mass_ref": 1.0e12,
+            "mass_luminosity_exponent": 1.0,
+            "candidates": [
+                {"subhalo_mass_msun": 5.0e10},
+                {"subhalo_mass_msun": 1.0e11},
+                {"subhalo_mass_msun": 3.0e11},
+                {"subhalo_mass_msun": 1.2e12},
+                {"subhalo_mass_msun": 2.0e12},
+            ],
+        },
+    }
+    recovered = pd.DataFrame(
+        {
+            "recovered_subhalo_mass_msun": [1.2e11, 2.5e11, 9.0e11],
+        }
+    )
+    hist_kwargs: list[dict[str, Any]] = []
+    plot_labels: list[str | None] = []
+    schechter_integrals: list[float] = []
+    xlabel_fontsizes: list[float | None] = []
+    ylabel_fontsizes: list[float | None] = []
+    legend_fontsizes: list[float | None] = []
+    legend_locs: list[str | None] = []
+    minor_locator_args: list[tuple[Any, ...]] = []
+    original_hist = validation.plt.Axes.hist
+    original_plot = validation.plt.Axes.plot
+    original_set_xlabel = validation.plt.Axes.set_xlabel
+    original_set_ylabel = validation.plt.Axes.set_ylabel
+    original_legend = validation.plt.Axes.legend
+    original_minor_locator = validation.AutoMinorLocator
+
+    def record_hist(self: Any, *args: Any, **kwargs: Any) -> Any:
+        hist_kwargs.append(dict(kwargs))
+        return original_hist(self, *args, **kwargs)
+
+    def record_plot(self: Any, *args: Any, **kwargs: Any) -> Any:
+        plot_labels.append(kwargs.get("label"))
+        if len(args) >= 2:
+            schechter_integrals.append(float(np.trapezoid(np.asarray(args[1], dtype=float), np.asarray(args[0], dtype=float))))
+        return original_plot(self, *args, **kwargs)
+
+    def fail_scatter(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("subhalo recovery SHMF should not draw scatter rug markers")
+
+    def fail_title(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("subhalo recovery SHMF should not draw a title")
+
+    def record_set_xlabel(self: Any, *args: Any, **kwargs: Any) -> Any:
+        xlabel_fontsizes.append(kwargs.get("fontsize"))
+        return original_set_xlabel(self, *args, **kwargs)
+
+    def record_set_ylabel(self: Any, *args: Any, **kwargs: Any) -> Any:
+        ylabel_fontsizes.append(kwargs.get("fontsize"))
+        return original_set_ylabel(self, *args, **kwargs)
+
+    def record_legend(self: Any, *args: Any, **kwargs: Any) -> Any:
+        legend_fontsizes.append(kwargs.get("fontsize"))
+        legend_locs.append(kwargs.get("loc"))
+        return original_legend(self, *args, **kwargs)
+
+    def record_minor_locator(*args: Any, **kwargs: Any) -> Any:
+        minor_locator_args.append(args)
+        return original_minor_locator(*args, **kwargs)
+
+    monkeypatch.setattr(validation.plt.Axes, "hist", record_hist)
+    monkeypatch.setattr(validation.plt.Axes, "plot", record_plot)
+    monkeypatch.setattr(validation.plt.Axes, "scatter", fail_scatter)
+    monkeypatch.setattr(validation.plt.Axes, "set_title", fail_title)
+    monkeypatch.setattr(validation.plt.Axes, "set_xlabel", record_set_xlabel)
+    monkeypatch.setattr(validation.plt.Axes, "set_ylabel", record_set_ylabel)
+    monkeypatch.setattr(validation.plt.Axes, "legend", record_legend)
+    monkeypatch.setattr(validation, "AutoMinorLocator", record_minor_locator)
+
+    path = tmp_path / "subhalo_recovery_shmf.pdf"
+
+    validation._plot_subhalo_recovery_shmf(truth, recovered, path)
+
+    hist_labels = [kwargs.get("label") for kwargs in hist_kwargs]
+    assert "parent candidates" not in hist_labels
+    assert "Truth subhalos" in hist_labels
+    truth_hist = next(kwargs for kwargs in hist_kwargs if kwargs.get("label") == "Truth subhalos")
+    assert truth_hist["color"] == "lightgray"
+    assert truth_hist["alpha"] == pytest.approx(0.8)
+    assert any(label is not None and label.startswith("Schechter") for label in plot_labels)
+    assert schechter_integrals == [pytest.approx(3.0)]
+    assert minor_locator_args == [(5,)]
+    assert xlabel_fontsizes == [14]
+    assert ylabel_fontsizes == [14]
+    assert legend_fontsizes == [11]
+    assert legend_locs == ["upper left"]
+    assert path.exists()
+    assert path.stat().st_size > 0
+
+
+def test_plot_subhalo_recovery_radial_writes_pdf(tmp_path: Path) -> None:
+    truth = {
+        "subhalos": [
+            {"x_arcsec": 3.0, "y_arcsec": 4.0},
+            {"x_arcsec": 8.0, "y_arcsec": 6.0},
+            {"x_arcsec": 12.0, "y_arcsec": 16.0},
+        ]
+    }
+    recovered = pd.DataFrame(
+        {
+            "recovered_radius_arcsec": [6.0, 12.0, 18.0],
+        }
+    )
+    path = tmp_path / "subhalo_recovery_radial.pdf"
+
+    validation._plot_subhalo_recovery_radial(truth, recovered, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+
+
+def test_plot_subhalo_recovery_radial_uses_truth_style_without_parent_or_rugs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    truth = {
+        "subhalos": [
+            {"x_arcsec": 3.0, "y_arcsec": 4.0},
+            {"x_arcsec": 8.0, "y_arcsec": 6.0},
+            {"x_arcsec": 12.0, "y_arcsec": 16.0},
+        ],
+        "subhalo_selection": {
+            "candidates": [
+                {"subhalo_mass_msun": 5.0e10},
+                {"subhalo_mass_msun": 1.0e11},
+            ],
+        },
+    }
+    recovered = pd.DataFrame(
+        {
+            "recovered_radius_arcsec": [6.0, 12.0, 18.0],
+        }
+    )
+    hist_kwargs: list[dict[str, Any]] = []
+    xlabel_fontsizes: list[float | None] = []
+    ylabel_fontsizes: list[float | None] = []
+    legend_fontsizes: list[float | None] = []
+    legend_locs: list[str | None] = []
+    minor_locator_args: list[tuple[Any, ...]] = []
+    original_hist = validation.plt.Axes.hist
+    original_set_xlabel = validation.plt.Axes.set_xlabel
+    original_set_ylabel = validation.plt.Axes.set_ylabel
+    original_legend = validation.plt.Axes.legend
+    original_minor_locator = validation.AutoMinorLocator
+
+    def record_hist(self: Any, *args: Any, **kwargs: Any) -> Any:
+        hist_kwargs.append(dict(kwargs))
+        return original_hist(self, *args, **kwargs)
+
+    def fail_scatter(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("subhalo radial recovery should not draw scatter rug markers")
+
+    def fail_title(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("subhalo radial recovery should not draw a title")
+
+    def fail_plot(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("subhalo radial recovery should not draw line plots")
+
+    def record_set_xlabel(self: Any, *args: Any, **kwargs: Any) -> Any:
+        xlabel_fontsizes.append(kwargs.get("fontsize"))
+        return original_set_xlabel(self, *args, **kwargs)
+
+    def record_set_ylabel(self: Any, *args: Any, **kwargs: Any) -> Any:
+        ylabel_fontsizes.append(kwargs.get("fontsize"))
+        return original_set_ylabel(self, *args, **kwargs)
+
+    def record_legend(self: Any, *args: Any, **kwargs: Any) -> Any:
+        legend_fontsizes.append(kwargs.get("fontsize"))
+        legend_locs.append(kwargs.get("loc"))
+        return original_legend(self, *args, **kwargs)
+
+    def record_minor_locator(*args: Any, **kwargs: Any) -> Any:
+        minor_locator_args.append(args)
+        return original_minor_locator(*args, **kwargs)
+
+    monkeypatch.setattr(validation.plt.Axes, "hist", record_hist)
+    monkeypatch.setattr(validation.plt.Axes, "plot", fail_plot)
+    monkeypatch.setattr(validation.plt.Axes, "scatter", fail_scatter)
+    monkeypatch.setattr(validation.plt.Axes, "set_title", fail_title)
+    monkeypatch.setattr(validation.plt.Axes, "set_xlabel", record_set_xlabel)
+    monkeypatch.setattr(validation.plt.Axes, "set_ylabel", record_set_ylabel)
+    monkeypatch.setattr(validation.plt.Axes, "legend", record_legend)
+    monkeypatch.setattr(validation, "AutoMinorLocator", record_minor_locator)
+
+    path = tmp_path / "subhalo_recovery_radial.pdf"
+
+    validation._plot_subhalo_recovery_radial(truth, recovered, path)
+
+    hist_labels = [kwargs.get("label") for kwargs in hist_kwargs]
+    assert "parent candidates" not in hist_labels
+    assert "Truth subhalos" in hist_labels
+    assert "recovered subhalos" in hist_labels
+    truth_hist = next(kwargs for kwargs in hist_kwargs if kwargs.get("label") == "Truth subhalos")
+    recovered_hist = next(kwargs for kwargs in hist_kwargs if kwargs.get("label") == "recovered subhalos")
+    assert truth_hist["color"] == "lightgray"
+    assert truth_hist["alpha"] == pytest.approx(0.8)
+    assert recovered_hist["histtype"] == "step"
+    assert recovered_hist["color"] == "tab:blue"
+    assert minor_locator_args == [(5,)]
+    assert xlabel_fontsizes == [14]
+    assert ylabel_fontsizes == [14]
+    assert legend_fontsizes == [11]
+    assert legend_locs == ["upper left"]
+    assert path.exists()
+    assert path.stat().st_size > 0
+
+
+def test_plot_prefit_subhalo_spatial_distribution_writes_partial_pdf(tmp_path: Path) -> None:
+    subhalo_df = pd.DataFrame(
+        {
+            "x_arcsec": [2.5, -1.0],
+            "y_arcsec": [-0.5, 1.5],
+            "luminosity_ratio": [1.0, 0.25],
+            "catalog_mag": [17.0, 19.0],
+        }
+    )
+    images = pd.DataFrame({"x_obs_arcsec": [-1.0, 1.0], "y_obs_arcsec": [0.0, 0.5]})
+    path = tmp_path / "prefit_subhalo_spatial_distribution.pdf"
+
+    validation._plot_prefit_subhalo_spatial_distribution(subhalo_df, images, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+
+
+def test_select_prefit_critical_line_contours_prefers_z9_then_highest() -> None:
+    z2_contour = validation.CausticContour(
+        caustic_index=0,
+        caustic_class="primary",
+        beta_x=np.asarray([-0.1, 0.0, 0.1]),
+        beta_y=np.asarray([0.0, 0.1, 0.0]),
+        critical_x=np.asarray([-1.0, 0.0, 1.0]),
+        critical_y=np.asarray([0.0, 1.0, 0.0]),
+        caustic_area_arcsec2=0.01,
+        critical_area_arcsec2=1.0,
+    )
+    z9_contour = validation.CausticContour(
+        caustic_index=0,
+        caustic_class="primary",
+        beta_x=np.asarray([-0.2, 0.0, 0.2]),
+        beta_y=np.asarray([0.0, 0.2, 0.0]),
+        critical_x=np.asarray([-2.0, 0.0, 2.0]),
+        critical_y=np.asarray([0.0, 2.0, 0.0]),
+        caustic_area_arcsec2=0.04,
+        critical_area_arcsec2=4.0,
+    )
+
+    selected = validation._select_prefit_critical_line_contours(
+        {"2.00000000": [z2_contour], "9.00000000": [z9_contour]}
+    )
+    fallback = validation._select_prefit_critical_line_contours(
+        {"2.00000000": [z2_contour], "5.00000000": [z9_contour]}
+    )
+
+    assert list(selected) == ["9.00000000"]
+    assert selected["9.00000000"][0] is z9_contour
+    assert list(fallback) == ["5.00000000"]
+    assert fallback["5.00000000"][0] is z9_contour
+
+
+def test_plot_prefit_critical_lines_writes_pdf(tmp_path: Path) -> None:
+    contour_payload = {
+        "caustic_index": 0,
+        "caustic_class": "primary",
+        "critical_x": [-2.0, 0.0, 2.0, -2.0],
+        "critical_y": [0.0, 2.0, 0.0, 0.0],
+        "caustic_beta_x": [-0.2, 0.0, 0.2, -0.2],
+        "caustic_beta_y": [0.0, 0.2, 0.0, 0.0],
+        "caustic_area_arcsec2": 0.04,
+        "critical_area_arcsec2": 4.0,
+    }
+    path = tmp_path / "prefit_critical_lines.pdf"
+
+    validation._plot_prefit_critical_lines({"caustics_by_source_redshift": {"9.00000000": [contour_payload]}}, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+
+
+def test_write_prefit_validation_diagnostics_writes_all_outputs(tmp_path: Path) -> None:
+    contour_payload = {
+        "caustic_index": 0,
+        "caustic_class": "primary",
+        "critical_x": [-2.0, 0.0, 2.0, -2.0],
+        "critical_y": [0.0, 2.0, 0.0, 0.0],
+        "caustic_beta_x": [-0.2, 0.0, 0.2, -0.2],
+        "caustic_beta_y": [0.0, 0.2, 0.0, 0.0],
+    }
+    truth = {
+        "subhalos": [
+            {
+                "subhalo_mass_msun": 1.0e11,
+                "x_arcsec": 2.0,
+                "y_arcsec": -1.0,
+                "luminosity_ratio": 1.0,
+                "catalog_mag": 17.0,
+            }
+        ],
+        "subhalo_selection": {"candidates": [{"subhalo_mass_msun": 1.0e11, "selected": True}]},
+        "caustics_by_source_redshift": {"9.00000000": [contour_payload]},
+    }
+    images = pd.DataFrame({"x_obs_arcsec": [0.0], "y_obs_arcsec": [1.0]})
+
+    outputs = validation.write_prefit_validation_diagnostics(truth, images, tmp_path)
+
+    assert outputs == {
+        "subhalo_shmf_plot": tmp_path / "subhalo_shmf.pdf",
+        "prefit_subhalo_spatial_distribution_plot": tmp_path / "prefit_subhalo_spatial_distribution.pdf",
+        "prefit_critical_lines_plot": tmp_path / "prefit_critical_lines.pdf",
+    }
+    for path in outputs.values():
+        assert path.exists()
+        assert path.stat().st_size > 0
 
 
 def test_generate_single_bcg_mock_can_request_subhalo_caustic_family(tmp_path: Path) -> None:
@@ -925,7 +2750,8 @@ def test_generate_single_bcg_mock_can_request_subhalo_caustic_family(tmp_path: P
         n_subhalo_families=1,
         n_subhalos=8,
         pos_sigma_arcsec=0.0,
-        source_redshifts=(2.0,),
+        primary_source_redshifts=(2.0,),
+        subhalo_source_redshifts=(2.0,),
     )
 
     _paths, images, truth = generate_single_bcg_mock(tmp_path, config)
@@ -1124,22 +2950,40 @@ def test_cosmology_parameter_specs_use_broad_uniform_priors() -> None:
     assert specs[1].physical_mean == pytest.approx(-0.8)
 
 
-def test_image_plane_scatter_default_log_uniform_prior_preserves_legacy_spec() -> None:
-    spec = cluster_solver._build_image_scatter_parameter_spec(start_index=0, upper_arcsec=2.0)
-
-    assert spec.sample_name == "image_sigma_int"
-    assert spec.prior_kind == "uniform"
-    assert spec.lower == pytest.approx(np.log(cluster_solver.DEFAULT_IMAGE_SIGMA_INT_LOWER_ARCSEC))
-    assert spec.upper == pytest.approx(np.log(2.0))
-    assert spec.transform_kind == "log_positive"
-    assert spec.physical_lower == pytest.approx(cluster_solver.DEFAULT_IMAGE_SIGMA_INT_LOWER_ARCSEC)
-    assert spec.physical_upper == pytest.approx(2.0)
-
-
-def test_image_plane_scatter_lognormal_prior_uses_normal_latent_log_sigma() -> None:
+def test_image_plane_scatter_default_log_uniform_prior_uses_default_floor() -> None:
     spec = cluster_solver._build_image_scatter_parameter_spec(
         start_index=0,
         upper_arcsec=2.0,
+    )
+
+    assert spec.sample_name == "image_sigma_int"
+    assert spec.prior_kind == "uniform"
+    assert spec.lower == pytest.approx(np.log(cluster_solver.DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC))
+    assert spec.upper == pytest.approx(np.log(2.0))
+    assert spec.transform_kind == "log_positive"
+    assert spec.physical_lower == pytest.approx(cluster_solver.DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC)
+    assert spec.physical_upper == pytest.approx(2.0)
+
+
+def test_image_plane_scatter_log_uniform_prior_uses_floor_as_lower_support() -> None:
+    spec = cluster_solver._build_image_scatter_parameter_spec(
+        start_index=0,
+        upper_arcsec=0.5,
+        floor_arcsec=0.05,
+    )
+
+    assert spec.prior_kind == "uniform"
+    assert spec.lower == pytest.approx(np.log(0.05))
+    assert spec.upper == pytest.approx(np.log(0.5))
+    assert spec.physical_lower == pytest.approx(0.05)
+    assert spec.physical_upper == pytest.approx(0.5)
+
+
+def test_image_plane_scatter_lognormal_prior_uses_truncated_normal_latent_log_sigma() -> None:
+    spec = cluster_solver._build_image_scatter_parameter_spec(
+        start_index=0,
+        upper_arcsec=0.5,
+        floor_arcsec=0.05,
         prior=cluster_solver.IMAGE_PLANE_SCATTER_PRIOR_LOGNORMAL,
         prior_median_arcsec=0.25,
         prior_log_sigma=0.4,
@@ -1148,15 +2992,61 @@ def test_image_plane_scatter_lognormal_prior_uses_normal_latent_log_sigma() -> N
     physical = cluster_solver._convert_theta_to_physical(np.asarray([np.log(0.25)]), [spec])
     log_prob = cluster_solver._prior_log_prob([spec], jnp.asarray([np.log(0.25)], dtype=jnp.float64))
 
-    assert spec.prior_kind == "normal"
-    assert spec.lower == float("-inf")
-    assert spec.upper == float("inf")
+    assert spec.prior_kind == "truncated_normal"
+    assert spec.lower == pytest.approx(np.log(0.05))
+    assert spec.upper == pytest.approx(np.log(0.5))
     assert spec.mean == pytest.approx(np.log(0.25))
     assert spec.std == pytest.approx(0.4)
     assert spec.transform_kind == "log_positive"
+    assert spec.physical_lower == pytest.approx(0.05)
+    assert spec.physical_upper == pytest.approx(0.5)
     assert spec.physical_mean == pytest.approx(0.25)
     assert physical.tolist() == pytest.approx([0.25])
-    assert float(log_prob) == pytest.approx(-0.5 * np.log(2.0 * np.pi * 0.4**2))
+    assert np.isfinite(float(log_prob))
+
+
+@pytest.mark.parametrize(
+    ("floor_arcsec", "upper_arcsec", "match"),
+    [
+        (0.0, 2.0, "floor"),
+        (float("nan"), 2.0, "floor"),
+        (0.1, 0.1, "upper"),
+        (0.1, float("nan"), "upper"),
+    ],
+)
+def test_image_plane_scatter_parameter_spec_rejects_invalid_direct_bounds(
+    floor_arcsec: float,
+    upper_arcsec: float,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        cluster_solver._build_image_scatter_parameter_spec(
+            start_index=0,
+            upper_arcsec=upper_arcsec,
+            floor_arcsec=floor_arcsec,
+        )
+
+
+def test_family_data_search_center_uses_observed_bounding_box_midpoint() -> None:
+    family = FamilyData(
+        family_id="1",
+        z_source=2.0,
+        effective_z_source=2.0,
+        sigma_arcsec=0.1,
+        image_labels=["1.a", "1.b", "1.c", "1.d", "1.e"],
+        x_obs=np.asarray([7.9, -19.9, -22.2, 9.5, 0.6], dtype=float),
+        y_obs=np.asarray([-26.4, 13.1, -0.3, 12.6, 0.9], dtype=float),
+        reliability=np.ones(5, dtype=float),
+    )
+
+    assert family.x_center == pytest.approx(0.5 * (np.min(family.x_obs) + np.max(family.x_obs)))
+    assert family.y_center == pytest.approx(0.5 * (np.min(family.y_obs) + np.max(family.y_obs)))
+    assert family.x_center != pytest.approx(float(np.mean(family.x_obs)))
+    assert family.y_center != pytest.approx(float(np.mean(family.y_obs)))
+    half_window = 0.5 * family.search_window
+    assert np.all(np.abs(family.x_obs - family.x_center) <= half_window)
+    assert np.all(np.abs(family.y_obs - family.y_center) <= half_window)
+    assert np.any(np.abs(family.y_obs - float(np.mean(family.y_obs))) > half_window)
 
 
 def test_prior_whitened_source_position_specs_map_unit_offsets_to_physical_beta() -> None:
@@ -1361,7 +3251,7 @@ def test_conditional_whitened_source_transport_correction_matches_change_of_vari
         )
     )
 
-    sigma2 = np.asarray(traced_bin.sigma_per_image) ** 2 + 0.3**2 + float(image_sigma_int) ** 2 + 0.01
+    sigma2 = np.asarray(traced_bin.sigma_per_image) ** 2 + float(image_sigma_int) ** 2 + 0.01
     weights = np.asarray(traced_bin.reliability_per_image) / sigma2
     prior_precision = 1.0 / 0.3**2
     precision_matrix = prior_precision * np.eye(2)
@@ -1655,6 +3545,351 @@ def test_stage4_refreshing_surrogate_enables_with_zero_newton_steps() -> None:
     )
 
     assert evaluator.surrogate_enabled is True
+
+
+def test_forward_metric_stage4_refreshing_surrogate_enables_with_zero_newton_steps() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=_minimal_stage4_surrogate_state(),
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
+        image_plane_newton_steps=0,
+        image_presence_penalty_weight=2.0,
+    )
+
+    assert evaluator.surrogate_enabled is True
+    assert evaluator.image_presence_penalty_weight == pytest.approx(2.0)
+
+
+def test_fold_regularized_stage4_refreshing_surrogate_enables_with_zero_newton_steps() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=_minimal_stage4_surrogate_state(),
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
+        image_plane_newton_steps=0,
+        fold_curvature_arcsec_inv=1.25,
+        image_presence_penalty_weight=2.0,
+    )
+
+    assert evaluator.surrogate_enabled is True
+    assert evaluator.fold_curvature_arcsec_inv == pytest.approx(1.25)
+    assert evaluator.image_presence_penalty_weight == pytest.approx(2.0)
+
+
+def test_zero_step_anchored_stage4_refreshing_surrogate_enables() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=_minimal_stage4_surrogate_state(),
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
+        image_plane_newton_steps=0,
+        anchored_image_plane_solve_steps=0,
+    )
+
+    assert evaluator.surrogate_enabled is True
+
+
+def test_critical_arc_stage4_refreshing_surrogate_enables() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=_minimal_stage4_surrogate_state(),
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+        image_plane_newton_steps=0,
+    )
+
+    assert evaluator.surrogate_enabled is True
+    assert evaluator.image_presence_penalty_weight == pytest.approx(0.0)
+
+
+def test_critical_arc_stage4_explicit_image_presence_penalty_is_honored() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=_minimal_stage4_surrogate_state(),
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+        image_plane_newton_steps=0,
+        image_presence_penalty_weight=2.0,
+    )
+
+    assert evaluator.image_presence_penalty_weight == pytest.approx(2.0)
+
+
+def test_iterative_anchored_stage4_refreshing_surrogate_rejects() -> None:
+    with pytest.raises(ValueError, match="anchored_image_plane_solve_steps=0"):
+        cluster_solver.ClusterJAXEvaluator(
+            state=_minimal_stage4_surrogate_state(),
+            match_tolerance_arcsec=0.1,
+            sampling_engine="refreshing_surrogate",
+            sample_likelihood_mode=SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
+            image_plane_newton_steps=0,
+            anchored_image_plane_solve_steps=1,
+        )
+
+
+def test_forward_metric_refresh_surrogate_populates_inactive_jacobian_cache() -> None:
+    state = _minimal_stage4_surrogate_state()
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
+        image_plane_newton_steps=0,
+    )
+
+    evaluator.refresh_surrogate(cluster_solver._default_theta(state.parameter_specs), reason="test")
+
+    assert evaluator.surrogate_cache_by_z
+    cache = next(iter(evaluator.surrogate_cache_by_z.values()))
+    n_obs = len(state.bin_data[0].x_obs)
+    n_surrogate = len(evaluator.surrogate_param_indices)
+    for field_name in (
+        "inactive_jacobian_delta_a00",
+        "inactive_jacobian_delta_a01",
+        "inactive_jacobian_delta_a10",
+        "inactive_jacobian_delta_a11",
+    ):
+        value = getattr(cache, field_name)
+        assert value is not None
+        np.testing.assert_equal(np.asarray(value).shape, (n_obs,))
+        assert np.isfinite(value).all()
+    for field_name in (
+        "inactive_jacobian_delta_da00_dparams",
+        "inactive_jacobian_delta_da01_dparams",
+        "inactive_jacobian_delta_da10_dparams",
+        "inactive_jacobian_delta_da11_dparams",
+    ):
+        value = getattr(cache, field_name)
+        assert value is not None
+        np.testing.assert_equal(np.asarray(value).shape, (n_surrogate, n_obs))
+        assert np.isfinite(value).all()
+
+
+def test_fold_regularized_refresh_surrogate_populates_cached_curvature_and_masks() -> None:
+    state = _minimal_stage4_surrogate_state()
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
+        image_plane_newton_steps=0,
+    )
+
+    evaluator.refresh_surrogate(cluster_solver._default_theta(state.parameter_specs), reason="test")
+
+    assert evaluator.surrogate_cache_by_z
+    cache = next(iter(evaluator.surrogate_cache_by_z.values()))
+    n_obs = len(state.bin_data[0].x_obs)
+    assert cache.fold_regularized_kappa_eff is not None
+    assert cache.fold_regularized_near_indices is not None
+    assert cache.fold_regularized_far_indices is not None
+    np.testing.assert_equal(np.asarray(cache.fold_regularized_kappa_eff).shape, (n_obs,))
+    assert np.isfinite(cache.fold_regularized_kappa_eff).all()
+    near_indices = np.asarray(cache.fold_regularized_near_indices, dtype=np.int32)
+    far_indices = np.asarray(cache.fold_regularized_far_indices, dtype=np.int32)
+    np.testing.assert_array_equal(np.sort(np.concatenate([near_indices, far_indices])), np.arange(n_obs, dtype=np.int32))
+    assert np.intersect1d(near_indices, far_indices).size == 0
+
+
+def _fold_regularized_source_loglike_fake(
+    surrogate_cache_by_z: dict[float, object],
+    *,
+    image_presence_penalty_weight: float,
+    signed_curvature_calls: list[int],
+) -> object:
+    traced_bin = cluster_solver.TracedBinData(
+        effective_z_source=2.0,
+        family_ids=("1",),
+        n_families=1,
+        family_index_per_image=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+        x_obs=jnp.asarray([0.0, 1.0, 2.0], dtype=jnp.float64),
+        y_obs=jnp.asarray([0.0, 0.0, 0.0], dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([0.2, 0.2, 0.2], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999, 0.999, 0.999], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True, True], dtype=bool),
+        constrained_image_indices=jnp.asarray([0, 1, 2], dtype=jnp.int32),
+    )
+
+    class FakeEvaluator:
+        source_position_conditional = False
+        source_position_param_indices_by_family = {"1": (0, 1)}
+        surrogate_enabled = True
+        sample_likelihood_mode = SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE
+        fold_curvature_arcsec_inv = 1.0
+        image_plane_scatter_floor_arcsec = 1.0e-3
+        source_plane_covariance_floor = 1.0e-6
+        source_plane_outlier_sigma_arcsec = 10.0
+        image_presence_match_radius_arcsec = 0.30
+        image_presence_temperature_arcsec = 0.10
+        image_presence_count_softness = 0.05
+        image_presence_count_margin = 0.05
+        likelihood_stabilizer_max_gain = 0.0
+        likelihood_stabilizer_max_residual_arcsec = 0.0
+        likelihood_stabilizer_residual_loss = "gaussian"
+        likelihood_stabilizer_student_t_nu = 4.0
+        fit_cosmology_flat_wcdm = False
+
+        def __init__(self) -> None:
+            self.surrogate_cache_by_z = surrogate_cache_by_z
+            self.image_presence_penalty_weight = image_presence_penalty_weight
+            self.traced_bin_data = [traced_bin]
+
+        def _physical_parameter_vector(self, params):
+            return params
+
+        def _source_sigma_int_from_physical(self, _physical_params):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+
+        def _image_sigma_int_from_physical(self, _physical_params):
+            return jnp.asarray(0.05, dtype=jnp.float64)
+
+        def _surrogate_beta(self, _params, _physical_params, bin_data):
+            return bin_data.x_obs + 0.4, bin_data.y_obs - 0.1, jnp.asarray(False), {}
+
+        def _surrogate_jacobian_entries(self, _params, bin_data, _packed_state, _invalid):
+            return (
+                jnp.asarray([0.05, 1.0, 0.05], dtype=jnp.float64),
+                jnp.zeros_like(bin_data.x_obs),
+                jnp.zeros_like(bin_data.y_obs),
+                jnp.ones_like(bin_data.y_obs),
+            )
+
+        def _scaling_scatter_extra_variance_from_physical(self, _physical_params, bin_data, _beta_x, _beta_y):
+            return jnp.zeros_like(bin_data.x_obs), jnp.zeros_like(bin_data.y_obs)
+
+        def _fold_signed_curvature_from_observed_jacobian(
+            self,
+            _z_source,
+            x_obs,
+            _y_obs,
+            _packed_state,
+            _observed_jacobian_entries,
+            _component_indices=None,
+            *,
+            fold_frame=None,
+            image_indices=None,
+            fill_value=1.0,
+        ):
+            del fold_frame, fill_value
+            signed_curvature_calls.append(
+                int(image_indices.shape[0]) if image_indices is not None else int(x_obs.shape[0])
+            )
+            return jnp.full_like(x_obs, 2.0)
+
+        def _cab_morphology_loglike_for_bin(self, *_args, **_kwargs):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+
+    fake = FakeEvaluator()
+    fake._source_position_vectors_for_bin = cluster_solver.ClusterJAXEvaluator._source_position_vectors_for_bin.__get__(
+        fake,
+        FakeEvaluator,
+    )
+    fake._explicit_source_position_vectors_for_bin = (
+        cluster_solver.ClusterJAXEvaluator._explicit_source_position_vectors_for_bin.__get__(fake, FakeEvaluator)
+    )
+    return fake
+
+
+def test_fold_regularized_cached_fast_path_skips_per_loglike_curvature_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_fold_loglike(**kwargs):
+        captured["near_n"] = int(np.asarray(kwargs["residual_beta_x"]).size)
+        captured["near_kappa_eff"] = np.asarray(kwargs["fold_kappa_eff"], dtype=float)
+        captured["near_presence_weight"] = float(kwargs["image_presence_penalty_weight"])
+        return jnp.asarray(100.0, dtype=jnp.float64)
+
+    def fake_forward_loglike(**kwargs):
+        captured["far_n"] = int(np.asarray(kwargs["residual_beta_x"]).size)
+        captured["far_presence_weight"] = float(kwargs["image_presence_penalty_weight"])
+        return jnp.asarray(10.0, dtype=jnp.float64)
+
+    monkeypatch.setattr(cluster_solver, "_fold_regularized_image_plane_bin_loglike", fake_fold_loglike)
+    monkeypatch.setattr(cluster_solver, "_forward_metric_image_plane_bin_loglike", fake_forward_loglike)
+    signed_curvature_calls: list[int] = []
+    fake = _fold_regularized_source_loglike_fake(
+        {
+            2.0: SimpleNamespace(
+                fold_regularized_kappa_eff=np.asarray([1.5, 9.0, 2.5], dtype=float),
+                fold_regularized_near_indices=np.asarray([0, 2], dtype=np.int32),
+                fold_regularized_far_indices=np.asarray([1], dtype=np.int32),
+            )
+        },
+        image_presence_penalty_weight=0.0,
+        signed_curvature_calls=signed_curvature_calls,
+    )
+
+    loglike = cluster_solver.ClusterJAXEvaluator._source_loglike_impl(fake, jnp.asarray([0.1, -0.2], dtype=jnp.float64))
+
+    assert float(loglike) == pytest.approx(110.0)
+    assert signed_curvature_calls == []
+    assert captured["near_n"] == 2
+    assert captured["far_n"] == 1
+    np.testing.assert_allclose(captured["near_kappa_eff"], np.asarray([1.5, 2.5], dtype=float))
+    assert captured["near_presence_weight"] == pytest.approx(0.0)
+    assert captured["far_presence_weight"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    ("surrogate_cache_by_z", "image_presence_penalty_weight"),
+    [
+        (
+            {
+                2.0: SimpleNamespace(
+                    fold_regularized_kappa_eff=None,
+                    fold_regularized_near_indices=None,
+                    fold_regularized_far_indices=None,
+                )
+            },
+            0.0,
+        ),
+        (
+            {
+                2.0: SimpleNamespace(
+                    fold_regularized_kappa_eff=np.asarray([1.5, 9.0, 2.5], dtype=float),
+                    fold_regularized_near_indices=np.asarray([0, 2], dtype=np.int32),
+                    fold_regularized_far_indices=np.asarray([1], dtype=np.int32),
+                )
+            },
+            2.0,
+        ),
+    ],
+)
+def test_fold_regularized_exact_fallback_when_cache_unavailable_or_presence_active(
+    monkeypatch: pytest.MonkeyPatch,
+    surrogate_cache_by_z: dict[float, object],
+    image_presence_penalty_weight: float,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_fold_loglike(**kwargs):
+        captured["n"] = int(np.asarray(kwargs["residual_beta_x"]).size)
+        captured["presence_weight"] = float(kwargs["image_presence_penalty_weight"])
+        captured["kappa_eff"] = np.asarray(kwargs["fold_kappa_eff"], dtype=float)
+        return jnp.asarray(123.0, dtype=jnp.float64)
+
+    def fail_forward_loglike(**_kwargs):
+        raise AssertionError("forward-metric split should not be used on the exact fold fallback path")
+
+    monkeypatch.setattr(cluster_solver, "_fold_regularized_image_plane_bin_loglike", fake_fold_loglike)
+    monkeypatch.setattr(cluster_solver, "_forward_metric_image_plane_bin_loglike", fail_forward_loglike)
+    signed_curvature_calls: list[int] = []
+    fake = _fold_regularized_source_loglike_fake(
+        surrogate_cache_by_z,
+        image_presence_penalty_weight=image_presence_penalty_weight,
+        signed_curvature_calls=signed_curvature_calls,
+    )
+
+    loglike = cluster_solver.ClusterJAXEvaluator._source_loglike_impl(fake, jnp.asarray([0.1, -0.2], dtype=jnp.float64))
+
+    assert float(loglike) == pytest.approx(123.0)
+    assert signed_curvature_calls == [3]
+    assert captured["n"] == 3
+    assert captured["presence_weight"] == pytest.approx(image_presence_penalty_weight)
+    np.testing.assert_allclose(captured["kappa_eff"], np.full(3, 2.0, dtype=float))
 
 
 def test_refreshing_surrogate_enables_with_sampled_flat_wcdm_cosmology() -> None:
@@ -2198,7 +4433,7 @@ def test_explicit_beta_surrogate_branch_uses_returned_packed_state() -> None:
         surrogate_cache_by_z = {2.0: object()}
         sample_likelihood_mode = SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
         image_plane_newton_steps = 0
-        image_plane_scatter_floor_arcsec = 0.0
+        image_plane_scatter_floor_arcsec = 1.0e-3
         source_plane_covariance_floor = 1.0e-6
         source_plane_outlier_sigma_arcsec = 10.0
         image_presence_penalty_weight = 0.0
@@ -2251,6 +4486,9 @@ def test_explicit_beta_surrogate_branch_uses_returned_packed_state() -> None:
         def _maybe_record_invalid_state(self, _validity):
             return None
 
+        def _cab_morphology_loglike_for_bin(self, *_args, **_kwargs):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+
     fake = FakeEvaluator()
     fake._source_position_vectors_for_bin = cluster_solver.ClusterJAXEvaluator._source_position_vectors_for_bin.__get__(
         fake,
@@ -2276,6 +4514,1237 @@ def test_explicit_beta_surrogate_branch_uses_returned_packed_state() -> None:
     assert fake.jacobian_calls >= 1
 
 
+def test_anchored_solved_source_loglike_branch_scores_local_image_residuals() -> None:
+    traced_bin = cluster_solver.TracedBinData(
+        effective_z_source=2.0,
+        family_ids=("1",),
+        n_families=1,
+        family_index_per_image=jnp.asarray([0], dtype=jnp.int32),
+        x_obs=jnp.asarray([0.0], dtype=jnp.float64),
+        y_obs=jnp.asarray([0.0], dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([0.2], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True], dtype=bool),
+    )
+
+    class FakeEvaluator:
+        source_position_conditional = False
+        source_position_param_indices_by_family = {"1": (0, 1)}
+        surrogate_enabled = False
+        surrogate_cache_by_z = {}
+        sample_likelihood_mode = SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE
+        anchored_image_plane_solve_steps = 3
+        anchored_image_plane_trust_radius_arcsec = 0.3
+        anchored_image_plane_lm_damping_relative = 1.0e-3
+        anchored_image_plane_lm_damping_absolute = 1.0e-6
+        image_plane_scatter_floor_arcsec = 1.0e-3
+        source_plane_covariance_floor = 1.0e-6
+        source_plane_outlier_sigma_arcsec = 10.0
+        image_presence_penalty_weight = 2.0
+        image_presence_match_radius_arcsec = 0.30
+        image_presence_temperature_arcsec = 0.10
+        image_presence_count_softness = 0.05
+        image_presence_count_margin = 0.05
+        likelihood_stabilizer_residual_loss = "student-t"
+        likelihood_stabilizer_student_t_nu = 4.0
+        traced_bin_data = [traced_bin]
+
+        def _physical_parameter_vector(self, params):
+            return params
+
+        def _source_sigma_int_from_physical(self, _physical_params):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+
+        def _image_sigma_int_from_physical(self, _physical_params):
+            return jnp.asarray(0.05, dtype=jnp.float64)
+
+        def _build_packed_lens_state_with_validity_from_physical(self, _physical_params, _z_source, stop_gradient=True):
+            return {}, {"is_valid": jnp.asarray(True)}
+
+        def _ray_shooting_for_components(self, _z_source, x, y, _packed_state):
+            return x, y
+
+        def _lensing_jacobian_for_components(self, _z_source, x, y, _packed_state):
+            return jnp.ones_like(x), jnp.zeros_like(x), jnp.zeros_like(y), jnp.ones_like(y)
+
+        def _scaling_scatter_extra_variance_from_physical(self, _physical_params, bin_data, _beta_x, _beta_y):
+            return jnp.zeros_like(bin_data.x_obs), jnp.zeros_like(bin_data.y_obs)
+
+        def _maybe_record_invalid_state(self, _validity):
+            return None
+
+        def _cab_morphology_loglike_for_bin(self, *_args, **_kwargs):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+
+    fake = FakeEvaluator()
+    fake._source_position_vectors_for_bin = cluster_solver.ClusterJAXEvaluator._source_position_vectors_for_bin.__get__(
+        fake,
+        FakeEvaluator,
+    )
+    fake._explicit_source_position_vectors_for_bin = (
+        cluster_solver.ClusterJAXEvaluator._explicit_source_position_vectors_for_bin.__get__(fake, FakeEvaluator)
+    )
+    fake._anchored_solved_image_plane_residuals_for_components = (
+        cluster_solver.ClusterJAXEvaluator._anchored_solved_image_plane_residuals_for_components.__get__(
+            fake,
+            FakeEvaluator,
+        )
+    )
+
+    loglike = cluster_solver.ClusterJAXEvaluator._source_loglike_impl(fake, jnp.asarray([0.0, 0.0], dtype=jnp.float64))
+
+    assert np.isfinite(float(loglike))
+    assert float(loglike) > 0.0
+
+
+def test_zero_step_anchored_source_loglike_uses_observed_anchor_lm_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    traced_bin = cluster_solver.TracedBinData(
+        effective_z_source=2.0,
+        family_ids=("1",),
+        n_families=1,
+        family_index_per_image=jnp.asarray([0], dtype=jnp.int32),
+        x_obs=jnp.asarray([0.0], dtype=jnp.float64),
+        y_obs=jnp.asarray([0.0], dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([0.2], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True], dtype=bool),
+    )
+    captured: dict[str, np.ndarray] = {}
+
+    def fake_bin_loglike(**kwargs):
+        captured["residual_x"] = np.asarray(kwargs["residual_x"], dtype=float)
+        captured["residual_y"] = np.asarray(kwargs["residual_y"], dtype=float)
+        return jnp.asarray(123.0, dtype=jnp.float64)
+
+    monkeypatch.setattr(cluster_solver, "_linearized_image_plane_bin_loglike", fake_bin_loglike)
+
+    class FakeEvaluator:
+        source_position_conditional = False
+        source_position_param_indices_by_family = {"1": (0, 1)}
+        surrogate_enabled = False
+        surrogate_cache_by_z = {}
+        sample_likelihood_mode = SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE
+        anchored_image_plane_solve_steps = 0
+        anchored_image_plane_trust_radius_arcsec = 10.0
+        anchored_image_plane_lm_damping_relative = 1.0e-3
+        anchored_image_plane_lm_damping_absolute = 1.0e-6
+        image_plane_scatter_floor_arcsec = 1.0e-3
+        source_plane_covariance_floor = 1.0e-6
+        source_plane_outlier_sigma_arcsec = 10.0
+        image_presence_penalty_weight = 0.0
+        image_presence_match_radius_arcsec = 0.30
+        image_presence_temperature_arcsec = 0.10
+        image_presence_count_softness = 0.05
+        image_presence_count_margin = 0.05
+        likelihood_stabilizer_residual_loss = "gaussian"
+        likelihood_stabilizer_student_t_nu = 4.0
+        traced_bin_data = [traced_bin]
+
+        def _physical_parameter_vector(self, params):
+            return params
+
+        def _source_sigma_int_from_physical(self, _physical_params):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+
+        def _image_sigma_int_from_physical(self, _physical_params):
+            return jnp.asarray(0.05, dtype=jnp.float64)
+
+        def _build_packed_lens_state_with_validity_from_physical(self, _physical_params, _z_source, stop_gradient=True):
+            return {}, {"is_valid": jnp.asarray(True)}
+
+        def _ray_shooting_for_components(self, _z_source, x, y, _packed_state):
+            return x + 0.4, y - 0.1
+
+        def _lensing_jacobian_for_components(self, _z_source, x, y, _packed_state):
+            return (
+                jnp.full_like(x, 2.0),
+                jnp.zeros_like(x),
+                jnp.zeros_like(y),
+                jnp.ones_like(y),
+            )
+
+        def _anchored_solved_image_plane_residuals_for_components(self, *_args, **_kwargs):
+            raise AssertionError("zero-step anchored likelihood must not call the iterative local solver")
+
+        def _scaling_scatter_extra_variance_from_physical(self, _physical_params, bin_data, _beta_x, _beta_y):
+            return jnp.zeros_like(bin_data.x_obs), jnp.zeros_like(bin_data.y_obs)
+
+        def _maybe_record_invalid_state(self, _validity):
+            return None
+
+        def _cab_morphology_loglike_for_bin(self, *_args, **_kwargs):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+
+    fake = FakeEvaluator()
+    fake._source_position_vectors_for_bin = cluster_solver.ClusterJAXEvaluator._source_position_vectors_for_bin.__get__(
+        fake,
+        FakeEvaluator,
+    )
+    fake._explicit_source_position_vectors_for_bin = (
+        cluster_solver.ClusterJAXEvaluator._explicit_source_position_vectors_for_bin.__get__(fake, FakeEvaluator)
+    )
+
+    params = jnp.asarray([0.1, -0.2], dtype=jnp.float64)
+    loglike = cluster_solver.ClusterJAXEvaluator._source_loglike_impl(fake, params)
+    expected_dx, expected_dy, expected_finite = _anchored_solved_image_plane_step_from_jacobian(
+        f_x=jnp.asarray([0.3], dtype=jnp.float64),
+        f_y=jnp.asarray([0.1], dtype=jnp.float64),
+        jac_a00=jnp.asarray([2.0], dtype=jnp.float64),
+        jac_a01=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a10=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a11=jnp.asarray([1.0], dtype=jnp.float64),
+        trust_radius_arcsec=10.0,
+        lm_damping_relative=1.0e-3,
+        lm_damping_absolute=1.0e-6,
+    )
+
+    assert float(loglike) == pytest.approx(123.0)
+    assert bool(np.asarray(expected_finite)[0])
+    np.testing.assert_allclose(captured["residual_x"], np.asarray(expected_dx), rtol=1.0e-12)
+    np.testing.assert_allclose(captured["residual_y"], np.asarray(expected_dy), rtol=1.0e-12)
+
+
+def _critical_arc_loglike_for_test(
+    *,
+    residual_x: float,
+    residual_y: float,
+    jac_a00: float = 0.0,
+    jac_a01: float = 0.0,
+    jac_a10: float = 0.0,
+    jac_a11: float = 1.0,
+    reliability: float = 0.999,
+    outlier_sigma_arcsec: float = 50.0,
+) -> float:
+    return float(
+        _critical_arc_mixture_image_plane_bin_loglike(
+            residual_x=jnp.asarray([residual_x], dtype=jnp.float64),
+            residual_y=jnp.asarray([residual_y], dtype=jnp.float64),
+            jac_a00=jnp.asarray([jac_a00], dtype=jnp.float64),
+            jac_a01=jnp.asarray([jac_a01], dtype=jnp.float64),
+            jac_a10=jnp.asarray([jac_a10], dtype=jnp.float64),
+            jac_a11=jnp.asarray([jac_a11], dtype=jnp.float64),
+            family_idx=None,
+            n_families=None,
+            sigma_per_image=jnp.asarray([0.05], dtype=jnp.float64),
+            reliability_per_image=jnp.asarray([reliability], dtype=jnp.float64),
+            image_has_constraint=jnp.asarray([True], dtype=bool),
+            image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+            covariance_floor=1.0e-12,
+            outlier_sigma_arcsec=outlier_sigma_arcsec,
+            image_scatter_floor_arcsec=1.0e-6,
+            image_presence_penalty_weight=0.0,
+            residual_loss="student-t",
+            student_t_nu=4.0,
+            critical_direction_sigma_arcsec=5.0,
+            base_prob=0.10,
+            max_prob=0.80,
+            singular_threshold=0.20,
+            singular_softness=0.05,
+        )
+    )
+
+
+def test_critical_arc_branch_probability_increases_near_singular() -> None:
+    probabilities = np.asarray(
+        _critical_arc_branch_probability(
+            jnp.asarray([1.0, 0.01], dtype=jnp.float64),
+            base_prob=0.10,
+            max_prob=0.80,
+            singular_threshold=0.20,
+            singular_softness=0.05,
+        )
+    )
+
+    assert probabilities[1] > probabilities[0]
+    assert probabilities[0] >= 0.10
+    assert probabilities[1] <= 0.80
+
+
+def test_critical_arc_lm_step_rank_deficient_jacobian_is_finite_and_bounded() -> None:
+    dx, dy, finite = _critical_arc_lm_step_from_jacobian(
+        f_x=jnp.asarray([100.0], dtype=jnp.float64),
+        f_y=jnp.asarray([-50.0], dtype=jnp.float64),
+        jac_a00=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a01=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a10=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a11=jnp.asarray([0.0], dtype=jnp.float64),
+        trust_radius_arcsec=20.0,
+        lm_damping_relative=1.0e-3,
+        lm_damping_absolute=1.0e-6,
+    )
+
+    radius = np.hypot(np.asarray(dx), np.asarray(dy))
+    assert bool(np.asarray(finite)[0])
+    assert np.isfinite(radius).all()
+    assert float(radius[0]) <= 20.0
+
+
+def test_critical_arc_fused_lm_geometry_matches_anchored_step() -> None:
+    f_x = jnp.asarray([0.3, -0.2], dtype=jnp.float64)
+    f_y = jnp.asarray([0.1, 0.4], dtype=jnp.float64)
+    jac_a00 = jnp.asarray([2.0, 0.4], dtype=jnp.float64)
+    jac_a01 = jnp.asarray([0.1, -0.3], dtype=jnp.float64)
+    jac_a10 = jnp.asarray([0.0, 0.2], dtype=jnp.float64)
+    jac_a11 = jnp.asarray([1.0, 0.8], dtype=jnp.float64)
+
+    fused_dx, fused_dy, *_geometry, fused_finite = _critical_arc_lm_geometry_from_jacobian(
+        f_x,
+        f_y,
+        jac_a00,
+        jac_a01,
+        jac_a10,
+        jac_a11,
+        trust_radius_arcsec=20.0,
+        lm_damping_relative=1.0e-3,
+        lm_damping_absolute=1.0e-6,
+    )
+    anchored_dx, anchored_dy, anchored_finite = _anchored_solved_image_plane_step_from_jacobian(
+        f_x,
+        f_y,
+        jac_a00,
+        jac_a01,
+        jac_a10,
+        jac_a11,
+        trust_radius_arcsec=20.0,
+        lm_damping_relative=1.0e-3,
+        lm_damping_absolute=1.0e-6,
+    )
+
+    np.testing.assert_allclose(np.asarray(fused_dx), np.asarray(anchored_dx), rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(fused_dy), np.asarray(anchored_dy), rtol=1.0e-12)
+    np.testing.assert_array_equal(np.asarray(fused_finite), np.asarray(anchored_finite))
+
+
+def test_critical_arc_projector_quadratics_match_frame_projection() -> None:
+    residual_x = jnp.asarray([0.7, -0.4], dtype=jnp.float64)
+    residual_y = jnp.asarray([0.2, 0.5], dtype=jnp.float64)
+    jac_a00 = jnp.asarray([2.0, 0.4], dtype=jnp.float64)
+    jac_a01 = jnp.asarray([0.3, -0.2], dtype=jnp.float64)
+    jac_a10 = jnp.asarray([0.1, 0.1], dtype=jnp.float64)
+    jac_a11 = jnp.asarray([1.0, 0.8], dtype=jnp.float64)
+
+    *_singulars, critical_p00, critical_p01, critical_p11, finite = _critical_arc_geometry_from_jacobian(
+        jac_a00,
+        jac_a01,
+        jac_a10,
+        jac_a11,
+    )
+    critical_direction_quad, noncritical_direction_quad = _critical_arc_projected_quadratics(
+        residual_x,
+        residual_y,
+        critical_p00,
+        critical_p01,
+        critical_p11,
+    )
+    critical_direction_x, critical_direction_y, noncritical_direction_x, noncritical_direction_y, *_frame = cluster_solver._critical_arc_jacobian_frame(
+        jac_a00,
+        jac_a01,
+        jac_a10,
+        jac_a11,
+    )
+    expected_critical_direction_quad = jnp.square(residual_x * critical_direction_x + residual_y * critical_direction_y)
+    expected_noncritical_direction_quad = jnp.square(residual_x * noncritical_direction_x + residual_y * noncritical_direction_y)
+
+    assert bool(np.asarray(jnp.all(finite)))
+    np.testing.assert_allclose(np.asarray(critical_direction_quad), np.asarray(expected_critical_direction_quad), rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(noncritical_direction_quad), np.asarray(expected_noncritical_direction_quad), rtol=1.0e-12)
+
+
+def test_critical_arc_mixture_is_finite_for_singular_jacobian() -> None:
+    loglike = _critical_arc_loglike_for_test(
+        residual_x=2.0,
+        residual_y=-1.0,
+        jac_a00=0.0,
+        jac_a01=0.0,
+        jac_a10=0.0,
+        jac_a11=0.0,
+    )
+
+    assert np.isfinite(loglike)
+
+
+def test_critical_arc_large_critical_direction_displacement_is_cheaper_than_noncritical() -> None:
+    critical_direction_loglike = _critical_arc_loglike_for_test(residual_x=2.0, residual_y=0.0)
+    noncritical_direction_loglike = _critical_arc_loglike_for_test(residual_x=0.0, residual_y=2.0)
+
+    assert critical_direction_loglike > noncritical_direction_loglike
+
+
+def test_critical_arc_image_presence_counts_along_arc_displacement_as_recovered() -> None:
+    kwargs = dict(
+        jac_a00=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a01=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a10=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a11=jnp.asarray([1.0], dtype=jnp.float64),
+        family_idx=jnp.asarray([0], dtype=jnp.int32),
+        n_families=1,
+        sigma_per_image=jnp.asarray([0.05], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True], dtype=bool),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        covariance_floor=1.0e-12,
+        outlier_sigma_arcsec=50.0,
+        image_scatter_floor_arcsec=1.0e-6,
+        image_presence_match_radius_arcsec=0.5,
+        image_presence_temperature_arcsec=0.1,
+        image_presence_count_softness=0.05,
+        image_presence_count_margin=0.05,
+        residual_loss="student-t",
+        student_t_nu=4.0,
+        critical_direction_sigma_arcsec=5.0,
+        base_prob=0.10,
+        max_prob=0.85,
+        singular_threshold=0.20,
+        singular_softness=0.05,
+    )
+
+    def penalty_delta(residual_x: float, residual_y: float) -> float:
+        base = _critical_arc_mixture_image_plane_bin_loglike(
+            residual_x=jnp.asarray([residual_x], dtype=jnp.float64),
+            residual_y=jnp.asarray([residual_y], dtype=jnp.float64),
+            image_presence_penalty_weight=0.0,
+            **kwargs,
+        )
+        with_presence = _critical_arc_mixture_image_plane_bin_loglike(
+            residual_x=jnp.asarray([residual_x], dtype=jnp.float64),
+            residual_y=jnp.asarray([residual_y], dtype=jnp.float64),
+            image_presence_penalty_weight=2.0,
+            **kwargs,
+        )
+        return float(with_presence - base)
+
+    along_arc_penalty = penalty_delta(2.0, 0.0)
+    noncritical_penalty = penalty_delta(0.0, 2.0)
+
+    assert along_arc_penalty > -0.05
+    assert noncritical_penalty < -0.5
+    assert along_arc_penalty > noncritical_penalty + 0.5
+
+
+def test_critical_arc_student_t_keeps_critical_direction_cheaper_than_noncritical() -> None:
+    kwargs = dict(
+        jac_a00=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a01=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a10=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a11=jnp.asarray([1.0], dtype=jnp.float64),
+        family_idx=None,
+        n_families=None,
+        sigma_per_image=jnp.asarray([0.05], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True], dtype=bool),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        covariance_floor=1.0e-12,
+        outlier_sigma_arcsec=50.0,
+        image_scatter_floor_arcsec=1.0e-6,
+        image_presence_penalty_weight=0.0,
+        residual_loss="student-t",
+        student_t_nu=4.0,
+        critical_direction_sigma_arcsec=5.0,
+        base_prob=0.10,
+        max_prob=0.80,
+        singular_threshold=0.20,
+        singular_softness=0.05,
+    )
+
+    critical_direction_loglike = _critical_arc_mixture_image_plane_bin_loglike(
+        residual_x=jnp.asarray([2.0], dtype=jnp.float64),
+        residual_y=jnp.asarray([0.0], dtype=jnp.float64),
+        **kwargs,
+    )
+    noncritical_direction_loglike = _critical_arc_mixture_image_plane_bin_loglike(
+        residual_x=jnp.asarray([0.0], dtype=jnp.float64),
+        residual_y=jnp.asarray([2.0], dtype=jnp.float64),
+        **kwargs,
+    )
+
+    assert np.isfinite(float(critical_direction_loglike))
+    assert np.isfinite(float(noncritical_direction_loglike))
+    assert float(critical_direction_loglike) > float(noncritical_direction_loglike)
+
+
+def test_critical_arc_det_sign_crossing_stays_finite_and_continuous() -> None:
+    positive = _critical_arc_loglike_for_test(
+        residual_x=0.4,
+        residual_y=0.2,
+        jac_a00=1.0,
+        jac_a11=0.02,
+    )
+    negative = _critical_arc_loglike_for_test(
+        residual_x=0.4,
+        residual_y=0.2,
+        jac_a00=1.0,
+        jac_a11=-0.02,
+    )
+
+    assert np.isfinite(positive)
+    assert np.isfinite(negative)
+    assert positive == pytest.approx(negative, abs=1.0e-12)
+
+
+def test_critical_arc_reliability_outlier_mixture_remains_active() -> None:
+    high_reliability = _critical_arc_loglike_for_test(residual_x=0.0, residual_y=8.0, reliability=0.999)
+    low_reliability = _critical_arc_loglike_for_test(residual_x=0.0, residual_y=8.0, reliability=0.10)
+
+    assert low_reliability > high_reliability
+
+
+def _constant_arc_jacobian(eps: float = 0.05):
+    def jacobian_at(x_values, _y_values):
+        x_array = np.asarray(x_values, dtype=float).reshape(-1)
+        return (
+            np.full_like(x_array, eps, dtype=float),
+            np.zeros_like(x_array, dtype=float),
+            np.zeros_like(x_array, dtype=float),
+            np.ones_like(x_array, dtype=float),
+        )
+
+    return jacobian_at
+
+
+def _circle_tangent_arc_jacobian(eps: float = 0.05):
+    def jacobian_at(x_values, y_values):
+        x_array = np.asarray(x_values, dtype=float).reshape(-1)
+        y_array = np.asarray(y_values, dtype=float).reshape(-1)
+        radius = np.maximum(np.hypot(x_array, y_array), 1.0e-12)
+        tangent_x = -y_array / radius
+        tangent_y = x_array / radius
+        normal_x = x_array / radius
+        normal_y = y_array / radius
+        a00 = eps * tangent_x * tangent_x + normal_x * normal_x
+        a01 = eps * tangent_x * tangent_y + normal_x * normal_y
+        a10 = eps * tangent_y * tangent_x + normal_y * normal_x
+        a11 = eps * tangent_y * tangent_y + normal_y * normal_y
+        return a00, a01, a10, a11
+
+    return jacobian_at
+
+
+def test_critical_arc_aware_support_prioritizes_point_recovery() -> None:
+    details = cluster_solver._arc_aware_image_support_from_local_linearization(
+        beta_residual_x=np.asarray([10.0]),
+        beta_residual_y=np.asarray([10.0]),
+        jac_a00=np.asarray([0.05]),
+        jac_a01=np.asarray([0.0]),
+        jac_a10=np.asarray([0.0]),
+        jac_a11=np.asarray([1.0]),
+        point_recovered_mask=np.asarray([True]),
+        point_residual_arcsec=np.asarray([0.07]),
+    )
+
+    assert details["arc_recovery_status"].tolist() == ["point_recovered"]
+    assert details["arc_supported_mask"].tolist() == [False]
+    assert details["arc_aware_image_residual_arcsec"][0] == pytest.approx(0.07)
+    assert details["arc_aware_image_rms_arcsec"] == pytest.approx(0.07)
+
+
+def test_critical_arc_aware_support_tolerates_large_critical_direction_residual() -> None:
+    eps = 0.05
+    critical_direction_delta = 4.0
+    details = cluster_solver._arc_aware_image_support_from_local_linearization(
+        beta_residual_x=np.asarray([-eps * critical_direction_delta]),
+        beta_residual_y=np.asarray([0.0]),
+        jac_a00=np.asarray([eps]),
+        jac_a01=np.asarray([0.0]),
+        jac_a10=np.asarray([0.0]),
+        jac_a11=np.asarray([1.0]),
+        theta_obs_x=np.asarray([0.0]),
+        theta_obs_y=np.asarray([0.0]),
+        jacobian_at=_constant_arc_jacobian(eps),
+        lm_damping_relative=0.0,
+        lm_damping_absolute=0.0,
+    )
+
+    assert details["arc_recovery_status"].tolist() == ["arc_supported"]
+    assert details["arc_supported_mask"].tolist() == [True]
+    assert details["arc_noncritical_direction_residual_arcsec"][0] == pytest.approx(0.0, abs=1.0e-6)
+    assert details["arc_critical_direction_residual_arcsec"][0] > 1.0
+    assert details["arc_aware_image_residual_arcsec"][0] == pytest.approx(0.0, abs=1.0e-6)
+    assert details["arc_curve_distance_arcsec"][0] == pytest.approx(0.0, abs=1.0e-6)
+    assert details["arc_curve_arclength_arcsec"][0] == pytest.approx(critical_direction_delta, abs=0.12)
+    assert details["arc_curve_finite"].tolist() == [True]
+    assert json.loads(details["arc_support_curve_x_arcsec"][0])
+    assert json.loads(details["arc_support_curve_y_arcsec"][0])
+    assert math.hypot(details["arc_critical_direction_x"][0], details["arc_critical_direction_y"][0]) == pytest.approx(1.0)
+    assert math.hypot(details["arc_noncritical_direction_x"][0], details["arc_noncritical_direction_y"][0]) == pytest.approx(1.0)
+    assert details["arc_s_min"][0] == pytest.approx(eps)
+    assert details["arc_s_max"][0] == pytest.approx(1.0)
+    assert details["arc_detA"][0] == pytest.approx(eps)
+    assert details["arc_support_finite_mask"].tolist() == [True]
+
+
+def test_critical_arc_aware_support_rejects_large_noncritical_direction_residual() -> None:
+    details = cluster_solver._arc_aware_image_support_from_local_linearization(
+        beta_residual_x=np.asarray([0.0]),
+        beta_residual_y=np.asarray([-1.0]),
+        jac_a00=np.asarray([0.05]),
+        jac_a01=np.asarray([0.0]),
+        jac_a10=np.asarray([0.0]),
+        jac_a11=np.asarray([1.0]),
+        theta_obs_x=np.asarray([0.0]),
+        theta_obs_y=np.asarray([0.0]),
+        jacobian_at=_constant_arc_jacobian(0.05),
+        lm_damping_relative=0.0,
+        lm_damping_absolute=0.0,
+    )
+
+    assert details["arc_recovery_status"].tolist() == ["not_recovered"]
+    assert details["arc_supported_mask"].tolist() == [False]
+    assert details["arc_curve_distance_arcsec"][0] > 0.5
+    assert np.isnan(details["arc_aware_image_residual_arcsec"][0])
+
+
+def test_critical_arc_aware_support_rejects_beyond_arclength_cap() -> None:
+    eps = 0.05
+    critical_direction_delta = 6.0
+    details = cluster_solver._arc_aware_image_support_from_local_linearization(
+        beta_residual_x=np.asarray([-eps * critical_direction_delta]),
+        beta_residual_y=np.asarray([0.0]),
+        jac_a00=np.asarray([eps]),
+        jac_a01=np.asarray([0.0]),
+        jac_a10=np.asarray([0.0]),
+        jac_a11=np.asarray([1.0]),
+        theta_obs_x=np.asarray([0.0]),
+        theta_obs_y=np.asarray([0.0]),
+        jacobian_at=_constant_arc_jacobian(eps),
+        lm_damping_relative=0.0,
+        lm_damping_absolute=0.0,
+    )
+
+    assert details["arc_recovery_status"].tolist() == ["not_recovered"]
+    assert details["arc_supported_mask"].tolist() == [False]
+    assert details["arc_curve_distance_arcsec"][0] > 0.5
+    assert np.isnan(details["arc_aware_image_residual_arcsec"][0])
+
+
+def test_critical_arc_aware_support_accepts_curved_support_curve() -> None:
+    eps = 0.05
+    details = cluster_solver._arc_aware_image_support_from_local_linearization(
+        beta_residual_x=np.asarray([-eps]),
+        beta_residual_y=np.asarray([1.0]),
+        jac_a00=np.asarray([eps]),
+        jac_a01=np.asarray([0.0]),
+        jac_a10=np.asarray([0.0]),
+        jac_a11=np.asarray([1.0]),
+        theta_obs_x=np.asarray([0.0]),
+        theta_obs_y=np.asarray([1.0]),
+        jacobian_at=_circle_tangent_arc_jacobian(eps),
+        curve_step_arcsec=0.05,
+        lm_damping_relative=0.0,
+        lm_damping_absolute=0.0,
+    )
+
+    assert details["arc_recovery_status"].tolist() == ["arc_supported"]
+    assert details["arc_supported_mask"].tolist() == [True]
+    assert details["arc_curve_distance_arcsec"][0] < 0.08
+    assert 0.0 < details["arc_curve_arclength_arcsec"][0] <= cluster_solver.DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC
+    assert details["arc_aware_image_residual_arcsec"][0] == pytest.approx(details["arc_curve_distance_arcsec"][0])
+
+
+def test_critical_arc_aware_support_rejects_noncritical_large_critical_direction_residual() -> None:
+    details = cluster_solver._arc_aware_image_support_from_local_linearization(
+        beta_residual_x=np.asarray([-4.0]),
+        beta_residual_y=np.asarray([0.0]),
+        jac_a00=np.asarray([1.0]),
+        jac_a01=np.asarray([0.0]),
+        jac_a10=np.asarray([0.0]),
+        jac_a11=np.asarray([1.0]),
+        theta_obs_x=np.asarray([0.0]),
+        theta_obs_y=np.asarray([0.0]),
+        jacobian_at=_constant_arc_jacobian(1.0),
+        lm_damping_relative=0.0,
+        lm_damping_absolute=0.0,
+    )
+
+    assert details["arc_recovery_status"].tolist() == ["not_recovered"]
+    assert details["arc_supported_mask"].tolist() == [False]
+    assert np.isnan(details["arc_aware_image_residual_arcsec"][0])
+
+
+def test_critical_arc_aware_support_requires_finite_curve_trace() -> None:
+    def broken_jacobian_at(_x_values, _y_values):
+        raise RuntimeError("no curve")
+
+    eps = 0.05
+    details = cluster_solver._arc_aware_image_support_from_local_linearization(
+        beta_residual_x=np.asarray([-eps * 4.0]),
+        beta_residual_y=np.asarray([0.0]),
+        jac_a00=np.asarray([eps]),
+        jac_a01=np.asarray([0.0]),
+        jac_a10=np.asarray([0.0]),
+        jac_a11=np.asarray([1.0]),
+        theta_obs_x=np.asarray([0.0]),
+        theta_obs_y=np.asarray([0.0]),
+        jacobian_at=broken_jacobian_at,
+        lm_damping_relative=0.0,
+        lm_damping_absolute=0.0,
+    )
+
+    assert details["arc_recovery_status"].tolist() == ["not_recovered"]
+    assert details["arc_supported_mask"].tolist() == [False]
+    assert details["arc_curve_finite"].tolist() == [False]
+    assert np.isnan(details["arc_aware_image_residual_arcsec"][0])
+
+
+def test_critical_arc_aware_evaluator_uses_configured_validation_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    family = SimpleNamespace(
+        family_id="1",
+        z_source=2.0,
+        effective_z_source=2.0,
+        n_images=1,
+        x_obs=np.asarray([0.0], dtype=float),
+        y_obs=np.asarray([0.0], dtype=float),
+    )
+    fake = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    fake.models_by_effective_z = {2.0: object()}
+    fake.arc_aware_noncritical_support_radius_arcsec = 1.25
+    fake.arc_aware_max_arclength_arcsec = 12.0
+    fake.arc_aware_curve_step_arcsec = 0.2
+    fake.critical_arc_lm_trust_radius_arcsec = cluster_solver.DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC
+    fake.critical_arc_lm_damping_relative = cluster_solver.DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE
+    fake.critical_arc_lm_damping_absolute = cluster_solver.DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE
+    fake.critical_arc_base_prob = cluster_solver.DEFAULT_CRITICAL_ARC_BASE_PROB
+    fake.critical_arc_max_prob = cluster_solver.DEFAULT_CRITICAL_ARC_MAX_PROB
+    fake.critical_arc_singular_threshold = cluster_solver.DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD
+    fake.critical_arc_singular_softness = cluster_solver.DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS
+    fake._build_packed_lens_state = lambda _params, _z_source: {}
+
+    def fake_ray_shooting(_z_source, _x, _y, _packed_state):
+        return jnp.asarray([0.0], dtype=jnp.float64), jnp.asarray([0.0], dtype=jnp.float64)
+
+    fake._ray_shooting_for_components = fake_ray_shooting
+    fake._lensing_jacobian_for_components = lambda _z_source, _x, _y, _packed_state: (
+        jnp.asarray([0.05], dtype=jnp.float64),
+        jnp.asarray([0.0], dtype=jnp.float64),
+        jnp.asarray([0.0], dtype=jnp.float64),
+        jnp.asarray([1.0], dtype=jnp.float64),
+    )
+    captured: dict[str, float] = {}
+
+    def fake_arc_support(*_args, **kwargs):
+        captured["noncritical_support_radius_arcsec"] = float(kwargs["noncritical_support_radius_arcsec"])
+        captured["max_arclength_arcsec"] = float(kwargs["max_arclength_arcsec"])
+        captured["curve_step_arcsec"] = float(kwargs["curve_step_arcsec"])
+        return {"sentinel": True}
+
+    monkeypatch.setattr(cluster_solver, "_arc_aware_image_support_from_local_linearization", fake_arc_support)
+
+    details = cluster_solver.ClusterJAXEvaluator._arc_aware_image_support_details(
+        fake,
+        np.asarray([], dtype=float),
+        family,
+        0.0,
+        0.0,
+    )
+
+    assert details == {"sentinel": True}
+    assert captured["noncritical_support_radius_arcsec"] == pytest.approx(1.25)
+    assert captured["max_arclength_arcsec"] == pytest.approx(12.0)
+    assert captured["curve_step_arcsec"] == pytest.approx(0.2)
+
+
+def test_critical_arc_aware_recovery_rows_and_counts_propagate() -> None:
+    family = SimpleNamespace(
+        family_id="1",
+        z_source=2.0,
+        effective_z_source=2.0,
+        n_images=3,
+        sigma_arcsec=0.2,
+        image_labels=["1.1", "1.2", "1.3"],
+        x_obs=np.asarray([0.0, 1.0, 2.0], dtype=float),
+        y_obs=np.asarray([0.0, 0.0, 0.0], dtype=float),
+    )
+    exact_details = {
+        "produced_image_count": 1,
+        "recovered_image_count": 1,
+        "missing_image_count": 2,
+        "extra_image_count": 0,
+        "multiplicity_failed": True,
+        "multiplicity_failure_reason": "missing_model_images",
+        "matched_model_x_arcsec": np.asarray([0.05, np.nan, np.nan], dtype=float),
+        "matched_model_y_arcsec": np.asarray([0.0, np.nan, np.nan], dtype=float),
+        "recovered_image_mask": np.asarray([True, False, False], dtype=bool),
+        "arc_recovery_status": np.asarray(["point_recovered", "arc_supported", "not_recovered"], dtype=object),
+        "arc_aware_image_residual_arcsec": np.asarray([0.05, 0.08, np.nan], dtype=float),
+        "arc_noncritical_direction_residual_arcsec": np.asarray([0.02, 0.08, 0.6], dtype=float),
+        "arc_critical_direction_residual_arcsec": np.asarray([0.04, 5.0, 1.0], dtype=float),
+        "arc_critical_direction_x": np.asarray([1.0, 0.0, 0.0], dtype=float),
+        "arc_critical_direction_y": np.asarray([0.0, 1.0, 1.0], dtype=float),
+        "arc_noncritical_direction_x": np.asarray([0.0, 1.0, 1.0], dtype=float),
+        "arc_noncritical_direction_y": np.asarray([1.0, 0.0, 0.0], dtype=float),
+        "arc_s_min": np.asarray([0.1, 0.04, 0.04], dtype=float),
+        "arc_s_max": np.asarray([1.0, 1.2, 1.3], dtype=float),
+        "arc_detA": np.asarray([0.1, 0.048, 0.052], dtype=float),
+        "arc_prior_probability": np.asarray([0.6, 0.75, 0.75], dtype=float),
+        "arc_curve_distance_arcsec": np.asarray([np.nan, 0.08, np.nan], dtype=float),
+        "arc_curve_arclength_arcsec": np.asarray([np.nan, 3.2, np.nan], dtype=float),
+        "arc_curve_finite": np.asarray([False, True, False], dtype=bool),
+        "arc_support_anchor_x_arcsec": np.asarray([np.nan, 1.0, np.nan], dtype=float),
+        "arc_support_anchor_y_arcsec": np.asarray([np.nan, 3.2, np.nan], dtype=float),
+        "arc_support_curve_x_arcsec": np.asarray(["[]", "[1,1,1]", "[]"], dtype=object),
+        "arc_support_curve_y_arcsec": np.asarray(["[]", "[-1,0,1]", "[]"], dtype=object),
+        "arc_supported_mask": np.asarray([False, True, False], dtype=bool),
+        "arc_support_finite_mask": np.asarray([True, True, True], dtype=bool),
+        "cab_has_constraint": np.asarray([False, True, False], dtype=bool),
+        "cab_anchor_x_arcsec": np.asarray([np.nan, 1.1, np.nan], dtype=float),
+        "cab_anchor_y_arcsec": np.asarray([np.nan, 0.2, np.nan], dtype=float),
+        "cab_tangent_angle_obs_rad": np.asarray([np.nan, 0.8, np.nan], dtype=float),
+        "cab_tangent_angle_model_rad": np.asarray([np.nan, 0.85, np.nan], dtype=float),
+        "cab_tangent_residual_rad": np.asarray([np.nan, 0.05, np.nan], dtype=float),
+        "cab_curvature_obs_arcsec_inv": np.asarray([np.nan, 0.09, np.nan], dtype=float),
+        "cab_curvature_model_arcsec_inv": np.asarray([np.nan, 0.11, np.nan], dtype=float),
+        "cab_curvature_residual_arcsec_inv": np.asarray([np.nan, 0.02, np.nan], dtype=float),
+        "cab_loglike": np.asarray([0.0, -1.25, 0.0], dtype=float),
+        "cab_finite": np.asarray([False, True, False], dtype=bool),
+        "failed": True,
+    }
+
+    image_rows, _extra_rows, _count_info = image_diagnostics.family_image_recovery_rows(family, exact_details)
+    row_by_label = {row["image_label"]: row for row in image_rows}
+
+    assert row_by_label["1.1"]["arc_recovery_status"] == "point_recovered"
+    assert row_by_label["1.1"]["arc_aware_image_residual_arcsec"] == pytest.approx(0.05)
+    assert row_by_label["1.2"]["image_recovery_status"] == "not_recovered"
+    assert row_by_label["1.2"]["arc_recovery_status"] == "arc_supported"
+    assert row_by_label["1.2"]["arc_supported"] is True
+    assert row_by_label["1.2"]["arc_support_finite"] is True
+    assert row_by_label["1.2"]["arc_critical_direction_y"] == pytest.approx(1.0)
+    assert row_by_label["1.2"]["arc_s_max"] == pytest.approx(1.2)
+    assert row_by_label["1.2"]["arc_detA"] == pytest.approx(0.048)
+    assert row_by_label["1.2"]["arc_aware_image_residual_arcsec"] == pytest.approx(0.08)
+    assert row_by_label["1.2"]["arc_curve_distance_arcsec"] == pytest.approx(0.08)
+    assert row_by_label["1.2"]["arc_curve_arclength_arcsec"] == pytest.approx(3.2)
+    assert row_by_label["1.2"]["arc_curve_finite"] is True
+    assert row_by_label["1.2"]["arc_support_curve_x_arcsec"] == "[1,1,1]"
+    assert row_by_label["1.2"]["arc_support_curve_y_arcsec"] == "[-1,0,1]"
+    assert row_by_label["1.2"]["cab_has_constraint"] is True
+    assert row_by_label["1.2"]["cab_anchor_x_arcsec"] == pytest.approx(1.1)
+    assert row_by_label["1.2"]["cab_tangent_residual_rad"] == pytest.approx(0.05)
+    assert row_by_label["1.2"]["cab_curvature_residual_arcsec_inv"] == pytest.approx(0.02)
+    assert row_by_label["1.2"]["cab_loglike"] == pytest.approx(-1.25)
+    assert row_by_label["1.2"]["cab_finite"] is True
+    assert row_by_label["1.3"]["arc_recovery_status"] == "not_recovered"
+    assert np.isnan(row_by_label["1.3"]["arc_aware_image_residual_arcsec"])
+
+    table = image_diagnostics.image_count_recovery_table(SimpleNamespace(family_data=[family]), pd.DataFrame(image_rows))
+    assert int(table.loc[0, "arc_aware_recovered_image_count"]) == 2
+    assert int(table.loc[0, "arc_aware_missing_image_count"]) == 1
+    assert int(table.loc[0, "arc_supported_image_count"]) == 1
+    assert table.loc[0, "arc_aware_image_rms_arcsec"] == pytest.approx(math.sqrt((0.05**2 + 0.08**2) / 2.0))
+    assert not image_diagnostics.exact_details_hard_failed(
+        {
+            "multiplicity_failure_reason": "exact_image_prediction_failed",
+            "arc_aware_image_residual_arcsec": np.asarray([np.nan, 0.08], dtype=float),
+            "failed": True,
+        }
+    )
+    assert image_diagnostics.exact_details_hard_failed(
+        {
+            "multiplicity_failure_reason": "exact_image_prediction_failed",
+            "arc_aware_image_residual_arcsec": np.asarray([np.nan, np.nan], dtype=float),
+            "failed": True,
+        }
+    )
+
+
+def test_critical_arc_aware_support_survives_exact_solver_failure() -> None:
+    family = SimpleNamespace(
+        family_id="1",
+        z_source=2.0,
+        effective_z_source=2.0,
+        sigma_arcsec=0.2,
+        n_images=1,
+        image_labels=["1.1"],
+        x_obs=np.asarray([0.0], dtype=float),
+        y_obs=np.asarray([0.0], dtype=float),
+    )
+    fake = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    fake.validation_cache = {"1": FamilyValidationCache()}
+    fake.source_plane_covariance_floor = 0.0
+    fake.sample_likelihood_mode = SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+    fake.models_by_effective_z = {2.0: object()}
+    fake.critical_arc_lm_trust_radius_arcsec = cluster_solver.DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC
+    fake.critical_arc_lm_damping_relative = cluster_solver.DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE
+    fake.critical_arc_lm_damping_absolute = cluster_solver.DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE
+    fake.critical_arc_base_prob = cluster_solver.DEFAULT_CRITICAL_ARC_BASE_PROB
+    fake.critical_arc_max_prob = cluster_solver.DEFAULT_CRITICAL_ARC_MAX_PROB
+    fake.critical_arc_singular_threshold = cluster_solver.DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD
+    fake.critical_arc_singular_softness = cluster_solver.DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS
+    fake._build_packed_lens_state = lambda _params, _z_source: {}
+    fake._source_sigma_int_numpy = lambda _params: 0.0
+    fake._source_position_for_family_numpy = lambda _params, _family_id: (0.0, 0.0)
+    fake._exact_source_ray_shooting = (
+        lambda _family, _packed_state: (np.asarray([-0.2], dtype=float), np.asarray([0.0], dtype=float))
+    )
+    fake._ray_shooting_for_components = (
+        lambda _z_source, _x, _y, _packed_state: (jnp.asarray([-0.2], dtype=jnp.float64), jnp.asarray([0.0], dtype=jnp.float64))
+    )
+    fake._lensing_jacobian_for_components = lambda _z_source, _x, _y, _packed_state: (
+        jnp.asarray([0.05], dtype=jnp.float64),
+        jnp.asarray([0.0], dtype=jnp.float64),
+        jnp.asarray([0.0], dtype=jnp.float64),
+        jnp.asarray([1.0], dtype=jnp.float64),
+    )
+
+    def fail_exact_solver(_family, _packed_state, _source_x, _source_y):
+        raise RuntimeError("solver failed")
+
+    fake._solve_exact_images_lenstronomy = fail_exact_solver
+
+    details = cluster_solver.ClusterJAXEvaluator._exact_family_prediction_details(
+        fake,
+        np.asarray([], dtype=float),
+        family,
+    )
+
+    assert details["failed"] is True
+    assert details["multiplicity_failure_reason"] == "exact_image_prediction_failed"
+    assert details["arc_recovery_status"].tolist() == ["arc_supported"]
+    assert details["arc_supported_mask"].tolist() == [True]
+    assert np.isfinite(details["arc_aware_image_residual_arcsec"][0])
+    assert not image_diagnostics.exact_details_hard_failed(details)
+
+
+def test_source_mode_exact_recovery_computes_arc_support_from_centroid_after_solver_failure() -> None:
+    family = SimpleNamespace(
+        family_id="1",
+        z_source=2.0,
+        effective_z_source=2.0,
+        sigma_arcsec=0.2,
+        n_images=1,
+        image_labels=["1.1"],
+        x_obs=np.asarray([0.0], dtype=float),
+        y_obs=np.asarray([0.0], dtype=float),
+    )
+    fake = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    fake.validation_cache = {"1": FamilyValidationCache()}
+    fake.source_plane_covariance_floor = 0.0
+    fake.sample_likelihood_mode = SAMPLE_LIKELIHOOD_SOURCE
+    fake.models_by_effective_z = {2.0: object()}
+    fake.critical_arc_lm_trust_radius_arcsec = cluster_solver.DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC
+    fake.critical_arc_lm_damping_relative = cluster_solver.DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE
+    fake.critical_arc_lm_damping_absolute = cluster_solver.DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE
+    fake.critical_arc_base_prob = cluster_solver.DEFAULT_CRITICAL_ARC_BASE_PROB
+    fake.critical_arc_max_prob = cluster_solver.DEFAULT_CRITICAL_ARC_MAX_PROB
+    fake.critical_arc_singular_threshold = cluster_solver.DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD
+    fake.critical_arc_singular_softness = cluster_solver.DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS
+    fake._build_packed_lens_state = lambda _params, _z_source: {}
+    fake._source_sigma_int_numpy = lambda _params: 0.0
+    fake._source_position_for_family_numpy = lambda _params, _family_id: (50.0, 50.0)
+    fake._exact_source_ray_shooting = (
+        lambda _family, _packed_state: (np.asarray([-0.2], dtype=float), np.asarray([0.0], dtype=float))
+    )
+    fake._ray_shooting_for_components = (
+        lambda _z_source, _x, _y, _packed_state: (jnp.asarray([-0.2], dtype=jnp.float64), jnp.asarray([0.0], dtype=jnp.float64))
+    )
+    fake._lensing_jacobian_for_components = lambda _z_source, _x, _y, _packed_state: (
+        jnp.asarray([0.05], dtype=jnp.float64),
+        jnp.asarray([0.0], dtype=jnp.float64),
+        jnp.asarray([0.0], dtype=jnp.float64),
+        jnp.asarray([1.0], dtype=jnp.float64),
+    )
+
+    def fail_exact_solver(_family, _packed_state, _source_x, _source_y):
+        raise RuntimeError("solver failed")
+
+    fake._solve_exact_images_lenstronomy = fail_exact_solver
+
+    details = cluster_solver.ClusterJAXEvaluator._exact_family_prediction_details(
+        fake,
+        np.asarray([], dtype=float),
+        family,
+    )
+
+    assert details["failed"] is True
+    assert details["multiplicity_failure_reason"] == "exact_image_prediction_failed"
+    assert details["arc_recovery_status"].tolist() == ["arc_supported"]
+    assert details["arc_supported_mask"].tolist() == [True]
+    assert details["arc_s_min"][0] == pytest.approx(0.05)
+    assert details["arc_noncritical_direction_residual_arcsec"][0] == pytest.approx(0.0, abs=1.0e-8)
+    assert np.isfinite(details["arc_critical_direction_residual_arcsec"][0])
+    assert np.isfinite(details["arc_prior_probability"][0])
+    assert not image_diagnostics.exact_details_hard_failed(details)
+
+
+def test_exact_recovery_arc_support_falls_back_when_jacobian_unavailable() -> None:
+    family = SimpleNamespace(
+        family_id="1",
+        z_source=2.0,
+        effective_z_source=2.0,
+        sigma_arcsec=0.2,
+        n_images=1,
+        image_labels=["1.1"],
+        x_obs=np.asarray([0.0], dtype=float),
+        y_obs=np.asarray([0.0], dtype=float),
+    )
+    fake = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    fake.validation_cache = {"1": FamilyValidationCache()}
+    fake.source_plane_covariance_floor = 0.0
+    fake.sample_likelihood_mode = SAMPLE_LIKELIHOOD_SOURCE
+    fake.models_by_effective_z = {2.0: object()}
+    fake.critical_arc_lm_trust_radius_arcsec = cluster_solver.DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC
+    fake.critical_arc_lm_damping_relative = cluster_solver.DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE
+    fake.critical_arc_lm_damping_absolute = cluster_solver.DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE
+    fake.critical_arc_base_prob = cluster_solver.DEFAULT_CRITICAL_ARC_BASE_PROB
+    fake.critical_arc_max_prob = cluster_solver.DEFAULT_CRITICAL_ARC_MAX_PROB
+    fake.critical_arc_singular_threshold = cluster_solver.DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD
+    fake.critical_arc_singular_softness = cluster_solver.DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS
+    fake._build_packed_lens_state = lambda _params, _z_source: {}
+    fake._source_sigma_int_numpy = lambda _params: 0.0
+    fake._source_position_for_family_numpy = lambda _params, _family_id: None
+    fake._exact_source_ray_shooting = (
+        lambda _family, _packed_state: (np.asarray([-0.2], dtype=float), np.asarray([0.0], dtype=float))
+    )
+    fake._ray_shooting_for_components = (
+        lambda _z_source, _x, _y, _packed_state: (jnp.asarray([-0.2], dtype=jnp.float64), jnp.asarray([0.0], dtype=jnp.float64))
+    )
+
+    def fail_jacobian(_z_source, _x, _y, _packed_state):
+        raise RuntimeError("jacobian unavailable")
+
+    def fail_exact_solver(_family, _packed_state, _source_x, _source_y):
+        raise RuntimeError("solver failed")
+
+    fake._lensing_jacobian_for_components = fail_jacobian
+    fake._solve_exact_images_lenstronomy = fail_exact_solver
+
+    details = cluster_solver.ClusterJAXEvaluator._exact_family_prediction_details(
+        fake,
+        np.asarray([], dtype=float),
+        family,
+    )
+
+    assert details["failed"] is True
+    assert details["arc_recovery_status"].tolist() == ["not_recovered"]
+    assert details["arc_supported_mask"].tolist() == [False]
+    assert np.isnan(details["arc_s_min"][0])
+    assert np.isnan(details["arc_noncritical_direction_residual_arcsec"][0])
+    assert image_diagnostics.exact_details_hard_failed(details)
+
+
+def test_critical_arc_source_loglike_branch_uses_anchor_lm_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    traced_bin = cluster_solver.TracedBinData(
+        effective_z_source=2.0,
+        family_ids=("1",),
+        n_families=1,
+        family_index_per_image=jnp.asarray([0], dtype=jnp.int32),
+        x_obs=jnp.asarray([0.0], dtype=jnp.float64),
+        y_obs=jnp.asarray([0.0], dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([0.2], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True], dtype=bool),
+    )
+    captured: dict[str, np.ndarray] = {}
+
+    def fake_bin_loglike(**kwargs):
+        captured["residual_x"] = np.asarray(kwargs["residual_x"], dtype=float)
+        captured["residual_y"] = np.asarray(kwargs["residual_y"], dtype=float)
+        captured["jac_a00"] = np.asarray(kwargs["jac_a00"], dtype=float)
+        captured["jac_a11"] = np.asarray(kwargs["jac_a11"], dtype=float)
+        return jnp.asarray(321.0, dtype=jnp.float64)
+
+    monkeypatch.setattr(cluster_solver, "_critical_arc_mixture_image_plane_bin_loglike", fake_bin_loglike)
+
+    class FakeEvaluator:
+        source_position_conditional = False
+        source_position_param_indices_by_family = {"1": (0, 1)}
+        surrogate_enabled = False
+        surrogate_cache_by_z = {}
+        sample_likelihood_mode = SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+        critical_arc_critical_direction_sigma_arcsec = 5.0
+        critical_arc_base_prob = 0.10
+        critical_arc_max_prob = 0.80
+        critical_arc_singular_threshold = 0.20
+        critical_arc_singular_softness = 0.05
+        critical_arc_lm_damping_relative = 1.0e-3
+        critical_arc_lm_damping_absolute = 1.0e-6
+        critical_arc_lm_trust_radius_arcsec = 20.0
+        image_plane_scatter_floor_arcsec = 1.0e-3
+        source_plane_covariance_floor = 1.0e-6
+        source_plane_outlier_sigma_arcsec = 10.0
+        image_presence_penalty_weight = 0.0
+        image_presence_match_radius_arcsec = 0.30
+        image_presence_temperature_arcsec = 0.10
+        image_presence_count_softness = 0.05
+        image_presence_count_margin = 0.05
+        likelihood_stabilizer_residual_loss = "gaussian"
+        likelihood_stabilizer_student_t_nu = 4.0
+        traced_bin_data = [traced_bin]
+
+        def _physical_parameter_vector(self, params):
+            return params
+
+        def _source_sigma_int_from_physical(self, _physical_params):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+
+        def _image_sigma_int_from_physical(self, _physical_params):
+            return jnp.asarray(0.05, dtype=jnp.float64)
+
+        def _build_packed_lens_state_with_validity_from_physical(self, _physical_params, _z_source, stop_gradient=True):
+            return {}, {"is_valid": jnp.asarray(True)}
+
+        def _ray_shooting_for_components(self, _z_source, x, y, _packed_state):
+            return x + 0.4, y - 0.1
+
+        def _lensing_jacobian_for_components(self, _z_source, x, y, _packed_state):
+            return (
+                jnp.full_like(x, 2.0),
+                jnp.zeros_like(x),
+                jnp.zeros_like(y),
+                jnp.ones_like(y),
+            )
+
+        def _scaling_scatter_extra_variance_from_physical(self, _physical_params, bin_data, _beta_x, _beta_y):
+            return jnp.zeros_like(bin_data.x_obs), jnp.zeros_like(bin_data.y_obs)
+
+        def _maybe_record_invalid_state(self, _validity):
+            return None
+
+        def _cab_morphology_loglike_for_bin(self, *_args, **_kwargs):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+
+    fake = FakeEvaluator()
+    fake._source_position_vectors_for_bin = cluster_solver.ClusterJAXEvaluator._source_position_vectors_for_bin.__get__(
+        fake,
+        FakeEvaluator,
+    )
+    fake._explicit_source_position_vectors_for_bin = (
+        cluster_solver.ClusterJAXEvaluator._explicit_source_position_vectors_for_bin.__get__(fake, FakeEvaluator)
+    )
+
+    params = jnp.asarray([0.1, -0.2], dtype=jnp.float64)
+    loglike = cluster_solver.ClusterJAXEvaluator._source_loglike_impl(fake, params)
+    expected_dx, expected_dy, expected_finite = _critical_arc_lm_step_from_jacobian(
+        f_x=jnp.asarray([0.3], dtype=jnp.float64),
+        f_y=jnp.asarray([0.1], dtype=jnp.float64),
+        jac_a00=jnp.asarray([2.0], dtype=jnp.float64),
+        jac_a01=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a10=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a11=jnp.asarray([1.0], dtype=jnp.float64),
+        trust_radius_arcsec=20.0,
+        lm_damping_relative=1.0e-3,
+        lm_damping_absolute=1.0e-6,
+    )
+
+    assert float(loglike) == pytest.approx(321.0)
+    assert bool(np.asarray(expected_finite)[0])
+    np.testing.assert_allclose(captured["residual_x"], np.asarray(expected_dx), rtol=1.0e-12)
+    np.testing.assert_allclose(captured["residual_y"], np.asarray(expected_dy), rtol=1.0e-12)
+    np.testing.assert_allclose(captured["jac_a00"], np.asarray([2.0]))
+    np.testing.assert_allclose(captured["jac_a11"], np.asarray([1.0]))
+
+
+def test_critical_arc_source_loglike_uses_full_exact_mixture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    traced_bin = cluster_solver.TracedBinData(
+        effective_z_source=2.0,
+        family_ids=("1",),
+        n_families=1,
+        family_index_per_image=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+        x_obs=jnp.asarray([0.0, 1.0, 2.0], dtype=jnp.float64),
+        y_obs=jnp.asarray([0.0, 0.0, 0.0], dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([0.2, 0.2, 0.2], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999, 0.999, 0.999], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True, True], dtype=bool),
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_critical_bin_loglike(**kwargs):
+        captured["critical_n"] = int(np.asarray(kwargs["residual_x"]).size)
+        captured["has_soft_anisotropic"] = "soft_anisotropic" in kwargs
+        captured["has_cheap_singular_proxy"] = "use_cheap_singular_proxy" in kwargs
+        captured["critical_presence_weight"] = float(kwargs["image_presence_penalty_weight"])
+        return jnp.asarray(100.0, dtype=jnp.float64)
+
+    def fake_linearized_bin_loglike(**_kwargs):
+        raise AssertionError("exact critical-arc likelihood must not split far rows into linearized likelihood")
+
+    monkeypatch.setattr(cluster_solver, "_critical_arc_mixture_image_plane_bin_loglike", fake_critical_bin_loglike)
+    monkeypatch.setattr(cluster_solver, "_linearized_image_plane_bin_loglike", fake_linearized_bin_loglike)
+
+    class FakeEvaluator:
+        source_position_conditional = False
+        source_position_param_indices_by_family = {"1": (0, 1)}
+        surrogate_enabled = True
+        surrogate_cache_by_z = {2.0: SimpleNamespace()}
+        sample_likelihood_mode = SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+        critical_arc_critical_direction_sigma_arcsec = 5.0
+        critical_arc_base_prob = 0.10
+        critical_arc_max_prob = 0.80
+        critical_arc_singular_threshold = 0.20
+        critical_arc_singular_softness = 0.05
+        critical_arc_lm_damping_relative = 1.0e-3
+        critical_arc_lm_damping_absolute = 1.0e-6
+        critical_arc_lm_trust_radius_arcsec = 20.0
+        image_plane_scatter_floor_arcsec = 1.0e-3
+        source_plane_covariance_floor = 1.0e-6
+        source_plane_outlier_sigma_arcsec = 10.0
+        image_presence_penalty_weight = 0.0
+        image_presence_match_radius_arcsec = 0.30
+        image_presence_temperature_arcsec = 0.10
+        image_presence_count_softness = 0.05
+        image_presence_count_margin = 0.05
+        likelihood_stabilizer_residual_loss = "gaussian"
+        likelihood_stabilizer_student_t_nu = 4.0
+        traced_bin_data = [traced_bin]
+
+        def _physical_parameter_vector(self, params):
+            return params
+
+        def _source_sigma_int_from_physical(self, _physical_params):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+
+        def _image_sigma_int_from_physical(self, _physical_params):
+            return jnp.asarray(0.05, dtype=jnp.float64)
+
+        def _build_packed_lens_state_with_validity_from_physical(self, _physical_params, _z_source, stop_gradient=True):
+            return {}, {"is_valid": jnp.asarray(True)}
+
+        def _ray_shooting_for_components(self, _z_source, x, y, _packed_state):
+            return x + 0.4, y - 0.1
+
+        def _surrogate_beta(self, _params, _physical_params, bin_data):
+            return bin_data.x_obs + 0.4, bin_data.y_obs - 0.1, jnp.asarray(False), {}
+
+        def _surrogate_jacobian_entries(self, _params, bin_data, _packed_state, _invalid):
+            return (
+                jnp.asarray([0.05, 1.0, 0.05], dtype=jnp.float64),
+                jnp.zeros_like(bin_data.x_obs),
+                jnp.zeros_like(bin_data.y_obs),
+                jnp.ones_like(bin_data.y_obs),
+            )
+
+        def _scaling_scatter_extra_variance_from_physical(self, _physical_params, bin_data, _beta_x, _beta_y):
+            return jnp.zeros_like(bin_data.x_obs), jnp.zeros_like(bin_data.y_obs)
+
+        def _maybe_record_invalid_state(self, _validity):
+            return None
+
+        def _cab_morphology_loglike_for_bin(self, *_args, **_kwargs):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+
+    fake = FakeEvaluator()
+    fake._source_position_vectors_for_bin = cluster_solver.ClusterJAXEvaluator._source_position_vectors_for_bin.__get__(
+        fake,
+        FakeEvaluator,
+    )
+    fake._explicit_source_position_vectors_for_bin = (
+        cluster_solver.ClusterJAXEvaluator._explicit_source_position_vectors_for_bin.__get__(fake, FakeEvaluator)
+    )
+
+    loglike = cluster_solver.ClusterJAXEvaluator._source_loglike_impl(fake, jnp.asarray([0.1, -0.2], dtype=jnp.float64))
+
+    assert float(loglike) == pytest.approx(100.0)
+    assert captured["critical_n"] == 3
+    assert captured["has_soft_anisotropic"] is False
+    assert captured["has_cheap_singular_proxy"] is False
+    assert captured["critical_presence_weight"] == pytest.approx(0.0)
+
+
 def test_cluster_solver_accepts_fit_cosmology_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         sys,
@@ -2285,17 +5754,15 @@ def test_cluster_solver_accepts_fit_cosmology_flag(monkeypatch: pytest.MonkeyPat
             "--par-path",
             "data/clustersim/input.par",
             "--fit-cosmology-flat-wcdm",
-            "--fit-cosmology-all-stages",
         ],
     )
 
     args = _parse_args()
 
     assert args.fit_cosmology_flat_wcdm is True
-    assert args.fit_cosmology_all_stages is True
 
 
-def test_cluster_solver_fit_cosmology_all_stages_requires_fit_cosmology(
+def test_cluster_solver_rejects_removed_fit_cosmology_all_stages_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -2309,10 +5776,8 @@ def test_cluster_solver_fit_cosmology_all_stages_requires_fit_cosmology(
         ],
     )
 
-    args = _parse_args()
-
-    with pytest.raises(SystemExit, match="requires --fit-cosmology-flat-wcdm"):
-        _normalize_stage_fit_controls(args)
+    with pytest.raises(SystemExit):
+        _parse_args()
 
 
 def test_cluster_solver_accepts_cosmology_init_flags(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2465,10 +5930,47 @@ def test_cluster_solver_defaults_to_prior_whitened_source_positions(monkeypatch:
     assert args.source_position_parameterization == "prior-whitened"
 
 
+def test_fixed_image_sigma_int_removes_sampled_image_scatter_and_evaluator_returns_fixed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cluster_solver", "--par-path", "data/clustersim/input.par", "--fit-mode", "joint"],
+    )
+    sampled_args = _parse_args()
+    sampled_args.sample_likelihood_mode = SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
+    source_position_priors = {str(index): (0.0, 0.0) for index in range(1, 128)}
+    sampled_state = cluster_solver._build_state_from_inputs(
+        sampled_args,
+        source_position_prior_values=source_position_priors,
+    )
+
+    assert any(spec.sample_name == "image_sigma_int" for spec in sampled_state.parameter_specs)
+
+    fixed_args = argparse.Namespace(**vars(sampled_args))
+    fixed_args.fix_image_sigma_int_arcsec = 0.35
+    fixed_state = cluster_solver._build_state_from_inputs(
+        fixed_args,
+        source_position_prior_values=source_position_priors,
+    )
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=fixed_state,
+        match_tolerance_arcsec=0.1,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
+        fixed_image_sigma_int_arcsec=0.35,
+    )
+
+    assert all(spec.sample_name != "image_sigma_int" for spec in fixed_state.parameter_specs)
+    assert evaluator.image_sigma_int_sampled is False
+    assert evaluator._image_sigma_int_numpy(np.zeros(len(fixed_state.parameter_specs), dtype=float)) == pytest.approx(0.35)
+
+
 def test_cluster_solver_quick_diagnostics_cli(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "data/clustersim/input.par"])
     args = _parse_args()
     assert args.quick_diagnostics is False
+    assert args.exact_image_diagnostics_stage3 is False
 
     monkeypatch.setattr(
         sys,
@@ -2482,6 +5984,59 @@ def test_cluster_solver_quick_diagnostics_cli(monkeypatch: pytest.MonkeyPatch) -
     )
     args = _parse_args()
     assert args.quick_diagnostics is True
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--exact-image-diagnostics-stage3",
+        ],
+    )
+    args = _parse_args()
+    assert args.exact_image_diagnostics_stage3 is True
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--quick-diagnostics",
+            "--exact-image-diagnostics-stage3",
+        ],
+    )
+    args = _parse_args()
+    with pytest.raises(SystemExit, match="exact-image-diagnostics-stage3"):
+        cluster_solver._normalize_stage_fit_controls(args)
+
+
+def test_critical_det_diagnostic_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "data/clustersim/input.par"])
+    args = _parse_args()
+    assert args.critical_det_diagnostic_threshold == pytest.approx(
+        cluster_solver.DEFAULT_CRITICAL_DET_DIAGNOSTIC_THRESHOLD
+    )
+    assert args.skip_critical_det_diagnostic is False
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--critical-det-diagnostic-threshold",
+            "0.0025",
+            "--skip-critical-det-diagnostic",
+        ],
+    )
+    args = _parse_args()
+    assert args.critical_det_diagnostic_threshold == pytest.approx(2.5e-3)
+    assert args.skip_critical_det_diagnostic is True
 
 
 def test_cluster_solver_fit_quality_draws_default_and_zero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2504,23 +6059,23 @@ def test_cluster_solver_fit_quality_draws_default_and_zero(monkeypatch: pytest.M
 
 
 def test_validation_parser_accepts_fit_cosmology_flag() -> None:
-    args = validation._build_parser().parse_args(["--fit-cosmology-flat-wcdm", "--fit-cosmology-all-stages"])
+    args = validation._build_parser().parse_args(["--fit-cosmology-flat-wcdm"])
 
     assert args.fit_cosmology_flat_wcdm is True
-    assert args.fit_cosmology_all_stages is True
 
 
-def test_validation_fit_cosmology_all_stages_requires_fit_cosmology() -> None:
-    args = validation._build_parser().parse_args(["--fit-cosmology-all-stages"])
+def test_validation_parser_rejects_removed_fit_cosmology_all_stages_flag() -> None:
+    parser = validation._build_parser()
 
-    with pytest.raises(SystemExit, match="requires --fit-cosmology-flat-wcdm"):
-        validation._normalize_validation_stage_fit_controls(args)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--fit-cosmology-all-stages"])
 
 
 def test_validation_parser_defaults_to_prior_whitened_source_positions() -> None:
     args = validation._build_parser().parse_args([])
 
     assert args.source_position_parameterization == "prior-whitened"
+    assert args.linearized_beta_prior_sigma_arcsec == pytest.approx(2.0)
 
 
 def test_flat_wcdm_jax_factor_is_differentiable() -> None:
@@ -2671,6 +6226,116 @@ def test_potfile_mode9_scaling_priors_transform_bounds_to_latent_log_space() -> 
     assert cut_spec.physical_std == pytest.approx(47.5)
 
 
+def test_potfile_mass_size_reparam_is_opt_in_and_preserves_public_fields() -> None:
+    potfiles = [
+        {
+            "id": "members",
+            "type": cluster_solver.DP_IE_PROFILE,
+            "catalog_df": pd.DataFrame({"id": ["member"]}),
+            "core_arcsec": 0.1,
+            "sigma": [9, 245.0, 55.0, 190.0, 300.0],
+            "cut": [9, 5.25, 4.75, 0.5, 10.0],
+        }
+    ]
+
+    specs_off, param_indices_off, _ = cluster_solver._build_scaling_parameter_specs(
+        potfiles,
+        kpc_per_arcsec=10.0,
+    )
+    specs_on, param_indices_on, _ = cluster_solver._build_scaling_parameter_specs(
+        potfiles,
+        kpc_per_arcsec=10.0,
+        potfile_mass_size_reparam=True,
+    )
+
+    sigma_off = specs_off[param_indices_off[0]["sigma"]]
+    cut_off = specs_off[param_indices_off[0]["cutkpc"]]
+    sigma_on = specs_on[param_indices_on[0]["sigma"]]
+    cut_on = specs_on[param_indices_on[0]["cutkpc"]]
+
+    assert sigma_off.sample_site_name is None
+    assert cut_off.sample_site_name is None
+    assert sigma_on.name == "members.sigma"
+    assert cut_on.name == "members.cutkpc"
+    assert sigma_on.sample_name == "members_sigma"
+    assert cut_on.sample_name == "members_cutkpc"
+    assert sigma_on.sample_site_name == cut_on.sample_site_name == "members_mass_size"
+    assert sigma_on.sample_site_index == 0
+    assert cut_on.sample_site_index == 1
+    assert sigma_on.coupled_role == cluster_solver.COUPLED_ROLE_MASS_NORM
+    assert cut_on.coupled_role == cluster_solver.COUPLED_ROLE_SIZE
+
+
+def test_potfile_mass_size_reparam_roundtrip_and_prior_jacobian() -> None:
+    specs, param_indices, _ = cluster_solver._build_scaling_parameter_specs(
+        [
+            {
+                "id": "members",
+                "type": cluster_solver.DP_IE_PROFILE,
+                "catalog_df": pd.DataFrame({"id": ["member"]}),
+                "core_arcsec": 0.1,
+                "sigma": [9, 245.0, 55.0, 190.0, 300.0],
+                "cut": [9, 5.25, 4.75, 0.5, 10.0],
+            }
+        ],
+        kpc_per_arcsec=10.0,
+        potfile_mass_size_reparam=True,
+    )
+    sigma_spec = specs[param_indices[0]["sigma"]]
+    cut_spec = specs[param_indices[0]["cutkpc"]]
+    theta = np.asarray([0.0, 0.0], dtype=float)
+
+    physical = cluster_solver._convert_theta_to_physical(theta, specs)
+    roundtrip = cluster_solver._convert_theta_to_latent(physical, specs)
+
+    mass_raw = sigma_spec.coupled_mass_center + sigma_spec.coupled_mass_scale * theta[0]
+    size_raw = sigma_spec.coupled_size_center + sigma_spec.coupled_size_scale * theta[1]
+    expected_sigma = math.exp(0.5 * (mass_raw - size_raw))
+    expected_cut = cut_spec.transform_offset + math.exp(size_raw)
+    old_prior_log_prob = (
+        cluster_solver._distribution_for_spec(sigma_spec).log_prob(jnp.asarray(math.log(expected_sigma)))
+        + cluster_solver._distribution_for_spec(cut_spec).log_prob(jnp.asarray(math.log(expected_cut - cut_spec.transform_offset)))
+    )
+    expected_jacobian = math.log(0.5 * sigma_spec.coupled_mass_scale * sigma_spec.coupled_size_scale)
+
+    np.testing.assert_allclose(physical, [expected_sigma, expected_cut])
+    np.testing.assert_allclose(roundtrip, theta)
+    assert float(cluster_solver._prior_log_prob(specs, jnp.asarray(theta, dtype=jnp.float64))) == pytest.approx(
+        float(old_prior_log_prob) + expected_jacobian
+    )
+
+
+def test_potfile_mass_size_reparam_vector_site_init_and_extraction() -> None:
+    specs, _param_indices, _ = cluster_solver._build_scaling_parameter_specs(
+        [
+            {
+                "id": "members",
+                "type": cluster_solver.DP_IE_PROFILE,
+                "catalog_df": pd.DataFrame({"id": ["member"]}),
+                "core_arcsec": 0.1,
+                "sigma": [1, 190.0, 300.0],
+                "cut": [1, 0.5, 10.0],
+            }
+        ],
+        kpc_per_arcsec=10.0,
+        potfile_mass_size_reparam=True,
+    )
+    site_name = specs[0].sample_site_name
+    samples_dict = {site_name: np.asarray([[[0.1, -0.2], [0.3, -0.4]]], dtype=float)}
+    seed = ChainSeed(values=np.asarray([0.1, -0.2], dtype=float), source_label="seed")
+
+    trace = cluster_solver.numpyro.handlers.trace(
+        cluster_solver.numpyro.handlers.seed(cluster_solver._sample_site_model(specs), jax.random.PRNGKey(11))
+    ).get_trace()
+    init_params = cluster_solver._seed_values_to_init_params(specs, [seed])
+    extracted = cluster_solver._extract_grouped_samples(samples_dict, specs, thin=1)
+
+    assert np.asarray(trace[site_name]["value"]).shape == (2,)
+    assert list(init_params) == [site_name]
+    assert np.asarray(init_params[site_name]).shape == (2,)
+    np.testing.assert_allclose(extracted, np.asarray([[[0.1, -0.2], [0.3, -0.4]]], dtype=float))
+
+
 def test_stage2_large_priors_keep_truncated_vdisp_identity_summary_values() -> None:
     large_specs, _assignments, _lens_model_list = _build_parameter_specs(
         [
@@ -2787,6 +6452,338 @@ def test_nuts_quality_diagnostics_flag_stuck_tree_depth_and_rhat() -> None:
     assert metrics["max_tree_depth_saturation_fraction"] == pytest.approx(1.0)
     assert any("max-tree-depth saturation" in warning for warning in warnings)
     assert any("extreme Rhat" in warning for warning in warnings)
+
+
+def test_sampler_debug_extra_fields_are_flag_gated() -> None:
+    default_fields = cluster_solver._sampler_debug_extra_field_names(
+        argparse.Namespace(debug_sampler_diagnostics=False)
+    )
+    debug_fields = cluster_solver._sampler_debug_extra_field_names(
+        argparse.Namespace(debug_sampler_diagnostics=True)
+    )
+
+    assert default_fields == ("accept_prob", "diverging", "num_steps", "potential_energy")
+    assert "energy" in debug_fields
+    assert "adapt_state.step_size" in debug_fields
+    assert "adapt_state.inverse_mass_matrix" in debug_fields
+
+
+def test_sanitize_grouped_posterior_filters_nested_debug_extra_fields() -> None:
+    spec = ParameterSpec(
+        "theta",
+        "theta",
+        "theta",
+        0,
+        "theta",
+        "normal",
+        -np.inf,
+        np.inf,
+        0.1,
+        mean=0.0,
+        std=1.0,
+    )
+    samples = {"theta": np.asarray([[0.0, 0.1], [np.nan, 0.2]], dtype=float)}
+    extra = {
+        "potential_energy": np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+        "adapt_state.inverse_mass_matrix": {("theta",): np.ones((2, 2, 1, 1), dtype=float)},
+    }
+
+    filtered_samples, filtered_extra, diagnostics = cluster_solver._sanitize_grouped_posterior(
+        samples,
+        extra,
+        [spec],
+    )
+
+    assert diagnostics["retained_chain_indices"] == [0]
+    assert filtered_samples["theta"].shape == (1, 2)
+    assert filtered_extra["potential_energy"].shape == (1, 2)
+    assert filtered_extra["adapt_state.inverse_mass_matrix"][("theta",)].shape == (1, 2, 1, 1)
+
+
+def test_nuts_integrator_debug_table_flags_constant_stuck_chain(tmp_path: Path) -> None:
+    grouped = np.stack(
+        [
+            np.linspace(0.0, 1.0, 5, dtype=float).reshape(5, 1),
+            np.full((5, 1), 2.0, dtype=float),
+        ],
+        axis=0,
+    )
+    posterior = PosteriorResults(
+        samples=grouped.reshape(-1, 1),
+        log_prob=np.zeros(10, dtype=float),
+        accept_prob=np.ones(10, dtype=float),
+        diverging=np.zeros(10, dtype=bool),
+        num_steps=np.full(10, 255.0, dtype=float),
+        warmup_steps=5,
+        sample_steps=5,
+        num_chains=2,
+        init_diagnostics={"chain_seed_labels": ["a", "b"]},
+        grouped_samples=grouped,
+        grouped_log_prob=np.zeros((2, 5), dtype=float),
+        sampler="numpyro_nuts",
+    )
+    extra = {
+        "accept_prob": np.ones((2, 5), dtype=float),
+        "num_steps": np.full((2, 5), 255.0, dtype=float),
+        "potential_energy": np.zeros((2, 5), dtype=float),
+        "energy": np.asarray([[1.0, 1.1, 0.9, 1.0, 1.2], [2.0, 2.0, 2.0, 2.0, 2.0]], dtype=float),
+        "adapt_state.step_size": np.asarray([[0.01] * 5, [1.0e-8] * 5], dtype=float),
+        "adapt_state.inverse_mass_matrix": {("theta",): np.ones((2, 5, 1, 1), dtype=float)},
+    }
+
+    df = cluster_solver._write_nuts_integrator_debug_table(
+        tmp_path / "nuts_integrator_diagnostics.csv",
+        argparse.Namespace(max_tree_depth=8),
+        posterior,
+        extra,
+        [0, 1],
+    )
+
+    assert (tmp_path / "nuts_integrator_diagnostics.csv").exists()
+    assert df.loc[1, "stuck_parameter_count_range_lt_1e_9"] == 1
+    assert df.loc[1, "parameter_range_min"] == pytest.approx(0.0)
+    assert df.loc[1, "max_tree_depth_saturation_fraction"] == pytest.approx(1.0)
+    assert df.loc[1, "step_size_last"] == pytest.approx(1.0e-8)
+
+
+def test_critical_arc_debug_terms_sum_to_bin_loglike_without_presence_penalty() -> None:
+    bin_data = cluster_solver.TracedBinData(
+        effective_z_source=2.0,
+        family_ids=("1",),
+        n_families=1,
+        family_index_per_image=jnp.asarray([0, 0], dtype=jnp.int32),
+        x_obs=jnp.asarray([0.0, 1.0], dtype=jnp.float64),
+        y_obs=jnp.asarray([0.0, 0.0], dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([0.25, 0.25], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([1.0, 1.0], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True], dtype=bool),
+    )
+
+    class FakeCriticalArcEvaluator:
+        sample_likelihood_mode = SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+        fit_cosmology_flat_wcdm = False
+        surrogate_enabled = False
+        surrogate_cache_by_z: dict[float, object] = {}
+        traced_bin_data = [bin_data]
+        critical_arc_lm_trust_radius_arcsec = 20.0
+        critical_arc_lm_damping_relative = 0.001
+        critical_arc_lm_damping_absolute = 1.0e-6
+        source_plane_covariance_floor = 1.0e-6
+        image_plane_scatter_floor_arcsec = 1.0e-3
+        source_plane_outlier_sigma_arcsec = 10.0
+        image_presence_penalty_weight = 0.0
+        image_presence_match_radius_arcsec = 1.0
+        image_presence_temperature_arcsec = 0.5
+        image_presence_count_softness = 0.05
+        image_presence_count_margin = 0.05
+        likelihood_stabilizer_residual_loss = cluster_solver.LIKELIHOOD_STABILIZER_RESIDUAL_LOSS_GAUSSIAN
+        likelihood_stabilizer_student_t_nu = 4.0
+        critical_arc_critical_direction_sigma_arcsec = 10.0
+        critical_arc_base_prob = 0.1
+        critical_arc_max_prob = 0.85
+        critical_arc_singular_threshold = 0.4
+        critical_arc_singular_softness = 0.1
+
+        def _physical_parameter_vector(self, params: jnp.ndarray) -> jnp.ndarray:
+            return params
+
+        def _image_sigma_int_from_physical(self, physical_params: jnp.ndarray) -> jnp.ndarray:
+            return jnp.asarray(0.1, dtype=jnp.float64)
+
+        def _build_packed_lens_state_with_validity_from_physical(self, *_args, **_kwargs):
+            return {}, {"is_valid": jnp.asarray(True)}
+
+        def _ray_shooting_for_components(self, *_args, **_kwargs):
+            return jnp.asarray([0.2, 1.2], dtype=jnp.float64), jnp.asarray([0.1, -0.1], dtype=jnp.float64)
+
+        def _lensing_jacobian_for_components(self, *_args, **_kwargs):
+            ones = jnp.ones(2, dtype=jnp.float64)
+            zeros = jnp.zeros(2, dtype=jnp.float64)
+            return ones, zeros, zeros, 0.2 * ones
+
+        def _explicit_source_position_vectors_for_bin(self, *_args, **_kwargs):
+            return (
+                jnp.asarray([0.0, 1.0], dtype=jnp.float64),
+                jnp.asarray([0.0, 0.0], dtype=jnp.float64),
+                jnp.asarray(True),
+                jnp.asarray(0.0, dtype=jnp.float64),
+            )
+
+    evaluator = FakeCriticalArcEvaluator()
+    theta = np.asarray([0.0], dtype=float)
+    image_rows, bin_rows = cluster_solver._critical_arc_debug_terms_for_state(
+        SimpleNamespace(),
+        evaluator,
+        theta,
+        state_index=0,
+        state_label="probe",
+        chain=1,
+        draw=0,
+    )
+
+    params = jnp.asarray(theta, dtype=jnp.float64)
+    physical_params = evaluator._physical_parameter_vector(params)
+    image_sigma_int = evaluator._image_sigma_int_from_physical(physical_params)
+    beta_x, beta_y = evaluator._ray_shooting_for_components(None, bin_data.x_obs, bin_data.y_obs, {})
+    jacobian_entries = evaluator._lensing_jacobian_for_components(None, bin_data.x_obs, bin_data.y_obs, {})
+    beta_family_x, beta_family_y, _has_sources, transport = evaluator._explicit_source_position_vectors_for_bin(
+        params,
+        physical_params,
+        bin_data,
+        beta_x,
+        beta_y,
+        image_sigma_int,
+        jacobian_entries,
+    )
+    (
+        residual_x,
+        residual_y,
+        singular_min,
+        singular_max,
+        critical_p00,
+        critical_p01,
+        critical_p11,
+        _residual_finite,
+    ) = cluster_solver._critical_arc_lm_geometry_from_jacobian(
+        beta_x - beta_family_x,
+        beta_y - beta_family_y,
+        *jacobian_entries,
+        trust_radius_arcsec=evaluator.critical_arc_lm_trust_radius_arcsec,
+        lm_damping_relative=evaluator.critical_arc_lm_damping_relative,
+        lm_damping_absolute=evaluator.critical_arc_lm_damping_absolute,
+    )
+    direct_bin_loglike = cluster_solver._critical_arc_mixture_image_plane_bin_loglike(
+        residual_x=residual_x,
+        residual_y=residual_y,
+        jac_a00=jacobian_entries[0],
+        jac_a01=jacobian_entries[1],
+        jac_a10=jacobian_entries[2],
+        jac_a11=jacobian_entries[3],
+        family_idx=bin_data.family_index_per_image,
+        n_families=bin_data.n_families,
+        sigma_per_image=bin_data.sigma_per_image,
+        reliability_per_image=bin_data.reliability_per_image,
+        image_has_constraint=bin_data.image_has_constraint,
+        image_sigma_int=image_sigma_int,
+        covariance_floor=evaluator.source_plane_covariance_floor,
+        outlier_sigma_arcsec=evaluator.source_plane_outlier_sigma_arcsec,
+        image_scatter_floor_arcsec=evaluator.image_plane_scatter_floor_arcsec,
+        image_presence_penalty_weight=evaluator.image_presence_penalty_weight,
+        image_presence_match_radius_arcsec=evaluator.image_presence_match_radius_arcsec,
+        image_presence_temperature_arcsec=evaluator.image_presence_temperature_arcsec,
+        image_presence_count_softness=evaluator.image_presence_count_softness,
+        image_presence_count_margin=evaluator.image_presence_count_margin,
+        residual_loss=evaluator.likelihood_stabilizer_residual_loss,
+        student_t_nu=evaluator.likelihood_stabilizer_student_t_nu,
+        critical_direction_sigma_arcsec=evaluator.critical_arc_critical_direction_sigma_arcsec,
+        base_prob=evaluator.critical_arc_base_prob,
+        max_prob=evaluator.critical_arc_max_prob,
+        singular_threshold=evaluator.critical_arc_singular_threshold,
+        singular_softness=evaluator.critical_arc_singular_softness,
+        singular_min_precomputed=singular_min,
+        singular_max_precomputed=singular_max,
+        critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+    )
+
+    assert len(image_rows) == 2
+    assert len(bin_rows) == 1
+    assert sum(row["final_image_mixture_contribution"] for row in image_rows) == pytest.approx(
+        bin_rows[0]["bin_loglike_without_transport"]
+    )
+    assert bin_rows[0]["bin_loglike_with_transport"] == pytest.approx(
+        float(direct_bin_loglike + transport)
+    )
+    for row in image_rows:
+        assert "outlier_responsibility" in row
+        assert "point_mixture_responsibility" in row
+        assert "arc_mixture_responsibility" in row
+        assert row["inlier_responsibility"] + row["outlier_responsibility"] == pytest.approx(1.0)
+        assert (
+            row["point_mixture_responsibility"]
+            + row["arc_mixture_responsibility"]
+            + row["outlier_responsibility"]
+        ) == pytest.approx(1.0)
+        assert row["point_inlier_responsibility"] + row["arc_inlier_responsibility"] == pytest.approx(1.0)
+    outlier_values = np.asarray([row["outlier_responsibility"] for row in image_rows], dtype=float)
+    assert bin_rows[0]["outlier_responsibility_mean"] == pytest.approx(float(np.mean(outlier_values)))
+    assert bin_rows[0]["outlier_responsibility_max"] == pytest.approx(float(np.max(outlier_values)))
+    assert bin_rows[0]["outlier_responsibility_sum"] == pytest.approx(float(np.sum(outlier_values)))
+    assert bin_rows[0]["outlier_responsibility_count_gt_0p1"] == int(np.sum(outlier_values > 0.1))
+    assert bin_rows[0]["outlier_responsibility_count_gt_0p5"] == int(np.sum(outlier_values > 0.5))
+
+
+def test_sampler_debug_writer_creates_core_csvs(tmp_path: Path) -> None:
+    spec = ParameterSpec(
+        "theta",
+        "theta",
+        "theta",
+        0,
+        "theta",
+        "normal",
+        -np.inf,
+        np.inf,
+        0.1,
+        mean=0.0,
+        std=1.0,
+    )
+    grouped = np.asarray([[[0.0], [0.1], [0.2]]], dtype=float)
+    posterior = PosteriorResults(
+        samples=grouped.reshape(-1, 1),
+        log_prob=np.asarray([0.0, -0.1, -0.2], dtype=float),
+        accept_prob=np.ones(3, dtype=float),
+        diverging=np.zeros(3, dtype=bool),
+        num_steps=np.ones(3, dtype=float),
+        warmup_steps=2,
+        sample_steps=3,
+        num_chains=1,
+        init_diagnostics={"retained_chain_indices": [0], "chain_seed_labels": ["seed"]},
+        grouped_samples=grouped,
+        grouped_log_prob=np.asarray([[0.0, -0.1, -0.2]], dtype=float),
+        sampler="numpyro_nuts",
+    )
+    nuts_init = NUTSInitialization(
+        init_params={},
+        chain_seeds=[ChainSeed(values=np.asarray([0.0], dtype=float), source_label="seed")],
+        diagnostics={"retained_chain_indices": [0], "chain_seed_labels": ["seed"]},
+        reference_theta=np.asarray([0.0], dtype=float),
+    )
+
+    class FakeEvaluator:
+        sample_likelihood_mode = SAMPLE_LIKELIHOOD_SOURCE
+
+        def _source_loglike_fn(self, theta: jnp.ndarray) -> jnp.ndarray:
+            return -0.5 * jnp.sum(jnp.square(theta))
+
+    extra = {
+        "accept_prob": np.ones((1, 3), dtype=float),
+        "num_steps": np.ones((1, 3), dtype=float),
+        "potential_energy": -posterior.grouped_log_prob,
+        "energy": np.asarray([[1.0, 1.1, 1.2]], dtype=float),
+        "adapt_state.step_size": np.asarray([[0.01, 0.01, 0.01]], dtype=float),
+        "adapt_state.inverse_mass_matrix": {("theta",): np.ones((1, 3, 1, 1), dtype=float)},
+    }
+
+    diagnostics = cluster_solver._write_sampler_debug_diagnostics(
+        argparse.Namespace(output_dir=str(tmp_path), debug_sampler_diagnostics=True, max_tree_depth=8),
+        SimpleNamespace(run_name="run", parameter_specs=[spec]),
+        FakeEvaluator(),
+        nuts_init,
+        posterior,
+        extra,
+    )
+
+    tables = tmp_path / "run" / "tables"
+    assert diagnostics["nuts_integrator_diagnostics_rows"] == 1
+    integrator_df = pd.read_csv(tables / "nuts_integrator_diagnostics.csv")
+    state_df = pd.read_csv(tables / "sampler_state_diagnostics.csv")
+    scan_df = pd.read_csv(tables / "sampler_direction_scan.csv")
+    assert {"chain", "step_size_last", "energy_bfmi_like", "inverse_mass_diag_median"} <= set(
+        integrator_df.columns
+    )
+    assert {"state_label", "prior_log_prob", "likelihood_log_prob", "gradient_norm"} <= set(
+        state_df.columns
+    )
+    assert {"state_label", "parameter", "delta", "posterior_log_prob"} <= set(scan_df.columns)
 
 
 def _svi_health_specs() -> list[ParameterSpec]:
@@ -2951,6 +6948,201 @@ def test_svi_health_diagnostics_are_recorded_in_init_diagnostics() -> None:
     assert svi_diagnostics["svi_health_warnings"] == warnings
 
 
+def test_svi_refresh_cache_probe_delta_is_bounded_and_tracks_metadata() -> None:
+    before_cache = {
+        1.0: {
+            "a": np.arange(1000, dtype=float),
+            "b": np.ones((2, 2), dtype=float),
+            "remove": np.ones(5, dtype=float),
+        }
+    }
+    after_cache = {
+        1.0: {
+            "a": np.arange(1000, dtype=float) + 5.0,
+            "added": np.ones(5, dtype=float),
+            "b": np.ones((3, 2), dtype=float),
+        }
+    }
+
+    before = cluster_solver._svi_refresh_cache_snapshot(
+        before_cache,
+        np.asarray([0.0, 0.0], dtype=float),
+        max_arrays=2,
+        max_values_per_array=4,
+    )
+    after = cluster_solver._svi_refresh_cache_snapshot(
+        after_cache,
+        np.asarray([1.0, 0.0], dtype=float),
+        max_arrays=2,
+        max_values_per_array=4,
+    )
+
+    assert before.shapes == {
+        "z=1.a": (1000,),
+        "z=1.b": (2, 2),
+        "z=1.remove": (5,),
+    }
+    assert set(before.probes) == {"z=1.a", "z=1.b"}
+    assert before.probes["z=1.a"].values.tolist() == pytest.approx([0.0, 333.0, 666.0, 999.0])
+
+    delta = cluster_solver._svi_refresh_cache_delta(before, after)
+
+    assert delta.compared_arrays == 1
+    assert delta.compared_values == 4
+    assert delta.max_abs == pytest.approx(5.0)
+    assert delta.rms == pytest.approx(5.0)
+    assert delta.added_arrays == 1
+    assert delta.removed_arrays == 1
+    assert delta.shape_changed_arrays == 1
+
+
+def test_svi_refresh_cache_probe_delta_reports_unchanged_disabled_and_empty() -> None:
+    cache = {1.0: {"a": np.asarray([1.0, 2.0, 3.0], dtype=float)}}
+    before = cluster_solver._svi_refresh_cache_snapshot(cache, np.asarray([0.0], dtype=float))
+    after = cluster_solver._svi_refresh_cache_snapshot(cache, np.asarray([0.0], dtype=float))
+
+    unchanged = cluster_solver._svi_refresh_cache_delta(before, after)
+    assert unchanged.compared_values == 3
+    assert unchanged.max_abs == pytest.approx(0.0)
+    assert unchanged.rms == pytest.approx(0.0)
+
+    disabled = cluster_solver._svi_refresh_cache_snapshot({}, None, enabled=False)
+    assert cluster_solver._format_svi_refresh_cache_delta(
+        "surrogate",
+        cluster_solver._svi_refresh_cache_delta(disabled, disabled),
+    ) == "surrogate=disabled"
+
+    empty = cluster_solver._svi_refresh_cache_snapshot({}, None)
+    assert cluster_solver._format_svi_refresh_cache_delta(
+        "scaling",
+        cluster_solver._svi_refresh_cache_delta(empty, empty),
+    ) == "scaling=empty arrays=0"
+
+
+def test_run_svi_fit_logs_bounded_refresh_deltas(monkeypatch: pytest.MonkeyPatch) -> None:
+    specs = _svi_health_specs()
+    centers = [
+        np.asarray([1.0, -1.0], dtype=float),
+        np.asarray([1.5, -1.5], dtype=float),
+        np.asarray([1.75, -1.25], dtype=float),
+    ]
+    logs: list[str] = []
+
+    class FakeGuide:
+        def __init__(self, center: np.ndarray) -> None:
+            self.center = np.asarray(center, dtype=float)
+
+        def median(self, _params: dict[str, Any]) -> dict[str, float]:
+            return {spec.sample_name: float(self.center[index]) for index, spec in enumerate(specs)}
+
+        def sample_posterior(self, _key: Any, _params: dict[str, Any], sample_shape: tuple[int, ...]):
+            return {
+                spec.sample_name: jnp.asarray(np.full(sample_shape, self.center[index], dtype=float))
+                for index, spec in enumerate(specs)
+            }
+
+    class FakeSVI:
+        run_count = 0
+
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def run(self, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
+            FakeSVI.run_count += 1
+            return SimpleNamespace(state=object(), losses=np.asarray([10.0 - FakeSVI.run_count], dtype=float))
+
+        def get_params(self, _state: object) -> dict[str, Any]:
+            return {}
+
+    class FakeEvaluator:
+        surrogate_enabled = True
+
+        def __init__(self) -> None:
+            self.timing_totals: dict[str, float] = {}
+            self.surrogate_reference_params = np.asarray([0.0, 0.0], dtype=float)
+            self.scaling_scatter_reference_params = np.asarray([0.0, 0.0], dtype=float)
+            self.source_metric_reference_params = np.asarray([0.0, 0.0], dtype=float)
+            self._set_caches(self.surrogate_reference_params)
+
+        def _set_caches(self, params: np.ndarray) -> None:
+            base = float(np.sum(params))
+            grid = np.arange(1024, dtype=float)
+            self.surrogate_cache_by_z = {
+                1.0: SurrogateBinCache(
+                    effective_z_source=1.0,
+                    inactive_alpha_x=grid + base,
+                    inactive_alpha_y=grid - base,
+                    inactive_alpha_dx_dparams=np.full((2, 1024), base, dtype=float),
+                    inactive_alpha_dy_dparams=np.full((2, 1024), -base, dtype=float),
+                )
+            }
+            self.scaling_scatter_cache_by_z = {
+                1.0: {
+                    "sigma_x": grid + 2.0 * base,
+                    "sigma_y": grid - 2.0 * base,
+                }
+            }
+            self.source_metric_cache_by_z = {
+                1.0: {
+                    "inv_abs_mu": np.ones(1024, dtype=float) + base,
+                }
+            }
+
+        def refresh_surrogate(self, params: np.ndarray, reason: str = "manual") -> None:
+            del reason
+            self.surrogate_reference_params = np.asarray(params, dtype=float).copy()
+            self._set_caches(self.surrogate_reference_params)
+
+        def refresh_scaling_scatter_cache(self, params: np.ndarray, reason: str = "manual") -> None:
+            del reason
+            self.scaling_scatter_reference_params = np.asarray(params, dtype=float).copy()
+            self._set_caches(self.scaling_scatter_reference_params)
+
+        def refresh_source_metric_cache(self, params: np.ndarray, reason: str = "manual") -> None:
+            del reason
+            self.source_metric_reference_params = np.asarray(params, dtype=float).copy()
+            self._set_caches(self.source_metric_reference_params)
+
+    def fake_make_guide(_sample_model: object, _parameter_specs: list[ParameterSpec], _init_values=None) -> FakeGuide:
+        return FakeGuide(centers.pop(0))
+
+    monkeypatch.setattr(cluster_solver, "_make_auto_normal_guide", fake_make_guide)
+    monkeypatch.setattr(cluster_solver, "SVI", FakeSVI)
+    monkeypatch.setattr(cluster_solver, "_run_logged_phase", lambda _args, _phase_name, fn, **_kwargs: fn())
+    monkeypatch.setattr(cluster_solver, "_posterior_logprob_matrix", lambda _specs, _evaluator, samples: np.zeros(samples.shape[0]))
+    monkeypatch.setattr(cluster_solver, "_log_posterior_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log", lambda _args, message: logs.append(str(message)))
+
+    args = argparse.Namespace(
+        svi_steps=3,
+        refresh_every=1,
+        svi_learning_rate=0.1,
+        seed=11,
+        nuts_init_boundary_frac=0.0,
+        samples=1,
+        chains=1,
+    )
+    state = SimpleNamespace(
+        parameter_specs=specs,
+        svi_init_values=None,
+    )
+
+    best_fit, posterior, diagnostics = cluster_solver._run_svi_fit(args, state, FakeEvaluator(), object())
+
+    assert best_fit.tolist() == pytest.approx([1.75, -1.25])
+    assert posterior.samples.shape == (1, 2)
+    assert diagnostics["svi_cache_refresh_count"] == 2
+    refresh_logs = [message for message in logs if message.startswith("[svi] refresh ")]
+    assert [message.split()[2] for message in refresh_logs] == [
+        "reason=svi_block_1",
+        "reason=svi_block_2",
+        "reason=svi_final",
+    ]
+    assert all("theta_linf=" in message and "top=" in message for message in refresh_logs)
+    assert all("surrogate=max=" in message and "probes=" in message for message in refresh_logs)
+    assert all("scaling=max=" in message and "source_metric=max=" in message for message in refresh_logs)
+
+
 def test_cluster_solver_rejects_removed_profile_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     for flag, value in (("--profile-variant", "original"), ("--compact-skip-factor", "1.0")):
         monkeypatch.setattr(
@@ -3059,6 +7251,80 @@ def test_cluster_solver_accepts_local_jacobian_image_plane_mode(monkeypatch: pyt
     assert args.image_plane_mode == IMAGE_PLANE_MODE_LOCAL_JACOBIAN
 
 
+def test_cluster_solver_accepts_start_at_stage3_for_local_jacobian(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+            "--start-at-stage3",
+            "--resume-fast",
+            "--fit-method",
+            "svi+nuts",
+            "svi",
+            "--svi-steps",
+            "1000",
+            "400",
+            "--warmup",
+            "200",
+            "0",
+            "--samples",
+            "50",
+            "20",
+        ],
+    )
+
+    args = _parse_args()
+    controls = _normalize_stage_fit_controls(args)
+
+    assert args.start_at_stage3 is True
+    assert args.resume_fast is True
+    assert controls["stage3"].fit_method == "svi"
+    assert controls["stage3"].svi_steps == 400
+    assert controls["stage3"].warmup == 0
+    assert controls["stage3"].samples == 20
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"fit_mode": "joint"}, "fit-mode sequential"),
+        ({"image_plane_mode": IMAGE_PLANE_MODE_NONE}, "stage-3-capable"),
+        (
+            {
+                "image_plane_mode": IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+                "skip_stage3_image_plane_local_jacobian": True,
+            },
+            "skip-stage3",
+        ),
+    ],
+)
+def test_cluster_solver_rejects_invalid_start_at_stage3_controls(
+    updates: dict[str, Any],
+    message: str,
+) -> None:
+    args = argparse.Namespace(
+        fit_mode=cluster_solver.FIT_MODE_SEQUENTIAL,
+        image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+        start_at_stage3=True,
+        skip_stage3_image_plane_local_jacobian=False,
+        resume_fast=False,
+        fit_method=["svi+nuts", "svi"],
+        svi_steps=[1000, 400],
+        warmup=[200, 0],
+        samples=[50, 20],
+    )
+    for key, value in updates.items():
+        setattr(args, key, value)
+
+    with pytest.raises(SystemExit, match=message):
+        _normalize_stage_fit_controls(args)
+
+
 def test_cluster_solver_accepts_linearized_forward_beta_image_plane_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         sys,
@@ -3077,7 +7343,9 @@ def test_cluster_solver_accepts_linearized_forward_beta_image_plane_mode(monkeyp
     assert args.image_plane_mode == IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA
 
 
-def test_cluster_solver_accepts_marginal_image_plane_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cluster_solver_accepts_blocked_linearized_forward_beta_image_plane_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
@@ -3086,13 +7354,814 @@ def test_cluster_solver_accepts_marginal_image_plane_mode(monkeypatch: pytest.Mo
             "--par-path",
             "data/clustersim/input.par",
             "--image-plane-mode",
-            IMAGE_PLANE_MODE_MARGINAL,
+            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
+        ],
+    )
+
+    args = _parse_args()
+    controls = _normalize_stage_fit_controls(args)
+
+    assert args.image_plane_mode == IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED
+    assert cluster_solver._stage4_sample_likelihood_mode(args) == SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
+    assert cluster_solver._stage4_run_directory_name(args) == "stage4_blocked_linearized_image_plane"
+    assert controls["stage4"].fit_method == "svi+nuts"
+
+
+def test_cluster_solver_accepts_forward_metric_image_plane_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_FORWARD_METRIC,
+            "--image-presence-penalty-weight",
+            "3.5",
+        ],
+    )
+
+    args = _parse_args()
+    controls = _normalize_stage_fit_controls(args)
+
+    assert args.image_plane_mode == IMAGE_PLANE_MODE_FORWARD_METRIC
+    assert args.image_presence_penalty_weight == pytest.approx(3.5)
+    assert cluster_solver._stage4_sample_likelihood_mode(args) == SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE
+    assert cluster_solver._stage4_run_directory_name(args) == "stage4_forward_metric_image_plane"
+    assert controls["stage4"].fit_method == "svi+nuts"
+
+
+def test_cluster_solver_accepts_anchored_solved_forward_beta_image_plane_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+            "--sampling-engine",
+            "full",
+            "--anchored-image-plane-solve-steps",
+            "0",
+            "--anchored-image-plane-trust-radius-arcsec",
+            "0.25",
+            "--anchored-image-plane-lm-damping-relative",
+            "0.002",
+            "--anchored-image-plane-lm-damping-absolute",
+            "1e-5",
+        ],
+    )
+
+    args = _parse_args()
+    controls = _normalize_stage_fit_controls(args)
+
+    assert args.image_plane_mode == IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA
+    assert args.anchored_image_plane_solve_steps == 0
+    assert args.anchored_image_plane_trust_radius_arcsec == pytest.approx(0.25)
+    assert args.anchored_image_plane_lm_damping_relative == pytest.approx(0.002)
+    assert args.anchored_image_plane_lm_damping_absolute == pytest.approx(1.0e-5)
+    assert cluster_solver._stage4_sample_likelihood_mode(args) == SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE
+    assert cluster_solver._stage4_run_directory_name(args) == "stage4_anchored_solved_image_plane"
+    assert controls["stage4"].fit_method == "svi+nuts"
+
+
+def test_cluster_solver_accepts_critical_arc_mixture_image_plane_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+            "--sampling-engine",
+            "refreshing_surrogate",
+            "--critical-arc-critical-direction-sigma-arcsec",
+            "4.5",
+            "--critical-arc-base-prob",
+            "0.2",
+            "--critical-arc-max-prob",
+            "0.7",
+            "--critical-arc-singular-threshold",
+            "0.15",
+            "--critical-arc-singular-softness",
+            "0.04",
+            "--critical-arc-lm-damping-relative",
+            "0.002",
+            "--critical-arc-lm-damping-absolute",
+            "1e-5",
+            "--critical-arc-lm-trust-radius-arcsec",
+            "18.0",
+            "--arc-aware-noncritical-support-radius-arcsec",
+            "1.25",
+            "--arc-aware-max-arclength-arcsec",
+            "12.0",
+            "--arc-aware-curve-step-arcsec",
+            "0.2",
+            "--image-catalog-family-cutout-image-dir",
+            "data/BUFFALO_Images",
+            "--image-catalog-family-cutout-image-scale",
+            "30mas",
+        ],
+    )
+
+    args = _parse_args()
+    controls = _normalize_stage_fit_controls(args)
+
+    assert args.image_plane_mode == IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
+    assert args.critical_arc_critical_direction_sigma_arcsec == pytest.approx(4.5)
+    assert args.critical_arc_base_prob == pytest.approx(0.2)
+    assert args.critical_arc_max_prob == pytest.approx(0.7)
+    assert args.critical_arc_singular_threshold == pytest.approx(0.15)
+    assert args.critical_arc_singular_softness == pytest.approx(0.04)
+    assert args.critical_arc_lm_damping_relative == pytest.approx(0.002)
+    assert args.critical_arc_lm_damping_absolute == pytest.approx(1.0e-5)
+    assert args.critical_arc_lm_trust_radius_arcsec == pytest.approx(18.0)
+    assert args.arc_aware_noncritical_support_radius_arcsec == pytest.approx(1.25)
+    assert args.arc_aware_max_arclength_arcsec == pytest.approx(12.0)
+    assert args.arc_aware_curve_step_arcsec == pytest.approx(0.2)
+    assert args.image_catalog_family_cutout_image_dir == "data/BUFFALO_Images"
+    assert args.image_catalog_family_cutout_image_scale == "30mas"
+    assert cluster_solver._stage4_sample_likelihood_mode(args) == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+    assert cluster_solver._stage4_run_directory_name(args) == "stage4_critical_arc_mixture_image_plane"
+    assert controls["stage4"].fit_method == "svi+nuts"
+
+
+def test_cluster_solver_accepts_fold_regularized_image_plane_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+            "--sampling-engine",
+            "refreshing_surrogate",
+            "--fold-curvature-arcsec-inv",
+            "1.25",
+            "--image-plane-newton-steps",
+            "0",
+        ],
+    )
+
+    args = _parse_args()
+    controls = _normalize_stage_fit_controls(args)
+
+    assert args.image_plane_mode == IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA
+    assert args.fold_curvature_arcsec_inv == pytest.approx(1.25)
+    assert (
+        cluster_solver._stage4_sample_likelihood_mode(args)
+        == SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE
+    )
+    assert cluster_solver._stage4_run_directory_name(args) == "stage4_fold_regularized_image_plane"
+    assert controls["stage4"].fit_method == "svi+nuts"
+
+
+def test_cluster_solver_accepts_ff_sims_cutout_image_args(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-catalog-family-cutout-image-dir",
+            "/data/ff_sims/fits",
+            "--image-catalog-family-cutout-image-scale",
+            "auto",
+            "--image-catalog-family-cutout-bands",
+            "F435W",
+            "F606W",
+            "F814W",
+            "--kappa-true-fits",
+            "data/ff_sims/hera/kappa_z9_0.fits",
         ],
     )
 
     args = _parse_args()
 
-    assert args.image_plane_mode == IMAGE_PLANE_MODE_MARGINAL
+    assert args.image_catalog_family_cutout_image_dir == "/data/ff_sims/fits"
+    assert args.image_catalog_family_cutout_image_scale == "auto"
+    assert args.image_catalog_family_cutout_bands == ["F435W", "F606W", "F814W"]
+    assert args.kappa_true_fits == "data/ff_sims/hera/kappa_z9_0.fits"
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--critical-arc-speed-mode", "all"),
+        ("--critical-arc-mask-margin-softness", "4.0"),
+    ],
+)
+def test_cluster_solver_rejects_removed_critical_arc_speed_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+    value: str,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+            flag,
+            value,
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+
+def test_cluster_solver_rejects_invalid_image_catalog_cutout_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-catalog-family-cutout-image-dir",
+            "data/BUFFALO_Images",
+            "--image-catalog-family-cutout-image-scale",
+            "15mas",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+
+def test_cluster_solver_rejects_conditional_whitened_for_critical_arc_mixture_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+            "--source-position-parameterization",
+            "conditional-whitened",
+        ],
+    )
+
+    args = _parse_args()
+    with pytest.raises(SystemExit, match="conditional-whitened"):
+        _normalize_stage_fit_controls(args)
+
+
+def test_cluster_solver_rejects_conditional_whitened_for_fold_regularized_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+            "--source-position-parameterization",
+            "conditional-whitened",
+        ],
+    )
+
+    args = _parse_args()
+    with pytest.raises(SystemExit, match="conditional-whitened"):
+        _normalize_stage_fit_controls(args)
+
+
+def test_cluster_solver_rejects_positive_newton_steps_for_fold_regularized_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+            "--image-plane-newton-steps",
+            "1",
+        ],
+    )
+
+    args = _parse_args()
+    with pytest.raises(SystemExit, match="image-plane-newton-steps must be 0"):
+        _normalize_stage_fit_controls(args)
+
+
+def test_cluster_solver_accepts_refreshing_surrogate_for_zero_step_anchored_solved_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+            "--sampling-engine",
+            "refreshing_surrogate",
+            "--anchored-image-plane-solve-steps",
+            "0",
+        ],
+    )
+
+    args = _parse_args()
+    controls = _normalize_stage_fit_controls(args)
+
+    assert args.anchored_image_plane_solve_steps == 0
+    assert controls["stage4"].fit_method == "svi+nuts"
+
+
+def test_cluster_solver_rejects_refreshing_surrogate_for_iterative_anchored_solved_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+            "--sampling-engine",
+            "refreshing_surrogate",
+            "--anchored-image-plane-solve-steps",
+            "1",
+        ],
+    )
+
+    args = _parse_args()
+    with pytest.raises(SystemExit, match="anchored-image-plane-solve-steps"):
+        _normalize_stage_fit_controls(args)
+
+
+def test_cluster_solver_rejects_marginal_image_plane_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            "marginal-" "image-plane",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+
+@pytest.mark.parametrize("stage4_fit_method", ["svi", "smc", "nuts"])
+def test_blocked_linearized_forward_beta_requires_stage4_svi_nuts(
+    monkeypatch: pytest.MonkeyPatch,
+    stage4_fit_method: str,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
+            "--fit-method",
+            "svi+nuts",
+            "svi+nuts",
+            stage4_fit_method,
+        ],
+    )
+
+    args = _parse_args()
+    with pytest.raises(SystemExit, match="requires stage-4 --fit-method svi\\+nuts"):
+        _normalize_stage_fit_controls(args)
+
+
+def test_direct_nuts_initialization_uses_reference_and_clipped_chain_seeds() -> None:
+    specs = [
+        ParameterSpec("halo.x", "halo_x", "halo", 0, "x", "uniform", -1.0, 1.0, 0.1),
+        ParameterSpec(
+            "halo.y",
+            "halo_y",
+            "halo",
+            0,
+            "y",
+            "truncated_normal",
+            -2.0,
+            2.0,
+            0.1,
+            mean=0.0,
+            std=1.0,
+        ),
+    ]
+    args = argparse.Namespace(
+        chains=3,
+        seed=12,
+        nuts_init_jitter_frac=0.2,
+        nuts_init_boundary_frac=0.1,
+    )
+
+    init = cluster_solver._nuts_initialization_from_reference(
+        args,
+        specs,
+        np.asarray([0.5, 1.0], dtype=float),
+    )
+
+    assert init.diagnostics["strategy_requested"] == cluster_solver.FIT_METHOD_NUTS
+    assert init.diagnostics["strategy_used"] == "previous_stage"
+    assert init.diagnostics["svi_used"] is False
+    assert init.diagnostics["chain_seed_labels"] == [
+        "direct_nuts_chain_1",
+        "direct_nuts_chain_2",
+        "direct_nuts_chain_3",
+    ]
+    assert np.asarray(init.init_params["halo_x"]).shape == (3,)
+    assert np.asarray(init.init_params["halo_y"]).shape == (3,)
+    for seed in init.chain_seeds:
+        assert -1.0 < seed.values[0] < 1.0
+        assert -2.0 < seed.values[1] < 2.0
+    np.testing.assert_allclose(init.reference_theta, np.asarray([0.5, 1.0], dtype=float))
+
+
+def test_run_inference_direct_nuts_uses_state_init_without_svi(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    specs = [
+        ParameterSpec("halo.x", "halo_x", "halo", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0),
+        ParameterSpec("halo.y", "halo_y", "halo", 0, "y", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0),
+    ]
+    state = SimpleNamespace(
+        run_name="stage4_critical_arc_mixture_image_plane",
+        par_path="data/clustersim/input.par",
+        parameter_specs=specs,
+        family_data=[],
+        bin_data=[],
+        svi_init_values={"halo_x": 0.25, "halo_y": -0.5},
+    )
+
+    class FakeEvaluator:
+        def __init__(self) -> None:
+            self.surrogate_enabled = False
+            self.sampling_engine = cluster_solver.SAMPLING_ENGINE_FULL
+            self.timing_totals = {"nuts_runtime": 0.0}
+            self.refresh_reasons: list[str] = []
+
+        def refresh_scaling_scatter_cache(self, _theta, reason: str) -> None:
+            self.refresh_reasons.append(reason)
+
+        def refresh_source_metric_cache(self, _theta, reason: str) -> None:
+            self.refresh_reasons.append(reason)
+
+        def release_runtime_caches(self) -> None:
+            self.refresh_reasons.append("released")
+
+    evaluator = FakeEvaluator()
+    captured: dict[str, Any] = {}
+
+    def fake_run_nuts(_args, _state, _evaluator, _sample_model, nuts_init):
+        captured["nuts_init"] = nuts_init
+        return PosteriorResults(
+            samples=np.asarray([[0.2, -0.4], [0.35, -0.2]], dtype=float),
+            log_prob=np.asarray([-2.0, -1.0], dtype=float),
+            accept_prob=np.asarray([0.8, 0.9], dtype=float),
+            diverging=np.asarray([False, False], dtype=bool),
+            num_steps=np.asarray([3.0, 5.0], dtype=float),
+            warmup_steps=2,
+            sample_steps=2,
+            num_chains=1,
+            init_diagnostics={"retained_chain_indices": [0]},
+            grouped_samples=np.asarray([[[0.2, -0.4], [0.35, -0.2]]], dtype=float),
+            grouped_log_prob=np.asarray([[-2.0, -1.0]], dtype=float),
+            sampler="numpyro_nuts",
+        )
+
+    monkeypatch.setattr(cluster_solver, "_configure_debug_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_prepare_direct_evaluator", lambda _args, _state: (evaluator, np.zeros(2)))
+    monkeypatch.setattr(cluster_solver, "_posterior_model", lambda _specs, _evaluator: object())
+    monkeypatch.setattr(cluster_solver, "_run_numpyro_nuts_sampler", fake_run_nuts)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_run_svi_fit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("SVI should not run")),
+    )
+    monkeypatch.setattr(
+        cluster_solver,
+        "_save_inference_checkpoint",
+        lambda _args, _state, _evaluator, run_dir, best_fit, posterior: (Path(run_dir) / "artifacts", best_fit, posterior),
+    )
+    monkeypatch.setattr(cluster_solver, "_output_evaluator_for_validation", lambda _args, _state, evaluator, _best_fit: evaluator)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_approximate_evaluation",
+        lambda _evaluator, _best_fit: EvaluationResult(loglike=0.0, family_predictions={}),
+    )
+    monkeypatch.setattr(cluster_solver, "_write_truth_validation_outputs", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log_posterior_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_max_likelihood_best_fit_from_posterior",
+        lambda _args, _evaluator, _posterior, fallback: np.asarray(fallback, dtype=float),
+    )
+    args = argparse.Namespace(
+        fit_method=cluster_solver.FIT_METHOD_NUTS,
+        output_dir=str(tmp_path),
+        skip_validation=True,
+        quick_diagnostics=False,
+        skip_plots=True,
+        quiet=True,
+        chains=2,
+        seed=22,
+        nuts_init_jitter_frac=0.0,
+        nuts_init_boundary_frac=0.1,
+    )
+
+    cluster_solver._run_inference(args, state, tmp_path / state.run_name)
+
+    nuts_init = captured["nuts_init"]
+    assert nuts_init.diagnostics["svi_used"] is False
+    assert nuts_init.diagnostics["strategy_requested"] == cluster_solver.FIT_METHOD_NUTS
+    np.testing.assert_allclose(nuts_init.reference_theta, np.asarray([0.25, -0.5], dtype=float))
+    assert [seed.source_label for seed in nuts_init.chain_seeds] == [
+        "direct_nuts_chain_1",
+        "direct_nuts_chain_2",
+    ]
+    assert "nuts_initial" in evaluator.refresh_reasons
+    assert "post_nuts" in evaluator.refresh_reasons
+
+
+@pytest.mark.parametrize("dense_mass", [True, False])
+def test_numpyro_nuts_sampler_passes_dense_mass_to_numpyro(
+    monkeypatch: pytest.MonkeyPatch,
+    dense_mass: bool,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_nuts(_model, **kwargs):
+        captured["nuts_kwargs"] = dict(kwargs)
+        return object()
+
+    class FakeMCMC:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def run(self, *_args, **_kwargs) -> None:
+            return None
+
+        def get_samples(self, group_by_chain: bool = False):
+            assert group_by_chain is True
+            return {"halo_x": jnp.asarray([[0.1, 0.2]], dtype=jnp.float64)}
+
+        def get_extra_fields(self, group_by_chain: bool = False):
+            assert group_by_chain is True
+            return {
+                "accept_prob": jnp.asarray([[0.8, 0.9]], dtype=jnp.float64),
+                "diverging": jnp.asarray([[False, False]], dtype=bool),
+                "num_steps": jnp.asarray([[3.0, 5.0]], dtype=jnp.float64),
+                "potential_energy": jnp.asarray([[2.0, 1.0]], dtype=jnp.float64),
+            }
+
+    monkeypatch.setattr(cluster_solver, "NUTS", fake_nuts)
+    monkeypatch.setattr(cluster_solver, "MCMC", FakeMCMC)
+    monkeypatch.setattr(cluster_solver, "_apply_nuts_quality_gate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log_posterior_summary", lambda *_args, **_kwargs: None)
+
+    specs = [
+        ParameterSpec("halo.x", "halo_x", "halo", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0)
+    ]
+    state = SimpleNamespace(parameter_specs=specs)
+    evaluator = SimpleNamespace(
+        timing_totals={"nuts_runtime": 0.0},
+        invalid_state_rejection_count=0,
+        invalid_state_reason_counts={},
+    )
+    init = NUTSInitialization(
+        init_params={"halo_x": jnp.asarray([0.0], dtype=jnp.float64)},
+        chain_seeds=[ChainSeed(values=np.asarray([0.0], dtype=float), source_label="seed")],
+        diagnostics={"strategy_used": "test", "distinct_chain_seeds": 1},
+        reference_theta=np.asarray([0.0], dtype=float),
+    )
+    args = argparse.Namespace(
+        chains=1,
+        warmup=0,
+        samples=2,
+        thin=1,
+        target_accept=0.8,
+        max_tree_depth=4,
+        initial_step_size=0.1,
+        seed=123,
+        dense_mass=dense_mass,
+        debug_sampler_diagnostics=False,
+        quiet=True,
+    )
+
+    posterior = cluster_solver._run_numpyro_nuts_sampler(args, state, evaluator, object(), init)
+
+    assert captured["nuts_kwargs"]["dense_mass"] is dense_mass
+    assert posterior.init_diagnostics["dense_mass"] is dense_mass
+    assert posterior.init_diagnostics["nuts_dense_mass"] is dense_mass
+
+
+@pytest.mark.parametrize("dense_mass", [True, False])
+def test_block_nuts_once_passes_dense_mass_to_numpyro(
+    monkeypatch: pytest.MonkeyPatch,
+    dense_mass: bool,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_nuts(_model, **kwargs):
+        captured["nuts_kwargs"] = dict(kwargs)
+        return object()
+
+    class FakeMCMC:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.last_state = SimpleNamespace(
+                adapt_state=SimpleNamespace(
+                    step_size=jnp.asarray(0.1),
+                    inverse_mass_matrix=jnp.asarray([1.0]),
+                )
+            )
+
+        def run(self, *_args, **_kwargs) -> None:
+            return None
+
+        def get_samples(self, group_by_chain: bool = False):
+            assert group_by_chain is False
+            return {"halo_x": jnp.asarray([0.25], dtype=jnp.float64)}
+
+        def get_extra_fields(self, group_by_chain: bool = False):
+            assert group_by_chain is False
+            return {
+                "accept_prob": jnp.asarray([0.9], dtype=jnp.float64),
+                "diverging": jnp.asarray([False], dtype=bool),
+                "num_steps": jnp.asarray([3.0], dtype=jnp.float64),
+                "potential_energy": jnp.asarray([1.0], dtype=jnp.float64),
+            }
+
+    monkeypatch.setattr(cluster_solver, "NUTS", fake_nuts)
+    monkeypatch.setattr(cluster_solver, "MCMC", FakeMCMC)
+    monkeypatch.setattr(cluster_solver, "_conditioned_posterior_model_for_block", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(cluster_solver, "_block_init_params", lambda *_args, **_kwargs: {})
+
+    specs = [
+        ParameterSpec("halo.x", "halo_x", "halo", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0)
+    ]
+    args = argparse.Namespace(
+        target_accept=0.8,
+        max_tree_depth=4,
+        initial_step_size=0.1,
+        dense_mass=dense_mass,
+        quiet=True,
+    )
+    evaluator = SimpleNamespace()
+    block = cluster_solver.BlockedNUTSParameterBlock("non_source", (0,))
+
+    cluster_solver._run_block_nuts_once(
+        args,
+        specs,
+        evaluator,
+        np.asarray([0.0], dtype=float),
+        block,
+        jax.random.PRNGKey(0),
+        num_warmup=0,
+    )
+
+    assert captured["nuts_kwargs"]["dense_mass"] is dense_mass
+
+
+def test_blocked_nuts_parameter_blocks_partition_source_positions() -> None:
+    specs = [
+        ParameterSpec("halo.x", "halo_x", "halo", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0),
+        ParameterSpec(
+            "source.1.beta_x",
+            "source_1_beta_x",
+            "1",
+            0,
+            "beta_x",
+            "normal",
+            -np.inf,
+            np.inf,
+            0.1,
+            mean=0.0,
+            std=1.0,
+            component_family="source_position",
+        ),
+        ParameterSpec("scale.sigma", "scale_sigma", "scale", 0, "sigma", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0),
+    ]
+
+    blocks = cluster_solver._blocked_nuts_parameter_blocks(specs)
+
+    assert [(block.name, block.indices) for block in blocks] == [
+        ("non_source", (0, 2)),
+        ("source_position", (1,)),
+    ]
+
+
+def test_blocked_nuts_conditioned_toy_sampler_reconstructs_full_samples() -> None:
+    specs = [
+        ParameterSpec("lens.x", "lens_x", "lens", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0),
+        ParameterSpec(
+            "source.1.beta_x",
+            "source_1_beta_x",
+            "1",
+            0,
+            "beta_x",
+            "normal",
+            -np.inf,
+            np.inf,
+            0.1,
+            mean=0.0,
+            std=1.0,
+            component_family="source_position",
+        ),
+    ]
+
+    class ToyEvaluator:
+        def __init__(self) -> None:
+            self.timing_totals = {"nuts_runtime": 0.0}
+            self.invalid_state_rejection_count = 0
+            self.invalid_state_reason_counts = {}
+            self._source_loglike_fn = jax.jit(
+                lambda theta: -0.5 * jnp.square(theta[0] + theta[1] - 0.75)
+            )
+
+    args = argparse.Namespace(
+        chains=1,
+        warmup=2,
+        samples=2,
+        thin=1,
+        target_accept=0.7,
+        initial_step_size=0.2,
+        max_tree_depth=3,
+        seed=11,
+        blocked_nuts_cycles=2,
+        blocked_nuts_pilot_warmup=2,
+        quiet=True,
+    )
+    evaluator = ToyEvaluator()
+    blocks = cluster_solver._blocked_nuts_parameter_blocks(specs)
+    theta = np.asarray([0.0, 0.25], dtype=float)
+    updated, _metrics, _adapted = cluster_solver._run_block_nuts_once(
+        args,
+        specs,
+        evaluator,
+        theta,
+        blocks[0],
+        jax.random.PRNGKey(5),
+        num_warmup=2,
+        adapt=True,
+    )
+    assert updated[1] == pytest.approx(theta[1])
+    assert abs(updated[0] - theta[0]) > 1.0e-12
+
+    state = SimpleNamespace(parameter_specs=specs)
+    init = NUTSInitialization(
+        init_params={},
+        chain_seeds=[ChainSeed(values=np.asarray([0.0, 0.0], dtype=float), source_label="toy")],
+        diagnostics={"strategy_used": "toy", "distinct_chain_seeds": 1},
+        reference_theta=np.asarray([0.0, 0.0], dtype=float),
+    )
+    posterior = cluster_solver._run_blocked_numpyro_nuts_sampler(args, state, evaluator, init)
+
+    assert posterior.sampler == "numpyro_blocked_nuts"
+    assert posterior.grouped_samples.shape == (1, 2, 2)
+    assert posterior.samples.shape == (2, 2)
+    assert posterior.grouped_log_prob.shape == (1, 2)
+    assert posterior.init_diagnostics["blocked_nuts_block_sizes"] == {
+        "non_source": 1,
+        "source_position": 1,
+    }
 
 
 def test_cluster_solver_rejects_removed_stage35_flag(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3103,7 +8172,7 @@ def test_cluster_solver_rejects_removed_stage35_flag(monkeypatch: pytest.MonkeyP
             "cluster_solver",
             "--par-path",
             "data/clustersim/input.par",
-            "--run-stage35-marginal-image-plane",
+            "--run-stage35-" "marginal-" "image-plane",
         ],
     )
 
@@ -3111,7 +8180,22 @@ def test_cluster_solver_rejects_removed_stage35_flag(monkeypatch: pytest.MonkeyP
         _parse_args()
 
 
-def test_cluster_solver_accepts_smc_only_for_linearized_stage4(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("stage4_fit_method", ["smc", "nuts"])
+@pytest.mark.parametrize(
+    "image_plane_mode",
+    [
+        IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_FORWARD_METRIC,
+        IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+    ],
+)
+def test_cluster_solver_accepts_direct_stage4_samplers_for_non_blocked_stage4_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    image_plane_mode: str,
+    stage4_fit_method: str,
+) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
@@ -3120,11 +8204,11 @@ def test_cluster_solver_accepts_smc_only_for_linearized_stage4(monkeypatch: pyte
             "--par-path",
             "data/clustersim/input.par",
             "--image-plane-mode",
-            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+            image_plane_mode,
             "--fit-method",
             "svi+nuts",
             "svi+nuts",
-            "smc",
+            stage4_fit_method,
             "--smc-particles",
             "32",
             "--smc-mcmc-kernel",
@@ -3139,6 +8223,8 @@ def test_cluster_solver_accepts_smc_only_for_linearized_stage4(monkeypatch: pyte
             "0.6",
             "--smc-mala-step-size",
             "0.02",
+            "--anchored-image-plane-solve-steps",
+            "0",
             "--jax-default-device",
             "cpu",
             "--smc-device",
@@ -3151,7 +8237,7 @@ def test_cluster_solver_accepts_smc_only_for_linearized_stage4(monkeypatch: pyte
 
     assert controls["stage2"].fit_method == "svi+nuts"
     assert controls["stage3"].fit_method == "svi+nuts"
-    assert controls["stage4"].fit_method == "smc"
+    assert controls["stage4"].fit_method == stage4_fit_method
     assert args.smc_particles == 32
     assert args.smc_mcmc_kernel == "mala"
     assert args.smc_mcmc_steps == 2
@@ -3161,6 +8247,44 @@ def test_cluster_solver_accepts_smc_only_for_linearized_stage4(monkeypatch: pyte
     assert args.smc_mala_step_size == pytest.approx(0.02)
     assert args.jax_default_device == "cpu"
     assert args.smc_device == "auto"
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        [
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
+        ],
+        [
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+            "--fit-method",
+            "svi+nuts",
+            "svi+nuts",
+            "smc",
+        ],
+    ],
+)
+def test_cluster_solver_rejects_potfile_mass_size_reparam_unsupported_sampler_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    extra_args: list[str],
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--potfile-mass-size-reparam",
+            *extra_args,
+        ],
+    )
+
+    args = _parse_args()
+    with pytest.raises(SystemExit, match="potfile-mass-size-reparam"):
+        _normalize_stage_fit_controls(args)
 
 
 def test_cluster_solver_rejects_unavailable_explicit_gpu_device(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3182,9 +8306,12 @@ def test_cluster_solver_resolves_cpu_and_auto_devices() -> None:
         ["smc", "svi+nuts", "svi+nuts"],
         ["svi+nuts", "smc", "svi+nuts"],
         ["smc"],
+        ["nuts", "svi+nuts", "svi+nuts"],
+        ["svi+nuts", "nuts", "svi+nuts"],
+        ["nuts"],
     ],
 )
-def test_cluster_solver_rejects_smc_outside_stage4(
+def test_cluster_solver_rejects_direct_stage4_samplers_outside_stage4(
     monkeypatch: pytest.MonkeyPatch,
     fit_methods: list[str],
 ) -> None:
@@ -3387,6 +8514,7 @@ def test_saved_likelihood_stabilizer_arg_prefers_new_key_and_reads_legacy_key() 
         ("--image-presence-temperature-arcsec", "0"),
         ("--image-presence-count-softness", "0"),
         ("--image-presence-count-margin", "-0.1"),
+        ("--image-plane-scatter-floor-arcsec", "0"),
         ("--image-plane-scatter-floor-arcsec", "-0.1"),
         ("--image-plane-scatter-floor-arcsec", "nan"),
         ("--image-plane-scatter-prior-median-arcsec", "0"),
@@ -3423,12 +8551,70 @@ def test_cluster_solver_rejects_invalid_image_presence_controls(
         _normalize_stage_fit_controls(args)
 
 
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--image-plane-scatter-floor-arcsec", "0.5", "--image-plane-scatter-upper-arcsec", "0.5"],
+        [
+            "--image-plane-scatter-prior",
+            "lognormal",
+            "--image-plane-scatter-floor-arcsec",
+            "0.1",
+            "--image-plane-scatter-upper-arcsec",
+            "0.5",
+            "--image-plane-scatter-prior-median-arcsec",
+            "0.05",
+        ],
+        [
+            "--image-plane-scatter-prior",
+            "lognormal",
+            "--image-plane-scatter-floor-arcsec",
+            "0.1",
+            "--image-plane-scatter-upper-arcsec",
+            "0.5",
+            "--image-plane-scatter-prior-median-arcsec",
+            "0.6",
+        ],
+    ],
+)
+def test_cluster_solver_rejects_image_scatter_support_mismatches(
+    monkeypatch: pytest.MonkeyPatch,
+    extra_args: list[str],
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            *extra_args,
+        ],
+    )
+
+    args = _parse_args()
+    with pytest.raises(SystemExit):
+        _normalize_stage_fit_controls(args)
+
+
 def test_image_presence_effective_default_weight_only_stage4() -> None:
     assert _effective_image_presence_penalty_weight(
         None,
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
         fit_mode="joint",
         image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+    ) == pytest.approx(2.0)
+    assert _effective_image_presence_penalty_weight(
+        None,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
+        fit_mode="joint",
+        image_plane_mode=IMAGE_PLANE_MODE_FORWARD_METRIC,
+    ) == pytest.approx(2.0)
+    assert _effective_image_presence_penalty_weight(
+        None,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
+        fit_mode="joint",
+        image_plane_mode=IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
     ) == pytest.approx(2.0)
     assert _effective_image_presence_penalty_weight(
         None,
@@ -3469,8 +8655,35 @@ def test_cluster_solver_accepts_evidence_ns_fit_mode(monkeypatch: pytest.MonkeyP
     controls = _normalize_stage_fit_controls(args)
 
     assert args.fit_mode == "evidence-ns"
-    assert args.evidence_likelihood_mode == SAMPLE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE
-    assert controls["stage2"].to_json() == {"fit_method": "ns", "warmup": 0, "samples": 0, "max_tree_depth": 10}
+    assert args.evidence_likelihood_mode == SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
+    assert controls["stage2"].to_json() == {
+        "fit_method": "ns",
+        "svi_steps": 0,
+        "warmup": 0,
+        "samples": 0,
+        "max_tree_depth": 10,
+    }
+
+
+def test_cluster_solver_rejects_marginal_evidence_likelihood_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--fit-mode",
+            "evidence-ns",
+            "--evidence-source-prior-sigma-arcsec",
+            "5.0",
+            "--evidence-likelihood-mode",
+            "linearized-" "marginal-" "beta-image-plane",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        _parse_args()
 
 
 def test_cluster_solver_evidence_ns_accepts_sampled_source_image_plane_mode(
@@ -3504,7 +8717,13 @@ def test_cluster_solver_evidence_ns_accepts_sampled_source_image_plane_mode(
     assert args.evidence_likelihood_mode == SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
     assert args.source_position_parameterization == "direct"
     assert args.image_plane_newton_steps == 1
-    assert controls["stage2"].to_json() == {"fit_method": "ns", "warmup": 0, "samples": 0, "max_tree_depth": 10}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "ns",
+        "svi_steps": 0,
+        "warmup": 0,
+        "samples": 0,
+        "max_tree_depth": 10,
+    }
 
 
 def test_cluster_solver_accepts_active_subset_sampling_engine(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3577,7 +8796,13 @@ def test_cluster_solver_evidence_ns_ignores_fit_method_and_stage_controls() -> N
         )
     )
 
-    assert controls["stage2"].to_json() == {"fit_method": "ns", "warmup": 0, "samples": 0, "max_tree_depth": 10}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "ns",
+        "svi_steps": 0,
+        "warmup": 0,
+        "samples": 0,
+        "max_tree_depth": 10,
+    }
 
 
 def test_cluster_solver_rejects_removed_linearized_stage_flag(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3610,6 +8835,9 @@ def test_cluster_solver_accepts_two_value_fit_controls_for_local_jacobian(monkey
             "--fit-method",
             "svi+nuts",
             "svi",
+            "--svi-steps",
+            "1200",
+            "400",
             "--warmup",
             "2000",
             "0",
@@ -3627,12 +8855,25 @@ def test_cluster_solver_accepts_two_value_fit_controls_for_local_jacobian(monkey
 
     assert controls["stage2"].to_json() == {
         "fit_method": "svi+nuts",
+        "svi_steps": 1200,
         "warmup": 2000,
         "samples": 250,
         "max_tree_depth": 9,
     }
-    assert controls["stage3"].to_json() == {"fit_method": "svi", "warmup": 0, "samples": 100, "max_tree_depth": 7}
-    assert controls["stage4"].to_json() == {"fit_method": "svi", "warmup": 0, "samples": 100, "max_tree_depth": 7}
+    assert controls["stage3"].to_json() == {
+        "fit_method": "svi",
+        "svi_steps": 400,
+        "warmup": 0,
+        "samples": 100,
+        "max_tree_depth": 7,
+    }
+    assert controls["stage4"].to_json() == {
+        "fit_method": "svi",
+        "svi_steps": 400,
+        "warmup": 0,
+        "samples": 100,
+        "max_tree_depth": 7,
+    }
 
 
 def test_cluster_solver_rejects_unknown_image_plane_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3672,6 +8913,7 @@ def test_cluster_solver_rejects_removed_ott_sinkhorn_image_plane_mode(monkeypatc
 def test_stage_fit_controls_scalar_values_apply_to_stage2_and_stage3() -> None:
     args = argparse.Namespace(
         fit_method="svi+nuts",
+        svi_steps=1500,
         warmup=2000,
         samples=250,
         max_tree_depth=9,
@@ -3681,14 +8923,33 @@ def test_stage_fit_controls_scalar_values_apply_to_stage2_and_stage3() -> None:
 
     controls = _normalize_stage_fit_controls(args)
 
-    assert controls["stage2"].to_json() == {"fit_method": "svi+nuts", "warmup": 2000, "samples": 250, "max_tree_depth": 9}
-    assert controls["stage3"].to_json() == {"fit_method": "svi+nuts", "warmup": 2000, "samples": 250, "max_tree_depth": 9}
-    assert controls["stage4"].to_json() == {"fit_method": "svi+nuts", "warmup": 2000, "samples": 250, "max_tree_depth": 9}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1500,
+        "warmup": 2000,
+        "samples": 250,
+        "max_tree_depth": 9,
+    }
+    assert controls["stage3"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1500,
+        "warmup": 2000,
+        "samples": 250,
+        "max_tree_depth": 9,
+    }
+    assert controls["stage4"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1500,
+        "warmup": 2000,
+        "samples": 250,
+        "max_tree_depth": 9,
+    }
 
 
 def test_stage_fit_controls_two_values_map_to_stage2_and_stage3() -> None:
     args = argparse.Namespace(
         fit_method=["svi+nuts", "svi"],
+        svi_steps=[1500, 400],
         warmup=[2000, 0],
         samples=[250, 100],
         max_tree_depth=[9, 7],
@@ -3698,14 +8959,33 @@ def test_stage_fit_controls_two_values_map_to_stage2_and_stage3() -> None:
 
     controls = _normalize_stage_fit_controls(args)
 
-    assert controls["stage2"].to_json() == {"fit_method": "svi+nuts", "warmup": 2000, "samples": 250, "max_tree_depth": 9}
-    assert controls["stage3"].to_json() == {"fit_method": "svi", "warmup": 0, "samples": 100, "max_tree_depth": 7}
-    assert controls["stage4"].to_json() == {"fit_method": "svi", "warmup": 0, "samples": 100, "max_tree_depth": 7}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1500,
+        "warmup": 2000,
+        "samples": 250,
+        "max_tree_depth": 9,
+    }
+    assert controls["stage3"].to_json() == {
+        "fit_method": "svi",
+        "svi_steps": 400,
+        "warmup": 0,
+        "samples": 100,
+        "max_tree_depth": 7,
+    }
+    assert controls["stage4"].to_json() == {
+        "fit_method": "svi",
+        "svi_steps": 400,
+        "warmup": 0,
+        "samples": 100,
+        "max_tree_depth": 7,
+    }
 
 
 def test_stage_fit_controls_three_values_map_to_stage4() -> None:
     args = argparse.Namespace(
         fit_method=["svi+nuts", "svi+nuts", "svi"],
+        svi_steps=[1500, 1000, 200],
         warmup=[2000, 1000, 0],
         samples=[250, 100, 20],
         max_tree_depth=[10, 8, 6],
@@ -3715,9 +8995,27 @@ def test_stage_fit_controls_three_values_map_to_stage4() -> None:
 
     controls = _normalize_stage_fit_controls(args)
 
-    assert controls["stage2"].to_json() == {"fit_method": "svi+nuts", "warmup": 2000, "samples": 250, "max_tree_depth": 10}
-    assert controls["stage3"].to_json() == {"fit_method": "svi+nuts", "warmup": 1000, "samples": 100, "max_tree_depth": 8}
-    assert controls["stage4"].to_json() == {"fit_method": "svi", "warmup": 0, "samples": 20, "max_tree_depth": 6}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1500,
+        "warmup": 2000,
+        "samples": 250,
+        "max_tree_depth": 10,
+    }
+    assert controls["stage3"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1000,
+        "warmup": 1000,
+        "samples": 100,
+        "max_tree_depth": 8,
+    }
+    assert controls["stage4"].to_json() == {
+        "fit_method": "svi",
+        "svi_steps": 200,
+        "warmup": 0,
+        "samples": 20,
+        "max_tree_depth": 6,
+    }
 
 
 def test_stage_fit_controls_reject_four_values() -> None:
@@ -3735,21 +9033,34 @@ def test_stage_fit_controls_reject_four_values() -> None:
         _normalize_stage_fit_controls(args)
 
 
-def test_stage_fit_controls_marginal_stage4_skipped_stage3_uses_stage4_values() -> None:
+def test_stage_fit_controls_linearized_stage4_skipped_stage3_uses_stage4_values() -> None:
     args = argparse.Namespace(
         fit_method=["svi+nuts", "svi"],
+        svi_steps=[1500, 200],
         warmup=[2000, 0],
         samples=[250, 20],
         max_tree_depth=[10, 6],
         fit_mode="sequential",
-        image_plane_mode=IMAGE_PLANE_MODE_MARGINAL,
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
         skip_stage3_image_plane_local_jacobian=True,
     )
 
     controls = _normalize_stage_fit_controls(args)
 
-    assert controls["stage2"].to_json() == {"fit_method": "svi+nuts", "warmup": 2000, "samples": 250, "max_tree_depth": 10}
-    assert controls["stage4"].to_json() == {"fit_method": "svi", "warmup": 0, "samples": 20, "max_tree_depth": 6}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1500,
+        "warmup": 2000,
+        "samples": 250,
+        "max_tree_depth": 10,
+    }
+    assert controls["stage4"].to_json() == {
+        "fit_method": "svi",
+        "svi_steps": 200,
+        "warmup": 0,
+        "samples": 20,
+        "max_tree_depth": 6,
+    }
 
 
 def test_stage_fit_controls_reject_refreshing_surrogate_stage4_newton_steps() -> None:
@@ -3782,7 +9093,8 @@ def test_stage_fit_controls_reject_three_values_without_stage4_mode() -> None:
 
 def test_stage_fit_controls_reject_two_values_without_image_plane_stage() -> None:
     args = argparse.Namespace(
-        fit_method=["svi+nuts", "svi"],
+        fit_method="svi+nuts",
+        svi_steps=[1000, 500],
         warmup=1,
         samples=2,
         fit_mode="sequential",
@@ -3795,7 +9107,8 @@ def test_stage_fit_controls_reject_two_values_without_image_plane_stage() -> Non
 
 def test_stage_fit_controls_reject_two_values_for_non_sequential_runs() -> None:
     args = argparse.Namespace(
-        fit_method=["svi+nuts", "svi"],
+        fit_method="svi+nuts",
+        svi_steps=[1000, 500],
         warmup=1,
         samples=2,
         fit_mode="joint",
@@ -3806,9 +9119,24 @@ def test_stage_fit_controls_reject_two_values_for_non_sequential_runs() -> None:
         _normalize_stage_fit_controls(args)
 
 
+def test_stage_fit_controls_reject_four_svi_step_values() -> None:
+    args = argparse.Namespace(
+        fit_method="svi+nuts",
+        svi_steps=[1000, 500, 100, 50],
+        warmup=1,
+        samples=2,
+        fit_mode="sequential",
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+    )
+
+    with pytest.raises(SystemExit, match="at most three"):
+        _normalize_stage_fit_controls(args)
+
+
 def test_stage_fit_controls_two_values_map_to_stage4_when_stage3_skipped() -> None:
     args = argparse.Namespace(
         fit_method=["svi+nuts", "svi"],
+        svi_steps=[1500, 200],
         warmup=[2000, 0],
         samples=[250, 20],
         max_tree_depth=[9, 5],
@@ -3819,8 +9147,20 @@ def test_stage_fit_controls_two_values_map_to_stage4_when_stage3_skipped() -> No
 
     controls = _normalize_stage_fit_controls(args)
 
-    assert controls["stage2"].to_json() == {"fit_method": "svi+nuts", "warmup": 2000, "samples": 250, "max_tree_depth": 9}
-    assert controls["stage4"].to_json() == {"fit_method": "svi", "warmup": 0, "samples": 20, "max_tree_depth": 5}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1500,
+        "warmup": 2000,
+        "samples": 250,
+        "max_tree_depth": 9,
+    }
+    assert controls["stage4"].to_json() == {
+        "fit_method": "svi",
+        "svi_steps": 200,
+        "warmup": 0,
+        "samples": 20,
+        "max_tree_depth": 5,
+    }
 
 
 def test_stage_fit_controls_reject_ns_for_stage2_without_image_plane() -> None:
@@ -3956,7 +9296,13 @@ def test_stage_fit_controls_accept_unlimited_ns_max_samples() -> None:
 
     controls = _normalize_stage_fit_controls(args)
 
-    assert controls["stage2"].to_json() == {"fit_method": "ns", "warmup": 0, "samples": 0, "max_tree_depth": 10}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "ns",
+        "svi_steps": 0,
+        "warmup": 0,
+        "samples": 0,
+        "max_tree_depth": 10,
+    }
 
 
 def test_stage_fit_controls_reject_non_positive_ns_max_samples() -> None:
@@ -3987,7 +9333,7 @@ def test_stage_fit_controls_reject_invalid_ns_max_samples_string() -> None:
         _normalize_stage_fit_controls(args)
 
 
-def test_evidence_state_uses_image_scatter_without_source_positions(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_evidence_state_uses_forward_beta_source_positions_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
@@ -4007,13 +9353,13 @@ def test_evidence_state_uses_image_scatter_without_source_positions(monkeypatch:
     args = _parse_args()
     evidence_args = cluster_solver._clone_args(
         args,
-        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE,
+        sample_likelihood_mode=cluster_solver.DEFAULT_EVIDENCE_LIKELIHOOD_MODE,
     )
 
     state = cluster_solver._build_state_from_inputs(evidence_args, fit_mode_override="evidence-ns")
 
     assert state.sigma_arcsec == pytest.approx(0.0)
-    assert sum(spec.component_family == "source_position" for spec in state.parameter_specs) == 0
+    assert sum(spec.component_family == "source_position" for spec in state.parameter_specs) == 2 * len(state.family_data)
     assert sum(spec.component_family == "image_scatter" for spec in state.parameter_specs) == 1
     assert {spec.sample_name for spec in state.parameter_specs if spec.component_family == "cosmology"} == {
         "cosmology_Om0",
@@ -4066,6 +9412,7 @@ def test_sampled_source_evidence_state_uses_shared_evidence_prior(
 def test_validation_stage_fit_controls_scalar_values_apply_to_stage2_and_stage3() -> None:
     args = argparse.Namespace(
         fit_method="svi+nuts",
+        svi_steps=1200,
         warmup=300,
         samples=500,
         max_tree_depth=8,
@@ -4074,14 +9421,33 @@ def test_validation_stage_fit_controls_scalar_values_apply_to_stage2_and_stage3(
 
     controls = _normalize_validation_stage_fit_controls(args)
 
-    assert controls["stage2"].to_json() == {"fit_method": "svi+nuts", "warmup": 300, "samples": 500, "max_tree_depth": 8}
-    assert controls["stage3"].to_json() == {"fit_method": "svi+nuts", "warmup": 300, "samples": 500, "max_tree_depth": 8}
-    assert controls["stage4"].to_json() == {"fit_method": "svi+nuts", "warmup": 300, "samples": 500, "max_tree_depth": 8}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1200,
+        "warmup": 300,
+        "samples": 500,
+        "max_tree_depth": 8,
+    }
+    assert controls["stage3"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1200,
+        "warmup": 300,
+        "samples": 500,
+        "max_tree_depth": 8,
+    }
+    assert controls["stage4"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1200,
+        "warmup": 300,
+        "samples": 500,
+        "max_tree_depth": 8,
+    }
 
 
 def test_validation_stage_fit_controls_two_values_map_to_stage2_and_stage3() -> None:
     args = argparse.Namespace(
         fit_method=["svi+nuts", "svi"],
+        svi_steps=[1200, 300],
         warmup=[1000, 0],
         samples=[250, 100],
         max_tree_depth=[8, 6],
@@ -4090,14 +9456,97 @@ def test_validation_stage_fit_controls_two_values_map_to_stage2_and_stage3() -> 
 
     controls = _normalize_validation_stage_fit_controls(args)
 
-    assert controls["stage2"].to_json() == {"fit_method": "svi+nuts", "warmup": 1000, "samples": 250, "max_tree_depth": 8}
-    assert controls["stage3"].to_json() == {"fit_method": "svi", "warmup": 0, "samples": 100, "max_tree_depth": 6}
-    assert controls["stage4"].to_json() == {"fit_method": "svi", "warmup": 0, "samples": 100, "max_tree_depth": 6}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1200,
+        "warmup": 1000,
+        "samples": 250,
+        "max_tree_depth": 8,
+    }
+    assert controls["stage3"].to_json() == {
+        "fit_method": "svi",
+        "svi_steps": 300,
+        "warmup": 0,
+        "samples": 100,
+        "max_tree_depth": 6,
+    }
+    assert controls["stage4"].to_json() == {
+        "fit_method": "svi",
+        "svi_steps": 300,
+        "warmup": 0,
+        "samples": 100,
+        "max_tree_depth": 6,
+    }
+
+
+def test_validation_stage_fit_controls_accept_start_at_stage3() -> None:
+    args = argparse.Namespace(
+        solver_fit_mode=validation.SOLVER_FIT_MODE_SEQUENTIAL,
+        fit_method=["svi+nuts", "svi"],
+        svi_steps=[1200, 300],
+        warmup=[1000, 0],
+        samples=[250, 100],
+        max_tree_depth=[8, 6],
+        image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+        start_at_stage3=True,
+        skip_stage3_image_plane_local_jacobian=False,
+        resume_fast=True,
+    )
+
+    controls = _normalize_validation_stage_fit_controls(args)
+
+    assert controls["stage3"].to_json() == {
+        "fit_method": "svi",
+        "svi_steps": 300,
+        "warmup": 0,
+        "samples": 100,
+        "max_tree_depth": 6,
+    }
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        (
+            {"solver_fit_mode": validation.SOLVER_FIT_MODE_EVIDENCE_NS},
+            "solver-fit-mode sequential",
+        ),
+        ({"image_plane_mode": IMAGE_PLANE_MODE_NONE}, "stage-3-capable"),
+        (
+            {
+                "image_plane_mode": IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+                "skip_stage3_image_plane_local_jacobian": True,
+            },
+            "skip-stage3",
+        ),
+    ],
+)
+def test_validation_stage_fit_controls_reject_invalid_start_at_stage3_controls(
+    updates: dict[str, Any],
+    message: str,
+) -> None:
+    payload = dict(
+        solver_fit_mode=validation.SOLVER_FIT_MODE_SEQUENTIAL,
+        fit_method=["svi+nuts", "svi"],
+        svi_steps=[1200, 300],
+        warmup=[1000, 0],
+        samples=[250, 100],
+        max_tree_depth=[8, 6],
+        image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+        start_at_stage3=True,
+        skip_stage3_image_plane_local_jacobian=False,
+        resume_fast=False,
+    )
+    payload.update(updates)
+
+    with pytest.raises(SystemExit, match=message):
+        _normalize_validation_stage_fit_controls(argparse.Namespace(**payload))
 
 
 def test_validation_stage_fit_controls_three_values_map_to_stage4() -> None:
     args = argparse.Namespace(
         fit_method=["svi+nuts", "svi+nuts", "svi"],
+        svi_steps=[1200, 600, 100],
         warmup=[1000, 500, 0],
         samples=[250, 100, 20],
         max_tree_depth=[10, 8, 6],
@@ -4106,9 +9555,27 @@ def test_validation_stage_fit_controls_three_values_map_to_stage4() -> None:
 
     controls = _normalize_validation_stage_fit_controls(args)
 
-    assert controls["stage2"].to_json() == {"fit_method": "svi+nuts", "warmup": 1000, "samples": 250, "max_tree_depth": 10}
-    assert controls["stage3"].to_json() == {"fit_method": "svi+nuts", "warmup": 500, "samples": 100, "max_tree_depth": 8}
-    assert controls["stage4"].to_json() == {"fit_method": "svi", "warmup": 0, "samples": 20, "max_tree_depth": 6}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1200,
+        "warmup": 1000,
+        "samples": 250,
+        "max_tree_depth": 10,
+    }
+    assert controls["stage3"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 600,
+        "warmup": 500,
+        "samples": 100,
+        "max_tree_depth": 8,
+    }
+    assert controls["stage4"].to_json() == {
+        "fit_method": "svi",
+        "svi_steps": 100,
+        "warmup": 0,
+        "samples": 20,
+        "max_tree_depth": 6,
+    }
 
 
 def test_validation_stage_fit_controls_reject_refreshing_surrogate_stage4_newton_steps() -> None:
@@ -4122,6 +9589,243 @@ def test_validation_stage_fit_controls_reject_refreshing_surrogate_stage4_newton
     )
 
     with pytest.raises(SystemExit, match="refreshing_surrogate"):
+        _normalize_validation_stage_fit_controls(args)
+
+
+def test_validation_stage_fit_controls_accept_anchored_solved_stage4() -> None:
+    args = argparse.Namespace(
+        fit_method=["svi+nuts", "svi+nuts", "svi+nuts"],
+        svi_steps=[1200, 600, 100],
+        warmup=[1000, 500, 20],
+        samples=[250, 100, 20],
+        max_tree_depth=[10, 8, 6],
+        image_plane_mode=IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+        sampling_engine="full",
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+        anchored_image_plane_solve_steps=3,
+        anchored_image_plane_trust_radius_arcsec=0.3,
+        anchored_image_plane_lm_damping_relative=1.0e-3,
+        anchored_image_plane_lm_damping_absolute=1.0e-6,
+    )
+
+    controls = _normalize_validation_stage_fit_controls(args)
+
+    assert controls["stage4"].fit_method == "svi+nuts"
+    assert validation._validation_final_stage_name(args) == "stage4_anchored_solved_image_plane"
+
+
+def test_validation_stage_fit_controls_accept_critical_arc_mixture_stage4() -> None:
+    args = argparse.Namespace(
+        fit_method=["svi+nuts", "svi+nuts", "svi+nuts"],
+        svi_steps=[1200, 600, 100],
+        warmup=[1000, 500, 20],
+        samples=[250, 100, 20],
+        max_tree_depth=[10, 8, 6],
+        image_plane_mode=IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        sampling_engine="refreshing_surrogate",
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+        critical_arc_critical_direction_sigma_arcsec=5.0,
+        critical_arc_base_prob=0.10,
+        critical_arc_max_prob=0.80,
+        critical_arc_singular_threshold=0.20,
+        critical_arc_singular_softness=0.05,
+        critical_arc_lm_damping_relative=1.0e-3,
+        critical_arc_lm_damping_absolute=1.0e-6,
+        critical_arc_lm_trust_radius_arcsec=20.0,
+    )
+
+    controls = _normalize_validation_stage_fit_controls(args)
+
+    assert controls["stage4"].fit_method == "svi+nuts"
+    assert validation._validation_final_stage_name(args) == "stage4_critical_arc_mixture_image_plane"
+
+
+def test_validation_stage_fit_controls_accept_fold_regularized_stage4() -> None:
+    args = argparse.Namespace(
+        fit_method=["svi+nuts", "svi+nuts", "svi+nuts"],
+        svi_steps=[1200, 600, 100],
+        warmup=[1000, 500, 20],
+        samples=[250, 100, 20],
+        max_tree_depth=[10, 8, 6],
+        image_plane_mode=IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        sampling_engine="refreshing_surrogate",
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+        fold_curvature_arcsec_inv=1.25,
+    )
+
+    controls = _normalize_validation_stage_fit_controls(args)
+
+    assert controls["stage4"].fit_method == "svi+nuts"
+    assert validation._validation_final_stage_name(args) == "stage4_fold_regularized_image_plane"
+
+
+@pytest.mark.parametrize("stage4_fit_method", ["smc", "nuts"])
+@pytest.mark.parametrize(
+    ("image_plane_mode", "stage_name"),
+    [
+        (IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA, "stage4_linearized_image_plane"),
+        (IMAGE_PLANE_MODE_FORWARD_METRIC, "stage4_forward_metric_image_plane"),
+        (IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA, "stage4_anchored_solved_image_plane"),
+        (IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE, "stage4_critical_arc_mixture_image_plane"),
+        (IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA, "stage4_fold_regularized_image_plane"),
+    ],
+)
+def test_validation_stage_fit_controls_accept_direct_stage4_samplers_for_non_blocked_stage4_modes(
+    image_plane_mode: str,
+    stage_name: str,
+    stage4_fit_method: str,
+) -> None:
+    args = argparse.Namespace(
+        fit_method=["svi+nuts", "svi+nuts", stage4_fit_method],
+        svi_steps=[1200, 600, 100],
+        warmup=[1000, 500, 20],
+        samples=[250, 100, 20],
+        max_tree_depth=[10, 8, 6],
+        image_plane_mode=image_plane_mode,
+        sampling_engine="full",
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+        critical_arc_critical_direction_sigma_arcsec=5.0,
+        critical_arc_base_prob=0.10,
+        critical_arc_max_prob=0.80,
+        critical_arc_singular_threshold=0.20,
+        critical_arc_singular_softness=0.05,
+        critical_arc_lm_damping_relative=1.0e-3,
+        critical_arc_lm_damping_absolute=1.0e-6,
+        critical_arc_lm_trust_radius_arcsec=20.0,
+        fold_curvature_arcsec_inv=1.0,
+    )
+
+    controls = _normalize_validation_stage_fit_controls(args)
+
+    assert controls["stage4"].fit_method == stage4_fit_method
+    assert validation._validation_final_stage_name(args) == stage_name
+
+
+@pytest.mark.parametrize("stage4_fit_method", ["smc", "nuts"])
+def test_validation_stage_fit_controls_reject_direct_sampler_for_blocked_linearized_stage4(
+    stage4_fit_method: str,
+) -> None:
+    args = argparse.Namespace(
+        fit_method=["svi+nuts", "svi+nuts", stage4_fit_method],
+        svi_steps=[1200, 600, 100],
+        warmup=[1000, 500, 20],
+        samples=[250, 100, 20],
+        max_tree_depth=[10, 8, 6],
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
+        sampling_engine="full",
+        image_plane_newton_steps=0,
+    )
+
+    with pytest.raises(SystemExit, match="requires stage-4 --fit-method svi\\+nuts"):
+        _normalize_validation_stage_fit_controls(args)
+
+
+@pytest.mark.parametrize(
+    "fit_methods",
+    [
+        ["nuts", "svi+nuts", "svi+nuts"],
+        ["svi+nuts", "nuts", "svi+nuts"],
+        ["nuts"],
+    ],
+)
+def test_validation_stage_fit_controls_reject_nuts_outside_stage4(fit_methods: list[str]) -> None:
+    args = argparse.Namespace(
+        fit_method=fit_methods,
+        svi_steps=[1200, 600, 100],
+        warmup=[1000, 500, 20],
+        samples=[250, 100, 20],
+        max_tree_depth=[10, 8, 6],
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+        sampling_engine="full",
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+    )
+
+    with pytest.raises(SystemExit, match="--fit-method nuts"):
+        _normalize_validation_stage_fit_controls(args)
+
+
+def test_validation_stage_fit_controls_reject_conditional_whitened_for_critical_arc_mixture_stage4() -> None:
+    args = argparse.Namespace(
+        fit_method=["svi+nuts", "svi+nuts", "svi+nuts"],
+        warmup=[1000, 500, 20],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        sampling_engine="refreshing_surrogate",
+        image_plane_newton_steps=0,
+        source_position_parameterization="conditional-whitened",
+    )
+
+    with pytest.raises(SystemExit, match="conditional-whitened"):
+        _normalize_validation_stage_fit_controls(args)
+
+
+def test_validation_stage_fit_controls_reject_conditional_whitened_for_fold_regularized_stage4() -> None:
+    args = argparse.Namespace(
+        fit_method=["svi+nuts", "svi+nuts", "svi+nuts"],
+        warmup=[1000, 500, 20],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        sampling_engine="refreshing_surrogate",
+        image_plane_newton_steps=0,
+        source_position_parameterization="conditional-whitened",
+        fold_curvature_arcsec_inv=1.0,
+    )
+
+    with pytest.raises(SystemExit, match="conditional-whitened"):
+        _normalize_validation_stage_fit_controls(args)
+
+
+def test_validation_stage_fit_controls_reject_positive_newton_steps_for_fold_regularized_stage4() -> None:
+    args = argparse.Namespace(
+        fit_method=["svi+nuts", "svi+nuts", "svi+nuts"],
+        warmup=[1000, 500, 20],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        sampling_engine="refreshing_surrogate",
+        image_plane_newton_steps=1,
+        source_position_parameterization="prior-whitened",
+        fold_curvature_arcsec_inv=1.0,
+    )
+
+    with pytest.raises(SystemExit, match="image-plane-newton-steps must be 0"):
+        _normalize_validation_stage_fit_controls(args)
+
+
+def test_validation_stage_fit_controls_accept_refreshing_surrogate_for_zero_step_anchored_solved_stage4() -> None:
+    args = argparse.Namespace(
+        fit_method=["svi+nuts", "svi+nuts", "svi+nuts"],
+        warmup=[1000, 500, 20],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+        sampling_engine="refreshing_surrogate",
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+        anchored_image_plane_solve_steps=0,
+    )
+
+    controls = _normalize_validation_stage_fit_controls(args)
+
+    assert controls["stage4"].fit_method == "svi+nuts"
+
+
+def test_validation_stage_fit_controls_reject_refreshing_surrogate_for_iterative_anchored_solved_stage4() -> None:
+    args = argparse.Namespace(
+        fit_method=["svi+nuts", "svi+nuts", "svi+nuts"],
+        warmup=[1000, 500, 20],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+        sampling_engine="refreshing_surrogate",
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+        anchored_image_plane_solve_steps=1,
+    )
+
+    with pytest.raises(SystemExit, match="anchored-image-plane-solve-steps"):
         _normalize_validation_stage_fit_controls(args)
 
 
@@ -4174,9 +9878,28 @@ def test_validation_stage_fit_controls_reject_invalid_image_presence_control() -
         _normalize_validation_stage_fit_controls(args)
 
 
+def test_validation_stage_fit_controls_accept_forward_metric_image_presence_penalty() -> None:
+    args = argparse.Namespace(
+        fit_method=["svi+nuts", "svi+nuts", "svi"],
+        svi_steps=[1200, 600, 100],
+        warmup=[1000, 500, 0],
+        samples=[250, 100, 20],
+        max_tree_depth=[10, 8, 6],
+        image_plane_mode=IMAGE_PLANE_MODE_FORWARD_METRIC,
+        image_plane_newton_steps=0,
+        image_presence_penalty_weight=4.0,
+    )
+
+    controls = _normalize_validation_stage_fit_controls(args)
+
+    assert controls["stage4"].fit_method == "svi"
+    assert args.image_presence_penalty_weight == pytest.approx(4.0)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
+        ("image_plane_scatter_floor_arcsec", 0.0, "image-plane-scatter-floor"),
         ("image_plane_scatter_floor_arcsec", -0.1, "image-plane-scatter-floor"),
         ("image_plane_scatter_floor_arcsec", float("nan"), "image-plane-scatter-floor"),
         ("image_plane_scatter_prior", "gamma", "image-plane-scatter-prior"),
@@ -4198,6 +9921,52 @@ def test_validation_stage_fit_controls_reject_invalid_image_scatter_control(
         image_plane_mode=IMAGE_PLANE_MODE_NONE,
     )
     setattr(args, field, value)
+
+    with pytest.raises(SystemExit, match=message):
+        _normalize_validation_stage_fit_controls(args)
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        (
+            {
+                "image_plane_scatter_floor_arcsec": 0.5,
+                "image_plane_scatter_upper_arcsec": 0.5,
+            },
+            "image-plane-scatter-upper",
+        ),
+        (
+            {
+                "image_plane_scatter_prior": "lognormal",
+                "image_plane_scatter_floor_arcsec": 0.1,
+                "image_plane_scatter_upper_arcsec": 0.5,
+                "image_plane_scatter_prior_median_arcsec": 0.05,
+            },
+            "image-plane-scatter-prior-median",
+        ),
+        (
+            {
+                "image_plane_scatter_prior": "lognormal",
+                "image_plane_scatter_floor_arcsec": 0.1,
+                "image_plane_scatter_upper_arcsec": 0.5,
+                "image_plane_scatter_prior_median_arcsec": 0.6,
+            },
+            "image-plane-scatter-prior-median",
+        ),
+    ],
+)
+def test_validation_stage_fit_controls_reject_image_scatter_support_mismatches(
+    updates: dict[str, Any],
+    message: str,
+) -> None:
+    args = argparse.Namespace(
+        fit_method="svi",
+        warmup=1,
+        samples=2,
+        image_plane_mode=IMAGE_PLANE_MODE_NONE,
+        **updates,
+    )
 
     with pytest.raises(SystemExit, match=message):
         _normalize_validation_stage_fit_controls(args)
@@ -4245,13 +10014,27 @@ def test_validation_stage_fit_controls_reject_three_values_without_stage4_mode()
 
 def test_validation_stage_fit_controls_reject_two_values_without_image_plane_stage() -> None:
     args = argparse.Namespace(
-        fit_method=["svi+nuts", "svi"],
+        fit_method="svi+nuts",
+        svi_steps=[1000, 500],
         warmup=1,
         samples=2,
         image_plane_mode=IMAGE_PLANE_MODE_NONE,
     )
 
     with pytest.raises(SystemExit):
+        _normalize_validation_stage_fit_controls(args)
+
+
+def test_validation_stage_fit_controls_reject_four_svi_step_values() -> None:
+    args = argparse.Namespace(
+        fit_method="svi+nuts",
+        svi_steps=[1000, 500, 100, 50],
+        warmup=1,
+        samples=2,
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+    )
+
+    with pytest.raises(SystemExit, match="at most three"):
         _normalize_validation_stage_fit_controls(args)
 
 
@@ -4319,7 +10102,13 @@ def test_validation_stage_fit_controls_accept_unlimited_ns_max_samples() -> None
         )
     )
 
-    assert controls["stage2"].to_json() == {"fit_method": "ns", "warmup": 0, "samples": 0, "max_tree_depth": 8}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "ns",
+        "svi_steps": 0,
+        "warmup": 0,
+        "samples": 0,
+        "max_tree_depth": 8,
+    }
 
 
 def test_validation_stage_fit_controls_accept_evidence_ns() -> None:
@@ -4335,7 +10124,13 @@ def test_validation_stage_fit_controls_accept_evidence_ns() -> None:
         )
     )
 
-    assert controls["stage2"].to_json() == {"fit_method": "ns", "warmup": 0, "samples": 0, "max_tree_depth": 8}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "ns",
+        "svi_steps": 0,
+        "warmup": 0,
+        "samples": 0,
+        "max_tree_depth": 8,
+    }
 
 
 def test_validation_stage_fit_controls_reject_evidence_ns_without_sigma() -> None:
@@ -4360,6 +10155,9 @@ def test_validation_parser_accepts_two_value_controls() -> None:
             "--fit-method",
             "svi+nuts",
             "svi",
+            "--svi-steps",
+            "1200",
+            "300",
             "--warmup",
             "1000",
             "0",
@@ -4374,19 +10172,57 @@ def test_validation_parser_accepts_two_value_controls() -> None:
 
     controls = _normalize_validation_stage_fit_controls(args)
 
-    assert controls["stage2"].to_json() == {"fit_method": "svi+nuts", "warmup": 1000, "samples": 250, "max_tree_depth": 8}
-    assert controls["stage3"].to_json() == {"fit_method": "svi", "warmup": 0, "samples": 100, "max_tree_depth": 6}
+    assert controls["stage2"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1200,
+        "warmup": 1000,
+        "samples": 250,
+        "max_tree_depth": 8,
+    }
+    assert controls["stage3"].to_json() == {
+        "fit_method": "svi",
+        "svi_steps": 300,
+        "warmup": 0,
+        "samples": 100,
+        "max_tree_depth": 6,
+    }
 
 
-def test_validation_parser_accepts_marginal_image_plane_three_value_controls() -> None:
+def test_validation_parser_accepts_start_at_stage3() -> None:
+    args = validation._build_parser().parse_args(
+        [
+            "--start-at-stage3",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+        ]
+    )
+
+    assert args.start_at_stage3 is True
+
+
+def test_validation_parser_rejects_marginal_image_plane_mode() -> None:
+    with pytest.raises(SystemExit):
+        validation._build_parser().parse_args(
+            [
+                "--image-plane-mode",
+                "marginal-" "image-plane",
+            ]
+        )
+
+
+def test_validation_parser_accepts_linearized_image_plane_three_value_controls() -> None:
     args = validation._build_parser().parse_args(
         [
             "--image-plane-mode",
-            IMAGE_PLANE_MODE_MARGINAL,
+            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
             "--fit-method",
             "svi+nuts",
             "svi+nuts",
             "svi",
+            "--svi-steps",
+            "1200",
+            "600",
+            "100",
             "--warmup",
             "1000",
             "500",
@@ -4404,13 +10240,158 @@ def test_validation_parser_accepts_marginal_image_plane_three_value_controls() -
 
     controls = _normalize_validation_stage_fit_controls(args)
 
-    assert args.image_plane_mode == IMAGE_PLANE_MODE_MARGINAL
-    assert controls["stage4"].to_json() == {"fit_method": "svi", "warmup": 0, "samples": 20, "max_tree_depth": 6}
+    assert args.image_plane_mode == IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA
+    assert controls["stage4"].to_json() == {
+        "fit_method": "svi",
+        "svi_steps": 100,
+        "warmup": 0,
+        "samples": 20,
+        "max_tree_depth": 6,
+    }
+
+
+def test_validation_parser_accepts_anchored_solved_image_plane_controls() -> None:
+    args = validation._build_parser().parse_args(
+        [
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+            "--sampling-engine",
+            "full",
+            "--anchored-image-plane-solve-steps",
+            "4",
+            "--anchored-image-plane-trust-radius-arcsec",
+            "0.25",
+        ]
+    )
+
+    controls = _normalize_validation_stage_fit_controls(args)
+
+    assert args.image_plane_mode == IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA
+    assert args.anchored_image_plane_solve_steps == 4
+    assert args.anchored_image_plane_trust_radius_arcsec == pytest.approx(0.25)
+    assert controls["stage4"].fit_method == "svi+nuts"
+
+
+def test_validation_parser_accepts_critical_arc_mixture_image_plane_controls() -> None:
+    args = validation._build_parser().parse_args(
+        [
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+            "--sampling-engine",
+            "refreshing_surrogate",
+            "--critical-arc-critical-direction-sigma-arcsec",
+            "4.5",
+            "--critical-arc-base-prob",
+            "0.2",
+            "--critical-arc-max-prob",
+            "0.7",
+            "--critical-arc-singular-threshold",
+            "0.15",
+            "--critical-arc-singular-softness",
+            "0.04",
+            "--critical-arc-lm-damping-relative",
+            "0.002",
+            "--critical-arc-lm-damping-absolute",
+            "1e-5",
+            "--critical-arc-lm-trust-radius-arcsec",
+            "18.0",
+            "--arc-aware-noncritical-support-radius-arcsec",
+            "1.25",
+            "--arc-aware-max-arclength-arcsec",
+            "12.0",
+            "--arc-aware-curve-step-arcsec",
+            "0.2",
+        ]
+    )
+
+    controls = _normalize_validation_stage_fit_controls(args)
+
+    assert args.image_plane_mode == IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
+    assert args.critical_arc_critical_direction_sigma_arcsec == pytest.approx(4.5)
+    assert args.critical_arc_base_prob == pytest.approx(0.2)
+    assert args.critical_arc_max_prob == pytest.approx(0.7)
+    assert args.critical_arc_singular_threshold == pytest.approx(0.15)
+    assert args.critical_arc_singular_softness == pytest.approx(0.04)
+    assert args.critical_arc_lm_damping_relative == pytest.approx(0.002)
+    assert args.critical_arc_lm_damping_absolute == pytest.approx(1.0e-5)
+    assert args.critical_arc_lm_trust_radius_arcsec == pytest.approx(18.0)
+    assert args.arc_aware_noncritical_support_radius_arcsec == pytest.approx(1.25)
+    assert args.arc_aware_max_arclength_arcsec == pytest.approx(12.0)
+    assert args.arc_aware_curve_step_arcsec == pytest.approx(0.2)
+    assert controls["stage4"].fit_method == "svi+nuts"
+
+
+def test_validation_parser_accepts_fold_regularized_image_plane_controls() -> None:
+    args = validation._build_parser().parse_args(
+        [
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+            "--sampling-engine",
+            "refreshing_surrogate",
+            "--fold-curvature-arcsec-inv",
+            "1.25",
+            "--image-plane-newton-steps",
+            "0",
+        ]
+    )
+
+    controls = _normalize_validation_stage_fit_controls(args)
+
+    assert args.image_plane_mode == IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA
+    assert args.fold_curvature_arcsec_inv == pytest.approx(1.25)
+    assert validation._validation_final_stage_name(args) == "stage4_fold_regularized_image_plane"
+    assert controls["stage4"].fit_method == "svi+nuts"
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--critical-arc-speed-mode", "all"),
+        ("--critical-arc-mask-margin-softness", "4.0"),
+    ],
+)
+def test_validation_parser_rejects_removed_critical_arc_speed_controls(flag: str, value: str) -> None:
+    with pytest.raises(SystemExit):
+        validation._build_parser().parse_args(
+            [
+                "--image-plane-mode",
+                IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+                flag,
+                value,
+            ]
+        )
+
+
+def test_run_xsh_critical_arc_mode_selects_new_image_plane_mode() -> None:
+    text = (Path(__file__).resolve().parents[1] / "run.xsh").read_text(encoding="utf-8")
+
+    assert 'mode = "critical_arc"' in text
+    assert '"fold_regularized": "fold-regularized-forward-beta-image-plane"' in text
+    assert '"--fold-curvature-arcsec-inv", 1.0' in text
+    assert '"critical_arc": "critical-arc-mixture-image-plane"' in text
+    assert 'sampling_engine = "refreshing_surrogate"' in text
+    assert '"--critical-arc-critical-direction-sigma-arcsec", 10.0' in text
+    assert '"--critical-arc-base-prob", 0.10' in text
+    assert '"--critical-arc-max-prob", 0.85' in text
+    assert '"--critical-arc-singular-threshold", 0.40' in text
+    assert '"--critical-arc-singular-softness", 0.10' in text
+    assert '"--critical-arc-lm-trust-radius-arcsec", 20.0' in text
+    assert "--critical-arc-speed-mode" not in text
+    assert '"--arc-aware-noncritical-support-radius-arcsec", 1.0' in text
+    assert '"--arc-aware-max-arclength-arcsec", 10.0' in text
+    assert '"--arc-aware-curve-step-arcsec", 0.1' in text
+    assert '"--match-tolerance-arcsec", 2.0' in text
+    assert '"kappa_true_fits": "data/ff_sims/ares/kappa_z9_0.fits"' in text
+    assert '"kappa_true_fits": "data/ff_sims/hera/kappa_z9_0.fits"' in text
+    assert '"image_catalog_family_cutout_image_dir": "data/ff_sims"' in text
+    assert 'kappa_true_args = ["--kappa-true-fits", kappa_true_fits] if kappa_true_fits else []' in text
+    assert '"--caustic-source-redshift", 9.0' in text
+    assert "*(kappa_true_args)" in text
 
 
 def test_validation_parser_rejects_removed_stage35_flag() -> None:
     with pytest.raises(SystemExit):
-        validation._build_parser().parse_args(["--run-stage35-marginal-image-plane"])
+        validation._build_parser().parse_args(["--run-stage35-" "marginal-" "image-plane"])
 
 
 def test_validation_stage_fit_controls_reject_four_values() -> None:
@@ -4419,7 +10400,7 @@ def test_validation_stage_fit_controls_reject_four_values() -> None:
         warmup=[1000, 500, 0, 250],
         samples=[250, 100, 20, 80],
         max_tree_depth=[8, 7, 6, 5],
-        image_plane_mode=IMAGE_PLANE_MODE_MARGINAL,
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
     )
 
     with pytest.raises(SystemExit, match="at most three"):
@@ -4448,11 +10429,33 @@ def test_validation_parser_accepts_evidence_ns_controls() -> None:
 def test_validation_parser_accepts_posterior_diagnostic_mode() -> None:
     defaults = validation._build_parser().parse_args([])
     args = validation._build_parser().parse_args(["--posterior-diagnostic-mode", "approximate", "--quick-diagnostics"])
+    exact_args = validation._build_parser().parse_args(["--exact-image-diagnostics-stage3"])
 
     assert defaults.posterior_diagnostic_mode == validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT
     assert defaults.quick_diagnostics is False
+    assert defaults.exact_image_diagnostics_stage3 is False
     assert args.posterior_diagnostic_mode == validation.POSTERIOR_DIAGNOSTIC_MODE_APPROXIMATE
     assert args.quick_diagnostics is True
+    assert exact_args.exact_image_diagnostics_stage3 is True
+
+
+def test_validation_rejects_quick_and_exact_stage3_diagnostics() -> None:
+    args = validation._build_parser().parse_args(["--quick-diagnostics", "--exact-image-diagnostics-stage3"])
+
+    with pytest.raises(SystemExit, match="exact-image-diagnostics-stage3"):
+        validation._validate_validation_args(args)
+
+
+def test_validation_parser_accepts_recovery_profile_draws() -> None:
+    defaults = validation._build_parser().parse_args([])
+    args = validation._build_parser().parse_args(["--recovery-profile-draws", "32"])
+    zero_args = validation._build_parser().parse_args(["--recovery-profile-draws", "0"])
+    negative_args = validation._build_parser().parse_args(["--recovery-profile-draws", "-4"])
+
+    assert defaults.recovery_profile_draws == validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP
+    assert args.recovery_profile_draws == 32
+    assert zero_args.recovery_profile_draws == 0
+    assert negative_args.recovery_profile_draws == -4
 
 
 def test_validation_parser_accepts_write_stage3_recovery() -> None:
@@ -4489,6 +10492,20 @@ def test_validation_parser_accepts_sampled_source_evidence_controls() -> None:
     assert controls["stage2"].fit_method == "ns"
 
 
+def test_validation_parser_rejects_marginal_evidence_likelihood_mode() -> None:
+    with pytest.raises(SystemExit):
+        validation._build_parser().parse_args(
+            [
+                "--solver-fit-mode",
+                "evidence-ns",
+                "--evidence-source-prior-sigma-arcsec",
+                "5.0",
+                "--evidence-likelihood-mode",
+                "linearized-" "marginal-" "beta-image-plane",
+            ]
+        )
+
+
 def test_validation_parser_accepts_active_subset_sampling_engine() -> None:
     args = validation._build_parser().parse_args(["--sampling-engine", "active_subset"])
 
@@ -4504,13 +10521,44 @@ def test_validation_parser_uses_primary_and_subhalo_family_counts() -> None:
     assert defaults.n_primary_families == 20
     assert defaults.n_subhalo_families == 0
     assert defaults.max_images_per_family is None
+    assert defaults.primary_source_redshifts == "1.5,2.0,3.0"
+    assert defaults.subhalo_source_redshifts == "1.5,2.0,3.0"
+    assert defaults.critical_caustic_plot_grid_scale_arcsec == pytest.approx(0.2)
+    assert defaults.primary_image_min_distance_arcsec == pytest.approx(
+        mock_cluster.DEFAULT_PRIMARY_IMAGE_MIN_DISTANCE_ARCSEC
+    )
+    assert defaults.subhalo_image_min_distance_arcsec == pytest.approx(
+        mock_cluster.DEFAULT_SUBHALO_IMAGE_MIN_DISTANCE_ARCSEC
+    )
 
-    args = parser.parse_args(["--n-primary-families", "4", "--n-subhalo-families", "2"])
+    args = parser.parse_args(
+        [
+            "--n-primary-families",
+            "4",
+            "--n-subhalo-families",
+            "2",
+            "--primary-source-redshifts",
+            "2.0,3.0",
+            "--subhalo-source-redshifts",
+            "5.0",
+            "--primary-image-min-distance-arcsec",
+            "2.5",
+            "--subhalo-image-min-distance-arcsec",
+            "0.75",
+            "--critical-caustic-plot-grid-scale-arcsec",
+            "0.15",
+        ]
+    )
     validation._validate_validation_args(args)
 
     assert args.n_primary_families == 4
     assert args.n_subhalo_families == 2
     assert args.min_images_per_family == 3
+    assert args.primary_image_min_distance_arcsec == pytest.approx(2.5)
+    assert args.subhalo_image_min_distance_arcsec == pytest.approx(0.75)
+    assert args.critical_caustic_plot_grid_scale_arcsec == pytest.approx(0.15)
+    assert validation._parse_source_redshifts(args.primary_source_redshifts, fallback=2.0) == (2.0, 3.0)
+    assert validation._parse_source_redshifts(args.subhalo_source_redshifts, fallback=2.0) == (5.0,)
 
 
 def test_validation_parser_accepts_max_images_per_family() -> None:
@@ -4532,6 +10580,16 @@ def test_validation_parser_rejects_removed_n_families_flag() -> None:
         validation._build_parser().parse_args(["--n-families", "3"])
 
 
+def test_validation_parser_rejects_removed_source_redshifts_flag() -> None:
+    with pytest.raises(SystemExit):
+        validation._build_parser().parse_args(["--source-redshifts", "1.5,2.0"])
+
+
+def test_validation_parser_rejects_removed_posterior_diagnostic_workers_flag() -> None:
+    with pytest.raises(SystemExit):
+        validation._build_parser().parse_args(["--posterior-diagnostic-workers", "2"])
+
+
 def test_validation_parser_rejects_invalid_family_counts() -> None:
     parser = validation._build_parser()
     with pytest.raises(SystemExit):
@@ -4544,6 +10602,17 @@ def test_validation_parser_rejects_invalid_family_counts() -> None:
         validation._validate_validation_args(
             parser.parse_args(["--min-images-per-family", "4", "--max-images-per-family", "3"])
         )
+    with pytest.raises(SystemExit):
+        validation._validate_validation_args(parser.parse_args(["--critical-caustic-plot-grid-scale-arcsec", "0"]))
+    with pytest.raises(SystemExit):
+        validation._validate_validation_args(parser.parse_args(["--primary-image-min-distance-arcsec", "0"]))
+    with pytest.raises(SystemExit):
+        validation._validate_validation_args(parser.parse_args(["--subhalo-image-min-distance-arcsec", "-1"]))
+    with pytest.raises(SystemExit):
+        validation._validate_validation_args(parser.parse_args(["--primary-image-min-distance-arcsec", "nan"]))
+
+    validation._validate_validation_args(parser.parse_args(["--recovery-profile-draws", "0"]))
+    validation._validate_validation_args(parser.parse_args(["--recovery-profile-draws", "-4"]))
 
 
 def test_validation_parser_rejects_removed_ott_sinkhorn_image_plane_mode() -> None:
@@ -4675,6 +10744,7 @@ def test_cluster_solver_parser_accepts_unlimited_ns_max_samples(monkeypatch: pyt
     args = _parse_args()
 
     assert args.ns_max_samples is None
+    assert args.linearized_beta_prior_sigma_arcsec == pytest.approx(2.0)
 
 
 def test_cluster_solver_parser_defaults_to_unlimited_ns_max_samples(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4732,25 +10802,81 @@ def test_validation_parser_rejects_invalid_ns_max_samples() -> None:
         validation._build_parser().parse_args(["--ns-max-samples", "forever"])
 
 
-def test_validation_parser_accepts_fit_quality_workers() -> None:
+def test_validation_parser_rejects_fit_quality_workers() -> None:
     parser = validation._build_parser()
 
     defaults = parser.parse_args([])
     validation._validate_validation_args(defaults)
 
-    assert defaults.fit_quality_workers == 1
-
-    args = parser.parse_args(["--fit-quality-workers", "32"])
-    validation._validate_validation_args(args)
-
-    assert args.fit_quality_workers == 32
-
-
-def test_validation_parser_rejects_invalid_fit_quality_workers() -> None:
-    parser = validation._build_parser()
+    assert not hasattr(defaults, "fit_quality_workers")
 
     with pytest.raises(SystemExit):
-        validation._validate_validation_args(parser.parse_args(["--fit-quality-workers", "0"]))
+        parser.parse_args(["--fit-quality-workers", "32"])
+
+
+def test_cluster_solver_parser_rejects_fit_quality_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--fit-quality-workers",
+            "32",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+
+def test_validation_parser_accepts_schechter_subhalo_controls_and_rejects_removed_model_flags() -> None:
+    parser = validation._build_parser()
+
+    defaults = parser.parse_args([])
+    validation._validate_validation_args(defaults)
+
+    assert defaults.subhalo_schechter_alpha == pytest.approx(-0.7)
+    assert defaults.subhalo_parent_factor == 1000
+    assert defaults.subhalo_mag_faint_limit == pytest.approx(24.0)
+    assert defaults.bcg_position_prior_half_width_arcsec == pytest.approx(
+        mock_cluster.DEFAULT_BCG_POSITION_PRIOR_HALF_WIDTH_ARCSEC
+    )
+
+    args = parser.parse_args(
+        [
+            "--subhalo-schechter-alpha",
+            "-0.5",
+            "--subhalo-parent-factor",
+            "9",
+            "--subhalo-mag-faint-limit",
+            "23.5",
+            "--subhalo-mass-min",
+            "1e8",
+            "--subhalo-mass-max",
+            "1e12",
+            "--subhalo-mass-ref",
+            "5e11",
+        ]
+    )
+    validation._validate_validation_args(args)
+
+    assert args.subhalo_schechter_alpha == pytest.approx(-0.5)
+    assert args.subhalo_parent_factor == 9
+    assert args.subhalo_mag_faint_limit == pytest.approx(23.5)
+    assert args.subhalo_mass_min == pytest.approx(1.0e8)
+    assert args.subhalo_mass_max == pytest.approx(1.0e12)
+    assert args.subhalo_mass_ref == pytest.approx(5.0e11)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--subhalo-population-model", "shmf"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--subhalo-shmf-alpha-ln", "0.8"])
+
+    invalid_bcg_args = parser.parse_args(["--bcg-position-prior-half-width-arcsec", "0"])
+    with pytest.raises(SystemExit):
+        validation._validate_validation_args(invalid_bcg_args)
 
 
 def _validation_solver_args(**updates) -> argparse.Namespace:
@@ -4758,15 +10884,30 @@ def _validation_solver_args(**updates) -> argparse.Namespace:
         solver_fit_mode="sequential",
         fit_method="svi+nuts",
         image_plane_mode=IMAGE_PLANE_MODE_NONE,
+        start_at_stage3=False,
         skip_stage3_image_plane_local_jacobian=False,
         image_plane_newton_steps=0,
-        linearized_beta_prior_sigma_arcsec=0.3,
+        anchored_image_plane_solve_steps=validation.DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS,
+        anchored_image_plane_trust_radius_arcsec=validation.DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC,
+        anchored_image_plane_lm_damping_relative=validation.DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE,
+        anchored_image_plane_lm_damping_absolute=validation.DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_ABSOLUTE,
+        critical_arc_critical_direction_sigma_arcsec=validation.DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+        critical_arc_base_prob=validation.DEFAULT_CRITICAL_ARC_BASE_PROB,
+        critical_arc_max_prob=validation.DEFAULT_CRITICAL_ARC_MAX_PROB,
+        critical_arc_singular_threshold=validation.DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+        critical_arc_singular_softness=validation.DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
+        critical_arc_lm_damping_relative=validation.DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE,
+        critical_arc_lm_damping_absolute=validation.DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE,
+        critical_arc_lm_trust_radius_arcsec=validation.DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC,
+        fold_curvature_arcsec_inv=validation.DEFAULT_FOLD_CURVATURE_ARCSEC_INV,
+        linearized_beta_prior_sigma_arcsec=validation.DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC,
         source_position_parameterization="prior-whitened",
         image_plane_scatter_upper_arcsec=2.0,
-        image_plane_scatter_floor_arcsec=0.0,
+        image_plane_scatter_floor_arcsec=validation.DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
         image_plane_scatter_prior="log-uniform",
         image_plane_scatter_prior_median_arcsec=0.3,
         image_plane_scatter_prior_log_sigma=0.5,
+        fix_image_sigma_int_arcsec=None,
         image_presence_penalty_weight=None,
         image_presence_match_radius_arcsec=0.30,
         image_presence_temperature_arcsec=0.10,
@@ -4791,7 +10932,6 @@ def _validation_solver_args(**updates) -> argparse.Namespace:
         source_plane_covariance_floor=1.0e-6,
         z_bin_efficiency_tol=0.01,
         fit_cosmology_flat_wcdm=False,
-        fit_cosmology_all_stages=False,
         active_scaling_selection="adaptive",
         active_scaling_cumulative_fraction=0.995,
         active_scaling_min=4,
@@ -4801,25 +10941,38 @@ def _validation_solver_args(**updates) -> argparse.Namespace:
         n_subhalo_families=0,
         min_images_per_family=3,
         max_images_per_family=None,
+        primary_image_min_distance_arcsec=mock_cluster.DEFAULT_PRIMARY_IMAGE_MIN_DISTANCE_ARCSEC,
+        subhalo_image_min_distance_arcsec=mock_cluster.DEFAULT_SUBHALO_IMAGE_MIN_DISTANCE_ARCSEC,
+        bcg_position_prior_half_width_arcsec=mock_cluster.DEFAULT_BCG_POSITION_PRIOR_HALF_WIDTH_ARCSEC,
         caustic_compute_window_arcsec=160.0,
         caustic_grid_scale_arcsec=0.2,
+        critical_caustic_plot_grid_scale_arcsec=0.2,
         caustic_min_area_arcsec2=1.0e-5,
         caustic_boundary_margin_arcsec=0.5,
         n_subhalos=0,
+        subhalo_schechter_alpha=-0.7,
+        subhalo_parent_factor=1000,
+        subhalo_mag_faint_limit=24.0,
+        subhalo_mass_min=1.0e9,
+        subhalo_mass_max=1.0e13,
+        subhalo_mass_ref=1.0e12,
         subhalo_sigma_scatter_dex=0.07,
         subhalo_cut_scatter_dex=0.20,
         scaling_scatter_max=0.5,
         pos_sigma_arcsec=0.15,
         seed=12345,
         target_accept=0.85,
-        fit_quality_workers=1,
+        dense_mass=True,
         jax_default_device="auto",
         smc_device="auto",
         max_tree_depth=8,
         skip_plots=True,
+        quick_diagnostics=False,
+        exact_image_diagnostics_stage3=False,
         quiet=False,
         resume=False,
         resume_fast=False,
+        recovery_profile_draws=validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
         write_stage3_recovery=False,
     )
     payload.update(updates)
@@ -4839,10 +10992,10 @@ def _validation_run_args(tmp_path: Path, **updates) -> argparse.Namespace:
             min_images_per_family=3,
             max_images_per_family=None,
             source_redshift=2.0,
-            source_redshifts="1.5",
+            primary_source_redshifts="1.5",
+            subhalo_source_redshifts="1.5",
             source_sigma_int_arcsec=0.05,
             posterior_diagnostic_draws=2,
-            posterior_diagnostic_workers=1,
             posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
         )
     )
@@ -4858,6 +11011,51 @@ def _option_values(cmd: list[str], option: str) -> list[str]:
             break
         values.append(value)
     return values
+
+
+def test_validation_parser_parses_dense_mass_boolean_optional() -> None:
+    parser = validation._build_parser()
+
+    default_args = parser.parse_args([])
+    assert default_args.dense_mass is True
+
+    diagonal_args = parser.parse_args(["--no-dense-mass"])
+    assert diagonal_args.dense_mass is False
+
+    dense_args = parser.parse_args(["--dense-mass"])
+    assert dense_args.dense_mass is True
+
+
+def test_validation_parser_accepts_potfile_mass_size_reparam_flag() -> None:
+    parser = validation._build_parser()
+
+    default_args = parser.parse_args([])
+    assert default_args.potfile_mass_size_reparam is False
+
+    reparam_args = parser.parse_args(["--potfile-mass-size-reparam"])
+    validation._validate_validation_args(reparam_args)
+    assert reparam_args.potfile_mass_size_reparam is True
+
+
+def test_validation_parser_accepts_and_validates_fixed_image_sigma_int() -> None:
+    parser = validation._build_parser()
+
+    default_args = parser.parse_args([])
+    validation._validate_validation_args(default_args)
+    assert default_args.fix_image_sigma_int_arcsec is None
+
+    fixed_args = parser.parse_args(["--fix-image-sigma-int-arcsec", "0.35"])
+    validation._validate_validation_args(fixed_args)
+    assert fixed_args.fix_image_sigma_int_arcsec == pytest.approx(0.35)
+
+    zero_args = parser.parse_args(["--fix-image-sigma-int-arcsec", "0.0"])
+    validation._validate_validation_args(zero_args)
+    assert zero_args.fix_image_sigma_int_arcsec == pytest.approx(0.0)
+
+    for invalid_value in ("-0.1", "nan"):
+        invalid_args = parser.parse_args(["--fix-image-sigma-int-arcsec", invalid_value])
+        with pytest.raises(SystemExit, match="fix-image-sigma-int"):
+            validation._validate_validation_args(invalid_args)
 
 
 @pytest.mark.parametrize(
@@ -4998,31 +11196,96 @@ def test_validation_run_cluster_solver_forwards_scalar_stage_controls(monkeypatc
     cmd = captured["cmd"]
 
     assert _option_values(cmd, "--fit-method") == ["svi+nuts"]
+    assert _option_values(cmd, "--svi-steps") == ["10"]
     assert _option_values(cmd, "--warmup") == ["300"]
     assert _option_values(cmd, "--samples") == ["500"]
     assert _option_values(cmd, "--max-tree-depth") == ["8"]
+    assert "--dense-mass" in cmd
+    assert "--no-dense-mass" not in cmd
+    assert "--potfile-mass-size-reparam" not in cmd
     assert "--ns-num-live-points" not in cmd
     assert "--ns-max-samples" not in cmd
     assert "--ns-dlogz" not in cmd
     assert _option_values(cmd, "--image-plane-mode") == [IMAGE_PLANE_MODE_NONE]
     assert "--linearized-image-plane-stage" not in cmd
+    assert "--start-at-stage3" not in cmd
     assert "--skip-stage3-image-plane-local-jacobian" not in cmd
     assert "--ott-sinkhorn-epsilon" not in cmd
     assert "--ott-sinkhorn-max-iterations" not in cmd
     assert "--ott-sinkhorn-threshold" not in cmd
     assert "--ott-sinkhorn-lse-mode" not in cmd
     assert _option_values(cmd, "--image-plane-newton-steps") == ["0"]
+    assert _option_values(cmd, "--linearized-beta-prior-sigma-arcsec") == ["2.0"]
     assert _option_values(cmd, "--source-position-parameterization") == ["prior-whitened"]
     assert _option_values(cmd, "--image-plane-scatter-upper-arcsec") == ["2.0"]
-    assert _option_values(cmd, "--image-plane-scatter-floor-arcsec") == ["0.0"]
+    assert _option_values(cmd, "--image-plane-scatter-floor-arcsec") == ["0.001"]
     assert _option_values(cmd, "--image-plane-scatter-prior") == ["log-uniform"]
     assert _option_values(cmd, "--image-plane-scatter-prior-median-arcsec") == ["0.3"]
     assert _option_values(cmd, "--image-plane-scatter-prior-log-sigma") == ["0.5"]
-    assert _option_values(cmd, "--fit-quality-workers") == ["1"]
+    assert "--fix-image-sigma-int-arcsec" not in cmd
+    assert "--fit-quality-workers" not in cmd
     assert run_dir == tmp_path / "solver" / "fit" / "stage2_joint"
 
 
-def test_validation_run_cluster_solver_forwards_fit_quality_workers(
+def test_validation_run_cluster_solver_forwards_fixed_image_sigma_int(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, cwd, check):
+        captured["cmd"] = list(cmd)
+        assert check is True
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(validation.subprocess, "run", fake_run)
+    args = _validation_solver_args(fix_image_sigma_int_arcsec=0.35)
+
+    validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
+
+    assert _option_values(captured["cmd"], "--fix-image-sigma-int-arcsec") == ["0.35"]
+
+
+def test_validation_run_cluster_solver_forwards_no_dense_mass(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, cwd, check):
+        captured["cmd"] = list(cmd)
+        assert check is True
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(validation.subprocess, "run", fake_run)
+    args = _validation_solver_args(dense_mass=False)
+
+    validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
+
+    assert "--no-dense-mass" in captured["cmd"]
+    assert "--dense-mass" not in captured["cmd"]
+
+
+def test_validation_run_cluster_solver_forwards_potfile_mass_size_reparam(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, cwd, check):
+        captured["cmd"] = list(cmd)
+        assert check is True
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(validation.subprocess, "run", fake_run)
+    args = _validation_solver_args(potfile_mass_size_reparam=True)
+
+    validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
+
+    assert "--potfile-mass-size-reparam" in captured["cmd"]
+
+
+def test_validation_run_cluster_solver_does_not_forward_fit_quality_workers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -5033,11 +11296,11 @@ def test_validation_run_cluster_solver_forwards_fit_quality_workers(
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(validation.subprocess, "run", fake_run)
-    args = _validation_solver_args(fit_quality_workers=32, posterior_diagnostic_workers=7)
+    args = _validation_solver_args()
 
     validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
 
-    assert _option_values(captured["cmd"], "--fit-quality-workers") == ["32"]
+    assert "--fit-quality-workers" not in captured["cmd"]
     assert "--posterior-diagnostic-workers" not in captured["cmd"]
 
 
@@ -5105,8 +11368,8 @@ def test_validation_run_cluster_solver_forwards_evidence_ns_mode(
     assert _option_values(cmd, "--evidence-source-prior-mean-x-arcsec") == ["0.2"]
     assert _option_values(cmd, "--evidence-source-prior-mean-y-arcsec") == ["-0.1"]
     assert "--linearized-beta-prior-sigma-arcsec" not in cmd
-    assert "--source-position-parameterization" not in cmd
-    assert "--image-plane-newton-steps" not in cmd
+    assert _option_values(cmd, "--source-position-parameterization") == ["prior-whitened"]
+    assert _option_values(cmd, "--image-plane-newton-steps") == ["0"]
     assert run_dir == tmp_path / "solver" / "fit"
 
 
@@ -5255,6 +11518,7 @@ def test_validation_run_cluster_solver_forwards_two_value_stage_controls(monkeyp
     args = _validation_solver_args(
         fit_method=["svi+nuts", "svi"],
         image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+        svi_steps=[1000, 500],
         warmup=[1000, 0],
         samples=[250, 100],
         max_tree_depth=[10, 8],
@@ -5264,6 +11528,7 @@ def test_validation_run_cluster_solver_forwards_two_value_stage_controls(monkeyp
     cmd = captured["cmd"]
 
     assert _option_values(cmd, "--fit-method") == ["svi+nuts", "svi"]
+    assert _option_values(cmd, "--svi-steps") == ["1000", "500"]
     assert _option_values(cmd, "--warmup") == ["1000", "0"]
     assert _option_values(cmd, "--samples") == ["250", "100"]
     assert _option_values(cmd, "--max-tree-depth") == ["10", "8"]
@@ -5283,6 +11548,7 @@ def test_validation_run_cluster_solver_forwards_three_value_stage_controls(monke
         fit_method=["svi+nuts", "svi+nuts", "svi"],
         image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
         image_plane_newton_steps=1,
+        svi_steps=[1000, 500, 100],
         warmup=[1000, 500, 0],
         samples=[250, 100, 20],
         max_tree_depth=[10, 8, 6],
@@ -5306,6 +11572,7 @@ def test_validation_run_cluster_solver_forwards_three_value_stage_controls(monke
     cmd = captured["cmd"]
 
     assert _option_values(cmd, "--fit-method") == ["svi+nuts", "svi+nuts", "svi"]
+    assert _option_values(cmd, "--svi-steps") == ["1000", "500", "100"]
     assert _option_values(cmd, "--warmup") == ["1000", "500", "0"]
     assert _option_values(cmd, "--samples") == ["250", "100", "20"]
     assert _option_values(cmd, "--max-tree-depth") == ["10", "8", "6"]
@@ -5345,6 +11612,7 @@ def test_validation_run_cluster_solver_forwards_stage3_skip_flag(monkeypatch: py
         fit_method=["svi+nuts", "svi"],
         image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
         skip_stage3_image_plane_local_jacobian=True,
+        svi_steps=[1000, 100],
         warmup=[1000, 0],
         samples=[250, 20],
     )
@@ -5354,7 +11622,38 @@ def test_validation_run_cluster_solver_forwards_stage3_skip_flag(monkeypatch: py
 
     assert "--skip-stage3-image-plane-local-jacobian" in cmd
     assert _option_values(cmd, "--fit-method") == ["svi+nuts", "svi"]
+    assert _option_values(cmd, "--svi-steps") == ["1000", "100"]
     assert run_dir == tmp_path / "solver" / "fit" / "stage4_linearized_image_plane"
+
+
+def test_validation_run_cluster_solver_forwards_start_at_stage3_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, cwd, check):
+        captured["cmd"] = list(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(validation.subprocess, "run", fake_run)
+    args = _validation_solver_args(
+        fit_method=["svi+nuts", "svi"],
+        image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+        start_at_stage3=True,
+        svi_steps=[1000, 100],
+        warmup=[1000, 0],
+        samples=[250, 20],
+    )
+
+    run_dir = validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
+    cmd = captured["cmd"]
+
+    assert "--start-at-stage3" in cmd
+    assert "--skip-stage3-image-plane-local-jacobian" not in cmd
+    assert _option_values(cmd, "--fit-method") == ["svi+nuts", "svi"]
+    assert _option_values(cmd, "--svi-steps") == ["1000", "100"]
+    assert run_dir == tmp_path / "solver" / "fit" / "stage3_image_plane"
 
 
 def test_validation_run_cluster_solver_forwards_resume_flag(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -5429,15 +11728,18 @@ def test_validation_run_cluster_solver_forwards_fit_cosmology_flag(monkeypatch: 
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(validation.subprocess, "run", fake_run)
-    args = _validation_solver_args(fit_cosmology_flat_wcdm=True, fit_cosmology_all_stages=True)
+    args = _validation_solver_args(fit_cosmology_flat_wcdm=True)
 
     validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
 
     assert "--fit-cosmology-flat-wcdm" in captured["cmd"]
-    assert "--fit-cosmology-all-stages" in captured["cmd"]
+    assert "--fit-cosmology-all-stages" not in captured["cmd"]
 
 
-def test_validation_run_cluster_solver_forwards_marginal_image_plane_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_validation_run_cluster_solver_forwards_forward_metric_image_plane_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     captured: dict[str, list[str]] = {}
 
     def fake_run(cmd, cwd, check):
@@ -5446,14 +11748,113 @@ def test_validation_run_cluster_solver_forwards_marginal_image_plane_mode(monkey
 
     monkeypatch.setattr(validation.subprocess, "run", fake_run)
     args = _validation_solver_args(
-        image_plane_mode=IMAGE_PLANE_MODE_MARGINAL,
+        image_plane_mode=IMAGE_PLANE_MODE_FORWARD_METRIC,
     )
 
     run_dir = validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
 
-    assert _option_values(captured["cmd"], "--image-plane-mode") == [IMAGE_PLANE_MODE_MARGINAL]
-    assert "--run-stage35-marginal-image-plane" not in captured["cmd"]
-    assert run_dir == tmp_path / "solver" / "fit" / "stage4_marginal_image_plane"
+    assert _option_values(captured["cmd"], "--image-plane-mode") == [IMAGE_PLANE_MODE_FORWARD_METRIC]
+    assert run_dir == tmp_path / "solver" / "fit" / "stage4_forward_metric_image_plane"
+
+
+def test_validation_run_cluster_solver_forwards_anchored_solved_image_plane_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, cwd, check):
+        captured["cmd"] = list(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(validation.subprocess, "run", fake_run)
+    args = _validation_solver_args(
+        image_plane_mode=IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+        sampling_engine="refreshing_surrogate",
+        anchored_image_plane_solve_steps=0,
+        anchored_image_plane_trust_radius_arcsec=0.25,
+        anchored_image_plane_lm_damping_relative=0.002,
+        anchored_image_plane_lm_damping_absolute=1.0e-5,
+    )
+
+    run_dir = validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
+
+    assert _option_values(captured["cmd"], "--image-plane-mode") == [IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA]
+    assert _option_values(captured["cmd"], "--anchored-image-plane-solve-steps") == ["0"]
+    assert _option_values(captured["cmd"], "--anchored-image-plane-trust-radius-arcsec") == ["0.25"]
+    assert _option_values(captured["cmd"], "--anchored-image-plane-lm-damping-relative") == ["0.002"]
+    assert _option_values(captured["cmd"], "--anchored-image-plane-lm-damping-absolute") == ["1e-05"]
+    assert run_dir == tmp_path / "solver" / "fit" / "stage4_anchored_solved_image_plane"
+
+
+def test_validation_run_cluster_solver_forwards_critical_arc_mixture_image_plane_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, cwd, check):
+        captured["cmd"] = list(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(validation.subprocess, "run", fake_run)
+    args = _validation_solver_args(
+        image_plane_mode=IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        sampling_engine="refreshing_surrogate",
+        critical_arc_critical_direction_sigma_arcsec=4.5,
+        critical_arc_base_prob=0.2,
+        critical_arc_max_prob=0.7,
+        critical_arc_singular_threshold=0.15,
+        critical_arc_singular_softness=0.04,
+        critical_arc_lm_damping_relative=0.002,
+        critical_arc_lm_damping_absolute=1.0e-5,
+        critical_arc_lm_trust_radius_arcsec=18.0,
+        arc_aware_noncritical_support_radius_arcsec=1.25,
+        arc_aware_max_arclength_arcsec=12.0,
+        arc_aware_curve_step_arcsec=0.2,
+    )
+
+    run_dir = validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
+
+    assert _option_values(captured["cmd"], "--image-plane-mode") == [IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE]
+    assert _option_values(captured["cmd"], "--critical-arc-critical-direction-sigma-arcsec") == ["4.5"]
+    assert _option_values(captured["cmd"], "--critical-arc-base-prob") == ["0.2"]
+    assert _option_values(captured["cmd"], "--critical-arc-max-prob") == ["0.7"]
+    assert _option_values(captured["cmd"], "--critical-arc-singular-threshold") == ["0.15"]
+    assert _option_values(captured["cmd"], "--critical-arc-singular-softness") == ["0.04"]
+    assert _option_values(captured["cmd"], "--critical-arc-lm-damping-relative") == ["0.002"]
+    assert _option_values(captured["cmd"], "--critical-arc-lm-damping-absolute") == ["1e-05"]
+    assert _option_values(captured["cmd"], "--critical-arc-lm-trust-radius-arcsec") == ["18.0"]
+    assert "--critical-arc-speed-mode" not in captured["cmd"]
+    assert "--critical-arc-mask-margin-softness" not in captured["cmd"]
+    assert _option_values(captured["cmd"], "--arc-aware-noncritical-support-radius-arcsec") == ["1.25"]
+    assert _option_values(captured["cmd"], "--arc-aware-max-arclength-arcsec") == ["12.0"]
+    assert _option_values(captured["cmd"], "--arc-aware-curve-step-arcsec") == ["0.2"]
+    assert run_dir == tmp_path / "solver" / "fit" / "stage4_critical_arc_mixture_image_plane"
+
+
+def test_validation_run_cluster_solver_forwards_fold_regularized_image_plane_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, cwd, check):
+        captured["cmd"] = list(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(validation.subprocess, "run", fake_run)
+    args = _validation_solver_args(
+        image_plane_mode=IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        sampling_engine="refreshing_surrogate",
+        fold_curvature_arcsec_inv=1.25,
+    )
+
+    run_dir = validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
+
+    assert _option_values(captured["cmd"], "--image-plane-mode") == [IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA]
+    assert _option_values(captured["cmd"], "--fold-curvature-arcsec-inv") == ["1.25"]
+    assert run_dir == tmp_path / "solver" / "fit" / "stage4_fold_regularized_image_plane"
 
 
 def test_validation_run_cluster_solver_forwards_quick_diagnostics(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -5469,6 +11870,25 @@ def test_validation_run_cluster_solver_forwards_quick_diagnostics(monkeypatch: p
     validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
 
     assert "--quick-diagnostics" in captured["cmd"]
+
+
+def test_validation_run_cluster_solver_forwards_exact_image_diagnostics_stage3(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, cwd, check):
+        captured["cmd"] = list(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(validation.subprocess, "run", fake_run)
+    args = _validation_solver_args(exact_image_diagnostics_stage3=True)
+
+    validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
+
+    assert "--exact-image-diagnostics-stage3" in captured["cmd"]
+    assert "--quick-diagnostics" not in captured["cmd"]
 
 
 def _touch_complete_stage(stage_dir: Path) -> None:
@@ -5773,7 +12193,7 @@ def test_validation_stage_recovery_metrics_accepts_single_direct_solver_run(
     _write_fake_stage_tables(
         solver_root,
         fit_method="ns",
-        likelihood=SAMPLE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE,
+        likelihood=SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
         sampler="numpyro_jaxns",
         runtime_sec=30.0,
         best_loglike=-5.0,
@@ -5793,7 +12213,7 @@ def test_validation_stage_recovery_metrics_accepts_single_direct_solver_run(
 
     assert [row["stage"] for row in rows] == ["fit"]
     assert rows[0]["fit_method"] == "ns"
-    assert rows[0]["sample_likelihood_mode"] == SAMPLE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE
+    assert rows[0]["sample_likelihood_mode"] == SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
 
 
 def test_validation_run_summary_text_formats_metrics_and_na_values(tmp_path: Path) -> None:
@@ -5875,7 +12295,7 @@ def test_solver_sequential_run_summary_txt_aggregates_existing_stages(tmp_path: 
     stage1 = root / "stage1_large_only"
     stage2 = root / "stage2_joint"
     missing_stage = root / "stage3_image_plane"
-    for stage, chi_square in [(stage1, 10.0), (stage2, 4.0)]:
+    for stage, headline_chi_square, arc_chi_square in [(stage1, 10.0, 8.0), (stage2, 4.0, 3.0)]:
         tables_dir = stage / "tables"
         tables_dir.mkdir(parents=True)
         (tables_dir / "run_summary.json").write_text(
@@ -5886,11 +12306,14 @@ def test_solver_sequential_run_summary_txt_aggregates_existing_stages(tmp_path: 
                     "sampler": "numpyro_nuts",
                     "n_families": 2,
                     "n_images": 6,
-                    "chi_square": chi_square,
-                    "dof": 3,
-                    "reduced_chi_square": chi_square / 3.0,
-                    "aic": chi_square + 6.0,
-                    "bic": chi_square + 7.0,
+                    "headline_chi_square": headline_chi_square,
+                    "headline_dof": 3,
+                    "headline_reduced_chi_square": headline_chi_square / 3.0,
+                    "arc_aware_chi_square": arc_chi_square,
+                    "arc_aware_dof": 4,
+                    "arc_aware_reduced_chi_square": arc_chi_square / 4.0,
+                    "arc_aware_arc_supported_image_count": 1,
+                    "arc_aware_missing_image_count": 2,
                     "ess_min": 12.0,
                     "rhat_max": 1.01,
                     "runtime_sec": 20.0,
@@ -5912,6 +12335,10 @@ def test_solver_sequential_run_summary_txt_aggregates_existing_stages(tmp_path: 
     assert "stage1_large_only" in text
     assert "stage2_joint" in text
     assert "stage3_image_plane" not in text
+    assert "headline_chi2" in text
+    assert "arc_chi2" in text
+    assert "AIC" not in text
+    assert "BIC" not in text
 
 
 def test_plot_run_summary_includes_nested_sampling_evidence() -> None:
@@ -6487,8 +12914,108 @@ def test_plot_bundle_round_trips_ns_diagnostics(tmp_path: Path) -> None:
     assert "samples" not in arrays["ns_diagnostics"]
 
 
+def test_plot_bundle_round_trips_cab_arc_arrays(tmp_path: Path) -> None:
+    packed = PackedLensSpec(
+        **{
+            field_name: np.asarray([], dtype=float)
+            for field_name in PackedLensSpec.__dataclass_fields__
+        }
+    )
+    family = FamilyData(
+        family_id="1",
+        z_source=2.0,
+        effective_z_source=2.0,
+        sigma_arcsec=0.2,
+        image_labels=["1.a", "1.b"],
+        x_obs=np.asarray([0.0, 1.0], dtype=float),
+        y_obs=np.asarray([0.0, 0.0], dtype=float),
+        reliability=np.asarray([1.0, 0.9], dtype=float),
+        arc_anchor_x=np.asarray([0.1, 1.0], dtype=float),
+        arc_anchor_y=np.asarray([0.2, 0.0], dtype=float),
+        arc_tangent_angle_rad=np.asarray([0.7, 0.0], dtype=float),
+        arc_curvature_arcsec_inv=np.asarray([0.08, 0.0], dtype=float),
+        arc_sigma_tangent_angle_rad=np.asarray([0.05, 0.001], dtype=float),
+        arc_sigma_curvature_arcsec_inv=np.asarray([0.02, 0.0001], dtype=float),
+        arc_reliability=np.asarray([0.8, 1.0], dtype=float),
+        arc_has_constraint=np.asarray([True, False], dtype=bool),
+    )
+    bin_item = cluster_solver.BinData(
+        effective_z_source=2.0,
+        family_ids=["1"],
+        family_index_per_image=np.asarray([0, 0], dtype=int),
+        x_obs=family.x_obs,
+        y_obs=family.y_obs,
+        sigma_per_image=np.asarray([0.2, 0.2], dtype=float),
+        reliability_per_image=family.reliability,
+        arc_anchor_x=family.arc_anchor_x,
+        arc_anchor_y=family.arc_anchor_y,
+        arc_tangent_angle_rad=family.arc_tangent_angle_rad,
+        arc_curvature_arcsec_inv=family.arc_curvature_arcsec_inv,
+        arc_sigma_tangent_angle_rad=family.arc_sigma_tangent_angle_rad,
+        arc_sigma_curvature_arcsec_inv=family.arc_sigma_curvature_arcsec_inv,
+        arc_reliability=family.arc_reliability,
+        arc_has_constraint=family.arc_has_constraint,
+    )
+    state = BuildState(
+        run_name="cab_run",
+        par_path="mock.par",
+        cosmo_config={"H0": 70.0},
+        z_lens=0.4,
+        sigma_arcsec=0.2,
+        parsed={},
+        parameter_specs=[],
+        base_components=[],
+        packed_lens_spec=packed,
+        family_data=[family],
+        bin_data=[bin_item],
+        lens_model_list=[],
+        reference=(0, 0.0, 0.0),
+        fit_mode="joint",
+        potfiles=[],
+        scaling_component_records=[],
+        previous_stage_best_values=None,
+        source_position_parameterization="direct",
+    )
+    results = PosteriorResults(
+        samples=np.empty((1, 0), dtype=float),
+        log_prob=np.asarray([-1.0], dtype=float),
+        accept_prob=np.empty((0,), dtype=float),
+        diverging=np.empty((0,), dtype=bool),
+        num_steps=np.empty((0,), dtype=float),
+        warmup_steps=0,
+        sample_steps=1,
+        num_chains=0,
+    )
+    path = tmp_path / "plot_bundle.h5"
+
+    cluster_solver._save_plot_bundle_h5(path, state, argparse.Namespace(foo="bar"), np.empty((0,), dtype=float), results)
+    loaded_state, _args, _arrays, _init_diag = cluster_solver._rebuild_state_from_h5(path)
+
+    loaded_family = loaded_state.family_data[0]
+    loaded_bin = loaded_state.bin_data[0]
+    np.testing.assert_allclose(loaded_family.arc_anchor_x, [0.1, 1.0])
+    np.testing.assert_allclose(loaded_family.arc_tangent_angle_rad, [0.7, 0.0])
+    assert loaded_family.arc_has_constraint.tolist() == [True, False]
+    np.testing.assert_allclose(loaded_bin.arc_curvature_arcsec_inv, [0.08, 0.0])
+    np.testing.assert_allclose(loaded_bin.arc_reliability, [0.8, 1.0])
+    assert loaded_bin.arc_has_constraint.tolist() == [True, False]
+
+
+def _expected_prefit_output_paths(realization_dir: Path) -> dict[str, Path]:
+    return {
+        "subhalo_shmf_plot": realization_dir / "subhalo_shmf.pdf",
+        "prefit_subhalo_spatial_distribution_plot": realization_dir / "prefit_subhalo_spatial_distribution.pdf",
+        "prefit_critical_lines_plot": realization_dir / "prefit_critical_lines.pdf",
+    }
+
+
 def test_validation_run_single_bcg_validation_logs_progress(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    def fake_generate(root, config):
+    call_order: list[str] = []
+    generated_configs: list[validation.SingleBCGMockConfig] = []
+
+    def fake_generate(root, config, progress_callback=None):
+        del progress_callback
+        generated_configs.append(config)
         paths = validation.MockClusterPaths(
             root=Path(root),
             par_path=Path(root) / "mock.par",
@@ -6500,7 +13027,13 @@ def test_validation_run_single_bcg_validation_logs_progress(monkeypatch: pytest.
         return paths, images, {"parameter_truth": {}}
 
     def fake_solver(par_path, output_dir, run_name, args):
+        call_order.append("solver")
         return Path(output_dir) / run_name / "stage3_image_plane"
+
+    def fake_prefit(truth, images, output_dir):
+        del truth, images
+        call_order.append("prefit")
+        return _expected_prefit_output_paths(Path(output_dir))
 
     def fake_recovery(
         run_dir,
@@ -6508,15 +13041,19 @@ def test_validation_run_single_bcg_validation_logs_progress(monkeypatch: pytest.
         mock_images_path,
         output_dir,
         posterior_diagnostic_draws,
-        posterior_diagnostic_workers=1,
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
+        critical_caustic_plot_grid_scale_arcsec=validation.DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC,
+        recovery_profile_draws=validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
         quick_diagnostics=False,
         progress_args=None,
         recovery_payload=None,
     ):
+        del recovery_profile_draws
+        call_order.append("recovery")
         return {"summary_plot": Path(output_dir) / "validation_summary.pdf"}
 
     monkeypatch.setattr(validation, "generate_single_bcg_mock", fake_generate)
+    monkeypatch.setattr(validation, "write_prefit_validation_diagnostics", fake_prefit)
     monkeypatch.setattr(validation, "_run_cluster_solver", fake_solver)
     monkeypatch.setattr(validation, "write_recovery_outputs", fake_recovery)
     monkeypatch.setattr(
@@ -6524,23 +13061,31 @@ def test_validation_run_single_bcg_validation_logs_progress(monkeypatch: pytest.
         "write_validation_run_summary",
         lambda _solver_run_dir, _truth_path, output_dir, run_name, seed: Path(output_dir) / "run_summary.txt",
     )
-    args = _validation_run_args(tmp_path, image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN)
+    args = _validation_run_args(
+        tmp_path,
+        image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+        bcg_position_prior_half_width_arcsec=2.0,
+    )
 
     outputs = validation.run_single_bcg_validation(args)
     validation._close_debug_log()
 
     root = tmp_path / "single_bcg" / "validation_log"
+    realization_dir = root / "seed_12345"
     assert outputs == [
         {
-            "summary_plot": root / "seed_12345" / "validation_summary.pdf",
+            **_expected_prefit_output_paths(realization_dir),
+            "summary_plot": realization_dir / "validation_summary.pdf",
             "results_json": root / "seed_12345_results.json",
         }
     ]
+    assert generated_configs[0].bcg_position_prior_half_width_arcsec == pytest.approx(2.0)
+    assert call_order == ["prefit", "solver", "recovery"]
     log_text = (tmp_path / "single_bcg" / "validation_log" / "run_debug.log").read_text(encoding="utf-8")
     assert "VALIDATION REALIZATION 1/1" in log_text
     assert "realization start" in log_text
     assert "mock complete images=2" in log_text
-    assert "recovery complete files=2" in log_text
+    assert "recovery complete files=5" in log_text
     assert "validation complete realizations=1" in log_text
 
 
@@ -6549,8 +13094,10 @@ def test_validation_run_single_bcg_validation_forwards_posterior_diagnostic_mode
     tmp_path: Path,
 ) -> None:
     captured_modes: list[str] = []
+    captured_profile_draws: list[int] = []
 
-    def fake_generate(root, config):
+    def fake_generate(root, config, progress_callback=None):
+        del progress_callback
         paths = validation.MockClusterPaths(
             root=Path(root),
             par_path=Path(root) / "mock.par",
@@ -6567,13 +13114,15 @@ def test_validation_run_single_bcg_validation_forwards_posterior_diagnostic_mode
         mock_images_path,
         output_dir,
         posterior_diagnostic_draws,
-        posterior_diagnostic_workers=1,
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
+        critical_caustic_plot_grid_scale_arcsec=validation.DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC,
+        recovery_profile_draws=validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
         quick_diagnostics=False,
         progress_args=None,
         recovery_payload=None,
     ):
         captured_modes.append(str(posterior_diagnostic_mode))
+        captured_profile_draws.append(int(recovery_profile_draws))
         return {"summary_plot": Path(output_dir) / "validation_summary.pdf"}
 
     monkeypatch.setattr(validation, "generate_single_bcg_mock", fake_generate)
@@ -6591,12 +13140,88 @@ def test_validation_run_single_bcg_validation_forwards_posterior_diagnostic_mode
     args = _validation_run_args(
         tmp_path,
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_APPROXIMATE,
+        recovery_profile_draws=32,
     )
 
     validation.run_single_bcg_validation(args)
     validation._close_debug_log()
 
     assert captured_modes == [validation.POSTERIOR_DIAGNOSTIC_MODE_APPROXIMATE]
+    assert captured_profile_draws == [32]
+
+
+def test_validation_run_single_bcg_validation_keeps_mock_and_plot_caustic_scales_separate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_mock_grid_scales: list[float] = []
+    captured_plot_grid_scales: list[float] = []
+    captured_mock_image_min_distances: list[tuple[float, float]] = []
+
+    def fake_generate(root, config, progress_callback=None):
+        del progress_callback
+        captured_mock_grid_scales.append(float(config.caustic_grid_scale_arcsec))
+        captured_mock_image_min_distances.append(
+            (
+                float(config.primary_image_min_distance_arcsec),
+                float(config.subhalo_image_min_distance_arcsec),
+            )
+        )
+        paths = validation.MockClusterPaths(
+            root=Path(root),
+            par_path=Path(root) / "mock.par",
+            image_catalog_path=Path(root) / "obs_arcs.cat",
+            truth_path=Path(root) / "truth.json",
+            mock_images_path=Path(root) / "mock_images.csv",
+        )
+        images = pd.DataFrame({"family_id": ["1"], "image_label": ["1.1"]})
+        return paths, images, {"parameter_truth": {}}
+
+    def fake_recovery(
+        _run_dir,
+        _truth_path,
+        _mock_images_path,
+        output_dir,
+        posterior_diagnostic_draws,
+        posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
+        critical_caustic_plot_grid_scale_arcsec=validation.DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC,
+        recovery_profile_draws=validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
+        quick_diagnostics=False,
+        progress_args=None,
+        recovery_payload=None,
+    ):
+        del posterior_diagnostic_draws, posterior_diagnostic_mode
+        del recovery_profile_draws, quick_diagnostics, progress_args, recovery_payload
+        captured_plot_grid_scales.append(float(critical_caustic_plot_grid_scale_arcsec))
+        return {"summary_plot": Path(output_dir) / "validation_summary.pdf"}
+
+    monkeypatch.setattr(validation, "generate_single_bcg_mock", fake_generate)
+    monkeypatch.setattr(
+        validation,
+        "_run_cluster_solver",
+        lambda _par_path, output_dir, run_name, _args: Path(output_dir) / run_name / "stage3_image_plane",
+    )
+    monkeypatch.setattr(validation, "write_recovery_outputs", fake_recovery)
+    monkeypatch.setattr(
+        validation,
+        "write_validation_run_summary",
+        lambda _solver_run_dir, _truth_path, output_dir, run_name, seed: Path(output_dir) / "run_summary.txt",
+    )
+    args = _validation_run_args(
+        tmp_path,
+        caustic_grid_scale_arcsec=0.5,
+        critical_caustic_plot_grid_scale_arcsec=0.2,
+        primary_image_min_distance_arcsec=2.75,
+        subhalo_image_min_distance_arcsec=0.9,
+    )
+
+    validation.run_single_bcg_validation(args)
+    validation._close_debug_log()
+
+    assert captured_mock_grid_scales == [pytest.approx(0.5)]
+    assert captured_mock_image_min_distances[0][0] == pytest.approx(2.75)
+    assert captured_mock_image_min_distances[0][1] == pytest.approx(0.9)
+    assert captured_plot_grid_scales == [pytest.approx(0.2)]
 
 
 def test_validation_run_single_bcg_validation_forwards_quick_diagnostics_to_recovery(
@@ -6605,7 +13230,8 @@ def test_validation_run_single_bcg_validation_forwards_quick_diagnostics_to_reco
 ) -> None:
     captured_quick: list[bool] = []
 
-    def fake_generate(root, config):
+    def fake_generate(root, config, progress_callback=None):
+        del progress_callback
         paths = validation.MockClusterPaths(
             root=Path(root),
             par_path=Path(root) / "mock.par",
@@ -6622,12 +13248,14 @@ def test_validation_run_single_bcg_validation_forwards_quick_diagnostics_to_reco
         mock_images_path,
         output_dir,
         posterior_diagnostic_draws,
-        posterior_diagnostic_workers=1,
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
+        critical_caustic_plot_grid_scale_arcsec=validation.DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC,
+        recovery_profile_draws=validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
         quick_diagnostics=False,
         progress_args=None,
         recovery_payload=None,
     ):
+        del recovery_profile_draws
         captured_quick.append(bool(quick_diagnostics))
         return {"summary_plot": Path(output_dir) / "validation_summary.pdf"}
 
@@ -6655,7 +13283,8 @@ def test_validation_run_single_bcg_validation_writes_stage3_recovery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    def fake_generate(root, config):
+    def fake_generate(root, config, progress_callback=None):
+        del progress_callback
         paths = validation.MockClusterPaths(
             root=Path(root),
             par_path=Path(root) / "mock.par",
@@ -6667,6 +13296,7 @@ def test_validation_run_single_bcg_validation_writes_stage3_recovery(
         return paths, images, {"parameter_truth": {}}
 
     recovery_calls: list[tuple[Path, Path]] = []
+    captured_profile_draws: list[int] = []
     artifact_checks: list[Path] = []
 
     def fake_recovery(
@@ -6675,13 +13305,15 @@ def test_validation_run_single_bcg_validation_writes_stage3_recovery(
         mock_images_path,
         output_dir,
         posterior_diagnostic_draws,
-        posterior_diagnostic_workers=1,
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
+        critical_caustic_plot_grid_scale_arcsec=validation.DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC,
+        recovery_profile_draws=validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
         quick_diagnostics=False,
         progress_args=None,
         recovery_payload=None,
     ):
         recovery_calls.append((Path(run_dir), Path(output_dir)))
+        captured_profile_draws.append(int(recovery_profile_draws))
         if recovery_payload is not None:
             recovery_payload.update(
                 {
@@ -6722,6 +13354,7 @@ def test_validation_run_single_bcg_validation_writes_stage3_recovery(
         tmp_path,
         image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
         write_stage3_recovery=True,
+        recovery_profile_draws=48,
     )
 
     outputs = validation.run_single_bcg_validation(args)
@@ -6735,8 +13368,10 @@ def test_validation_run_single_bcg_validation_writes_stage3_recovery(
         (final_run_dir, realization_dir),
         (stage3_run_dir, realization_dir / "stage3_recovery"),
     ]
+    assert captured_profile_draws == [48, 48]
     assert outputs == [
         {
+            **_expected_prefit_output_paths(realization_dir),
             "summary_plot": realization_dir / "validation_summary.pdf",
             "image_recovery_plot": realization_dir / "image_recovery.pdf",
             "stage3_summary_plot": realization_dir / "stage3_recovery" / "validation_summary.pdf",
@@ -6765,20 +13400,28 @@ def test_validation_resume_reuses_existing_mock(monkeypatch: pytest.MonkeyPatch,
         encoding="utf-8",
     )
     solver_calls: list[Path] = []
+    call_order: list[str] = []
 
     def fail_generate(*_args, **_kwargs):
         raise AssertionError("generate_single_bcg_mock should not run in resume mode with complete mock inputs")
 
+    def fake_prefit(truth, images, output_dir):
+        del truth, images
+        call_order.append("prefit")
+        return _expected_prefit_output_paths(Path(output_dir))
+
     def fake_solver(par_path, output_dir, run_name, args):
+        call_order.append("solver")
         solver_calls.append(Path(par_path))
         return Path(output_dir) / run_name / "stage2_joint"
 
     monkeypatch.setattr(validation, "generate_single_bcg_mock", fail_generate)
+    monkeypatch.setattr(validation, "write_prefit_validation_diagnostics", fake_prefit)
     monkeypatch.setattr(validation, "_run_cluster_solver", fake_solver)
     monkeypatch.setattr(
         validation,
         "write_recovery_outputs",
-        lambda _run_dir, _truth_path, _mock_images_path, output_dir, posterior_diagnostic_draws, posterior_diagnostic_workers=1, posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT, quick_diagnostics=False, progress_args=None, recovery_payload=None: {
+        lambda _run_dir, _truth_path, _mock_images_path, output_dir, posterior_diagnostic_draws, posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT, critical_caustic_plot_grid_scale_arcsec=validation.DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC, recovery_profile_draws=validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP, quick_diagnostics=False, progress_args=None, recovery_payload=None: {
             "summary_plot": Path(output_dir) / "validation_summary.pdf"
         },
     )
@@ -6793,9 +13436,11 @@ def test_validation_resume_reuses_existing_mock(monkeypatch: pytest.MonkeyPatch,
     validation._close_debug_log()
 
     assert solver_calls == [mock_dir / "single_bcg_mock.par"]
+    assert call_order == ["prefit", "solver"]
     root = tmp_path / "single_bcg" / "validation_log"
     assert outputs == [
         {
+            **_expected_prefit_output_paths(root / "seed_12345"),
             "summary_plot": root / "seed_12345" / "validation_summary.pdf",
             "results_json": root / "seed_12345_results.json",
         }
@@ -6839,12 +13484,14 @@ def test_validation_resume_refreshes_complete_realization_outputs(monkeypatch: p
         _mock_images_path,
         output_dir,
         posterior_diagnostic_draws,
-        posterior_diagnostic_workers=1,
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
+        critical_caustic_plot_grid_scale_arcsec=validation.DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC,
+        recovery_profile_draws=validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
         quick_diagnostics=False,
         progress_args=None,
         recovery_payload=None,
     ):
+        del recovery_profile_draws
         recovery_calls.append(Path(output_dir))
         return {"summary_plot": Path(output_dir) / "validation_summary.pdf"}
 
@@ -6865,6 +13512,7 @@ def test_validation_resume_refreshes_complete_realization_outputs(monkeypatch: p
     assert summary_calls == [realization_dir]
     assert outputs == [
         {
+            **_expected_prefit_output_paths(realization_dir),
             "summary_plot": realization_dir / "validation_summary.pdf",
             "results_json": tmp_path / "single_bcg" / "validation_log" / "seed_12345_results.json",
         }
@@ -6879,7 +13527,8 @@ def test_validation_quiet_suppresses_console_but_writes_debug_log(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    def fake_generate(root, config):
+    def fake_generate(root, config, progress_callback=None):
+        del progress_callback
         paths = validation.MockClusterPaths(
             root=Path(root),
             par_path=Path(root) / "mock.par",
@@ -6894,7 +13543,7 @@ def test_validation_quiet_suppresses_console_but_writes_debug_log(
     monkeypatch.setattr(
         validation,
         "write_recovery_outputs",
-        lambda _run_dir, _truth_path, _mock_images_path, output_dir, posterior_diagnostic_draws, posterior_diagnostic_workers=1, posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT, quick_diagnostics=False, progress_args=None, recovery_payload=None: {
+        lambda _run_dir, _truth_path, _mock_images_path, output_dir, posterior_diagnostic_draws, posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT, critical_caustic_plot_grid_scale_arcsec=validation.DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC, recovery_profile_draws=validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP, quick_diagnostics=False, progress_args=None, recovery_payload=None: {
             "summary_plot": Path(output_dir) / "validation_summary.pdf"
         },
     )
@@ -7043,6 +13692,119 @@ def test_local_jacobian_loglike_changes_with_off_diagonal_covariance() -> None:
     assert not np.isclose(float(diagonal), float(sheared))
 
 
+def test_jittered_2x2_covariance_det_stabilizes_rank_one_covariance() -> None:
+    c00, c11, det = _jittered_2x2_covariance_det(
+        jnp.asarray([1.0], dtype=jnp.float64),
+        jnp.asarray([1.0], dtype=jnp.float64),
+        jnp.asarray([1.0], dtype=jnp.float64),
+    )
+    inv00 = c11 / det
+    inv11 = c00 / det
+    inv01 = -jnp.asarray([1.0], dtype=jnp.float64) / det
+
+    assert float(c00[0]) > 1.0
+    assert float(c11[0]) > 1.0
+    assert float(det[0]) > cluster_solver.MIN_COVARIANCE_DETERMINANT_GUARD
+    assert np.isfinite(float(jnp.log(det[0])))
+    assert np.all(np.isfinite(np.asarray([inv00[0], inv01[0], inv11[0]])))
+
+
+class _TinyCriticalDetEvaluator:
+    def __init__(self, det_values: list[float]) -> None:
+        self.det_values = np.asarray(det_values, dtype=float)
+        self.fit_cosmology_flat_wcdm = False
+        self.traced_bin_data = (
+            SimpleNamespace(
+                effective_z_source=2.0,
+                family_ids=("1", "2"),
+                family_index_per_image=jnp.asarray([0, 0, 1], dtype=jnp.int32),
+                x_obs=jnp.asarray([10.0, 11.0, -5.0], dtype=jnp.float64),
+                y_obs=jnp.asarray([20.0, 21.0, 7.0], dtype=jnp.float64),
+                effective_z_index=0,
+            ),
+        )
+
+    def reported_physical_to_latent_parameter_vector(self, best_fit_physical):
+        return np.asarray(best_fit_physical, dtype=float)
+
+    def _physical_parameter_vector(self, params):
+        return jnp.asarray(params, dtype=jnp.float64)
+
+    def _build_packed_lens_state_with_validity_from_physical(self, _physical_params, _z_source, **_kwargs):
+        return {}, {"is_valid": jnp.asarray(True)}
+
+    def _lensing_jacobian_for_components(self, _z_source, _x_obs, _y_obs, _packed_state):
+        return (
+            jnp.asarray(self.det_values, dtype=jnp.float64),
+            jnp.zeros_like(jnp.asarray(self.det_values, dtype=jnp.float64)),
+            jnp.zeros_like(jnp.asarray(self.det_values, dtype=jnp.float64)),
+            jnp.ones_like(jnp.asarray(self.det_values, dtype=jnp.float64)),
+        )
+
+
+def _tiny_critical_det_state():
+    return SimpleNamespace(
+        parameter_specs=[],
+        family_data=[
+            FamilyData(
+                family_id="1",
+                z_source=2.0,
+                effective_z_source=2.0,
+                sigma_arcsec=0.1,
+                image_labels=["1.1", "1.2"],
+                x_obs=np.asarray([10.0, 11.0], dtype=float),
+                y_obs=np.asarray([20.0, 21.0], dtype=float),
+                reliability=np.ones(2, dtype=float),
+            ),
+            FamilyData(
+                family_id="2",
+                z_source=2.3,
+                effective_z_source=2.0,
+                sigma_arcsec=0.1,
+                image_labels=["2.1"],
+                x_obs=np.asarray([-5.0], dtype=float),
+                y_obs=np.asarray([7.0], dtype=float),
+                reliability=np.ones(1, dtype=float),
+            ),
+        ],
+    )
+
+
+def test_critical_det_diagnostic_flags_only_images_below_threshold() -> None:
+    result = cluster_solver._stage3_critical_det_diagnostic_from_evaluator(
+        _tiny_critical_det_state(),
+        _TinyCriticalDetEvaluator([5.0e-3, 2.0e-2, -9.0e-3]),
+        np.asarray([], dtype=float),
+        threshold=1.0e-2,
+    )
+
+    assert result.total_images == 3
+    assert result.min_abs_detA == pytest.approx(5.0e-3)
+    assert result.flagged["family_id"].tolist() == ["1", "2"]
+    assert result.flagged["image_label"].tolist() == ["1.1", "2.1"]
+    np.testing.assert_allclose(result.flagged["detA"].to_numpy(dtype=float), [5.0e-3, -9.0e-3])
+    np.testing.assert_allclose(result.flagged["abs_detA"].to_numpy(dtype=float), [5.0e-3, 9.0e-3])
+
+
+def test_critical_det_diagnostic_empty_table_has_headers(tmp_path: Path) -> None:
+    result = cluster_solver._stage3_critical_det_diagnostic_from_evaluator(
+        _tiny_critical_det_state(),
+        _TinyCriticalDetEvaluator([5.0e-3, 2.0e-2, -9.0e-3]),
+        np.asarray([], dtype=float),
+        threshold=1.0e-4,
+    )
+    table_path = cluster_solver._write_critical_det_diagnostic_table(
+        result,
+        tmp_path / "critical_det_images.csv",
+    )
+
+    assert result.flagged.empty
+    assert list(result.flagged.columns) == list(cluster_solver.CRITICAL_DET_DIAGNOSTIC_COLUMNS)
+    loaded = pd.read_csv(table_path)
+    assert loaded.empty
+    assert list(loaded.columns) == list(cluster_solver.CRITICAL_DET_DIAGNOSTIC_COLUMNS)
+
+
 def test_local_jacobian_loglike_stabilizes_near_singular_covariance() -> None:
     value = _local_jacobian_bin_loglike(
         beta_x=jnp.asarray([0.0, 0.01], dtype=jnp.float64),
@@ -7055,11 +13817,11 @@ def test_local_jacobian_loglike_stabilizes_near_singular_covariance() -> None:
         source_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
         scatter_var_x=jnp.zeros(2, dtype=jnp.float64),
         scatter_var_y=jnp.zeros(2, dtype=jnp.float64),
-        jac_a00=jnp.zeros(2, dtype=jnp.float64),
+        jac_a00=jnp.ones(2, dtype=jnp.float64),
         jac_a01=jnp.zeros(2, dtype=jnp.float64),
-        jac_a10=jnp.zeros(2, dtype=jnp.float64),
-        jac_a11=jnp.zeros(2, dtype=jnp.float64),
-        covariance_floor=1.0e-3,
+        jac_a10=jnp.ones(2, dtype=jnp.float64),
+        jac_a11=jnp.asarray([1.0e-12, 1.0e-12], dtype=jnp.float64),
+        covariance_floor=0.0,
         outlier_sigma_arcsec=100.0,
     )
 
@@ -7147,6 +13909,672 @@ def test_local_jacobian_student_t_loss_is_less_punitive_for_large_residual() -> 
     assert float(student_t) > float(gaussian)
 
 
+def test_forward_metric_image_plane_matches_linearized_identity_metric() -> None:
+    common = dict(
+        sigma_per_image=jnp.asarray([0.1, 0.2], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999, 0.999], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True]),
+        image_sigma_int=jnp.asarray(0.01, dtype=jnp.float64),
+        covariance_floor=1.0e-6,
+        outlier_sigma_arcsec=10.0,
+        residual_loss="gaussian",
+    )
+    forward = _forward_metric_image_plane_bin_loglike(
+        residual_beta_x=jnp.asarray([0.03, -0.02], dtype=jnp.float64),
+        residual_beta_y=jnp.asarray([0.01, 0.04], dtype=jnp.float64),
+        jac_a00=jnp.ones(2, dtype=jnp.float64),
+        jac_a01=jnp.zeros(2, dtype=jnp.float64),
+        jac_a10=jnp.zeros(2, dtype=jnp.float64),
+        jac_a11=jnp.ones(2, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(2, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(2, dtype=jnp.float64),
+        **common,
+    )
+    linearized = _linearized_image_plane_bin_loglike(
+        residual_x=jnp.asarray([0.03, -0.02], dtype=jnp.float64),
+        residual_y=jnp.asarray([0.01, 0.04], dtype=jnp.float64),
+        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
+        n_families=1,
+        image_presence_penalty_weight=0.0,
+        **common,
+    )
+
+    np.testing.assert_allclose(float(forward), float(linearized), rtol=1.0e-7, atol=1.0e-10)
+
+
+def test_fold_regularized_image_plane_matches_linearized_identity_with_zero_curvature() -> None:
+    common = dict(
+        sigma_per_image=jnp.asarray([0.1, 0.2], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.95, 0.80], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True]),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        covariance_floor=0.0,
+        outlier_sigma_arcsec=10.0,
+        residual_loss="gaussian",
+    )
+    residual_x = jnp.asarray([0.03, -0.02], dtype=jnp.float64)
+    residual_y = jnp.asarray([0.01, 0.04], dtype=jnp.float64)
+    fold_regularized = _fold_regularized_image_plane_bin_loglike(
+        residual_beta_x=residual_x,
+        residual_beta_y=residual_y,
+        jac_a00=jnp.ones(2, dtype=jnp.float64),
+        jac_a01=jnp.zeros(2, dtype=jnp.float64),
+        jac_a10=jnp.zeros(2, dtype=jnp.float64),
+        jac_a11=jnp.ones(2, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(2, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(2, dtype=jnp.float64),
+        fold_curvature_arcsec_inv=0.0,
+        max_gain=0.0,
+        max_residual_arcsec=0.0,
+        **common,
+    )
+    linearized = _linearized_image_plane_bin_loglike(
+        residual_x=residual_x,
+        residual_y=residual_y,
+        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
+        n_families=1,
+        image_presence_penalty_weight=0.0,
+        **common,
+    )
+
+    np.testing.assert_allclose(float(fold_regularized), float(linearized), rtol=1.0e-7, atol=1.0e-10)
+
+
+def _synthetic_fold_jacobian_entries(x: Any, y: Any) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    x_array = jnp.asarray(x, dtype=jnp.float64)
+    y_array = jnp.asarray(y, dtype=jnp.float64)
+    return (
+        0.08 + 0.30 * x_array + 0.05 * y_array,
+        0.02 + 0.07 * x_array - 0.03 * y_array,
+        -0.04 + 0.11 * y_array,
+        1.20 + 0.02 * x_array + 0.09 * y_array,
+    )
+
+
+def _reference_fold_signed_curvature(
+    x_obs: jnp.ndarray,
+    y_obs: jnp.ndarray,
+    observed_jacobian_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    fold_frame: tuple[jnp.ndarray, ...],
+) -> jnp.ndarray:
+    (
+        source_critical_x,
+        source_critical_y,
+        _source_noncritical_x,
+        _source_noncritical_y,
+        image_critical_x,
+        image_critical_y,
+        _image_noncritical_x,
+        _image_noncritical_y,
+        _singular_min,
+        _singular_max,
+        frame_finite,
+    ) = fold_frame
+    del observed_jacobian_entries
+    step = jnp.asarray(cluster_solver.DEFAULT_FOLD_CURVATURE_FINITE_DIFFERENCE_STEP_ARCSEC, dtype=jnp.float64)
+    plus_entries = _synthetic_fold_jacobian_entries(
+        x_obs + step * image_critical_x,
+        y_obs + step * image_critical_y,
+    )
+    minus_entries = _synthetic_fold_jacobian_entries(
+        x_obs - step * image_critical_x,
+        y_obs - step * image_critical_y,
+    )
+    da00_dcrit = (plus_entries[0] - minus_entries[0]) / (2.0 * step)
+    da01_dcrit = (plus_entries[1] - minus_entries[1]) / (2.0 * step)
+    da10_dcrit = (plus_entries[2] - minus_entries[2]) / (2.0 * step)
+    da11_dcrit = (plus_entries[3] - minus_entries[3]) / (2.0 * step)
+    d_a_v_x = da00_dcrit * image_critical_x + da01_dcrit * image_critical_y
+    d_a_v_y = da10_dcrit * image_critical_x + da11_dcrit * image_critical_y
+    kappa_eff = source_critical_x * d_a_v_x + source_critical_y * d_a_v_y
+    return jnp.where(frame_finite & jnp.isfinite(kappa_eff), kappa_eff, jnp.full_like(kappa_eff, jnp.nan))
+
+
+class _FoldCurvatureProbeEvaluator:
+    use_bulk_ray_shooting = True
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def _lensing_jacobian_for_components(
+        self,
+        z_source: float,
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        packed_state: dict[str, Any],
+        component_indices: np.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        del z_source, packed_state, component_indices
+        self.calls.append(int(jnp.asarray(x).shape[0]))
+        return _synthetic_fold_jacobian_entries(x, y)
+
+
+def test_fold_signed_curvature_packs_centered_difference_probes() -> None:
+    x_obs = jnp.asarray([-0.4, 0.1, 0.9], dtype=jnp.float64)
+    y_obs = jnp.asarray([0.2, -0.3, 0.7], dtype=jnp.float64)
+    observed_jacobian_entries = _synthetic_fold_jacobian_entries(x_obs, y_obs)
+    fold_frame = cluster_solver._fold_regularized_singular_frame_from_jacobian(*observed_jacobian_entries)
+    expected = _reference_fold_signed_curvature(x_obs, y_obs, observed_jacobian_entries, fold_frame)
+    fake = _FoldCurvatureProbeEvaluator()
+
+    actual = cluster_solver.ClusterJAXEvaluator._fold_signed_curvature_from_observed_jacobian(
+        fake,
+        2.0,
+        x_obs,
+        y_obs,
+        {},
+        observed_jacobian_entries,
+        fold_frame=fold_frame,
+        fill_value=1.0,
+    )
+
+    assert fake.calls == [2 * x_obs.shape[0]]
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1.0e-10, atol=1.0e-10)
+
+
+def test_fold_signed_curvature_skips_unconstrained_rows_without_changing_loglike() -> None:
+    x_obs = jnp.asarray([-0.5, 0.0, 0.6], dtype=jnp.float64)
+    y_obs = jnp.asarray([0.4, -0.2, 0.3], dtype=jnp.float64)
+    observed_jacobian_entries = _synthetic_fold_jacobian_entries(x_obs, y_obs)
+    fold_frame = cluster_solver._fold_regularized_singular_frame_from_jacobian(*observed_jacobian_entries)
+    expected_all = _reference_fold_signed_curvature(x_obs, y_obs, observed_jacobian_entries, fold_frame)
+    constrained_indices = jnp.asarray([0, 2], dtype=jnp.int32)
+    fake = _FoldCurvatureProbeEvaluator()
+
+    skipped = cluster_solver.ClusterJAXEvaluator._fold_signed_curvature_from_observed_jacobian(
+        fake,
+        2.0,
+        x_obs,
+        y_obs,
+        {},
+        observed_jacobian_entries,
+        fold_frame=fold_frame,
+        image_indices=constrained_indices,
+        fill_value=7.0,
+    )
+
+    assert fake.calls == [2 * constrained_indices.shape[0]]
+    np.testing.assert_allclose(np.asarray(skipped)[[0, 2]], np.asarray(expected_all)[[0, 2]], rtol=1.0e-10, atol=1.0e-10)
+    assert float(np.asarray(skipped)[1]) == pytest.approx(7.0)
+
+    common = dict(
+        residual_beta_x=jnp.asarray([0.05, 10.0, -0.04], dtype=jnp.float64),
+        residual_beta_y=jnp.asarray([-0.02, -10.0, 0.03], dtype=jnp.float64),
+        jac_a00=observed_jacobian_entries[0],
+        jac_a01=observed_jacobian_entries[1],
+        jac_a10=observed_jacobian_entries[2],
+        jac_a11=observed_jacobian_entries[3],
+        sigma_per_image=jnp.asarray([0.2, 0.2, 0.2], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.9, 0.9, 0.9], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, False, True]),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(3, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(3, dtype=jnp.float64),
+        covariance_floor=1.0e-6,
+        outlier_sigma_arcsec=10.0,
+        fold_curvature_arcsec_inv=7.0,
+        fold_frame=fold_frame,
+        max_gain=0.0,
+        max_residual_arcsec=0.0,
+        residual_loss="gaussian",
+    )
+    reference_loglike = _fold_regularized_image_plane_bin_loglike(
+        fold_kappa_eff=expected_all,
+        **common,
+    )
+    skipped_loglike = _fold_regularized_image_plane_bin_loglike(
+        fold_kappa_eff=skipped,
+        **common,
+    )
+
+    np.testing.assert_allclose(float(skipped_loglike), float(reference_loglike), rtol=1.0e-10, atol=1.0e-10)
+
+
+def test_fold_regularized_image_plane_exact_fold_uses_root_distance_exponent() -> None:
+    residual = 0.25
+    sigma = 1.0
+    curvature = 2.0
+    value = _fold_regularized_image_plane_bin_loglike(
+        residual_beta_x=jnp.asarray([residual], dtype=jnp.float64),
+        residual_beta_y=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a00=jnp.zeros(1, dtype=jnp.float64),
+        jac_a01=jnp.zeros(1, dtype=jnp.float64),
+        jac_a10=jnp.zeros(1, dtype=jnp.float64),
+        jac_a11=jnp.ones(1, dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([sigma], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([1.0], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True]),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(1, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(1, dtype=jnp.float64),
+        covariance_floor=0.0,
+        outlier_sigma_arcsec=1.0e-3,
+        fold_curvature_arcsec_inv=curvature,
+        fold_kappa_eff=jnp.asarray([curvature], dtype=jnp.float64),
+        max_gain=0.0,
+        max_residual_arcsec=0.0,
+        residual_loss="gaussian",
+    )
+
+    expected_quad = 2.0 * abs(residual) / (curvature * sigma**2)
+    expected = math.log(1.0 - 1.0e-6) - 0.5 * (expected_quad + 2.0 * math.log(2.0 * math.pi * sigma**2))
+    np.testing.assert_allclose(float(value), expected, rtol=1.0e-8, atol=1.0e-8)
+
+
+def test_fold_regularized_image_plane_does_not_include_source_plane_logdet() -> None:
+    residual = 0.25
+    sigma = 1.0
+    curvature = 2.0
+    value = _fold_regularized_image_plane_bin_loglike(
+        residual_beta_x=jnp.asarray([residual], dtype=jnp.float64),
+        residual_beta_y=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a00=jnp.zeros(1, dtype=jnp.float64),
+        jac_a01=jnp.zeros(1, dtype=jnp.float64),
+        jac_a10=jnp.zeros(1, dtype=jnp.float64),
+        jac_a11=jnp.ones(1, dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([sigma], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([1.0], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True]),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(1, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(1, dtype=jnp.float64),
+        covariance_floor=0.0,
+        outlier_sigma_arcsec=1.0e-3,
+        fold_curvature_arcsec_inv=curvature,
+        fold_kappa_eff=jnp.asarray([curvature], dtype=jnp.float64),
+        max_gain=0.0,
+        max_residual_arcsec=0.0,
+        residual_loss="gaussian",
+    )
+
+    expected_quad = 2.0 * abs(residual) / (curvature * sigma**2)
+    expected = math.log(1.0 - 1.0e-6) - 0.5 * (expected_quad + 2.0 * math.log(2.0 * math.pi * sigma**2))
+    pseudo_covariance_logdet_extra = -0.5 * math.log(0.5 * curvature * sigma**2 * abs(residual))
+    np.testing.assert_allclose(float(value), expected, rtol=1.0e-8, atol=1.0e-8)
+    assert not math.isclose(float(value), expected + pseudo_covariance_logdet_extra, rel_tol=1.0e-8, abs_tol=1.0e-8)
+
+
+def test_fold_regularized_image_plane_noncritical_residual_stays_quadratic() -> None:
+    residual = 0.20
+    sigma = 1.0
+    value = _fold_regularized_image_plane_bin_loglike(
+        residual_beta_x=jnp.asarray([0.0], dtype=jnp.float64),
+        residual_beta_y=jnp.asarray([residual], dtype=jnp.float64),
+        jac_a00=jnp.zeros(1, dtype=jnp.float64),
+        jac_a01=jnp.zeros(1, dtype=jnp.float64),
+        jac_a10=jnp.zeros(1, dtype=jnp.float64),
+        jac_a11=jnp.ones(1, dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([sigma], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([1.0], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True]),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(1, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(1, dtype=jnp.float64),
+        covariance_floor=0.0,
+        outlier_sigma_arcsec=1.0e-3,
+        fold_curvature_arcsec_inv=100.0,
+        fold_kappa_eff=jnp.asarray([100.0], dtype=jnp.float64),
+        max_gain=0.0,
+        max_residual_arcsec=0.0,
+        residual_loss="gaussian",
+    )
+
+    expected_quad = residual**2 / sigma**2
+    expected = math.log(1.0 - 1.0e-6) - 0.5 * (expected_quad + 2.0 * math.log(2.0 * math.pi * sigma**2))
+    np.testing.assert_allclose(float(value), expected, rtol=1.0e-10, atol=1.0e-10)
+
+
+def test_fold_regularized_image_plane_away_from_criticality_matches_forward_metric() -> None:
+    residual_x = jnp.asarray([0.03, -0.02], dtype=jnp.float64)
+    residual_y = jnp.asarray([0.01, 0.04], dtype=jnp.float64)
+    common = dict(
+        sigma_per_image=jnp.asarray([0.1, 0.2], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.95, 0.80], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True]),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(2, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(2, dtype=jnp.float64),
+        covariance_floor=1.0e-6,
+        outlier_sigma_arcsec=10.0,
+        max_gain=0.0,
+        max_residual_arcsec=0.0,
+        residual_loss="gaussian",
+    )
+    fold_regularized = _fold_regularized_image_plane_bin_loglike(
+        residual_beta_x=residual_x,
+        residual_beta_y=residual_y,
+        jac_a00=jnp.ones(2, dtype=jnp.float64),
+        jac_a01=jnp.zeros(2, dtype=jnp.float64),
+        jac_a10=jnp.zeros(2, dtype=jnp.float64),
+        jac_a11=jnp.ones(2, dtype=jnp.float64),
+        fold_curvature_arcsec_inv=2.0,
+        fold_kappa_eff=jnp.asarray([2.0, -3.0], dtype=jnp.float64),
+        **common,
+    )
+    forward = _forward_metric_image_plane_bin_loglike(
+        residual_beta_x=residual_x,
+        residual_beta_y=residual_y,
+        jac_a00=jnp.ones(2, dtype=jnp.float64),
+        jac_a01=jnp.zeros(2, dtype=jnp.float64),
+        jac_a10=jnp.zeros(2, dtype=jnp.float64),
+        jac_a11=jnp.ones(2, dtype=jnp.float64),
+        **common,
+    )
+
+    np.testing.assert_allclose(float(fold_regularized), float(forward), rtol=1.0e-6, atol=1.0e-7)
+
+
+def test_fold_regularized_image_plane_wrong_side_root_falls_back_to_forward_metric() -> None:
+    residual = -0.25
+    common = dict(
+        residual_beta_x=jnp.asarray([residual], dtype=jnp.float64),
+        residual_beta_y=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a00=jnp.zeros(1, dtype=jnp.float64),
+        jac_a01=jnp.zeros(1, dtype=jnp.float64),
+        jac_a10=jnp.zeros(1, dtype=jnp.float64),
+        jac_a11=jnp.ones(1, dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([1.0], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([1.0], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True]),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(1, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(1, dtype=jnp.float64),
+        covariance_floor=1.0e-6,
+        outlier_sigma_arcsec=1.0e-3,
+        max_gain=0.0,
+        max_residual_arcsec=0.0,
+        residual_loss="gaussian",
+    )
+    fold_regularized = _fold_regularized_image_plane_bin_loglike(
+        fold_curvature_arcsec_inv=2.0,
+        fold_kappa_eff=jnp.asarray([2.0], dtype=jnp.float64),
+        **common,
+    )
+    forward = _forward_metric_image_plane_bin_loglike(**common)
+
+    np.testing.assert_allclose(float(fold_regularized), float(forward), rtol=1.0e-10, atol=1.0e-10)
+
+
+def test_fold_regularized_image_plane_zero_jacobian_has_finite_value_and_gradient() -> None:
+    def loglike(rx):
+        return _fold_regularized_image_plane_bin_loglike(
+            residual_beta_x=jnp.asarray([rx], dtype=jnp.float64),
+            residual_beta_y=jnp.asarray([0.2], dtype=jnp.float64),
+            jac_a00=jnp.zeros(1, dtype=jnp.float64),
+            jac_a01=jnp.zeros(1, dtype=jnp.float64),
+            jac_a10=jnp.zeros(1, dtype=jnp.float64),
+            jac_a11=jnp.zeros(1, dtype=jnp.float64),
+            sigma_per_image=jnp.asarray([1.0], dtype=jnp.float64),
+            reliability_per_image=jnp.asarray([1.0], dtype=jnp.float64),
+            image_has_constraint=jnp.asarray([True]),
+            image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+            scatter_var_x=jnp.zeros(1, dtype=jnp.float64),
+            scatter_var_y=jnp.zeros(1, dtype=jnp.float64),
+            covariance_floor=1.0e-6,
+            outlier_sigma_arcsec=1.0e-3,
+            fold_curvature_arcsec_inv=1.0,
+            max_gain=0.0,
+            max_residual_arcsec=0.0,
+            residual_loss="gaussian",
+        )
+
+    value = loglike(jnp.asarray(0.1, dtype=jnp.float64))
+    grad = jax.grad(loglike)(jnp.asarray(0.1, dtype=jnp.float64))
+
+    assert np.isfinite(float(value))
+    assert np.isfinite(float(grad))
+
+
+def test_fold_regularized_image_plane_near_caustic_has_finite_value_and_gradient() -> None:
+    def loglike(rx):
+        return _fold_regularized_image_plane_bin_loglike(
+            residual_beta_x=jnp.asarray([rx], dtype=jnp.float64),
+            residual_beta_y=jnp.asarray([0.05], dtype=jnp.float64),
+            jac_a00=jnp.asarray([1.0e-3], dtype=jnp.float64),
+            jac_a01=jnp.zeros(1, dtype=jnp.float64),
+            jac_a10=jnp.zeros(1, dtype=jnp.float64),
+            jac_a11=jnp.ones(1, dtype=jnp.float64),
+            sigma_per_image=jnp.asarray([1.0], dtype=jnp.float64),
+            reliability_per_image=jnp.asarray([1.0], dtype=jnp.float64),
+            image_has_constraint=jnp.asarray([True]),
+            image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+            scatter_var_x=jnp.zeros(1, dtype=jnp.float64),
+            scatter_var_y=jnp.zeros(1, dtype=jnp.float64),
+            covariance_floor=1.0e-6,
+            outlier_sigma_arcsec=1.0e-3,
+            fold_curvature_arcsec_inv=2.0,
+            fold_kappa_eff=jnp.asarray([2.0], dtype=jnp.float64),
+            max_gain=0.0,
+            max_residual_arcsec=0.0,
+            residual_loss="gaussian",
+        )
+
+    value = loglike(jnp.asarray(0.1, dtype=jnp.float64))
+    grad = jax.grad(loglike)(jnp.asarray(0.1, dtype=jnp.float64))
+
+    assert np.isfinite(float(value))
+    assert np.isfinite(float(grad))
+
+
+def test_forward_metric_image_plane_adds_image_presence_penalty_from_forward_metric() -> None:
+    residual_beta_x = jnp.asarray([0.0, 0.03, 0.8], dtype=jnp.float64)
+    residual_beta_y = jnp.asarray([0.0, -0.02, 0.0], dtype=jnp.float64)
+    jac_a00 = jnp.asarray([2.0, 2.0, 2.0], dtype=jnp.float64)
+    jac_a01 = jnp.zeros(3, dtype=jnp.float64)
+    jac_a10 = jnp.zeros(3, dtype=jnp.float64)
+    jac_a11 = jnp.ones(3, dtype=jnp.float64)
+    family_idx = jnp.asarray([0, 0, 0], dtype=jnp.int32)
+    reliability = jnp.asarray([0.9, 0.9, 0.9], dtype=jnp.float64)
+    common = dict(
+        residual_beta_x=residual_beta_x,
+        residual_beta_y=residual_beta_y,
+        jac_a00=jac_a00,
+        jac_a01=jac_a01,
+        jac_a10=jac_a10,
+        jac_a11=jac_a11,
+        family_idx=family_idx,
+        n_families=1,
+        sigma_per_image=jnp.asarray([0.1, 0.1, 0.1], dtype=jnp.float64),
+        reliability_per_image=reliability,
+        image_has_constraint=jnp.asarray([True, True, True]),
+        image_sigma_int=jnp.asarray(0.01, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(3, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(3, dtype=jnp.float64),
+        covariance_floor=1.0e-6,
+        outlier_sigma_arcsec=10.0,
+        max_gain=0.0,
+        max_residual_arcsec=0.0,
+        residual_loss="gaussian",
+    )
+    zero_weight = _forward_metric_image_plane_bin_loglike(
+        image_presence_penalty_weight=0.0,
+        **common,
+    )
+    with_penalty = _forward_metric_image_plane_bin_loglike(
+        image_presence_penalty_weight=3.0,
+        image_presence_match_radius_arcsec=0.1,
+        image_presence_temperature_arcsec=0.05,
+        image_presence_count_softness=0.05,
+        image_presence_count_margin=0.0,
+        **common,
+    )
+    presence_residual2, presence_finite = _forward_metric_image_presence_residual2(
+        residual_beta_x,
+        residual_beta_y,
+        jac_a00,
+        jac_a01,
+        jac_a10,
+        jac_a11,
+        common["sigma_per_image"],
+        common["image_sigma_int"],
+        common["covariance_floor"],
+        max_gain=0.0,
+    )
+    expected_penalty = _soft_observed_image_presence_loglike_from_residual2(
+        residual2=presence_residual2,
+        family_idx=family_idx,
+        n_families=1,
+        reliability_per_image=reliability,
+        image_has_constraint=jnp.asarray([True, True, True]),
+        penalty_weight=3.0,
+        match_radius_arcsec=0.1,
+        temperature_arcsec=0.05,
+        count_softness=0.05,
+        count_margin=0.0,
+    )
+
+    assert bool(np.all(np.asarray(presence_finite)))
+    assert float(expected_penalty) < 0.0
+    np.testing.assert_allclose(
+        float(with_penalty),
+        float(zero_weight + expected_penalty),
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+
+
+def test_forward_metric_image_presence_residual_matches_identity_image_plane() -> None:
+    residual_x = jnp.asarray([0.02, -0.04, 0.10], dtype=jnp.float64)
+    residual_y = jnp.asarray([0.03, 0.05, -0.20], dtype=jnp.float64)
+    residual2, finite = _forward_metric_image_presence_residual2(
+        residual_x,
+        residual_y,
+        jac_a00=jnp.ones(3, dtype=jnp.float64),
+        jac_a01=jnp.zeros(3, dtype=jnp.float64),
+        jac_a10=jnp.zeros(3, dtype=jnp.float64),
+        jac_a11=jnp.ones(3, dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([0.10, 0.20, 0.30], dtype=jnp.float64),
+        image_sigma_int=jnp.asarray(0.01, dtype=jnp.float64),
+        covariance_floor=1.0e-6,
+        max_gain=0.0,
+    )
+
+    assert bool(np.all(np.asarray(finite)))
+    np.testing.assert_allclose(
+        np.asarray(residual2),
+        np.asarray(jnp.square(residual_x) + jnp.square(residual_y)),
+        rtol=1.0e-7,
+        atol=1.0e-12,
+    )
+
+
+def test_forward_metric_image_presence_is_finite_for_singular_jacobian() -> None:
+    value = _forward_metric_image_plane_bin_loglike(
+        residual_beta_x=jnp.asarray([0.1, -0.2], dtype=jnp.float64),
+        residual_beta_y=jnp.asarray([0.05, 0.3], dtype=jnp.float64),
+        jac_a00=jnp.zeros(2, dtype=jnp.float64),
+        jac_a01=jnp.zeros(2, dtype=jnp.float64),
+        jac_a10=jnp.zeros(2, dtype=jnp.float64),
+        jac_a11=jnp.zeros(2, dtype=jnp.float64),
+        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
+        n_families=1,
+        sigma_per_image=jnp.asarray([0.1, 0.1], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.9, 0.9], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True]),
+        image_sigma_int=jnp.asarray(0.01, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(2, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(2, dtype=jnp.float64),
+        covariance_floor=1.0e-6,
+        outlier_sigma_arcsec=10.0,
+        max_gain=0.0,
+        max_residual_arcsec=0.0,
+        residual_loss="gaussian",
+        image_presence_penalty_weight=3.0,
+        image_presence_match_radius_arcsec=0.1,
+        image_presence_temperature_arcsec=0.05,
+        image_presence_count_softness=0.05,
+        image_presence_count_margin=0.0,
+    )
+
+    assert np.isfinite(float(value))
+    assert float(value) > -1.0e20
+
+
+def test_forward_metric_image_presence_is_finite_for_near_rank_one_covariance() -> None:
+    value = _forward_metric_image_plane_bin_loglike(
+        residual_beta_x=jnp.asarray([0.1, -0.2], dtype=jnp.float64),
+        residual_beta_y=jnp.asarray([0.05, 0.3], dtype=jnp.float64),
+        jac_a00=jnp.ones(2, dtype=jnp.float64),
+        jac_a01=jnp.zeros(2, dtype=jnp.float64),
+        jac_a10=jnp.ones(2, dtype=jnp.float64),
+        jac_a11=jnp.asarray([1.0e-12, 1.0e-12], dtype=jnp.float64),
+        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
+        n_families=1,
+        sigma_per_image=jnp.asarray([0.1, 0.1], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.9, 0.9], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True]),
+        image_sigma_int=jnp.asarray(0.01, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(2, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(2, dtype=jnp.float64),
+        covariance_floor=0.0,
+        outlier_sigma_arcsec=10.0,
+        max_gain=0.0,
+        max_residual_arcsec=0.0,
+        residual_loss="gaussian",
+        image_presence_penalty_weight=3.0,
+        image_presence_match_radius_arcsec=0.1,
+        image_presence_temperature_arcsec=0.05,
+        image_presence_count_softness=0.05,
+        image_presence_count_margin=0.0,
+    )
+
+    assert np.isfinite(float(value))
+    assert float(value) > -1.0e20
+
+
+def test_forward_metric_image_plane_uses_current_jacobian_covariance() -> None:
+    common = dict(
+        residual_beta_x=jnp.asarray([0.2], dtype=jnp.float64),
+        residual_beta_y=jnp.asarray([0.1], dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([0.1], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True]),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(1, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(1, dtype=jnp.float64),
+        covariance_floor=1.0e-9,
+        outlier_sigma_arcsec=10.0,
+    )
+    identity = _forward_metric_image_plane_bin_loglike(
+        jac_a00=jnp.ones(1, dtype=jnp.float64),
+        jac_a01=jnp.zeros(1, dtype=jnp.float64),
+        jac_a10=jnp.zeros(1, dtype=jnp.float64),
+        jac_a11=jnp.ones(1, dtype=jnp.float64),
+        **common,
+    )
+    magnified = _forward_metric_image_plane_bin_loglike(
+        jac_a00=jnp.asarray([2.0], dtype=jnp.float64),
+        jac_a01=jnp.zeros(1, dtype=jnp.float64),
+        jac_a10=jnp.zeros(1, dtype=jnp.float64),
+        jac_a11=jnp.asarray([2.0], dtype=jnp.float64),
+        **common,
+    )
+
+    assert np.isfinite(float(magnified))
+    assert not np.isclose(float(identity), float(magnified))
+
+
+def test_forward_metric_image_plane_stabilizes_near_singular_covariance() -> None:
+    value = _forward_metric_image_plane_bin_loglike(
+        residual_beta_x=jnp.asarray([0.01], dtype=jnp.float64),
+        residual_beta_y=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a00=jnp.ones(1, dtype=jnp.float64),
+        jac_a01=jnp.zeros(1, dtype=jnp.float64),
+        jac_a10=jnp.ones(1, dtype=jnp.float64),
+        jac_a11=jnp.asarray([1.0e-12], dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([0.1], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.9], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True]),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(1, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(1, dtype=jnp.float64),
+        covariance_floor=0.0,
+        outlier_sigma_arcsec=10.0,
+    )
+
+    assert np.isfinite(float(value))
+
+
 def test_linearized_image_plane_residual_identity_jacobian() -> None:
     dx, dy, finite = _linearized_image_plane_residual_from_jacobian(
         f_x=jnp.asarray([0.2], dtype=jnp.float64),
@@ -7162,7 +14590,32 @@ def test_linearized_image_plane_residual_identity_jacobian() -> None:
     assert np.allclose(np.asarray(dy), [0.1])
 
 
+def test_linearized_image_plane_default_damped_inverse_is_finite_for_singular_jacobian() -> None:
+    dx, dy, finite = _linearized_image_plane_residual_from_jacobian(
+        f_x=jnp.asarray([1.0], dtype=jnp.float64),
+        f_y=jnp.asarray([-2.0], dtype=jnp.float64),
+        jac_a00=jnp.zeros(1, dtype=jnp.float64),
+        jac_a01=jnp.zeros(1, dtype=jnp.float64),
+        jac_a10=jnp.zeros(1, dtype=jnp.float64),
+        jac_a11=jnp.zeros(1, dtype=jnp.float64),
+    )
+
+    assert bool(np.asarray(finite)[0])
+    assert np.isfinite(float(np.asarray(dx)[0]))
+    assert np.isfinite(float(np.asarray(dy)[0]))
+    assert float(np.asarray(dx)[0]) == pytest.approx(0.0)
+    assert float(np.asarray(dy)[0]) == pytest.approx(0.0)
+
+
 def test_linearized_image_plane_damped_inverse_limits_near_critical_gain() -> None:
+    default_dx, _, default_finite = _linearized_image_plane_residual_from_jacobian(
+        f_x=jnp.asarray([1.0], dtype=jnp.float64),
+        f_y=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a00=jnp.asarray([1.0e-6], dtype=jnp.float64),
+        jac_a01=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a10=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a11=jnp.asarray([1.0], dtype=jnp.float64),
+    )
     dx, dy, finite = _linearized_image_plane_residual_from_jacobian(
         f_x=jnp.asarray([1.0], dtype=jnp.float64),
         f_y=jnp.asarray([0.0], dtype=jnp.float64),
@@ -7173,9 +14626,12 @@ def test_linearized_image_plane_damped_inverse_limits_near_critical_gain() -> No
         max_gain=50.0,
     )
 
+    assert bool(np.asarray(default_finite)[0])
+    assert np.isfinite(float(np.asarray(default_dx)[0]))
     assert bool(np.asarray(finite)[0])
     assert np.isfinite(float(np.asarray(dx)[0]))
     assert abs(float(np.asarray(dx)[0])) < 1.0
+    assert abs(float(np.asarray(dx)[0])) < 1.0e-3 * abs(float(np.asarray(default_dx)[0]))
     assert float(np.asarray(dy)[0]) == pytest.approx(0.0)
 
 
@@ -7194,6 +14650,142 @@ def test_linearized_image_plane_smooth_residual_cap_bounds_large_step() -> None:
     assert bool(np.asarray(finite)[0])
     assert radius <= 3.0 + 1.0e-10
     assert radius > 2.9
+
+
+def test_anchored_solved_image_plane_zero_residual_for_matching_source() -> None:
+    class FakeEvaluator:
+        anchored_image_plane_solve_steps = 3
+        anchored_image_plane_trust_radius_arcsec = 0.3
+        anchored_image_plane_lm_damping_relative = 1.0e-3
+        anchored_image_plane_lm_damping_absolute = 1.0e-6
+
+        def _ray_shooting_for_components(self, _z_source, x, y, _packed_state):
+            return x, y
+
+        def _lensing_jacobian_for_components(self, _z_source, x, y, _packed_state):
+            return jnp.ones_like(x), jnp.zeros_like(x), jnp.zeros_like(y), jnp.ones_like(y)
+
+    fake = FakeEvaluator()
+    residual_method = cluster_solver.ClusterJAXEvaluator._anchored_solved_image_plane_residuals_for_components.__get__(
+        fake,
+        FakeEvaluator,
+    )
+    x_obs = jnp.asarray([0.2, -0.4], dtype=jnp.float64)
+    y_obs = jnp.asarray([0.1, 0.3], dtype=jnp.float64)
+    dx, dy, finite = residual_method(2.0, x_obs, y_obs, x_obs, y_obs, {})
+
+    assert bool(np.all(np.asarray(finite)))
+    np.testing.assert_allclose(np.asarray(dx), np.zeros(2), atol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(dy), np.zeros(2), atol=1.0e-12)
+
+
+def test_anchored_solved_image_plane_improves_nonlinear_map_over_one_linear_step() -> None:
+    class FakeEvaluator:
+        anchored_image_plane_solve_steps = 3
+        anchored_image_plane_trust_radius_arcsec = 10.0
+        anchored_image_plane_lm_damping_relative = 1.0e-8
+        anchored_image_plane_lm_damping_absolute = 1.0e-12
+
+        def _ray_shooting_for_components(self, _z_source, x, y, _packed_state):
+            return x + x**2, y
+
+        def _lensing_jacobian_for_components(self, _z_source, x, y, _packed_state):
+            return 1.0 + 2.0 * x, jnp.zeros_like(x), jnp.zeros_like(y), jnp.ones_like(y)
+
+    fake = FakeEvaluator()
+    residual_method = cluster_solver.ClusterJAXEvaluator._anchored_solved_image_plane_residuals_for_components.__get__(
+        fake,
+        FakeEvaluator,
+    )
+    x_obs = jnp.asarray([0.5], dtype=jnp.float64)
+    y_obs = jnp.asarray([0.0], dtype=jnp.float64)
+    target_x = jnp.asarray([0.0], dtype=jnp.float64)
+    target_y = jnp.asarray([0.0], dtype=jnp.float64)
+    anchored_dx, anchored_dy, anchored_finite = residual_method(2.0, x_obs, y_obs, target_x, target_y, {})
+
+    beta_obs_x, beta_obs_y = fake._ray_shooting_for_components(2.0, x_obs, y_obs, {})
+    jacobian = fake._lensing_jacobian_for_components(2.0, x_obs, y_obs, {})
+    linear_dx, linear_dy, linear_finite = _linearized_image_plane_residual_from_jacobian(
+        beta_obs_x - target_x,
+        beta_obs_y - target_y,
+        *jacobian,
+        max_residual_arcsec=0.0,
+    )
+    linear_x = x_obs + linear_dx
+    linear_y = y_obs + linear_dy
+    anchored_x = x_obs + anchored_dx
+    anchored_y = y_obs + anchored_dy
+    linear_beta_x, linear_beta_y = fake._ray_shooting_for_components(2.0, linear_x, linear_y, {})
+    anchored_beta_x, anchored_beta_y = fake._ray_shooting_for_components(2.0, anchored_x, anchored_y, {})
+    linear_residual = float(np.hypot(np.asarray(linear_beta_x - target_x)[0], np.asarray(linear_beta_y - target_y)[0]))
+    anchored_residual = float(
+        np.hypot(np.asarray(anchored_beta_x - target_x)[0], np.asarray(anchored_beta_y - target_y)[0])
+    )
+
+    assert bool(np.asarray(linear_finite)[0])
+    assert bool(np.asarray(anchored_finite)[0])
+    assert anchored_residual < 0.2 * linear_residual
+
+
+def test_anchored_solved_image_plane_rank_deficient_jacobian_is_finite_and_bounded() -> None:
+    dx, dy, finite = _anchored_solved_image_plane_step_from_jacobian(
+        f_x=jnp.asarray([100.0], dtype=jnp.float64),
+        f_y=jnp.asarray([100.0], dtype=jnp.float64),
+        jac_a00=jnp.asarray([1.0], dtype=jnp.float64),
+        jac_a01=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a10=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a11=jnp.asarray([0.0], dtype=jnp.float64),
+        trust_radius_arcsec=0.3,
+        lm_damping_relative=1.0e-3,
+        lm_damping_absolute=1.0e-6,
+    )
+
+    radius = float(np.hypot(float(np.asarray(dx)[0]), float(np.asarray(dy)[0])))
+    assert bool(np.asarray(finite)[0])
+    assert np.isfinite(radius)
+    assert radius <= 0.3 + 1.0e-10
+
+
+def test_anchored_solved_image_plane_trust_radius_smoothly_bounds_step() -> None:
+    dx, dy, finite = _anchored_solved_image_plane_step_from_jacobian(
+        f_x=jnp.asarray([100.0], dtype=jnp.float64),
+        f_y=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a00=jnp.asarray([1.0], dtype=jnp.float64),
+        jac_a01=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a10=jnp.asarray([0.0], dtype=jnp.float64),
+        jac_a11=jnp.asarray([1.0], dtype=jnp.float64),
+        trust_radius_arcsec=0.3,
+        lm_damping_relative=1.0e-8,
+        lm_damping_absolute=1.0e-12,
+    )
+
+    radius = float(np.hypot(float(np.asarray(dx)[0]), float(np.asarray(dy)[0])))
+    assert bool(np.asarray(finite)[0])
+    assert radius <= 0.3 + 1.0e-10
+    assert radius > 0.29
+
+
+def test_anchored_solved_image_plane_student_t_and_presence_scoring_is_finite() -> None:
+    common = dict(
+        residual_x=jnp.asarray([2.0, 0.0], dtype=jnp.float64),
+        residual_y=jnp.asarray([0.0, 0.0], dtype=jnp.float64),
+        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
+        n_families=1,
+        sigma_per_image=jnp.asarray([0.1, 0.1], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999, 0.999], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True]),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        covariance_floor=0.0,
+        outlier_sigma_arcsec=1.0e-3,
+        image_presence_penalty_weight=2.0,
+        image_presence_match_radius_arcsec=0.3,
+        image_presence_temperature_arcsec=0.1,
+    )
+    gaussian = _linearized_image_plane_bin_loglike(residual_loss="gaussian", **common)
+    student_t = _linearized_image_plane_bin_loglike(residual_loss="student-t", student_t_nu=4.0, **common)
+
+    assert np.isfinite(float(student_t))
+    assert float(student_t) > float(gaussian)
 
 
 def test_linearized_image_plane_loglike_scores_zero_residual() -> None:
@@ -7215,7 +14807,7 @@ def test_linearized_image_plane_loglike_scores_zero_residual() -> None:
     assert float(value) > 0.0
 
 
-def test_image_plane_scatter_effective_sigma2_includes_floor() -> None:
+def test_image_plane_scatter_effective_sigma2_ignores_floor_argument() -> None:
     sigma2 = cluster_solver._image_plane_effective_sigma2(
         sigma_per_image=jnp.asarray([0.2], dtype=jnp.float64),
         image_sigma_int=jnp.asarray(0.1, dtype=jnp.float64),
@@ -7223,10 +14815,10 @@ def test_image_plane_scatter_effective_sigma2_includes_floor() -> None:
         image_scatter_floor_arcsec=0.3,
     )
 
-    assert np.asarray(sigma2).tolist() == pytest.approx([0.2**2 + 0.1**2 + 0.3**2 + 0.01])
+    assert np.asarray(sigma2).tolist() == pytest.approx([0.2**2 + 0.1**2 + 0.01])
 
 
-def test_linearized_image_plane_loglike_image_plane_scatter_floor_matches_intrinsic_scatter() -> None:
+def test_linearized_image_plane_loglike_image_plane_scatter_floor_is_support_only() -> None:
     common = dict(
         residual_x=jnp.asarray([0.12, -0.05], dtype=jnp.float64),
         residual_y=jnp.asarray([0.02, 0.09], dtype=jnp.float64),
@@ -7245,13 +14837,13 @@ def test_linearized_image_plane_loglike_image_plane_scatter_floor_matches_intrin
         image_scatter_floor_arcsec=0.3,
         **common,
     )
-    intrinsic_value = _linearized_image_plane_bin_loglike(
-        image_sigma_int=jnp.asarray(0.3, dtype=jnp.float64),
+    zero_floor_value = _linearized_image_plane_bin_loglike(
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
         image_scatter_floor_arcsec=0.0,
         **common,
     )
 
-    assert float(floor_value) == pytest.approx(float(intrinsic_value), abs=1.0e-12)
+    assert float(floor_value) == pytest.approx(float(zero_floor_value), abs=1.0e-12)
 
 
 def test_linearized_image_plane_student_t_loss_is_less_punitive_for_large_residual() -> None:
@@ -7280,68 +14872,6 @@ def test_linearized_image_plane_student_t_loss_is_less_punitive_for_large_residu
 
     assert np.isfinite(float(student_t))
     assert float(student_t) > float(gaussian)
-
-
-def test_linearized_marginal_beta_image_plane_uses_shared_max_gain() -> None:
-    common = dict(
-        beta_x=jnp.asarray([0.0, 1.0], dtype=jnp.float64),
-        beta_y=jnp.asarray([0.0, 0.0], dtype=jnp.float64),
-        jacobian_entries=(
-            jnp.asarray([1.0e-6, 1.0e-6], dtype=jnp.float64),
-            jnp.zeros(2, dtype=jnp.float64),
-            jnp.zeros(2, dtype=jnp.float64),
-            jnp.ones(2, dtype=jnp.float64),
-        ),
-        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
-        n_families=1,
-        sigma_per_image=jnp.asarray([0.1, 0.1], dtype=jnp.float64),
-        image_has_constraint=jnp.asarray([True, True]),
-        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
-        covariance_floor=0.0,
-        source_prior_mean_x=0.0,
-        source_prior_mean_y=0.0,
-        source_prior_sigma_arcsec=100.0,
-    )
-
-    raw = _linearized_marginal_beta_image_plane_bin_loglike(**common)
-    stabilized = _linearized_marginal_beta_image_plane_bin_loglike(max_gain=50.0, **common)
-
-    assert np.isfinite(float(stabilized))
-    assert float(stabilized) > float(raw)
-
-
-def test_linearized_marginal_beta_image_plane_scatter_floor_matches_intrinsic_scatter() -> None:
-    common = dict(
-        beta_x=jnp.asarray([0.0, 0.4], dtype=jnp.float64),
-        beta_y=jnp.asarray([0.0, -0.2], dtype=jnp.float64),
-        jacobian_entries=(
-            jnp.ones(2, dtype=jnp.float64),
-            jnp.zeros(2, dtype=jnp.float64),
-            jnp.zeros(2, dtype=jnp.float64),
-            jnp.ones(2, dtype=jnp.float64),
-        ),
-        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
-        n_families=1,
-        sigma_per_image=jnp.asarray([0.1, 0.2], dtype=jnp.float64),
-        image_has_constraint=jnp.asarray([True, True]),
-        covariance_floor=0.01,
-        source_prior_mean_x=0.0,
-        source_prior_mean_y=0.0,
-        source_prior_sigma_arcsec=1.2,
-    )
-
-    floor_value = _linearized_marginal_beta_image_plane_bin_loglike(
-        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
-        image_scatter_floor_arcsec=0.3,
-        **common,
-    )
-    intrinsic_value = _linearized_marginal_beta_image_plane_bin_loglike(
-        image_sigma_int=jnp.asarray(0.3, dtype=jnp.float64),
-        image_scatter_floor_arcsec=0.0,
-        **common,
-    )
-
-    assert float(floor_value) == pytest.approx(float(intrinsic_value), abs=1.0e-12)
 
 
 def test_soft_observed_image_presence_penalty_is_near_zero_for_present_images() -> None:
@@ -7422,173 +14952,6 @@ def test_soft_observed_image_presence_penalty_zero_weight_is_neutral() -> None:
     )
 
     assert float(value) == 0.0
-
-
-def test_linearized_marginal_beta_loglike_matches_numerical_gaussian_integration() -> None:
-    beta_x = np.asarray([0.0, 0.4], dtype=float)
-    beta_y = np.asarray([0.0, -0.2], dtype=float)
-    image_sigma = 0.3
-    prior_sigma = 1.2
-    prior_mean_x = 0.1
-    prior_mean_y = -0.05
-    analytic = _linearized_marginal_beta_image_plane_bin_loglike(
-        beta_x=jnp.asarray(beta_x, dtype=jnp.float64),
-        beta_y=jnp.asarray(beta_y, dtype=jnp.float64),
-        jacobian_entries=(
-            jnp.ones(2, dtype=jnp.float64),
-            jnp.zeros(2, dtype=jnp.float64),
-            jnp.zeros(2, dtype=jnp.float64),
-            jnp.ones(2, dtype=jnp.float64),
-        ),
-        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
-        n_families=1,
-        sigma_per_image=jnp.full((2,), image_sigma, dtype=jnp.float64),
-        image_has_constraint=jnp.asarray([True, True]),
-        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
-        covariance_floor=0.0,
-        source_prior_mean_x=prior_mean_x,
-        source_prior_mean_y=prior_mean_y,
-        source_prior_sigma_arcsec=prior_sigma,
-    )
-
-    grid = np.linspace(-6.0, 6.0, 501)
-    xx, yy = np.meshgrid(grid, grid, indexing="xy")
-    prior = np.exp(
-        -0.5 * (((xx - prior_mean_x) ** 2 + (yy - prior_mean_y) ** 2) / prior_sigma**2)
-    ) / (2.0 * np.pi * prior_sigma**2)
-    likelihood = np.ones_like(prior)
-    for obs_x, obs_y in zip(beta_x, beta_y, strict=True):
-        likelihood *= np.exp(-0.5 * (((obs_x - xx) ** 2 + (obs_y - yy) ** 2) / image_sigma**2)) / (
-            2.0 * np.pi * image_sigma**2
-        )
-    numerical = np.log(np.trapezoid(np.trapezoid(prior * likelihood, grid, axis=0), grid))
-
-    assert float(analytic) == pytest.approx(float(numerical), abs=5.0e-4)
-
-
-def test_linearized_marginal_beta_accepts_per_family_prior_means() -> None:
-    beta_x = jnp.asarray([0.0, 0.4, 2.0, 2.4], dtype=jnp.float64)
-    beta_y = jnp.asarray([0.0, -0.2, 1.0, 1.2], dtype=jnp.float64)
-    common = dict(
-        jacobian_entries=(
-            jnp.ones(4, dtype=jnp.float64),
-            jnp.zeros(4, dtype=jnp.float64),
-            jnp.zeros(4, dtype=jnp.float64),
-            jnp.ones(4, dtype=jnp.float64),
-        ),
-        sigma_per_image=jnp.full((4,), 0.3, dtype=jnp.float64),
-        image_has_constraint=jnp.asarray([True, True, True, True]),
-        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
-        covariance_floor=0.0,
-        source_prior_sigma_arcsec=0.7,
-    )
-
-    combined = _linearized_marginal_beta_image_plane_bin_loglike(
-        beta_x=beta_x,
-        beta_y=beta_y,
-        family_idx=jnp.asarray([0, 0, 1, 1], dtype=jnp.int32),
-        n_families=2,
-        source_prior_mean_x=jnp.asarray([0.1, 2.1], dtype=jnp.float64),
-        source_prior_mean_y=jnp.asarray([-0.1, 1.1], dtype=jnp.float64),
-        **common,
-    )
-    first = _linearized_marginal_beta_image_plane_bin_loglike(
-        beta_x=beta_x[:2],
-        beta_y=beta_y[:2],
-        jacobian_entries=tuple(entry[:2] for entry in common["jacobian_entries"]),
-        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
-        n_families=1,
-        sigma_per_image=common["sigma_per_image"][:2],
-        image_has_constraint=common["image_has_constraint"][:2],
-        image_sigma_int=common["image_sigma_int"],
-        covariance_floor=common["covariance_floor"],
-        source_prior_mean_x=0.1,
-        source_prior_mean_y=-0.1,
-        source_prior_sigma_arcsec=common["source_prior_sigma_arcsec"],
-    )
-    second = _linearized_marginal_beta_image_plane_bin_loglike(
-        beta_x=beta_x[2:],
-        beta_y=beta_y[2:],
-        jacobian_entries=tuple(entry[2:] for entry in common["jacobian_entries"]),
-        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
-        n_families=1,
-        sigma_per_image=common["sigma_per_image"][2:],
-        image_has_constraint=common["image_has_constraint"][2:],
-        image_sigma_int=common["image_sigma_int"],
-        covariance_floor=common["covariance_floor"],
-        source_prior_mean_x=2.1,
-        source_prior_mean_y=1.1,
-        source_prior_sigma_arcsec=common["source_prior_sigma_arcsec"],
-    )
-
-    assert float(combined) == pytest.approx(float(first + second), abs=1.0e-12)
-
-
-def test_linearized_marginal_beta_broad_prior_matches_profiled_shape_with_prior_volume_penalty() -> None:
-    beta_x = np.asarray([0.0, 0.4], dtype=float)
-    beta_y = np.asarray([0.0, -0.2], dtype=float)
-    image_sigma = 0.3
-    prior_sigma = 1.0e6
-    value = _linearized_marginal_beta_image_plane_bin_loglike(
-        beta_x=jnp.asarray(beta_x, dtype=jnp.float64),
-        beta_y=jnp.asarray(beta_y, dtype=jnp.float64),
-        jacobian_entries=(
-            jnp.ones(2, dtype=jnp.float64),
-            jnp.zeros(2, dtype=jnp.float64),
-            jnp.zeros(2, dtype=jnp.float64),
-            jnp.ones(2, dtype=jnp.float64),
-        ),
-        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
-        n_families=1,
-        sigma_per_image=jnp.full((2,), image_sigma, dtype=jnp.float64),
-        image_has_constraint=jnp.asarray([True, True]),
-        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
-        covariance_floor=0.0,
-        source_prior_mean_x=0.0,
-        source_prior_mean_y=0.0,
-        source_prior_sigma_arcsec=prior_sigma,
-    )
-
-    profiled_x = float(np.mean(beta_x))
-    profiled_y = float(np.mean(beta_y))
-    image_sigma2 = image_sigma**2
-    profiled_loglike = float(
-        np.sum(
-            -0.5
-            * (
-                ((beta_x - profiled_x) ** 2 + (beta_y - profiled_y) ** 2) / image_sigma2
-                + 2.0 * np.log(2.0 * np.pi * image_sigma2)
-            )
-        )
-    )
-    prior_volume_penalty = -0.5 * (2.0 * np.log(prior_sigma**2) + 2.0 * np.log(len(beta_x) / image_sigma2))
-
-    assert float(value) == pytest.approx(profiled_loglike + prior_volume_penalty, abs=1.0e-5)
-
-
-def test_linearized_marginal_beta_near_singular_jacobian_stays_finite() -> None:
-    value = _linearized_marginal_beta_image_plane_bin_loglike(
-        beta_x=jnp.asarray([0.0, 1.0e-8], dtype=jnp.float64),
-        beta_y=jnp.asarray([0.0, -1.0e-8], dtype=jnp.float64),
-        jacobian_entries=(
-            jnp.asarray([1.0e-12, 1.0e-12], dtype=jnp.float64),
-            jnp.zeros(2, dtype=jnp.float64),
-            jnp.zeros(2, dtype=jnp.float64),
-            jnp.ones(2, dtype=jnp.float64),
-        ),
-        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
-        n_families=1,
-        sigma_per_image=jnp.full((2,), 0.15, dtype=jnp.float64),
-        image_has_constraint=jnp.asarray([True, True]),
-        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
-        covariance_floor=1.0e-6,
-        source_prior_mean_x=0.0,
-        source_prior_mean_y=0.0,
-        source_prior_sigma_arcsec=20.0,
-    )
-
-    assert np.isfinite(float(value))
-    assert float(value) < 1.0e6
 
 
 def test_linearized_image_plane_off_diagonal_jacobian_changes_residual() -> None:
@@ -7715,6 +15078,35 @@ def test_image_match_diagnostics_counts_extra_model_images() -> None:
     np.testing.assert_allclose(diagnostics["extra_model_y_arcsec"], np.asarray([5.0], dtype=float))
 
 
+def test_image_match_diagnostics_recovers_all_observed_with_extra_model_images() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    evaluator.match_tolerance_arcsec = 0.2
+    family = SimpleNamespace(
+        family_id="1",
+        n_images=3,
+        x_obs=np.asarray([0.0, 1.0, 2.0], dtype=float),
+        y_obs=np.asarray([0.0, 0.0, 0.0], dtype=float),
+    )
+
+    diagnostics = evaluator._image_match_diagnostics(
+        np.asarray([0.01, 1.02, 2.03, 8.0, -9.0], dtype=float),
+        np.asarray([0.01, 0.02, 0.03, 1.0, -1.0], dtype=float),
+        family,
+    )
+
+    assert diagnostics["produced_image_count"] == 5
+    assert diagnostics["recovered_image_count"] == 3
+    assert diagnostics["missing_image_count"] == 0
+    assert diagnostics["extra_image_count"] == 2
+    assert diagnostics["multiplicity_failed"] is True
+    assert diagnostics["multiplicity_failure_reason"] == "extra_model_images"
+    np.testing.assert_array_equal(diagnostics["recovered_image_mask"], np.asarray([True, True, True], dtype=bool))
+    np.testing.assert_allclose(diagnostics["matched_model_x_arcsec"], np.asarray([0.01, 1.02, 2.03], dtype=float))
+    np.testing.assert_allclose(diagnostics["matched_model_y_arcsec"], np.asarray([0.01, 0.02, 0.03], dtype=float))
+    np.testing.assert_allclose(diagnostics["extra_model_x_arcsec"], np.asarray([8.0, -9.0], dtype=float))
+    np.testing.assert_allclose(diagnostics["extra_model_y_arcsec"], np.asarray([1.0, -1.0], dtype=float))
+
+
 def test_image_match_diagnostics_counts_missing_model_images() -> None:
     evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
     evaluator.match_tolerance_arcsec = 0.2
@@ -7771,6 +15163,47 @@ def test_image_match_diagnostics_counts_partial_same_multiplicity_match_failure(
     np.testing.assert_allclose(diagnostics["matched_model_y_arcsec"], np.asarray([0.01, np.nan], dtype=float))
     np.testing.assert_allclose(diagnostics["extra_model_x_arcsec"], np.asarray([4.0], dtype=float))
     np.testing.assert_allclose(diagnostics["extra_model_y_arcsec"], np.asarray([0.0], dtype=float))
+
+
+def test_exact_image_solver_uses_family_bounding_box_search_center() -> None:
+    captured_kwargs: list[dict[str, Any]] = []
+
+    class FakeSolver:
+        def image_position_from_source(self, _source_x, _source_y, _kwargs_lens, **kwargs):
+            captured_kwargs.append(dict(kwargs))
+            return np.asarray([0.0], dtype=float), np.asarray([0.0], dtype=float)
+
+    evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    evaluator.timing_totals = {}
+    evaluator._get_exact_model_solver = lambda _z_source: (object(), FakeSolver())
+    evaluator._packed_to_kwargs_lens = lambda _packed_state: []
+    family = FamilyData(
+        family_id="1",
+        z_source=2.0,
+        effective_z_source=2.0,
+        sigma_arcsec=0.1,
+        image_labels=["1.a", "1.b", "1.c", "1.d", "1.e"],
+        x_obs=np.asarray([7.9, -19.9, -22.2, 9.5, 0.6], dtype=float),
+        y_obs=np.asarray([-26.4, 13.1, -0.3, 12.6, 0.9], dtype=float),
+        reliability=np.ones(5, dtype=float),
+    )
+
+    x_pred, y_pred = evaluator._solve_exact_images_lenstronomy(
+        family,
+        packed_state={},
+        source_x=1.2,
+        source_y=-3.4,
+    )
+
+    assert x_pred.tolist() == [0.0]
+    assert y_pred.tolist() == [0.0]
+    assert len(captured_kwargs) == 1
+    kwargs = captured_kwargs[0]
+    assert kwargs["solver"] == "lenstronomy"
+    assert kwargs["min_distance"] == pytest.approx(0.2)
+    assert kwargs["search_window"] == pytest.approx(family.search_window)
+    assert kwargs["x_center"] == pytest.approx(0.5 * (np.min(family.x_obs) + np.max(family.x_obs)))
+    assert kwargs["y_center"] == pytest.approx(0.5 * (np.min(family.y_obs) + np.max(family.y_obs)))
 
 
 def test_exact_family_prediction_details_reports_solver_failure_counts() -> None:
@@ -7858,12 +15291,9 @@ def test_family_source_summary_handles_zero_measurement_and_source_scatter() -> 
     }
     evaluator.surrogate_enabled = False
     evaluator.source_plane_covariance_floor = 1.0e-6
-    evaluator.sample_likelihood_mode = SAMPLE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE
-    evaluator.evidence_source_prior_mean_x_arcsec = 0.0
-    evaluator.evidence_source_prior_mean_y_arcsec = 0.0
-    evaluator.evidence_source_prior_sigma_arcsec = 1000.0
+    evaluator.sample_likelihood_mode = SAMPLE_LIKELIHOOD_SOURCE
     evaluator.likelihood_stabilizer_max_gain = 0.0
-    evaluator.image_plane_scatter_floor_arcsec = 0.0
+    evaluator.image_plane_scatter_floor_arcsec = 1.0e-3
     evaluator._fit_component_indices = lambda: None
     evaluator._physical_parameter_vector = lambda params: params
     evaluator._source_sigma_int_numpy = lambda _params: 0.0
@@ -7929,7 +15359,7 @@ def test_exact_family_prediction_handles_zero_measurement_sigma() -> None:
     evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
     evaluator.validation_cache = {"1": cache}
     evaluator.source_plane_covariance_floor = 1.0e-6
-    evaluator.sample_likelihood_mode = SAMPLE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE
+    evaluator.sample_likelihood_mode = SAMPLE_LIKELIHOOD_SOURCE
     evaluator.timing_totals = {"exact_solver": 0.0}
     evaluator._get_exact_model_solver = lambda _z_source: (FakeModel(), solver)
     evaluator._build_packed_lens_state = lambda _params, _z_source: {}
@@ -7988,7 +15418,7 @@ def test_sequential_skips_stage3_when_image_plane_mode_none(monkeypatch: pytest.
     assert "stage3=disabled" in str(banners[0][1])
 
 
-def test_sequential_fit_cosmology_defaults_to_final_local_jacobian_stage(
+def test_sequential_fit_cosmology_applies_only_to_image_plane_local_jacobian_stage(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -8016,7 +15446,6 @@ def test_sequential_fit_cosmology_defaults_to_final_local_jacobian_stage(
         image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
         fit_mode="sequential",
         fit_cosmology_flat_wcdm=True,
-        fit_cosmology_all_stages=False,
     )
 
     cluster_solver._run_sequential(args)
@@ -8027,10 +15456,14 @@ def test_sequential_fit_cosmology_defaults_to_final_local_jacobian_stage(
         ("fit/stage3_image_plane", True),
     ]
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
-    assert summary["fit_cosmology_all_stages"] is False
+    assert summary["fit_cosmology_flat_wcdm"] is True
+    assert summary["stage_cosmology_fit"] == {"stage1": False, "stage2": False, "stage3": True, "stage4": False}
+    assert summary["sequential_fiducial_cosmology_config"]["H0"] == pytest.approx(70.0)
+    assert summary["sequential_fiducial_cosmology_config"]["Om0"] == pytest.approx(0.3)
+    assert "fit_cosmology_all_stages" not in summary
 
 
-def test_sequential_fit_cosmology_defaults_to_final_linearized_stage(
+def test_sequential_fit_cosmology_applies_only_to_stage3_and_linearized_stage4(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -8060,7 +15493,6 @@ def test_sequential_fit_cosmology_defaults_to_final_linearized_stage(
         skip_stage3_image_plane_local_jacobian=False,
         fit_mode="sequential",
         fit_cosmology_flat_wcdm=True,
-        fit_cosmology_all_stages=False,
     )
 
     cluster_solver._run_sequential(args)
@@ -8068,7 +15500,7 @@ def test_sequential_fit_cosmology_defaults_to_final_linearized_stage(
     assert calls == [
         ("fit/stage1_large_only", False),
         ("fit/stage2_joint", False),
-        ("fit/stage3_image_plane", False),
+        ("fit/stage3_image_plane", True),
         ("fit/stage4_linearized_image_plane", True),
     ]
 
@@ -8119,7 +15551,7 @@ def test_sequential_applies_stage_max_tree_depth_controls(
     assert summary["stage_fit_controls"]["stage4"]["max_tree_depth"] == 6
 
 
-def test_sequential_fit_cosmology_all_stages_local_jacobian(
+def test_sequential_without_fit_cosmology_leaves_local_jacobian_stages_fixed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -8146,22 +15578,22 @@ def test_sequential_fit_cosmology_all_stages_local_jacobian(
         samples=[5, 5],
         image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
         fit_mode="sequential",
-        fit_cosmology_flat_wcdm=True,
-        fit_cosmology_all_stages=True,
+        fit_cosmology_flat_wcdm=False,
     )
 
     cluster_solver._run_sequential(args)
 
     assert calls == [
-        ("fit/stage1_large_only", True),
-        ("fit/stage2_joint", True),
-        ("fit/stage3_image_plane", True),
+        ("fit/stage1_large_only", False),
+        ("fit/stage2_joint", False),
+        ("fit/stage3_image_plane", False),
     ]
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
-    assert summary["fit_cosmology_all_stages"] is True
+    assert summary["fit_cosmology_flat_wcdm"] is False
+    assert "fit_cosmology_all_stages" not in summary
 
 
-def test_sequential_fit_cosmology_all_stages_linearized(
+def test_sequential_without_fit_cosmology_leaves_linearized_stages_fixed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -8190,21 +15622,65 @@ def test_sequential_fit_cosmology_all_stages_linearized(
         image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
         skip_stage3_image_plane_local_jacobian=False,
         fit_mode="sequential",
-        fit_cosmology_flat_wcdm=True,
-        fit_cosmology_all_stages=True,
+        fit_cosmology_flat_wcdm=False,
     )
 
     cluster_solver._run_sequential(args)
 
     assert calls == [
-        ("fit/stage1_large_only", True),
-        ("fit/stage2_joint", True),
-        ("fit/stage3_image_plane", True),
-        ("fit/stage4_linearized_image_plane", True),
+        ("fit/stage1_large_only", False),
+        ("fit/stage2_joint", False),
+        ("fit/stage3_image_plane", False),
+        ("fit/stage4_linearized_image_plane", False),
     ]
 
 
-def test_stage2_cosmology_initializes_from_stage1_summary_in_all_stage_mode(
+def test_sequential_passes_direct_nuts_to_stage4(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_run_single_stage(args, _fit_mode, run_name, **_kwargs):
+        calls.append((run_name, str(args.fit_method)))
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={}, means={}, stds={}),
+    )
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {})
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {})
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts", "nuts"],
+        warmup=[10, 10, 5],
+        samples=[5, 5, 3],
+        image_plane_mode=IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        sampling_engine="full",
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+        skip_stage3_image_plane_local_jacobian=False,
+        fit_mode="sequential",
+        fit_cosmology_flat_wcdm=False,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert calls == [
+        ("fit/stage1_large_only", "svi"),
+        ("fit/stage2_joint", "svi+nuts"),
+        ("fit/stage3_image_plane", "svi+nuts"),
+        ("fit/stage4_critical_arc_mixture_image_plane", "nuts"),
+    ]
+
+
+def test_stage2_cosmology_initializes_from_stage1_summary_when_fit_cosmology_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -8215,7 +15691,6 @@ def test_stage2_cosmology_initializes_from_stage1_summary_in_all_stage_mode(
             "--par-path",
             "data/clustersim/input.par",
             "--fit-cosmology-flat-wcdm",
-            "--fit-cosmology-all-stages",
         ],
     )
     args = _parse_args()
@@ -8237,6 +15712,37 @@ def test_stage2_cosmology_initializes_from_stage1_summary_in_all_stage_mode(
     assert state.svi_init_values is not None
     assert state.svi_init_values[cluster_solver.COSMOLOGY_OM0_SAMPLE_NAME] == pytest.approx(0.42)
     assert state.svi_init_values[cluster_solver.COSMOLOGY_W0_SAMPLE_NAME] == pytest.approx(-0.75)
+
+
+def test_sequential_stage12_cosmology_override_uses_fiducial_fixed_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--fit-cosmology-flat-wcdm",
+        ],
+    )
+    args = _parse_args()
+    stage_args = cluster_solver._clone_args(
+        args,
+        fit_cosmology_flat_wcdm=False,
+        cosmology_init_om0=None,
+        cosmology_init_w0=None,
+        cosmology_config_override=cluster_solver._sequential_fiducial_cosmology_config(),
+    )
+
+    state = cluster_solver._build_state_from_inputs(stage_args, fit_mode_override="large-only")
+
+    assert state.fit_cosmology_flat_wcdm is False
+    assert state.cosmo_config["class"] == "FlatLambdaCDM"
+    assert state.cosmo_config["H0"] == pytest.approx(70.0)
+    assert state.cosmo_config["Om0"] == pytest.approx(0.3)
+    assert all(spec.component_family != "cosmology" for spec in state.parameter_specs)
 
 
 def test_sequential_resume_skips_completed_stage1_and_runs_stage2(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -8273,6 +15779,61 @@ def test_sequential_resume_skips_completed_stage1_and_runs_stage2(monkeypatch: p
 
     assert rerenders == [tmp_path / "fit" / "stage1_large_only"]
     assert calls == ["fit/stage2_joint"]
+
+
+def test_sequential_resume_reruns_stage1_with_old_cosmology_sampled_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, bool, dict[str, Any] | None]] = []
+    rerenders: list[Path] = []
+    _touch_complete_stage(tmp_path / "fit" / "stage1_large_only")
+    (tmp_path / "fit" / "stage1_large_only" / "tables" / "run_summary.json").write_text(
+        json.dumps({"fit_cosmology_flat_wcdm": True}),
+        encoding="utf-8",
+    )
+
+    def fake_run_single_stage(args, fit_mode, run_name, **_kwargs):
+        calls.append(
+            (
+                run_name,
+                bool(getattr(args, "fit_cosmology_flat_wcdm", False)),
+                getattr(args, "cosmology_config_override", None),
+            )
+        )
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_rerender_plots", lambda _args, run_dir: rerenders.append(Path(run_dir)))
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={}, means={}, stds={}),
+    )
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method="svi+nuts",
+        warmup=2000,
+        samples=250,
+        image_plane_mode=IMAGE_PLANE_MODE_NONE,
+        fit_mode="sequential",
+        resume=True,
+        skip_plots=False,
+        fit_cosmology_flat_wcdm=True,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert rerenders == []
+    assert [(item[0], item[1]) for item in calls] == [
+        ("fit/stage1_large_only", False),
+        ("fit/stage2_joint", False),
+    ]
+    assert calls[0][2]["H0"] == pytest.approx(70.0)
+    assert calls[0][2]["Om0"] == pytest.approx(0.3)
 
 
 def test_sequential_resume_finalizes_checkpointed_stage1_and_runs_stage2(
@@ -8452,7 +16013,7 @@ def test_evidence_ns_main_runs_single_marginal_stage(monkeypatch: pytest.MonkeyP
     cluster_solver.main()
 
     assert calls == [
-        ("evidence-ns", "fit", "ns", 0, SAMPLE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE),
+        ("evidence-ns", "fit", "ns", 0, SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE),
     ]
 
 
@@ -8623,6 +16184,76 @@ def test_rerender_plots_forces_quick_diagnostics_before_stage4(
 
     assert calls == ["approx"]
     assert plot_quick == [True]
+
+
+def test_rerender_plots_exact_image_diagnostics_stage3_overrides_saved_quick(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    plot_quick: list[bool] = []
+
+    class FakeEvaluator:
+        def __init__(self, *args: Any, quick_diagnostics: bool = False, **_kwargs: Any) -> None:
+            self.quick_diagnostics = bool(quick_diagnostics)
+            self.surrogate_enabled = False
+            self.timing_totals = {"plot_runtime": 0.0}
+
+        def reported_physical_to_latent_parameter_vector(self, values: np.ndarray) -> np.ndarray:
+            return np.asarray(values, dtype=float)
+
+        def refresh_surrogate(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def refresh_scaling_scatter_cache(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def refresh_source_metric_cache(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def evaluate(self, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
+            calls.append("exact")
+            return SimpleNamespace(loglike=0.0)
+
+    state = SimpleNamespace(parameter_specs=[], fit_mode="joint")
+    arrays = {
+        "best_fit": np.empty((0,), dtype=float),
+        "samples": np.empty((0, 0), dtype=float),
+        "log_prob": np.empty((0,), dtype=float),
+        "accept_prob": np.empty((0,), dtype=float),
+        "diverging": np.empty((0,), dtype=bool),
+        "num_steps": np.empty((0,), dtype=float),
+    }
+    saved_args = {"quick_diagnostics": True, "warmup": 0, "samples": 0, "chains": 1}
+
+    monkeypatch.setattr(cluster_solver, "_configure_debug_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_run_logged_phase", lambda _args, _phase_name, fn, **_kwargs: fn())
+    monkeypatch.setattr(cluster_solver, "_load_artifacts", lambda _artifacts_dir: (state, saved_args, arrays, {}))
+    monkeypatch.setattr(cluster_solver, "_log_state_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_maybe_convert_loaded_posterior_arrays_to_physical", lambda arrays, *_args: (arrays, False))
+    monkeypatch.setattr(cluster_solver, "ClusterJAXEvaluator", FakeEvaluator)
+    monkeypatch.setattr(cluster_solver, "_log_solver_active_approximation_warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_approximate_evaluation",
+        lambda *_args, **_kwargs: calls.append("approx") or SimpleNamespace(loglike=0.0),
+    )
+    monkeypatch.setattr(
+        cluster_solver,
+        "_generate_plots_and_tables",
+        lambda **kwargs: plot_quick.append(bool(getattr(kwargs["args"], "quick_diagnostics", False))),
+    )
+
+    cluster_solver._rerender_plots(
+        argparse.Namespace(quick_diagnostics=False, exact_image_diagnostics_stage3=True),
+        tmp_path / "fit" / "stage3_image_plane",
+        exact_diagnostics_stage="stage4_linearized_image_plane",
+    )
+
+    assert calls == ["exact"]
+    assert plot_quick == [False]
 
 
 def test_rerender_plots_treats_direct_stage2_as_final_without_later_siblings(
@@ -8802,6 +16433,49 @@ def test_sequential_forces_quick_diagnostics_until_stage4(
     ]
 
 
+def test_sequential_exact_image_diagnostics_stage3_keeps_stage3_exact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, bool]] = []
+
+    def fake_run_single_stage(args, _fit_mode, run_name, **_kwargs):
+        calls.append((run_name, bool(getattr(args, "quick_diagnostics", False))))
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={}, means={}, stds={}),
+    )
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {})
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {})
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts", "svi"],
+        warmup=[2000, 1000, 0],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+        skip_stage3_image_plane_local_jacobian=False,
+        fit_mode="sequential",
+        quick_diagnostics=False,
+        exact_image_diagnostics_stage3=True,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert calls == [
+        ("fit/stage1_large_only", True),
+        ("fit/stage2_joint", True),
+        ("fit/stage3_image_plane", False),
+        ("fit/stage4_linearized_image_plane", False),
+    ]
+
+
 def test_sequential_skip_stage3_keeps_stage4_exact_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -8904,10 +16578,198 @@ def test_sequential_adds_local_jacobian_stage3(monkeypatch: pytest.MonkeyPatch, 
     assert "stage3=enabled" in str(banners[0][1])
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
     assert summary["stage_fit_controls"] == {
-        "stage2": {"fit_method": "svi+nuts", "warmup": 2000, "samples": 250, "max_tree_depth": 10},
-        "stage3": {"fit_method": "svi", "warmup": 0, "samples": 100, "max_tree_depth": 10},
-        "stage4": {"fit_method": "svi", "warmup": 0, "samples": 100, "max_tree_depth": 10},
+        "stage2": {"fit_method": "svi+nuts", "svi_steps": 2000, "warmup": 2000, "samples": 250, "max_tree_depth": 10},
+        "stage3": {"fit_method": "svi", "svi_steps": 2000, "warmup": 0, "samples": 100, "max_tree_depth": 10},
+        "stage4": {"fit_method": "svi", "svi_steps": 2000, "warmup": 0, "samples": 100, "max_tree_depth": 10},
     }
+
+
+def test_sequential_start_at_stage3_runs_stage3_without_previous_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[
+        tuple[
+            str,
+            str,
+            str,
+            int,
+            int,
+            str,
+            Stage1PriorSummary | None,
+            dict[str, float] | None,
+            dict[str, float] | None,
+            bool,
+        ]
+    ] = []
+
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        stage1_prior_summary=None,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        svi_init_physical_values=None,
+        previous_stage_best_values=None,
+        **_kwargs,
+    ):
+        calls.append(
+            (
+                fit_mode,
+                run_name,
+                args.fit_method,
+                args.warmup,
+                args.samples,
+                sample_likelihood_mode,
+                stage1_prior_summary,
+                svi_init_physical_values,
+                previous_stage_best_values,
+                bool(getattr(args, "quick_diagnostics", False)),
+            )
+        )
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: (_ for _ in ()).throw(AssertionError("stage1 summary should not be loaded")),
+    )
+    monkeypatch.setattr(
+        cluster_solver,
+        "_physical_best_fit_values_from_artifacts",
+        lambda _artifacts_dir: (_ for _ in ()).throw(AssertionError("stage2 artifacts should not be loaded")),
+    )
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi"],
+        svi_steps=[1000, 400],
+        warmup=[2000, 0],
+        samples=[250, 100],
+        image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+        fit_mode="sequential",
+        quick_diagnostics=False,
+        start_at_stage3=True,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert [item[1] for item in calls] == ["fit/stage3_image_plane"]
+    assert calls[0][2:6] == ("svi", 0, 100, SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN)
+    assert calls[0][6] is None
+    assert calls[0][7] is None
+    assert calls[0][8] is None
+    assert calls[0][9] is False
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["start_at_stage3"] is True
+    assert "stage1_run_dir" not in summary
+    assert "stage2_run_dir" not in summary
+    assert summary["stage3_run_dir"].endswith("stage3_image_plane")
+
+
+def test_sequential_start_at_stage3_then_stage4_uses_stage3_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[
+        tuple[
+            str,
+            str,
+            str,
+            int,
+            int,
+            str,
+            Stage1PriorSummary | None,
+            dict[str, float] | None,
+            dict[str, tuple[float, float]] | None,
+            dict[str, float] | None,
+            bool,
+        ]
+    ] = []
+
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        stage1_prior_summary=None,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        svi_init_physical_values=None,
+        source_position_prior_values=None,
+        previous_stage_best_values=None,
+        **_kwargs,
+    ):
+        calls.append(
+            (
+                fit_mode,
+                run_name,
+                args.fit_method,
+                args.warmup,
+                args.samples,
+                sample_likelihood_mode,
+                stage1_prior_summary,
+                svi_init_physical_values,
+                source_position_prior_values,
+                previous_stage_best_values,
+                bool(getattr(args, "quick_diagnostics", False)),
+            )
+        )
+        return tmp_path / run_name
+
+    def fake_best_fit(artifacts_dir: Path) -> dict[str, float]:
+        assert str(artifacts_dir).endswith("stage3_image_plane/artifacts")
+        return {"halo_v_disp": 1200.0}
+
+    def fake_source_priors(artifacts_dir: Path) -> dict[str, tuple[float, float]]:
+        assert str(artifacts_dir).endswith("stage3_image_plane/artifacts")
+        return {"1": (0.1, -0.2)}
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: (_ for _ in ()).throw(AssertionError("stage1 summary should not be loaded")),
+    )
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", fake_best_fit)
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", fake_source_priors)
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts", "svi"],
+        svi_steps=[1000, 400, 200],
+        warmup=[2000, 1000, 0],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_FORWARD_METRIC,
+        skip_stage3_image_plane_local_jacobian=False,
+        fit_mode="sequential",
+        quick_diagnostics=False,
+        start_at_stage3=True,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert [item[1] for item in calls] == ["fit/stage3_image_plane", "fit/stage4_forward_metric_image_plane"]
+    assert calls[0][2:6] == ("svi+nuts", 1000, 100, SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN)
+    assert calls[0][6] is None
+    assert calls[0][7] is None
+    assert calls[0][9] is None
+    assert calls[0][10] is True
+    assert calls[1][2:6] == ("svi", 0, 20, SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE)
+    assert calls[1][6] is None
+    assert calls[1][7] == {"halo_v_disp": 1200.0}
+    assert calls[1][8] == {"1": (0.1, -0.2)}
+    assert calls[1][9] == {"halo_v_disp": 1200.0}
+    assert calls[1][10] is False
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["start_at_stage3"] is True
+    assert "stage1_run_dir" not in summary
+    assert "stage2_run_dir" not in summary
+    assert summary["stage3_run_dir"].endswith("stage3_image_plane")
+    assert summary["stage4_run_dir"].endswith("stage4_forward_metric_image_plane")
 
 
 def test_sequential_resume_skips_completed_stage1_and_stage2_then_runs_stage3(
@@ -9080,7 +16942,222 @@ def test_sequential_adds_linearized_stage4(monkeypatch: pytest.MonkeyPatch, tmp_
     assert summary["skip_stage3_image_plane_local_jacobian"] is False
 
 
-def test_sequential_marginal_image_plane_runs_as_stage4_with_cosmology(
+def test_sequential_stage3_triggers_critical_det_before_stage4(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, str]] = []
+
+    def fake_run_single_stage(
+        args,
+        _fit_mode,
+        run_name,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        **_kwargs,
+    ):
+        events.append(("stage", run_name))
+        return tmp_path / run_name
+
+    def fake_critical_det(_args, stage3_run_dir):
+        events.append(("critical_det", Path(stage3_run_dir).name))
+        return cluster_solver.CriticalDetDiagnosticResult(
+            flagged=cluster_solver._empty_critical_det_diagnostic_table(),
+            min_abs_detA=float("nan"),
+            total_images=0,
+        )
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_run_stage3_critical_det_diagnostic", fake_critical_det)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={"halo_v_disp": 1000.0}, means={}, stds={}),
+    )
+
+    def fake_best_fit(artifacts_dir: Path) -> dict[str, float]:
+        text = str(artifacts_dir)
+        if text.endswith("stage2_joint/artifacts"):
+            return {"halo_v_disp": 1100.0}
+        if text.endswith("stage3_image_plane/artifacts"):
+            return {"halo_v_disp": 1200.0}
+        raise AssertionError(f"unexpected artifacts_dir={artifacts_dir}")
+
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", fake_best_fit)
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts", "svi"],
+        warmup=[2000, 1000, 0],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+        skip_stage3_image_plane_local_jacobian=False,
+        skip_critical_det_diagnostic=False,
+        critical_det_diagnostic_threshold=1.0e-2,
+        fit_mode="sequential",
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert events == [
+        ("stage", "fit/stage1_large_only"),
+        ("stage", "fit/stage2_joint"),
+        ("stage", "fit/stage3_image_plane"),
+        ("critical_det", "stage3_image_plane"),
+        ("stage", "fit/stage4_linearized_image_plane"),
+    ]
+
+
+def test_sequential_skip_critical_det_suppresses_stage3_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    diagnostic_calls: list[Path] = []
+
+    def fake_run_single_stage(args, _fit_mode, run_name, **_kwargs):
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={"halo_v_disp": 1000.0}, means={}, stds={}),
+    )
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {"halo_v_disp": 1200.0})
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
+    monkeypatch.setattr(
+        cluster_solver,
+        "_run_stage3_critical_det_diagnostic",
+        lambda _args, stage3_run_dir: diagnostic_calls.append(Path(stage3_run_dir)),
+    )
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts", "svi"],
+        warmup=[2000, 1000, 0],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+        skip_stage3_image_plane_local_jacobian=False,
+        skip_critical_det_diagnostic=True,
+        critical_det_diagnostic_threshold=1.0e-2,
+        fit_mode="sequential",
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert diagnostic_calls == []
+
+
+def test_sequential_skip_stage3_does_not_attempt_critical_det(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    diagnostic_calls: list[Path] = []
+
+    def fake_run_single_stage(args, _fit_mode, run_name, **_kwargs):
+        return tmp_path / run_name
+
+    def fake_best_fit(artifacts_dir):
+        assert str(artifacts_dir).endswith("stage2_joint/artifacts")
+        return {"halo_v_disp": 1200.0}
+
+    def fake_source_priors(artifacts_dir):
+        assert str(artifacts_dir).endswith("stage2_joint/artifacts")
+        return {"1": (0.3, 0.4)}
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={"halo_v_disp": 1000.0}, means={}, stds={}),
+    )
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", fake_best_fit)
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", fake_source_priors)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_run_stage3_critical_det_diagnostic",
+        lambda _args, stage3_run_dir: diagnostic_calls.append(Path(stage3_run_dir)),
+    )
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi"],
+        warmup=[2000, 0],
+        samples=[250, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+        skip_stage3_image_plane_local_jacobian=True,
+        skip_critical_det_diagnostic=False,
+        critical_det_diagnostic_threshold=1.0e-2,
+        fit_mode="sequential",
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert diagnostic_calls == []
+
+
+def test_sequential_blocked_linearized_image_plane_runs_as_separate_stage4(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, str, dict[str, float] | None, dict[str, tuple[float, float]] | None]] = []
+
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        svi_init_physical_values=None,
+        source_position_prior_values=None,
+        **_kwargs,
+    ):
+        calls.append((fit_mode, run_name, sample_likelihood_mode, svi_init_physical_values, source_position_prior_values))
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={"halo_v_disp": 1000.0}, means={}, stds={}),
+    )
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {"halo_v_disp": 1200.0})
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts", "svi+nuts"],
+        warmup=[2000, 1000, 10],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
+        skip_stage3_image_plane_local_jacobian=False,
+        fit_mode="sequential",
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert [item[1] for item in calls] == [
+        "fit/stage1_large_only",
+        "fit/stage2_joint",
+        "fit/stage3_image_plane",
+        "fit/stage4_blocked_linearized_image_plane",
+    ]
+    assert calls[3][2] == SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
+    assert calls[3][3] == {"halo_v_disp": 1200.0}
+    assert calls[3][4] == {"1": (0.1, -0.2)}
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["stage4_run_dir"].endswith("stage4_blocked_linearized_image_plane")
+    assert summary["image_plane_mode"] == IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED
+
+
+def test_sequential_forward_metric_image_plane_runs_as_stage4_with_cosmology(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -9149,12 +17226,11 @@ def test_sequential_marginal_image_plane_runs_as_stage4_with_cosmology(
         fit_method=["svi+nuts", "svi+nuts", "svi"],
         warmup=[2000, 1000, 0],
         samples=[250, 100, 20],
-        image_plane_mode=IMAGE_PLANE_MODE_MARGINAL,
+        image_plane_mode=IMAGE_PLANE_MODE_FORWARD_METRIC,
         skip_stage3_image_plane_local_jacobian=False,
         linearized_beta_prior_sigma_arcsec=0.42,
         fit_mode="sequential",
         fit_cosmology_flat_wcdm=True,
-        fit_cosmology_all_stages=False,
     )
 
     cluster_solver._run_sequential(args)
@@ -9163,23 +17239,260 @@ def test_sequential_marginal_image_plane_runs_as_stage4_with_cosmology(
         "fit/stage1_large_only",
         "fit/stage2_joint",
         "fit/stage3_image_plane",
-        "fit/stage4_marginal_image_plane",
+        "fit/stage4_forward_metric_image_plane",
     ]
-    assert [item[3] for item in calls] == [False, False, False, True]
-    assert calls[3][2] == SAMPLE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE
-    assert calls[3][4] == pytest.approx(0.42)
+    assert [item[3] for item in calls] == [False, False, True, True]
+    assert calls[3][2] == SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE
+    assert calls[3][4] is None
     assert calls[3][5] == {"halo_v_disp": 1200.0}
     assert calls[3][6] == {"1": (0.1, -0.2)}
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
-    assert summary["stage4_run_dir"].endswith("stage4_marginal_image_plane")
-    assert "stage35_run_dir" not in summary
-    assert "run_stage35_marginal_image_plane" not in summary
+    assert summary["stage4_run_dir"].endswith("stage4_forward_metric_image_plane")
+    assert summary["image_plane_mode"] == IMAGE_PLANE_MODE_FORWARD_METRIC
     assert summary["stage_fit_controls"]["stage4"] == {
         "fit_method": "svi",
+        "svi_steps": 2000,
         "warmup": 0,
         "samples": 20,
         "max_tree_depth": 10,
     }
+
+
+def test_sequential_fold_regularized_image_plane_runs_as_stage4(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, str, dict[str, float] | None, dict[str, tuple[float, float]] | None]] = []
+
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        svi_init_physical_values=None,
+        source_position_prior_values=None,
+        **_kwargs,
+    ):
+        calls.append((fit_mode, run_name, sample_likelihood_mode, svi_init_physical_values, source_position_prior_values))
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={"halo_v_disp": 1000.0}, means={}, stds={}),
+    )
+
+    def fake_best_fit(artifacts_dir: Path) -> dict[str, float]:
+        text = str(artifacts_dir)
+        if text.endswith("stage2_joint/artifacts"):
+            return {"halo_v_disp": 1100.0}
+        if text.endswith("stage3_image_plane/artifacts"):
+            return {"halo_v_disp": 1200.0}
+        raise AssertionError(f"unexpected artifacts_dir={artifacts_dir}")
+
+    def fake_source_priors(artifacts_dir: Path) -> dict[str, tuple[float, float]]:
+        text = str(artifacts_dir)
+        if text.endswith("stage3_image_plane/artifacts"):
+            return {"1": (0.1, -0.2)}
+        raise AssertionError(f"unexpected artifacts_dir={artifacts_dir}")
+
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", fake_best_fit)
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", fake_source_priors)
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts", "svi"],
+        warmup=[2000, 1000, 0],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        skip_stage3_image_plane_local_jacobian=False,
+        linearized_beta_prior_sigma_arcsec=0.42,
+        fit_mode="sequential",
+        sampling_engine="refreshing_surrogate",
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+        fold_curvature_arcsec_inv=1.25,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert [item[1] for item in calls] == [
+        "fit/stage1_large_only",
+        "fit/stage2_joint",
+        "fit/stage3_image_plane",
+        "fit/stage4_fold_regularized_image_plane",
+    ]
+    assert calls[3][2] == SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE
+    assert calls[3][3] == {"halo_v_disp": 1200.0}
+    assert calls[3][4] == {"1": (0.1, -0.2)}
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["stage4_run_dir"].endswith("stage4_fold_regularized_image_plane")
+    assert summary["image_plane_mode"] == IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA
+    assert summary["fold_curvature_arcsec_inv"] == pytest.approx(1.25)
+
+
+def test_sequential_anchored_solved_image_plane_runs_as_stage4(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, str, dict[str, float] | None, dict[str, tuple[float, float]] | None]] = []
+
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        svi_init_physical_values=None,
+        source_position_prior_values=None,
+        **_kwargs,
+    ):
+        calls.append((fit_mode, run_name, sample_likelihood_mode, svi_init_physical_values, source_position_prior_values))
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={"halo_v_disp": 1000.0}, means={}, stds={}),
+    )
+
+    def fake_best_fit(artifacts_dir: Path) -> dict[str, float]:
+        text = str(artifacts_dir)
+        if text.endswith("stage2_joint/artifacts"):
+            return {"halo_v_disp": 1100.0}
+        if text.endswith("stage3_image_plane/artifacts"):
+            return {"halo_v_disp": 1200.0}
+        raise AssertionError(f"unexpected artifacts_dir={artifacts_dir}")
+
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", fake_best_fit)
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts", "svi+nuts"],
+        warmup=[2000, 1000, 10],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+        skip_stage3_image_plane_local_jacobian=False,
+        skip_critical_det_diagnostic=True,
+        fit_mode="sequential",
+        sampling_engine="full",
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+        anchored_image_plane_solve_steps=3,
+        anchored_image_plane_trust_radius_arcsec=0.3,
+        anchored_image_plane_lm_damping_relative=1.0e-3,
+        anchored_image_plane_lm_damping_absolute=1.0e-6,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert [item[1] for item in calls] == [
+        "fit/stage1_large_only",
+        "fit/stage2_joint",
+        "fit/stage3_image_plane",
+        "fit/stage4_anchored_solved_image_plane",
+    ]
+    assert calls[3][2] == SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE
+    assert calls[3][3] == {"halo_v_disp": 1200.0}
+    assert calls[3][4] == {"1": (0.1, -0.2)}
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["stage4_run_dir"].endswith("stage4_anchored_solved_image_plane")
+    assert summary["image_plane_mode"] == IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA
+    assert summary["anchored_image_plane_solve_steps"] == 3
+
+
+def test_sequential_critical_arc_mixture_image_plane_runs_as_stage4(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, str, str, dict[str, float] | None, dict[str, tuple[float, float]] | None]] = []
+
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        svi_init_physical_values=None,
+        source_position_prior_values=None,
+        **_kwargs,
+    ):
+        calls.append(
+            (
+                fit_mode,
+                run_name,
+                sample_likelihood_mode,
+                args.fit_method,
+                svi_init_physical_values,
+                source_position_prior_values,
+            )
+        )
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={"halo_v_disp": 1000.0}, means={}, stds={}),
+    )
+
+    def fake_best_fit(artifacts_dir: Path) -> dict[str, float]:
+        text = str(artifacts_dir)
+        if text.endswith("stage2_joint/artifacts"):
+            return {"halo_v_disp": 1100.0}
+        if text.endswith("stage3_image_plane/artifacts"):
+            return {"halo_v_disp": 1200.0}
+        raise AssertionError(f"unexpected artifacts_dir={artifacts_dir}")
+
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", fake_best_fit)
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts", "smc"],
+        warmup=[2000, 1000, 10],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        skip_stage3_image_plane_local_jacobian=False,
+        skip_critical_det_diagnostic=True,
+        fit_mode="sequential",
+        sampling_engine="refreshing_surrogate",
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+        critical_arc_critical_direction_sigma_arcsec=4.5,
+        critical_arc_base_prob=0.2,
+        critical_arc_max_prob=0.7,
+        critical_arc_singular_threshold=0.15,
+        critical_arc_singular_softness=0.04,
+        critical_arc_lm_damping_relative=0.002,
+        critical_arc_lm_damping_absolute=1.0e-5,
+        critical_arc_lm_trust_radius_arcsec=18.0,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert [item[1] for item in calls] == [
+        "fit/stage1_large_only",
+        "fit/stage2_joint",
+        "fit/stage3_image_plane",
+        "fit/stage4_critical_arc_mixture_image_plane",
+    ]
+    assert calls[3][2] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+    assert calls[3][3] == "smc"
+    assert calls[3][4] == {"halo_v_disp": 1200.0}
+    assert calls[3][5] == {"1": (0.1, -0.2)}
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["stage4_run_dir"].endswith("stage4_critical_arc_mixture_image_plane")
+    assert summary["image_plane_mode"] == IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
+    assert summary["critical_arc_critical_direction_sigma_arcsec"] == pytest.approx(4.5)
+    assert summary["critical_arc_lm_trust_radius_arcsec"] == pytest.approx(18.0)
 
 
 def test_sequential_linearized_stage4_can_skip_stage3(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -9256,6 +17569,140 @@ def test_sequential_linearized_stage4_can_skip_stage3(monkeypatch: pytest.Monkey
     assert "stage4=enabled" in str(banners[0][1])
 
 
+def test_sequential_anchored_solved_stage4_can_skip_stage3(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, str, dict[str, float] | None, dict[str, tuple[float, float]] | None]] = []
+
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        svi_init_physical_values=None,
+        source_position_prior_values=None,
+        **_kwargs,
+    ):
+        calls.append((run_name, sample_likelihood_mode, args.fit_method, svi_init_physical_values, source_position_prior_values))
+        return tmp_path / run_name
+
+    def fake_best_fit(artifacts_dir):
+        assert str(artifacts_dir).endswith("stage2_joint/artifacts")
+        return {"halo_v_disp": 1200.0}
+
+    def fake_source_priors(artifacts_dir):
+        assert str(artifacts_dir).endswith("stage2_joint/artifacts")
+        return {"1": (0.3, 0.4)}
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={"halo_v_disp": 1000.0}, means={}, stds={}),
+    )
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", fake_best_fit)
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", fake_source_priors)
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts"],
+        warmup=[2000, 20],
+        samples=[250, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+        skip_stage3_image_plane_local_jacobian=True,
+        skip_critical_det_diagnostic=False,
+        fit_mode="sequential",
+        sampling_engine="full",
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+        anchored_image_plane_solve_steps=3,
+        anchored_image_plane_trust_radius_arcsec=0.3,
+        anchored_image_plane_lm_damping_relative=1.0e-3,
+        anchored_image_plane_lm_damping_absolute=1.0e-6,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert [item[0] for item in calls] == [
+        "fit/stage1_large_only",
+        "fit/stage2_joint",
+        "fit/stage4_anchored_solved_image_plane",
+    ]
+    assert calls[2][1] == SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE
+    assert calls[2][3] == {"halo_v_disp": 1200.0}
+    assert calls[2][4] == {"1": (0.3, 0.4)}
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["stage4_run_dir"].endswith("stage4_anchored_solved_image_plane")
+
+
+def test_sequential_critical_arc_mixture_stage4_can_skip_stage3(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, str, dict[str, float] | None, dict[str, tuple[float, float]] | None]] = []
+
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        svi_init_physical_values=None,
+        source_position_prior_values=None,
+        **_kwargs,
+    ):
+        calls.append((run_name, sample_likelihood_mode, args.fit_method, svi_init_physical_values, source_position_prior_values))
+        return tmp_path / run_name
+
+    def fake_best_fit(artifacts_dir):
+        assert str(artifacts_dir).endswith("stage2_joint/artifacts")
+        return {"halo_v_disp": 1200.0}
+
+    def fake_source_priors(artifacts_dir):
+        assert str(artifacts_dir).endswith("stage2_joint/artifacts")
+        return {"1": (0.3, 0.4)}
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={"halo_v_disp": 1000.0}, means={}, stds={}),
+    )
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", fake_best_fit)
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", fake_source_priors)
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts"],
+        warmup=[2000, 20],
+        samples=[250, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        skip_stage3_image_plane_local_jacobian=True,
+        skip_critical_det_diagnostic=False,
+        fit_mode="sequential",
+        sampling_engine="refreshing_surrogate",
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert [item[0] for item in calls] == [
+        "fit/stage1_large_only",
+        "fit/stage2_joint",
+        "fit/stage4_critical_arc_mixture_image_plane",
+    ]
+    assert calls[2][1] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+    assert calls[2][3] == {"halo_v_disp": 1200.0}
+    assert calls[2][4] == {"1": (0.3, 0.4)}
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["stage4_run_dir"].endswith("stage4_critical_arc_mixture_image_plane")
+
+
 def test_sequential_marginal_stage4_can_skip_stage3(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     calls: list[
         tuple[
@@ -9306,7 +17753,7 @@ def test_sequential_marginal_stage4_can_skip_stage3(monkeypatch: pytest.MonkeyPa
         fit_method=["svi+nuts", "svi"],
         warmup=[2000, 0],
         samples=[250, 20],
-        image_plane_mode=IMAGE_PLANE_MODE_MARGINAL,
+        image_plane_mode=IMAGE_PLANE_MODE_FORWARD_METRIC,
         skip_stage3_image_plane_local_jacobian=True,
         linearized_beta_prior_sigma_arcsec=0.31,
         fit_mode="sequential",
@@ -9317,10 +17764,10 @@ def test_sequential_marginal_stage4_can_skip_stage3(monkeypatch: pytest.MonkeyPa
     assert [item[0] for item in calls] == [
         "fit/stage1_large_only",
         "fit/stage2_joint",
-        "fit/stage4_marginal_image_plane",
+        "fit/stage4_forward_metric_image_plane",
     ]
-    assert calls[2][1] == SAMPLE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE
-    assert calls[2][2] == pytest.approx(0.31)
+    assert calls[2][1] == SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE
+    assert calls[2][2] is None
     assert calls[2][3] == {"halo_v_disp": 1200.0}
     assert calls[2][4] == {"1": (0.3, 0.4)}
     assert calls[2][5] == {"halo_v_disp": 1200.0}
@@ -9332,6 +17779,80 @@ def test_sequential_resume_fast_runs_only_stage4_from_stage3(
 ) -> None:
     _touch_stage1_summary(tmp_path / "fit" / "stage1_large_only", {"halo_v_disp": 1000.0})
     _touch_artifact_checkpoint(tmp_path / "fit" / "stage2_joint")
+    _touch_artifact_checkpoint(tmp_path / "fit" / "stage3_image_plane")
+    calls: list[
+        tuple[str, str, str, dict[str, float] | None, dict[str, tuple[float, float]] | None]
+    ] = []
+    diagnostic_calls: list[Path] = []
+
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        svi_init_physical_values=None,
+        source_position_prior_values=None,
+        **_kwargs,
+    ):
+        calls.append((fit_mode, run_name, sample_likelihood_mode, svi_init_physical_values, source_position_prior_values))
+        return tmp_path / run_name
+
+    def fake_best_fit(artifacts_dir):
+        assert str(artifacts_dir).endswith("stage3_image_plane/artifacts")
+        return {"halo_v_disp": 1300.0}
+
+    def fake_source_priors(artifacts_dir):
+        assert str(artifacts_dir).endswith("stage3_image_plane/artifacts")
+        return {"1": (0.1, -0.2)}
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", fake_best_fit)
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", fake_source_priors)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_run_stage3_critical_det_diagnostic",
+        lambda _args, stage3_run_dir: diagnostic_calls.append(Path(stage3_run_dir)),
+    )
+
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts", "smc"],
+        warmup=[2000, 1000, 1],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+        skip_stage3_image_plane_local_jacobian=False,
+        skip_critical_det_diagnostic=False,
+        fit_mode="sequential",
+        resume_fast=True,
+        resume=False,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert calls == [
+        (
+            "joint",
+            "fit/stage4_linearized_image_plane",
+            SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
+            {"halo_v_disp": 1300.0},
+            {"1": (0.1, -0.2)},
+        )
+    ]
+    assert diagnostic_calls == [tmp_path / "fit" / "stage3_image_plane"]
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["resume_fast"] is True
+    assert summary["stage2_run_dir"].endswith("stage2_joint")
+    assert summary["stage3_run_dir"].endswith("stage3_image_plane")
+    assert summary["stage4_run_dir"].endswith("stage4_linearized_image_plane")
+
+
+def test_sequential_start_at_stage3_resume_fast_runs_only_stage4_from_stage3(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     _touch_artifact_checkpoint(tmp_path / "fit" / "stage3_image_plane")
     calls: list[
         tuple[str, str, str, dict[str, float] | None, dict[str, tuple[float, float]] | None]
@@ -9359,6 +17880,11 @@ def test_sequential_resume_fast_runs_only_stage4_from_stage3(
 
     monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
     monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: (_ for _ in ()).throw(AssertionError("stage1 summary should not be loaded")),
+    )
     monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", fake_best_fit)
     monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", fake_source_priors)
 
@@ -9371,9 +17897,11 @@ def test_sequential_resume_fast_runs_only_stage4_from_stage3(
         samples=[250, 100, 20],
         image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
         skip_stage3_image_plane_local_jacobian=False,
+        skip_critical_det_diagnostic=True,
         fit_mode="sequential",
         resume_fast=True,
         resume=False,
+        start_at_stage3=True,
     )
 
     cluster_solver._run_sequential(args)
@@ -9389,7 +17917,9 @@ def test_sequential_resume_fast_runs_only_stage4_from_stage3(
     ]
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
     assert summary["resume_fast"] is True
-    assert summary["stage2_run_dir"].endswith("stage2_joint")
+    assert summary["start_at_stage3"] is True
+    assert "stage1_run_dir" not in summary
+    assert "stage2_run_dir" not in summary
     assert summary["stage3_run_dir"].endswith("stage3_image_plane")
     assert summary["stage4_run_dir"].endswith("stage4_linearized_image_plane")
 
@@ -9483,6 +18013,63 @@ def test_sequential_resume_fast_runs_only_stage3_from_stage2(
     assert calls == [("joint", "fit/stage3_image_plane", {"halo_v_disp": 1100.0})]
 
 
+def test_sequential_start_at_stage3_resume_fast_runs_stage3_without_previous_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, dict[str, float] | None, dict[str, float] | None]] = []
+
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        svi_init_physical_values=None,
+        previous_stage_best_values=None,
+        **_kwargs,
+    ):
+        calls.append((fit_mode, run_name, svi_init_physical_values, previous_stage_best_values))
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: (_ for _ in ()).throw(AssertionError("stage1 summary should not be loaded")),
+    )
+    monkeypatch.setattr(
+        cluster_solver,
+        "_physical_best_fit_values_from_artifacts",
+        lambda _artifacts_dir: (_ for _ in ()).throw(AssertionError("stage2 artifacts should not be loaded")),
+    )
+
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi"],
+        warmup=[2000, 100],
+        samples=[250, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+        skip_critical_det_diagnostic=True,
+        fit_mode="sequential",
+        resume_fast=True,
+        resume=False,
+        start_at_stage3=True,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert calls == [("joint", "fit/stage3_image_plane", None, None)]
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["resume_fast"] is True
+    assert summary["start_at_stage3"] is True
+    assert "stage1_run_dir" not in summary
+    assert "stage2_run_dir" not in summary
+    assert summary["stage3_run_dir"].endswith("stage3_image_plane")
+    assert "stage4_run_dir" not in summary
+
+
 def test_sequential_resume_fast_runs_only_stage2_from_stage1_summary(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -9570,26 +18157,16 @@ def test_sequential_resume_fast_requires_previous_stage_artifacts(
         cluster_solver._run_sequential(args)
 
 
-def test_sequential_resume_fast_with_resume_only_rerenders_final_stage(
+def test_sequential_start_at_stage3_resume_fast_stage4_requires_stage3_artifacts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    _touch_stage1_summary(tmp_path / "fit" / "stage1_large_only", {"halo_v_disp": 1000.0})
-    _touch_artifact_checkpoint(tmp_path / "fit" / "stage2_joint")
-    _touch_artifact_checkpoint(tmp_path / "fit" / "stage3_image_plane")
-    _touch_complete_stage(tmp_path / "fit" / "stage4_linearized_image_plane")
-    rerenders: list[Path] = []
-
     monkeypatch.setattr(
         cluster_solver,
         "_run_single_stage",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("final complete stage should resume")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("resume-fast should fail before running")),
     )
-    monkeypatch.setattr(cluster_solver, "_rerender_plots", lambda _args, run_dir: rerenders.append(Path(run_dir)))
     monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {"halo_v_disp": 1300.0})
-    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
-
     args = argparse.Namespace(
         run_name="fit",
         par_path="data/clustersim/input.par",
@@ -9601,12 +18178,59 @@ def test_sequential_resume_fast_with_resume_only_rerenders_final_stage(
         skip_stage3_image_plane_local_jacobian=False,
         fit_mode="sequential",
         resume_fast=True,
+        resume=False,
+        start_at_stage3=True,
+    )
+
+    with pytest.raises(SystemExit, match="stage3_image_plane plot artifacts"):
+        cluster_solver._run_sequential(args)
+
+
+def test_sequential_resume_fast_with_resume_only_rerenders_final_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _touch_stage1_summary(tmp_path / "fit" / "stage1_large_only", {"halo_v_disp": 1000.0})
+    _touch_artifact_checkpoint(tmp_path / "fit" / "stage2_joint")
+    _touch_artifact_checkpoint(tmp_path / "fit" / "stage3_image_plane")
+    _touch_complete_stage(tmp_path / "fit" / "stage4_linearized_image_plane")
+    rerenders: list[Path] = []
+    diagnostic_calls: list[Path] = []
+
+    monkeypatch.setattr(
+        cluster_solver,
+        "_run_single_stage",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("final complete stage should resume")),
+    )
+    monkeypatch.setattr(cluster_solver, "_rerender_plots", lambda _args, run_dir: rerenders.append(Path(run_dir)))
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {"halo_v_disp": 1300.0})
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
+    monkeypatch.setattr(
+        cluster_solver,
+        "_run_stage3_critical_det_diagnostic",
+        lambda _args, stage3_run_dir: diagnostic_calls.append(Path(stage3_run_dir)),
+    )
+
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts", "smc"],
+        warmup=[2000, 1000, 1],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+        skip_stage3_image_plane_local_jacobian=False,
+        skip_critical_det_diagnostic=False,
+        fit_mode="sequential",
+        resume_fast=True,
         resume=True,
     )
 
     cluster_solver._run_sequential(args)
 
     assert rerenders == [tmp_path / "fit" / "stage4_linearized_image_plane"]
+    assert diagnostic_calls == [tmp_path / "fit" / "stage3_image_plane"]
 
 
 def test_adaptive_active_scaling_count_uses_importance_curve() -> None:
@@ -9827,6 +18451,250 @@ def test_validation_recovery_progress_tracks_parent_and_subtasks(monkeypatch: py
     assert quiet_instances == []
 
 
+def test_validation_mock_progress_tracks_redshifts_families_and_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    progress_instances = _install_recording_progress(monkeypatch)
+    messages: list[str] = []
+    monkeypatch.setattr(validation, "_log", lambda _args, message: messages.append(message))
+
+    with validation._ValidationMockProgress(argparse.Namespace(quiet=False)) as progress:
+        progress.callback(
+            "subhalos_complete",
+            {
+                "requested_subhalos": 100,
+                "selected_subhalos": 100,
+                "parent_count": 500,
+                "observable_count": 420,
+                "retry_count": 0,
+                "mag_faint_limit": 24.0,
+            },
+        )
+        progress.callback(
+            "redshift_start",
+            {
+                "z_source": 2.0,
+                "redshift_index": 1,
+                "redshift_count": 2,
+                "lens_component_count": 102,
+                "caustic_grid_pixels": 801,
+            },
+        )
+        progress.callback(
+            "redshift_complete",
+            {
+                "z_source": 2.0,
+                "redshift_index": 1,
+                "redshift_count": 2,
+                "lens_component_count": 102,
+                "caustic_grid_pixels": 801,
+                "caustic_compute_window_arcsec": 160.0,
+                "caustic_grid_scale_arcsec": 0.2,
+                "caustic_count": 3,
+            },
+        )
+        progress.callback(
+            "family_start",
+            {
+                "family_index": 1,
+                "family_count": 3,
+                "caustic_class": "primary",
+                "z_source": 2.0,
+                "max_attempts": 100,
+            },
+        )
+        progress.callback(
+            "family_attempt",
+            {
+                "family_index": 1,
+                "family_count": 3,
+                "caustic_class": "primary",
+                "z_source": 2.0,
+                "attempt": 25,
+                "max_attempts": 100,
+                "image_count": 2,
+            },
+        )
+        progress.callback(
+            "family_accept",
+            {
+                "family_index": 1,
+                "family_count": 3,
+                "caustic_class": "primary",
+                "z_source": 2.0,
+                "attempt": 26,
+                "max_attempts": 100,
+                "image_count": 4,
+                "caustic_index": 0,
+            },
+        )
+        progress.callback(
+            "outputs_complete",
+            {
+                "image_count": 12,
+                "par_path": "mock/single_bcg_mock.par",
+                "image_catalog_path": "mock/obs_arcs.cat",
+                "truth_path": "mock/truth.json",
+            },
+        )
+
+    assert len(progress_instances) == 1
+    recorder = progress_instances[0]
+    assert recorder.kwargs["transient"] is True
+    assert ("add_task", 1, "mock caustics: starting", 2) in recorder.events
+    assert ("add_task", 2, "mock families: starting", 3) in recorder.events
+    assert ("advance", 1, 1) in recorder.events
+    assert ("advance", 2, 1) in recorder.events
+    assert any(
+        event[0] == "update" and "attempt=25/100" in event[2].get("description", "")
+        for event in recorder.events
+    )
+    assert any("mock subhalos selected=100/100" in message for message in messages)
+    assert not any("mock caustics" in message for message in messages)
+    assert not any("mock family" in message for message in messages)
+    assert any("mock outputs complete images=12" in message for message in messages)
+
+
+def test_validation_mock_progress_quiet_suppresses_rich_and_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    progress_instances = _install_recording_progress(monkeypatch)
+    messages: list[str] = []
+    monkeypatch.setattr(validation, "_log", lambda _args, message: messages.append(message))
+
+    with validation._ValidationMockProgress(argparse.Namespace(quiet=True)) as progress:
+        progress.callback(
+            "family_attempt",
+            {
+                "family_index": 1,
+                "family_count": 1,
+                "caustic_class": "primary",
+                "z_source": 2.0,
+                "attempt": 25,
+                "max_attempts": 100,
+                "image_count": 2,
+            },
+        )
+
+    assert progress_instances == []
+    assert messages == []
+
+
+def test_recovered_model_tables_reports_partial_image_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    families = [
+        SimpleNamespace(
+            family_id="1",
+            z_source=2.0,
+            effective_z_source=2.0,
+            sigma_arcsec=0.1,
+            n_images=2,
+            image_labels=["1.1", "1.2"],
+            x_obs=np.asarray([0.0, 1.0], dtype=float),
+            y_obs=np.asarray([0.0, 0.0], dtype=float),
+        ),
+        SimpleNamespace(
+            family_id="2",
+            z_source=3.0,
+            effective_z_source=3.0,
+            sigma_arcsec=0.1,
+            n_images=3,
+            image_labels=["2.1", "2.2", "2.3"],
+            x_obs=np.asarray([2.0, 3.0, 4.0], dtype=float),
+            y_obs=np.asarray([0.0, 0.0, 0.0], dtype=float),
+        ),
+    ]
+    state = SimpleNamespace(parameter_specs=[], family_data=families)
+    images = pd.DataFrame(
+        {
+            "family_id": ["1", "1", "2", "2", "2"],
+            "image_label": ["1.1", "1.2", "2.1", "2.2", "2.3"],
+            "x_obs_arcsec": [0.0, 1.0, 2.0, 3.0, 4.0],
+            "y_obs_arcsec": [0.0, 0.0, 0.0, 0.0, 0.0],
+        }
+    )
+
+    class FakeModel:
+        def magnification(self, x, y, kwargs_lens):
+            del y, kwargs_lens
+            return np.asarray(x, dtype=float) + 10.0
+
+    class FakeEvaluator:
+        source_plane_covariance_floor = 0.0
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.state = kwargs["state"]
+
+        def reported_physical_to_latent_parameter_vector(self, sample):
+            return np.asarray(sample, dtype=float)
+
+        def _image_sigma_int_numpy(self, _sample_latent):
+            return 0.2
+
+        def evaluate(self, _sample_latent):
+            return SimpleNamespace(
+                family_predictions={
+                    "1": {"source_x": 0.1, "source_y": 0.2, "source_plane_rms": 0.3, "failed": False},
+                    "2": {"source_x": 1.1, "source_y": 1.2, "source_plane_rms": 1.3, "failed": False},
+                }
+            )
+
+        def _get_exact_model_solver(self, _z_source):
+            return FakeModel(), None
+
+        def _build_packed_lens_state(self, _sample_latent, _z_source):
+            return {}
+
+        def _packed_to_kwargs_lens(self, _packed_state):
+            return []
+
+        def _exact_family_prediction_details(self, _sample_latent, family):
+            if str(family.family_id) == "1":
+                return {
+                    "produced_image_count": 2,
+                    "recovered_image_count": 2,
+                    "missing_image_count": 0,
+                    "extra_image_count": 0,
+                    "multiplicity_failed": False,
+                    "multiplicity_failure_reason": "",
+                    "matched_model_x_arcsec": np.asarray([0.05, 1.05], dtype=float),
+                    "matched_model_y_arcsec": np.asarray([0.0, 0.0], dtype=float),
+                    "recovered_image_mask": np.asarray([True, True], dtype=bool),
+                    "failed": False,
+                    "exact_image_rms": 0.05,
+                }
+            return {
+                "produced_image_count": 3,
+                "recovered_image_count": 2,
+                "missing_image_count": 1,
+                "extra_image_count": 1,
+                "multiplicity_failed": True,
+                "multiplicity_failure_reason": "match_tolerance_exceeded",
+                "matched_model_x_arcsec": np.asarray([2.1, np.nan, 4.2], dtype=float),
+                "matched_model_y_arcsec": np.asarray([0.0, np.nan, 0.0], dtype=float),
+                "recovered_image_mask": np.asarray([True, False, True], dtype=bool),
+                "extra_model_x_arcsec": np.asarray([8.0], dtype=float),
+                "extra_model_y_arcsec": np.asarray([-2.0], dtype=float),
+                "failed": True,
+            }
+
+    monkeypatch.setattr(cluster_solver, "ClusterJAXEvaluator", FakeEvaluator)
+
+    magnification_df, image_df, source_df = validation._recovered_model_tables(
+        state,
+        np.asarray([0.0], dtype=float),
+        images,
+    )
+
+    assert len(image_df) == 5
+    indexed = image_df.set_index("image_label")
+    assert indexed["image_recovery_status"].tolist() == ["recovered", "recovered", "recovered", "not_recovered", "recovered"]
+    assert indexed["exact_image_prediction_failed"].tolist() == [False, False, False, True, False]
+    assert indexed.loc["2.1", "x_model_arcsec"] == pytest.approx(2.1)
+    assert np.isnan(indexed.loc["2.2", "x_model_arcsec"])
+    assert indexed.loc["2.3", "image_residual_arcsec"] == pytest.approx(0.2)
+    assert int(indexed.loc["2.1", "model_recovered_image_count"]) == 2
+    assert int(indexed.loc["2.1", "model_missing_image_count"]) == 1
+    assert int(indexed.loc["2.1", "model_extra_image_count"]) == 1
+    assert magnification_df.set_index("image_label").loc["2.3", "magnification_recovered"] == pytest.approx(14.0)
+    assert source_df.set_index("family_id").loc["1", "exact_image_rms_arcsec"] == pytest.approx(0.05)
+
+
 def test_posterior_prediction_uncertainty_tables_advances_progress_per_draw_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9883,6 +18751,7 @@ def test_posterior_prediction_uncertainty_tables_advances_progress_per_draw_fami
 
     monkeypatch.setattr(cluster_solver, "ClusterJAXEvaluator", FakeEvaluator)
     monkeypatch.setattr(cluster_solver, "_convert_theta_to_latent", lambda sample, _specs: np.asarray(sample, dtype=float))
+    monkeypatch.setattr(validation, "jax_cpu_worker_count", lambda: 1)
     state = SimpleNamespace(
         parameter_specs=[],
         family_data=[
@@ -10007,19 +18876,19 @@ def test_posterior_prediction_uncertainty_tables_threaded_matches_serial(
     )
     samples = np.asarray([[0.0], [0.5], [1.0], [1.5]], dtype=float)
 
+    monkeypatch.setattr(validation, "jax_cpu_worker_count", lambda: 1)
     serial = validation._posterior_prediction_uncertainty_tables(
         state,
         samples,
         images,
         max_draws=3,
-        max_workers=1,
     )
+    monkeypatch.setattr(validation, "jax_cpu_worker_count", lambda: 2)
     threaded = validation._posterior_prediction_uncertainty_tables(
         state,
         samples,
         images,
         max_draws=3,
-        max_workers=2,
     )
 
     for serial_df, threaded_df, key in zip(serial, threaded, ["image_label", "image_label", "family_id"]):
@@ -10077,6 +18946,7 @@ def test_posterior_prediction_uncertainty_tables_threaded_skips_failed_exact_fam
 
     monkeypatch.setattr(cluster_solver, "ClusterJAXEvaluator", FakeEvaluator)
     monkeypatch.setattr(cluster_solver, "_convert_theta_to_latent", lambda sample, _specs: np.asarray(sample, dtype=float))
+    monkeypatch.setattr(validation, "jax_cpu_worker_count", lambda: 2)
     state = SimpleNamespace(
         parameter_specs=[],
         family_data=[
@@ -10112,13 +18982,117 @@ def test_posterior_prediction_uncertainty_tables_threaded_skips_failed_exact_fam
         np.asarray([[0.0], [1.0], [2.0]], dtype=float),
         images,
         max_draws=3,
-        max_workers=2,
     )
 
     assert exact_calls.count("1") == 3
     assert exact_calls.count("2") == 1
     family2 = source_df[source_df["family_id"] == "2"].iloc[0]
     assert np.isnan(family2["exact_image_rms_q50"])
+
+
+def test_posterior_prediction_uncertainty_tables_keeps_partial_exact_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact_offsets: list[float] = []
+
+    class FakeExactModel:
+        def magnification(self, x, y, kwargs_lens):
+            del y
+            offset = float(kwargs_lens[0]["offset"])
+            return np.asarray(x, dtype=float) + offset
+
+    class FakeEvaluator:
+        def __init__(self, *args, **kwargs) -> None:
+            self.state = kwargs["state"]
+
+        def reported_physical_to_latent_parameter_vector(self, sample):
+            return np.asarray(sample, dtype=float)
+
+        def _family_source_summary(self, sample_latent):
+            offset = float(np.sum(sample_latent))
+            return {
+                "1": {
+                    "source_x": offset,
+                    "source_y": -offset,
+                    "source_plane_rms": offset + 0.5,
+                }
+            }
+
+        def _get_exact_model_solver(self, _z_source):
+            return FakeExactModel(), None
+
+        def _build_packed_lens_state(self, sample_latent, _z_source):
+            return {"offset": float(np.sum(np.asarray(sample_latent, dtype=float)))}
+
+        def _packed_to_kwargs_lens(self, packed_state):
+            return [{"offset": float(packed_state["offset"])}]
+
+        def _exact_family_prediction_details(self, sample_latent, _family):
+            offset = float(np.sum(sample_latent))
+            exact_offsets.append(offset)
+            return {
+                "produced_image_count": 3,
+                "recovered_image_count": 2,
+                "missing_image_count": 1,
+                "extra_image_count": 1,
+                "multiplicity_failed": True,
+                "multiplicity_failure_reason": "match_tolerance_exceeded",
+                "matched_model_x_arcsec": np.asarray([0.1 + offset, np.nan, 2.1 + offset], dtype=float),
+                "matched_model_y_arcsec": np.asarray([0.0, np.nan, 0.0], dtype=float),
+                "recovered_image_mask": np.asarray([True, False, True], dtype=bool),
+                "extra_model_x_arcsec": np.asarray([8.0 + offset], dtype=float),
+                "extra_model_y_arcsec": np.asarray([-2.0], dtype=float),
+                "arc_recovery_status": np.asarray(["point_recovered", "arc_supported", "point_recovered"], dtype=object),
+                "arc_aware_image_residual_arcsec": np.asarray([0.1 + offset, 0.05 + offset, 0.1 + offset], dtype=float),
+                "arc_noncritical_direction_residual_arcsec": np.asarray([0.02, 0.05 + offset, 0.03], dtype=float),
+                "arc_critical_direction_residual_arcsec": np.asarray([0.0, 5.0 + offset, 0.0], dtype=float),
+                "arc_s_min": np.asarray([0.2, 0.04, 0.2], dtype=float),
+                "arc_prior_probability": np.asarray([0.4, 0.75, 0.4], dtype=float),
+                "arc_supported_mask": np.asarray([False, True, False], dtype=bool),
+                "arc_aware_image_rms_arcsec": 0.25 + offset,
+                "failed": True,
+            }
+
+    monkeypatch.setattr(cluster_solver, "ClusterJAXEvaluator", FakeEvaluator)
+    monkeypatch.setattr(cluster_solver, "_convert_theta_to_latent", lambda sample, _specs: np.asarray(sample, dtype=float))
+    monkeypatch.setattr(validation, "jax_cpu_worker_count", lambda: 1)
+    state = SimpleNamespace(
+        parameter_specs=[],
+        family_data=[
+            SimpleNamespace(
+                family_id="1",
+                z_source=2.0,
+                n_images=3,
+                image_labels=["1.1", "1.2", "1.3"],
+                x_obs=np.asarray([0.0, 1.0, 2.0], dtype=float),
+                y_obs=np.asarray([0.0, 0.0, 0.0], dtype=float),
+            )
+        ],
+    )
+    images = pd.DataFrame(
+        {
+            "family_id": ["1", "1", "1"],
+            "image_label": ["1.1", "1.2", "1.3"],
+            "x_obs_arcsec": [0.0, 1.0, 2.0],
+            "y_obs_arcsec": [0.0, 0.0, 0.0],
+        }
+    )
+
+    _mag_df, image_df, source_df = validation._posterior_prediction_uncertainty_tables(
+        state,
+        np.asarray([[0.0], [1.0], [2.0]], dtype=float),
+        images,
+        max_draws=3,
+    )
+
+    assert exact_offsets == [0.0, 1.0, 2.0]
+    indexed = image_df.set_index("image_label")
+    assert indexed.loc["1.1", "x_model_q50"] == pytest.approx(1.1)
+    assert np.isnan(indexed.loc["1.2", "x_model_q50"])
+    assert indexed.loc["1.3", "x_model_q50"] == pytest.approx(3.1)
+    assert indexed.loc["1.3", "image_residual_q50"] == pytest.approx(1.1)
+    assert indexed.loc["1.2", "arc_aware_image_residual_q50"] == pytest.approx(1.05)
+    assert source_df.set_index("family_id").loc["1", "arc_aware_image_rms_q50"] == pytest.approx(1.25)
 
 
 def test_posterior_prediction_uncertainty_tables_approximate_uses_median_std_without_exact(
@@ -10166,6 +19140,7 @@ def test_posterior_prediction_uncertainty_tables_approximate_uses_median_std_wit
 
     monkeypatch.setattr(cluster_solver, "ClusterJAXEvaluator", FakeEvaluator)
     monkeypatch.setattr(cluster_solver, "_convert_theta_to_latent", lambda sample, _specs: np.asarray(sample, dtype=float))
+    monkeypatch.setattr(validation, "jax_cpu_worker_count", lambda: 2)
     state = SimpleNamespace(
         parameter_specs=[],
         family_data=[
@@ -10193,7 +19168,6 @@ def test_posterior_prediction_uncertainty_tables_approximate_uses_median_std_wit
         np.asarray([[0.0], [1.0], [3.0]], dtype=float),
         images,
         max_draws=3,
-        max_workers=2,
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_APPROXIMATE,
     )
 
@@ -10251,10 +19225,13 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
     run_dir = tmp_path / "run"
     output_dir = tmp_path / "out"
     all_samples = np.arange(200, dtype=float).reshape(200, 1)
+    best_fit = np.asarray([123.0], dtype=float)
+    recovery_profile_draws = 32
     captured_profile_samples: list[np.ndarray] = []
     captured_posterior_modes: list[str | None] = []
     captured_recovered_quick: list[bool] = []
     captured_logs: list[str] = []
+    approximate_recovery_payload: dict[str, Any] = {}
 
     def fake_logged_phase(args, phase_name, fn, **kwargs):
         return fn()
@@ -10281,6 +19258,7 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
 
     monkeypatch.setattr(validation, "_run_logged_phase", fake_logged_phase)
     monkeypatch.setattr(validation, "_log", lambda _args, message: captured_logs.append(str(message)))
+    monkeypatch.setattr(validation, "jax_cpu_worker_count", lambda: 5)
     monkeypatch.setattr(
         validation,
         "_load_plot_bundle",
@@ -10291,7 +19269,7 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
                 packed_lens_spec=SimpleNamespace(component_family=np.asarray([], dtype=int)),
             ),
             {},
-            {"samples": all_samples, "best_fit": np.zeros((1,), dtype=float)},
+            {"samples": all_samples, "best_fit": best_fit},
             {},
         ),
     )
@@ -10333,13 +19311,13 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
     )
     monkeypatch.setattr(validation, "_plot_parameter_recovery", lambda _df, path, scale="log_abs": touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_magnification_recovery", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_absolute_magnification_recovery_grid", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(validation, "_plot_absolute_magnification_recovery", lambda _grid, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_image_recovery", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_image_residual_histogram", lambda _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_source_recovery", lambda _df, path: touch(Path(path)))
-    monkeypatch.setattr(
-        validation,
-        "_plot_subhalo_population",
-        lambda _subhalos, _images, _parameter_df, path: touch(Path(path)),
-    )
+    monkeypatch.setattr(validation, "_plot_subhalo_recovery_shmf", lambda _truth, _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_subhalo_recovery_radial", lambda _truth, _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_validation_summary", lambda _summary, _uncertainty, path: touch(Path(path)))
 
     validation.write_recovery_outputs(
@@ -10348,6 +19326,8 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
         mock_images_path,
         output_dir=output_dir,
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_APPROXIMATE,
+        recovery_profile_draws=recovery_profile_draws,
+        recovery_payload=approximate_recovery_payload,
     )
 
     approximate_warnings = [
@@ -10359,6 +19339,10 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
     assert len(approximate_warnings) == 1
     assert "median+/-std" in approximate_warnings[0]
     assert "exact per-draw image validation skipped" in approximate_warnings[0]
+    assert approximate_recovery_payload["posterior_diagnostics"]["workers"] == 5
+    assert approximate_recovery_payload["posterior_diagnostics"]["recovery_profile_draws"] == recovery_profile_draws
+    assert approximate_recovery_payload["posterior_diagnostics"]["recovery_profile_draws_effective"] == recovery_profile_draws
+    assert approximate_recovery_payload["posterior_diagnostics"]["recovery_profile_mode"] == "posterior"
 
     captured_logs.clear()
     validation.write_recovery_outputs(
@@ -10367,6 +19351,7 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
         mock_images_path,
         output_dir=tmp_path / "out_exact",
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
+        recovery_profile_draws=recovery_profile_draws,
     )
 
     assert not any("posterior_diagnostic_mode=approximate" in message for message in captured_logs)
@@ -10378,6 +19363,7 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
         mock_images_path,
         output_dir=tmp_path / "out_quick",
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
+        recovery_profile_draws=recovery_profile_draws,
         quick_diagnostics=True,
     )
 
@@ -10392,12 +19378,184 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
     expected_indices = np.linspace(
         0,
         all_samples.shape[0] - 1,
-        validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
+        recovery_profile_draws,
         dtype=int,
     )
     for profile_samples in captured_profile_samples:
-        assert profile_samples.shape == (validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP, 1)
+        assert profile_samples.shape == (recovery_profile_draws, 1)
         np.testing.assert_array_equal(profile_samples, all_samples[expected_indices])
+
+    best_fit_only_recovery_payload: dict[str, Any] = {}
+    validation.write_recovery_outputs(
+        run_dir,
+        truth_path,
+        mock_images_path,
+        output_dir=tmp_path / "out_best_fit_only",
+        posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
+        recovery_profile_draws=0,
+        recovery_payload=best_fit_only_recovery_payload,
+    )
+
+    assert captured_profile_samples[-1].shape == (1, 1)
+    np.testing.assert_array_equal(captured_profile_samples[-1], best_fit.reshape(1, -1))
+    assert best_fit_only_recovery_payload["posterior_diagnostics"]["recovery_profile_draws"] == 0
+    assert best_fit_only_recovery_payload["posterior_diagnostics"]["recovery_profile_draws_effective"] == 1
+    assert best_fit_only_recovery_payload["posterior_diagnostics"]["recovery_profile_mode"] == "best_fit"
+
+    negative_draws_recovery_payload: dict[str, Any] = {}
+    validation.write_recovery_outputs(
+        run_dir,
+        truth_path,
+        mock_images_path,
+        output_dir=tmp_path / "out_negative_draws",
+        posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
+        recovery_profile_draws=-4,
+        recovery_payload=negative_draws_recovery_payload,
+    )
+
+    assert captured_profile_samples[-1].shape == (1, 1)
+    np.testing.assert_array_equal(captured_profile_samples[-1], best_fit.reshape(1, -1))
+    assert negative_draws_recovery_payload["posterior_diagnostics"]["recovery_profile_draws"] == -4
+    assert negative_draws_recovery_payload["posterior_diagnostics"]["recovery_profile_draws_effective"] == 1
+    assert negative_draws_recovery_payload["posterior_diagnostics"]["recovery_profile_mode"] == "best_fit"
+
+
+def test_write_recovery_outputs_always_includes_critical_arc_support_plots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    truth_path = tmp_path / "truth.json"
+    truth_path.write_text(
+        json.dumps(
+            {
+                "config": {"z_lens": 0.4, "source_redshift": 2.0},
+                "kwargs_lens": [],
+                "images": [{"family_id": "1", "image_label": "1.1", "magnification_true": 2.0}],
+                "subhalos": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    mock_images_path = tmp_path / "mock_images.json"
+    mock_images_path.write_text(
+        json.dumps([{"family_id": "1", "image_label": "1.1", "magnification_true": 2.0}]),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "out"
+    touched: list[Path] = []
+
+    def fake_logged_phase(args, phase_name, fn, **kwargs):
+        return fn()
+
+    def touch(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("pdf", encoding="utf-8")
+        touched.append(path)
+
+    state = SimpleNamespace(
+        parameter_specs=[],
+        lens_model_list=[],
+        packed_lens_spec=SimpleNamespace(component_family=np.asarray([], dtype=int)),
+        family_data=[
+            SimpleNamespace(
+                family_id="1",
+                z_source=2.0,
+                effective_z_source=2.0,
+                n_images=1,
+            )
+        ],
+    )
+    image_df = pd.DataFrame(
+        {
+            "family_id": ["1"],
+            "image_label": ["1.1"],
+            "z_source": [2.0],
+            "effective_z_source": [2.0],
+            "image_residual_arcsec": [0.4],
+            "arc_aware_image_residual_arcsec": [0.03],
+            "arc_noncritical_direction_residual_arcsec": [0.03],
+            "arc_critical_direction_residual_arcsec": [4.0],
+            "arc_s_min": [0.04],
+            "arc_prior_probability": [0.75],
+            "arc_recovery_status": ["arc_supported"],
+            "arc_supported": [True],
+            "model_produced_image_count": [1],
+            "model_recovered_image_count": [0],
+            "model_missing_image_count": [1],
+            "model_extra_image_count": [0],
+            "model_multiplicity_failed": [True],
+            "model_multiplicity_failure_reason": ["missing_model_images"],
+        }
+    )
+
+    monkeypatch.setattr(validation, "_run_logged_phase", fake_logged_phase)
+    monkeypatch.setattr(
+        validation,
+        "_load_plot_bundle",
+        lambda _run_dir: (
+            state,
+            {"sample_likelihood_mode": SAMPLE_LIKELIHOOD_SOURCE},
+            {"samples": np.zeros((3, 0), dtype=float), "best_fit": np.zeros((0,), dtype=float)},
+            {},
+        ),
+    )
+    monkeypatch.setattr(validation, "_artifact_parameter_names", lambda _state: [])
+    monkeypatch.setattr(
+        validation,
+        "parameter_recovery_table",
+        lambda *_args, **_kwargs: pd.DataFrame(
+            {
+                "parameter": ["p"],
+                "truth": [0.0],
+                "q16": [-1.0],
+                "median": [0.0],
+                "q84": [1.0],
+                "bias": [0.0],
+                "covered_68": [True],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        validation,
+        "_recovered_model_tables",
+        lambda *_args, **_kwargs: (
+            pd.DataFrame({"image_label": ["1.1"], "magnification_recovered": [2.1]}),
+            image_df.copy(),
+            pd.DataFrame({"family_id": ["1"]}),
+        ),
+    )
+    monkeypatch.setattr(validation, "_posterior_prediction_uncertainty_tables", lambda *_args, **_kwargs: (pd.DataFrame(), pd.DataFrame(), pd.DataFrame()))
+    monkeypatch.setattr(validation, "_mass_and_surface_density_profiles_for_samples", lambda *_args, **_kwargs: (pd.DataFrame(), pd.DataFrame()))
+    monkeypatch.setattr(validation, "_scaling_parameter_subset", lambda *_args, **_kwargs: ([], np.zeros((3, 0), dtype=float), np.zeros((0,), dtype=float)))
+    monkeypatch.setattr(validation, "_plot_corner_pdf", lambda output_dir, _samples, _specs, filename="corner.pdf", **_kwargs: touch(Path(output_dir) / filename))
+    monkeypatch.setattr(validation, "_plot_parameter_recovery", lambda _df, path, scale="log_abs": touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_magnification_recovery", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_absolute_magnification_recovery_grid", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(validation, "_plot_absolute_magnification_recovery", lambda _grid, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_image_recovery", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_image_residual_histogram", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_critical_arc_support_histogram", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_critical_arc_support_phase_space", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_critical_arc_recovery_by_family", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_source_recovery", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_subhalo_recovery_shmf", lambda _truth, _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_subhalo_recovery_radial", lambda _truth, _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_validation_summary", lambda _summary, _uncertainty, path: touch(Path(path)))
+
+    outputs = validation.write_recovery_outputs(
+        tmp_path / "run",
+        truth_path,
+        mock_images_path,
+        output_dir=output_dir,
+        posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_APPROXIMATE,
+    )
+
+    assert outputs["critical_arc_support_histogram_plot"] == output_dir / "critical_arc_support_histogram.pdf"
+    assert outputs["critical_arc_support_phase_space_plot"] == output_dir / "critical_arc_support_phase_space.pdf"
+    assert outputs["critical_arc_recovery_by_family_plot"] == output_dir / "critical_arc_recovery_by_family.pdf"
+    assert outputs["critical_arc_support_histogram_plot"] in touched
+    assert outputs["critical_arc_support_phase_space_plot"] in touched
+    assert outputs["critical_arc_recovery_by_family_plot"] in touched
 
 
 def test_write_recovery_outputs_includes_cosmology_corner_for_cosmology_specs(
@@ -10514,9 +19672,13 @@ def test_write_recovery_outputs_includes_cosmology_corner_for_cosmology_specs(
     monkeypatch.setattr(validation, "_plot_corner_pdf", fake_plot_corner_pdf)
     monkeypatch.setattr(validation, "_plot_parameter_recovery", lambda _df, path, scale="log_abs": touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_magnification_recovery", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_absolute_magnification_recovery_grid", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(validation, "_plot_absolute_magnification_recovery", lambda _grid, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_image_recovery", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_image_residual_histogram", lambda _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_source_recovery", lambda _df, path: touch(Path(path)))
-    monkeypatch.setattr(validation, "_plot_subhalo_population", lambda _subhalos, _images, _parameter_df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_subhalo_recovery_shmf", lambda _truth, _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_subhalo_recovery_radial", lambda _truth, _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_validation_summary", lambda _summary, _uncertainty, path: touch(Path(path)))
 
     outputs = validation.write_recovery_outputs(
@@ -10566,6 +19728,7 @@ def test_combined_mass_surface_density_profiles_match_separate_helpers(monkeypat
     monkeypatch.setattr(validation, "_annular_surface_density_msun_per_arcsec2", fake_annular_surface_density)
     monkeypatch.setattr(cluster_solver, "ClusterJAXEvaluator", FakeEvaluator)
     monkeypatch.setattr(cluster_solver, "_convert_theta_to_latent", lambda sample, _specs: np.asarray(sample, dtype=float))
+    monkeypatch.setattr(validation, "jax_cpu_worker_count", lambda: 1)
 
     state = SimpleNamespace(
         lens_model_list=["fake_halo", "fake_subhalo"],
@@ -10585,6 +19748,42 @@ def test_combined_mass_surface_density_profiles_match_separate_helpers(monkeypat
 
     pd.testing.assert_frame_equal(mass_df.reset_index(drop=True), expected_mass_df.reset_index(drop=True))
     pd.testing.assert_frame_equal(surface_df.reset_index(drop=True), expected_surface_df.reset_index(drop=True))
+
+    executor_worker_counts: list[int] = []
+    submitted_samples: list[int] = []
+
+    class InlineExecutor:
+        def __init__(self, *, max_workers: int) -> None:
+            executor_worker_counts.append(int(max_workers))
+
+        def __enter__(self) -> "InlineExecutor":
+            return self
+
+        def __exit__(self, *_exc: Any) -> bool:
+            return False
+
+        def submit(self, fn: Any, sample_index: int, sample: np.ndarray) -> Future[Any]:
+            submitted_samples.append(int(sample_index))
+            future: Future[Any] = Future()
+            try:
+                future.set_result(fn(sample_index, sample))
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+    monkeypatch.setattr(validation, "jax_cpu_worker_count", lambda: 4)
+    monkeypatch.setattr(validation, "ThreadPoolExecutor", InlineExecutor)
+    threaded_mass_df, threaded_surface_df = validation._mass_and_surface_density_profiles_for_samples(
+        state,
+        samples,
+        truth,
+        radii,
+    )
+
+    assert executor_worker_counts == [2]
+    assert submitted_samples == [1, 2]
+    pd.testing.assert_frame_equal(threaded_mass_df.reset_index(drop=True), mass_df.reset_index(drop=True))
+    pd.testing.assert_frame_equal(threaded_surface_df.reset_index(drop=True), surface_df.reset_index(drop=True))
 
 
 def test_plot_surface_density_recovery_writes_pdf(tmp_path: Path) -> None:
@@ -10622,7 +19821,7 @@ def test_plot_critical_caustic_recovery_writes_pdf(tmp_path: Path) -> None:
         caustic_area_arcsec2=0.08,
         critical_area_arcsec2=8.0,
     )
-    truth_contour_z7 = validation.CausticContour(
+    truth_contour_z9 = validation.CausticContour(
         caustic_index=0,
         caustic_class="primary",
         beta_x=np.asarray([-0.3, 0.0, 0.3, 0.0, -0.3]),
@@ -10642,7 +19841,7 @@ def test_plot_critical_caustic_recovery_writes_pdf(tmp_path: Path) -> None:
         caustic_area_arcsec2=0.08,
         critical_area_arcsec2=8.0,
     )
-    recovered_contour_z7 = validation.CausticContour(
+    recovered_contour_z9 = validation.CausticContour(
         caustic_index=0,
         caustic_class="primary",
         beta_x=np.asarray([-0.28, 0.02, 0.32, 0.02, -0.28]),
@@ -10684,8 +19883,8 @@ def test_plot_critical_caustic_recovery_writes_pdf(tmp_path: Path) -> None:
     path = tmp_path / "critical_caustic_recovery.pdf"
 
     validation._plot_critical_caustic_recovery(
-        {"2.00000000": [truth_contour_z2], "7.00000000": [truth_contour_z7]},
-        {"2.00000000": [recovered_contour_z2], "7.00000000": [recovered_contour_z7]},
+        {"2.00000000": [truth_contour_z2], "9.00000000": [truth_contour_z9]},
+        {"2.00000000": [recovered_contour_z2], "9.00000000": [recovered_contour_z9]},
         images,
         image_df,
         source_df,
@@ -10697,7 +19896,7 @@ def test_plot_critical_caustic_recovery_writes_pdf(tmp_path: Path) -> None:
     assert path.stat().st_size > 0
 
 
-def test_select_critical_caustic_plot_contours_keeps_z7_only() -> None:
+def test_select_critical_caustic_plot_contours_keeps_z9_only() -> None:
     contour = validation.CausticContour(
         caustic_index=0,
         caustic_class="primary",
@@ -10712,14 +19911,14 @@ def test_select_critical_caustic_plot_contours_keeps_z7_only() -> None:
     selected = validation._select_critical_caustic_plot_contours(
         {
             "2.00000000": [contour],
-            "7.00000000": [contour],
+            "9.00000000": [contour],
             "bad-key": [contour],
-            "7.00000200": [contour],
-            "7.00000050": [],
+            "9.00000200": [contour],
+            "9.00000050": [],
         }
     )
 
-    assert selected == {"7.00000000": [contour]}
+    assert selected == {"9.00000000": [contour]}
 
 
 def test_plot_critical_caustic_recovery_ignores_marker_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -10745,8 +19944,8 @@ def test_plot_critical_caustic_recovery_ignores_marker_inputs(tmp_path: Path, mo
     monkeypatch.setattr(Axes, "scatter", record_scatter)
 
     validation._plot_critical_caustic_recovery(
-        {"7.00000000": [contour]},
-        {"7.00000000": [contour]},
+        {"9.00000000": [contour]},
+        {"9.00000000": [contour]},
         pd.DataFrame({"x_obs_arcsec": [-1.0], "y_obs_arcsec": [0.0]}),
         pd.DataFrame(
             {
@@ -10771,7 +19970,7 @@ def test_plot_critical_caustic_recovery_ignores_marker_inputs(tmp_path: Path, mo
     assert scatter_labels == ["truth caustic", "recovered caustic"]
 
 
-def test_write_recovery_outputs_filters_recovered_caustics_to_z7_and_logs_phases(
+def test_write_recovery_outputs_filters_recovered_caustics_to_z9_and_logs_phases(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10789,11 +19988,11 @@ def test_write_recovery_outputs_filters_recovered_caustics_to_z7_and_logs_phases
     truth_path.write_text(
         json.dumps(
             {
-                "config": {"z_lens": 0.4, "source_redshift": 2.0},
+                "config": {"z_lens": 0.4, "source_redshift": 2.0, "caustic_grid_scale_arcsec": 0.5},
                 "kwargs_lens": [],
                 "caustics_by_source_redshift": {
                     "2.00000000": [contour_payload],
-                    "7.00000000": [contour_payload],
+                    "9.00000000": [contour_payload],
                 },
                 "subhalos": [],
             }
@@ -10808,7 +20007,10 @@ def test_write_recovery_outputs_filters_recovered_caustics_to_z7_and_logs_phases
     run_dir = tmp_path / "run"
     output_dir = tmp_path / "out"
     phases: list[str] = []
+    requested_truth_caustic_keys: list[list[str]] = []
     requested_caustic_keys: list[list[str]] = []
+    truth_plot_grid_scales: list[float] = []
+    recovered_plot_grid_scales: list[float] = []
     progress_instances = _install_recording_progress(monkeypatch)
 
     def fake_logged_phase(args, phase_name, fn, **kwargs):
@@ -10871,10 +20073,17 @@ def test_write_recovery_outputs_filters_recovered_caustics_to_z7_and_logs_phases
     monkeypatch.setattr(validation, "_mass_and_surface_density_profiles_for_samples", lambda *_args, **_kwargs: (pd.DataFrame(), pd.DataFrame()))
     monkeypatch.setattr(validation, "_scaling_parameter_subset", lambda *_args, **_kwargs: ([], np.zeros((2, 0), dtype=float), np.zeros((0,), dtype=float)))
 
-    def fake_recovered_caustics(_state, _best_fit, _truth, z_keys, **_kwargs):
-        requested_caustic_keys.append(list(z_keys))
-        return {"7.00000000": [contour]}
+    def fake_truth_plot_caustics(_state, _truth, z_keys, **kwargs):
+        requested_truth_caustic_keys.append(list(z_keys))
+        truth_plot_grid_scales.append(float(kwargs["caustic_grid_scale_arcsec"]))
+        return {"9.00000000": [contour]}
 
+    def fake_recovered_caustics(_state, _best_fit, _truth, z_keys, **kwargs):
+        requested_caustic_keys.append(list(z_keys))
+        recovered_plot_grid_scales.append(float(kwargs["caustic_grid_scale_arcsec"]))
+        return {"9.00000000": [contour]}
+
+    monkeypatch.setattr(validation, "_truth_caustic_contours_by_z_for_plot", fake_truth_plot_caustics)
     monkeypatch.setattr(validation, "_recovered_caustic_contours_by_z", fake_recovered_caustics)
     monkeypatch.setattr(
         validation,
@@ -10886,9 +20095,13 @@ def test_write_recovery_outputs_filters_recovered_caustics_to_z7_and_logs_phases
     monkeypatch.setattr(validation, "_plot_parameter_recovery", lambda _df, path, scale="log_abs": touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_critical_caustic_recovery", lambda *_args: touch(Path(_args[-1])))
     monkeypatch.setattr(validation, "_plot_magnification_recovery", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_absolute_magnification_recovery_grid", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(validation, "_plot_absolute_magnification_recovery", lambda _grid, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_image_recovery", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_image_residual_histogram", lambda _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_source_recovery", lambda _df, path: touch(Path(path)))
-    monkeypatch.setattr(validation, "_plot_subhalo_population", lambda _subhalos, _images, _parameter_df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_subhalo_recovery_shmf", lambda _truth, _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_subhalo_recovery_radial", lambda _truth, _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_validation_summary", lambda _summary, _uncertainty, path: touch(Path(path)))
 
     outputs = validation.write_recovery_outputs(
@@ -10897,13 +20110,18 @@ def test_write_recovery_outputs_filters_recovered_caustics_to_z7_and_logs_phases
         mock_images_path,
         output_dir=output_dir,
         posterior_diagnostic_draws=1,
+        critical_caustic_plot_grid_scale_arcsec=0.2,
         progress_args=argparse.Namespace(quiet=False),
     )
 
-    assert requested_caustic_keys == [["7.00000000"]]
+    assert requested_truth_caustic_keys == [["9.00000000"]]
+    assert requested_caustic_keys == [["9.00000000"]]
+    assert truth_plot_grid_scales == [pytest.approx(0.2)]
+    assert recovered_plot_grid_scales == [pytest.approx(0.2)]
     assert "critical_caustic_plot" in outputs
     assert "cosmology_corner_plot" not in outputs
     assert "validation.recovery.load_plot_bundle" in phases
+    assert "validation.recovery.truth_plot_caustics" in phases
     assert "validation.recovery.recovered_caustics" in phases
     assert "validation.recovery.plot_corner" in phases
     assert len(progress_instances) == 1
@@ -10961,9 +20179,12 @@ def test_single_bcg_recovery_smoke(tmp_path: Path) -> None:
         "surface_density_recovery.pdf",
         "critical_caustic_recovery.pdf",
         "magnification_recovery.pdf",
+        "absolute_magnification_recovery.pdf",
         "image_recovery.pdf",
+        "image_residual_histogram.pdf",
         "source_recovery.pdf",
-        "subhalo_population.pdf",
+        "subhalo_recovery_shmf.pdf",
+        "subhalo_recovery_radial.pdf",
         "validation_summary.pdf",
     ]
     for figure_name in expected_figures:

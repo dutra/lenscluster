@@ -9,6 +9,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
+from astropy.io import fits
+from astropy.wcs import WCS
 
 import lenscluster.plotting as plotting
 from lenscluster.plotting import plot_path
@@ -20,6 +22,32 @@ def test_plot_path_creates_directory(tmp_path: Path) -> None:
 
     assert output == tmp_path / "plots" / "summary.pdf"
     assert output.parent.is_dir()
+
+
+def test_image_catalog_family_cutout_stage_eligibility(tmp_path: Path) -> None:
+    args = SimpleNamespace(
+        image_catalog_family_cutout_image_dir=tmp_path / "images",
+        exact_image_diagnostics_stage3=False,
+    )
+
+    assert plotting._image_catalog_family_cutout_enabled(
+        args,
+        tmp_path / "fit" / "stage4_critical_arc_mixture_image_plane",
+    )
+    assert not plotting._image_catalog_family_cutout_enabled(
+        args,
+        tmp_path / "fit" / "stage3_image_plane",
+    )
+    args.exact_image_diagnostics_stage3 = True
+    assert plotting._image_catalog_family_cutout_enabled(
+        args,
+        tmp_path / "fit" / "stage3_image_plane",
+    )
+    args.image_catalog_family_cutout_image_dir = None
+    assert not plotting._image_catalog_family_cutout_enabled(
+        args,
+        tmp_path / "fit" / "stage4_critical_arc_mixture_image_plane",
+    )
 
 
 def test_run_plot_tasks_with_progress_tracks_plot_names(monkeypatch: Any) -> None:
@@ -172,6 +200,142 @@ def _mixed_cosmology_test_specs() -> list[ParameterSpec]:
     ]
 
 
+def test_corner_uses_one_two_three_sigma_contour_levels(tmp_path: Path, monkeypatch: Any) -> None:
+    calls: list[tuple[str, Any, dict[str, Any]]] = []
+
+    class FakeFig:
+        def savefig(self, path: Path, **_kwargs: Any) -> None:
+            Path(path).write_text("pdf", encoding="utf-8")
+
+    class FakeCorner:
+        def corner(self, samples: np.ndarray, **kwargs: Any) -> FakeFig:
+            calls.append(("corner", np.asarray(samples), kwargs))
+            return FakeFig()
+
+        def overplot_points(self, _fig: FakeFig, _xs: list[list[float]], **_kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(plotting, "corner", FakeCorner())
+    monkeypatch.setattr(plotting.plt, "close", lambda _fig: None)
+
+    plotting._plot_corner(
+        tmp_path,
+        np.asarray([[0.0, 1.0], [1.0, 2.0], [2.0, 4.0]], dtype=float),
+        _corner_test_specs(),
+    )
+
+    assert calls[0][0] == "corner"
+    expected = [1.0 - math.exp(-0.5 * sigma**2) for sigma in (1.0, 2.0, 3.0)]
+    np.testing.assert_allclose(plotting.CORNER_SIGMA_CONTOUR_LEVELS, expected)
+    np.testing.assert_allclose(calls[0][2]["levels"], expected)
+
+
+def _image_scatter_test_spec() -> ParameterSpec:
+    return ParameterSpec(
+        name="image.sigma_int",
+        sample_name="image_sigma_int",
+        potential_id="image",
+        profile_type=0,
+        field="sigma_int",
+        prior_kind="uniform",
+        lower=0.0,
+        upper=2.0,
+        step=0.01,
+        component_family="image_scatter",
+    )
+
+
+def _source_position_test_spec(index: int) -> ParameterSpec:
+    return ParameterSpec(
+        name=f"source.{index}.beta_x",
+        sample_name=f"source_{index}_beta_x",
+        potential_id=str(index),
+        profile_type=0,
+        field="beta_x",
+        prior_kind="uniform",
+        lower=-10.0,
+        upper=10.0,
+        step=0.01,
+        component_family="source_position",
+    )
+
+
+def _synthetic_stuck_chain_posterior() -> tuple[PosteriorResults, list[ParameterSpec]]:
+    specs = [
+        ParameterSpec(
+            name="halo.x",
+            sample_name="halo_x",
+            potential_id="halo",
+            profile_type=81,
+            field="x",
+            prior_kind="uniform",
+            lower=-5.0,
+            upper=5.0,
+            step=0.1,
+            component_family="large",
+        ),
+        ParameterSpec(
+            name="halo.y",
+            sample_name="halo_y",
+            potential_id="halo",
+            profile_type=81,
+            field="y",
+            prior_kind="uniform",
+            lower=-5.0,
+            upper=5.0,
+            step=0.1,
+            component_family="large",
+        ),
+        _image_scatter_test_spec(),
+    ]
+    draws = np.linspace(-0.02, 0.02, 12)
+    grouped = np.zeros((4, draws.size, len(specs)), dtype=float)
+    grouped[:, :, 0] = np.asarray([0.0, 0.05, 0.08, 0.1], dtype=float)[:, None] + draws[None, :]
+    grouped[:, :, 1] = np.asarray([0.0, 0.02, 0.03, 0.04], dtype=float)[:, None] + 0.5 * draws[None, :]
+    grouped[0, :, 2] = 1.23 + 0.002 * np.linspace(-1.0, 1.0, draws.size)
+    grouped[1, :, 2] = 0.10 + 0.01 * np.linspace(-1.0, 1.0, draws.size)
+    grouped[2, :, 2] = 0.11 + 0.01 * np.linspace(-1.0, 1.0, draws.size)
+    grouped[3, :, 2] = 0.09 + 0.01 * np.linspace(-1.0, 1.0, draws.size)
+    grouped_log_prob = np.vstack(
+        [
+            np.full(draws.size, -230.0),
+            np.linspace(-10.0, 5.0, draws.size),
+            np.linspace(-8.0, 7.0, draws.size),
+            np.linspace(0.0, 20.0, draws.size),
+        ]
+    )
+    accept_prob = np.vstack(
+        [
+            np.full(draws.size, 0.95),
+            np.full(draws.size, 0.98),
+            np.full(draws.size, 0.97),
+            np.full(draws.size, 0.90),
+        ]
+    )
+    num_steps = np.vstack(
+        [
+            np.full(draws.size, 255.0),
+            np.full(draws.size, 64.0),
+            np.full(draws.size, 128.0),
+            np.full(draws.size, 200.0),
+        ]
+    )
+    posterior = PosteriorResults(
+        samples=grouped.reshape((-1, grouped.shape[-1])),
+        log_prob=grouped_log_prob.reshape(-1),
+        accept_prob=accept_prob.reshape(-1),
+        diverging=np.zeros(grouped.shape[0] * grouped.shape[1], dtype=bool),
+        num_steps=num_steps.reshape(-1),
+        warmup_steps=0,
+        sample_steps=grouped.shape[1],
+        num_chains=grouped.shape[0],
+        init_diagnostics={"chain_seed_labels": ["stuck", "ok-1", "ok-2", "ok-3"]},
+        grouped_samples=grouped,
+        grouped_log_prob=grouped_log_prob,
+    )
+    return posterior, specs
+
+
 def test_load_bayes_corner_overlay_maps_object_and_potfile_columns(tmp_path: Path, monkeypatch: Any) -> None:
     bayes_path = tmp_path / "bayes.dat"
     bayes_path.write_text(
@@ -208,6 +372,7 @@ def test_load_bayes_corner_overlay_maps_object_and_potfile_columns(tmp_path: Pat
 
 def test_bayes_corner_overlay_uses_existing_corner_figure(tmp_path: Path, monkeypatch: Any) -> None:
     calls: list[tuple[str, Any, dict[str, Any]]] = []
+    figures: list[Any] = []
     specs = [
         ParameterSpec(
             name="potfile.cutkpc",
@@ -241,8 +406,10 @@ def test_bayes_corner_overlay_uses_existing_corner_figure(tmp_path: Path, monkey
 
     class FakeCorner:
         def corner(self, samples: np.ndarray, **kwargs: Any) -> FakeFig:
+            fig = kwargs.get("fig") or FakeFig()
+            figures.append(fig)
             calls.append(("corner", np.asarray(samples), kwargs))
-            return kwargs.get("fig") or FakeFig()
+            return fig
 
         def overplot_lines(self, _fig: FakeFig, xs: list[float | None], **kwargs: Any) -> None:
             calls.append(("lines", xs, kwargs))
@@ -265,10 +432,16 @@ def test_bayes_corner_overlay_uses_existing_corner_figure(tmp_path: Path, monkey
 
     assert calls[0][0] == "corner"
     assert calls[1][0] == "corner"
+    np.testing.assert_allclose(calls[0][2]["weights"], np.full(3, 1.0 / 3.0))
+    assert np.sum(calls[0][2]["weights"]) == pytest.approx(1.0)
     np.testing.assert_allclose(calls[1][1], np.asarray([[21.0, 190.0], [26.0, 210.0], [31.0, 230.0]]))
-    assert calls[1][2]["fig"] is not None
+    np.testing.assert_allclose(calls[1][2]["weights"], np.full(3, 1.0 / 3.0))
+    assert np.sum(calls[1][2]["weights"]) == pytest.approx(1.0)
+    assert calls[1][2]["fig"] is figures[0]
     assert calls[1][2]["color"] == plotting.CORNER_BAYES_OVERLAY_COLOR
     assert calls[1][2]["fill_contours"] is False
+    assert calls[1][2]["no_fill_contours"] is True
+    assert "contourf_kwargs" not in calls[1][2]
     assert calls[1][2]["plot_datapoints"] is False
 
 
@@ -388,13 +561,128 @@ def test_best_par_marker_draws_without_fit_markers(tmp_path: Path, monkeypatch: 
     )
 
     assert calls[0][0] == "corner"
-    assert calls[1] == ("lines", [1.5, 3.5], {"color": plotting.CORNER_BEST_FIT_COLOR})
-    assert calls[2] == (
+    assert calls[1] == (
         "points",
         [[1.5, 3.5]],
-        {"marker": "s", "color": plotting.CORNER_BEST_FIT_COLOR},
+        {
+            "marker": "x",
+            "color": plotting.CORNER_BEST_PAR_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
     )
-    assert len(calls) == 3
+    assert len(calls) == 2
+
+
+def test_per_potential_summary_uses_corner_marker_colors_and_limits(tmp_path: Path, monkeypatch: Any) -> None:
+    class FakeAxis:
+        def __init__(self) -> None:
+            self.hlines_calls: list[tuple[Any, Any, Any, dict[str, Any]]] = []
+            self.scatters: list[tuple[Any, Any, dict[str, Any]]] = []
+            self.xlim: tuple[float, float] | None = None
+            self.title: str | None = None
+
+        def hlines(self, y: Any, xmin: Any, xmax: Any, **kwargs: Any) -> None:
+            self.hlines_calls.append((y, xmin, xmax, kwargs))
+
+        def scatter(self, x: Any, y: Any, **kwargs: Any) -> None:
+            self.scatters.append((x, y, kwargs))
+
+        def set_xlim(self, x_min: float, x_max: float) -> None:
+            self.xlim = (x_min, x_max)
+
+        def set_yticks(self, _ticks: list[Any]) -> None:
+            return None
+
+        def set_title(self, title: str) -> None:
+            self.title = title
+
+        def get_legend_handles_labels(self) -> tuple[list[str], list[str]]:
+            labels = [str(kwargs["label"]) for _x, _y, kwargs in self.scatters if "label" in kwargs]
+            return labels, labels
+
+    class FakeFig:
+        def __init__(self) -> None:
+            self.legend_calls: list[tuple[Any, Any, dict[str, Any]]] = []
+            self.saved_path: Path | None = None
+
+        def legend(self, handles: Any, labels: Any, **kwargs: Any) -> None:
+            self.legend_calls.append((handles, labels, kwargs))
+
+        def tight_layout(self) -> None:
+            return None
+
+        def savefig(self, path: Path, **_kwargs: Any) -> None:
+            self.saved_path = Path(path)
+            self.saved_path.write_text("pdf", encoding="utf-8")
+
+    axis = FakeAxis()
+    fig = FakeFig()
+    monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: (fig, axis))
+    monkeypatch.setattr(plotting.plt, "close", lambda _fig: None)
+    summary_df = pd.DataFrame(
+        [
+            {
+                "label": "potfile.sigma",
+                "p16": 2.0,
+                "p84": 8.0,
+                "median": 5.0,
+                "map": 6.0,
+                "lower": 0.0,
+                "upper": 10.0,
+                "std": 1.0,
+            }
+        ]
+    )
+
+    plotting._plot_per_potential_summary(
+        tmp_path,
+        summary_df,
+        best_par_marker_values={"potfile.sigma": 20.0},
+        previous_stage_best_values={"potfile_sigma": -5.0},
+        parameter_specs=[
+            ParameterSpec(
+                name="potfile.sigma",
+                sample_name="potfile_sigma",
+                potential_id="potfile",
+                profile_type=81,
+                field="sigma",
+                prior_kind="uniform",
+                lower=0.0,
+                upper=10.0,
+                step=1.0,
+                component_family="scaling",
+            )
+        ],
+    )
+
+    assert axis.hlines_calls == [(1, 2.0, 8.0, {"linewidth": 4, "color": "tab:blue"})]
+    assert axis.scatters[0] == ([5.0], [1], {"color": "tab:blue", "s": 35, "label": "median"})
+    assert axis.scatters[1] == (
+        [6.0],
+        [1],
+        {"color": plotting.CORNER_BEST_FIT_COLOR, "marker": "x", "s": 30, "label": "best fit"},
+    )
+    assert axis.scatters[2] == (
+        [20.0],
+        [1],
+        {"color": plotting.CORNER_BEST_PAR_COLOR, "marker": "x", "s": 30, "label": "best.par"},
+    )
+    assert axis.scatters[3] == (
+        [-5.0],
+        [1],
+        {
+            "color": plotting.CORNER_PREVIOUS_STAGE_COLOR,
+            "marker": "x",
+            "s": 30,
+            "label": "previous stage",
+        },
+    )
+    assert axis.xlim is not None
+    assert axis.xlim[0] < -5.0
+    assert axis.xlim[1] > 20.0
+    assert axis.title == "potfile.sigma"
+    assert fig.saved_path == tmp_path / "per_potential_summary.pdf"
 
 
 def test_cosmology_parameter_subset_keeps_only_cosmology_columns() -> None:
@@ -451,12 +739,25 @@ def test_corner_overlays_gold_best_fit_and_preserves_truths(tmp_path: Path, monk
 
     assert calls[0][0] == "corner"
     assert calls[0][2]["truths"] == [0.5, 2.5]
-    assert calls[1] == ("lines", [1.25, 3.25], {"color": plotting.CORNER_PREVIOUS_STAGE_COLOR})
-    assert calls[2] == ("lines", [1.5, 3.5], {"color": plotting.CORNER_BEST_FIT_COLOR})
-    assert calls[3] == (
+    assert calls[1] == (
+        "points",
+        [[1.25, 3.25]],
+        {
+            "marker": "x",
+            "color": plotting.CORNER_PREVIOUS_STAGE_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
+    )
+    assert calls[2] == (
         "points",
         [[1.5, 3.5]],
-        {"marker": "s", "color": plotting.CORNER_BEST_FIT_COLOR},
+        {
+            "marker": "x",
+            "color": plotting.CORNER_BEST_FIT_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
     )
 
 
@@ -550,11 +851,15 @@ def test_corner_excludes_source_positions_before_finite_filtering(tmp_path: Path
     np.testing.assert_allclose(calls[0][1], np.asarray([[0.0, 1.0], [1.0, 2.0], [2.0, 4.0]]))
     assert calls[0][2]["labels"] == ["x", "y"]
     assert calls[0][2]["truths"] == [0.5, 2.5]
-    assert calls[1] == ("lines", [1.5, 3.5], {"color": plotting.CORNER_BEST_FIT_COLOR})
-    assert calls[2] == (
+    assert calls[1] == (
         "points",
         [[1.5, 3.5]],
-        {"marker": "s", "color": plotting.CORNER_BEST_FIT_COLOR},
+        {
+            "marker": "x",
+            "color": plotting.CORNER_BEST_FIT_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
     )
 
 
@@ -589,12 +894,25 @@ def test_potfile_corner_uses_scaling_best_fit_values(tmp_path: Path, monkeypatch
     )
 
     assert calls[0][2]["truths"] == [10.5, 22.5]
-    assert calls[1] == ("lines", [11.5, 22.0], {"color": plotting.CORNER_PREVIOUS_STAGE_COLOR})
-    assert calls[2] == ("lines", [12.0, 23.0], {"color": plotting.CORNER_BEST_FIT_COLOR})
-    assert calls[3] == (
+    assert calls[1] == (
+        "points",
+        [[11.5, 22.0]],
+        {
+            "marker": "x",
+            "color": plotting.CORNER_PREVIOUS_STAGE_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
+    )
+    assert calls[2] == (
         "points",
         [[12.0, 23.0]],
-        {"marker": "s", "color": plotting.CORNER_BEST_FIT_COLOR},
+        {
+            "marker": "x",
+            "color": plotting.CORNER_BEST_FIT_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
     )
 
 
@@ -646,16 +964,30 @@ def test_cosmology_corner_uses_sample_name_truths_and_best_fit(tmp_path: Path, m
     np.testing.assert_allclose(calls[0][1], samples[:, [1, 2]])
     assert calls[0][2]["labels"] == ["cosmology.Om0", "cosmology.w0"]
     assert calls[0][2]["truths"] == [0.3, -1.0]
-    assert calls[1] == ("lines", [0.29, -1.05], {"color": plotting.CORNER_PREVIOUS_STAGE_COLOR})
-    assert calls[2] == ("lines", [0.31, -0.95], {"color": plotting.CORNER_BEST_FIT_COLOR})
-    assert calls[3] == (
+    assert calls[1] == (
+        "points",
+        [[0.29, -1.05]],
+        {
+            "marker": "x",
+            "color": plotting.CORNER_PREVIOUS_STAGE_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
+    )
+    assert calls[2] == (
         "points",
         [[0.31, -0.95]],
-        {"marker": "s", "color": plotting.CORNER_BEST_FIT_COLOR},
+        {
+            "marker": "x",
+            "color": plotting.CORNER_BEST_FIT_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
     )
 
 
-def test_fit_quality_tables_cap_draws_convert_physical_and_quantile() -> None:
+def test_fit_quality_tables_cap_draws_convert_physical_and_quantile(monkeypatch: Any) -> None:
+    monkeypatch.setattr(plotting, "jax_cpu_worker_count", lambda: 1)
     family = SimpleNamespace(
         family_id="1",
         z_source=2.0,
@@ -709,7 +1041,7 @@ def test_fit_quality_tables_cap_draws_convert_physical_and_quantile() -> None:
         evaluator,
         np.asarray([5.0], dtype=float),
         results,
-        argparse.Namespace(fit_quality_draws=2, fit_quality_workers=1),
+        argparse.Namespace(fit_quality_draws=2),
     )
 
     assert [float(item[0]) for item in evaluator.converted] == [5.0, 0.0, 30.0]
@@ -748,7 +1080,8 @@ def test_fit_quality_tables_cap_draws_convert_physical_and_quantile() -> None:
     assert int(mag_row["posterior_valid_draws"]) == 2
 
 
-def test_fit_quality_tables_defaults_to_best_fit_only() -> None:
+def test_fit_quality_tables_defaults_to_best_fit_only(monkeypatch: Any) -> None:
+    monkeypatch.setattr(plotting, "jax_cpu_worker_count", lambda: 1)
     family = SimpleNamespace(
         family_id="1",
         z_source=2.0,
@@ -802,7 +1135,7 @@ def test_fit_quality_tables_defaults_to_best_fit_only() -> None:
         evaluator,
         np.asarray([5.0], dtype=float),
         results,
-        argparse.Namespace(fit_quality_workers=1),
+        argparse.Namespace(),
     )
 
     assert evaluator.converted == [5.0]
@@ -822,7 +1155,8 @@ def test_fit_quality_tables_defaults_to_best_fit_only() -> None:
     assert int(mag_row["posterior_valid_draws"]) == 0
 
 
-def test_fit_quality_tables_quick_diagnostics_skips_exact_and_uses_median_std() -> None:
+def test_fit_quality_tables_quick_diagnostics_skips_exact_and_uses_median_std(monkeypatch: Any) -> None:
+    monkeypatch.setattr(plotting, "jax_cpu_worker_count", lambda: 1)
     family = SimpleNamespace(
         family_id="1",
         z_source=2.0,
@@ -873,7 +1207,7 @@ def test_fit_quality_tables_quick_diagnostics_skips_exact_and_uses_median_std() 
         evaluator,
         np.asarray([10.0], dtype=float),
         results,
-        argparse.Namespace(fit_quality_draws=3, fit_quality_workers=1, quick_diagnostics=True),
+        argparse.Namespace(fit_quality_draws=3, quick_diagnostics=True),
     )
 
     assert evaluator.exact_calls == 0
@@ -894,7 +1228,8 @@ def test_fit_quality_tables_quick_diagnostics_skips_exact_and_uses_median_std() 
     assert mag_row["magnification_model_q84"] == pytest.approx(float(np.median(mag_values) + np.std(mag_values)))
 
 
-def test_fit_quality_tables_tracks_partial_recovery_and_extra_images() -> None:
+def test_fit_quality_tables_tracks_partial_recovery_and_extra_images(monkeypatch: Any) -> None:
+    monkeypatch.setattr(plotting, "jax_cpu_worker_count", lambda: 1)
     family = SimpleNamespace(
         family_id="1",
         z_source=2.0,
@@ -950,7 +1285,7 @@ def test_fit_quality_tables_tracks_partial_recovery_and_extra_images() -> None:
         FakeEvaluator(),
         np.asarray([0.0], dtype=float),
         SimpleNamespace(samples=np.empty((0, 1), dtype=float)),
-        argparse.Namespace(fit_quality_draws=0, fit_quality_workers=1),
+        argparse.Namespace(fit_quality_draws=0),
     )
 
     indexed = image_df.set_index("image_label")
@@ -1069,13 +1404,14 @@ def test_posterior_fit_quality_predictions_parallelizes_per_sample_family(monkey
     monkeypatch.setattr(plotting, "ThreadPoolExecutor", InlineExecutor)
     monkeypatch.setattr(plotting, "as_completed", lambda futures: list(futures))
     monkeypatch.setattr(plotting, "Progress", FakeProgress)
+    monkeypatch.setattr(plotting, "jax_cpu_worker_count", lambda: 4)
     monkeypatch.setattr(plotting, "_log", lambda _args, message: log_messages.append(str(message)))
 
     predictions = plotting._posterior_fit_quality_predictions(
         evaluator,
         state,
         [np.asarray([1.0], dtype=float), np.asarray([2.0], dtype=float)],
-        argparse.Namespace(fit_quality_workers=4),
+        argparse.Namespace(),
     )
 
     assert submitted == [(0, 1), (1, 1), (0, 2), (1, 2), (0, 0), (1, 0)]
@@ -1103,12 +1439,12 @@ def test_posterior_fit_quality_predictions_parallelizes_per_sample_family(monkey
     assert (2, "draw progress: 2/2 complete") in progress.descriptions
     assert (
         1,
-        "fit quality exact: 6/6 family diagnostics | completed draw 2/2 family=fam-0 z=2.0000 window=10.0 grid=100x100",
+        "fit quality exact: 6/6 family diagnostics | completed draw 2/2 family=fam-0 z=2.0000 window=10.0 grid=50x50",
     ) in progress.descriptions
     assert log_messages == [
         (
             "[plot:fit_quality] family diagnostics tasks=6 workers=4 families=3 draws=2 "
-            "largest_grid=300x300 total_grid_points=280000"
+            "largest_grid=150x150 total_grid_points=70000"
         ),
         "[plot:fit_quality] draw 1/2 complete families=3/3 completed_tasks=5/6",
         "[plot:fit_quality] draw 2/2 complete families=3/3 completed_tasks=6/6",
@@ -1186,6 +1522,7 @@ def test_posterior_fit_quality_predictions_tracks_serial_progress(monkeypatch: A
             self.advances[task_id] += 1
 
     monkeypatch.setattr(plotting, "Progress", FakeProgress)
+    monkeypatch.setattr(plotting, "jax_cpu_worker_count", lambda: 1)
     log_messages: list[str] = []
     monkeypatch.setattr(plotting, "_log", lambda _args, message: log_messages.append(str(message)))
 
@@ -1193,7 +1530,7 @@ def test_posterior_fit_quality_predictions_tracks_serial_progress(monkeypatch: A
         FakeEvaluator(),
         state,
         [np.asarray([1.0], dtype=float), np.asarray([2.0], dtype=float)],
-        argparse.Namespace(fit_quality_workers=1),
+        argparse.Namespace(),
     )
 
     assert len(predictions) == 2
@@ -1264,12 +1601,13 @@ def test_posterior_fit_quality_predictions_quiet_skips_progress(monkeypatch: Any
         raise AssertionError("quiet fit-quality diagnostics should not create a progress bar")
 
     monkeypatch.setattr(plotting, "Progress", fail_progress)
+    monkeypatch.setattr(plotting, "jax_cpu_worker_count", lambda: 1)
 
     predictions = plotting._posterior_fit_quality_predictions(
         FakeEvaluator(),
         state,
         [np.asarray([1.0], dtype=float)],
-        argparse.Namespace(fit_quality_workers=1, quiet=True),
+        argparse.Namespace(quiet=True),
     )
 
     assert len(predictions) == 1
@@ -1379,14 +1717,20 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert (tmp_path / "tables" / "image_count_recovery.csv").exists()
     assert (tmp_path / "tables" / "image_recovery_extra_images.csv").exists()
     assert (tmp_path / "tables" / "model_magnification.csv").exists()
+    assert (tmp_path / "tables" / "subhalo_properties.csv").exists()
     assert (tmp_path / "tables" / "run_summary.txt").exists()
     assert "image_recovery" in captured_tasks
     assert "image_count_recovery" in captured_tasks
     assert "model_magnification" in captured_tasks
     assert "normalized_image_residuals" in captured_tasks
+    assert "image_residual_histogram" in captured_tasks
     assert "residual_vs_magnification" in captured_tasks
     assert "residual_geometry_trends" in captured_tasks
     assert "posterior_predictive_coverage" in captured_tasks
+    assert "subhalo_mass_function" in captured_tasks
+    assert "subhalo_radial_distribution" in captured_tasks
+    assert "kappa_comparison" not in captured_tasks
+    assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" not in captured_tasks
 
     captured_tasks.clear()
@@ -1399,8 +1743,14 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         best_eval=SimpleNamespace(loglike=0.0),
         results=results,
         runtime_sec=0.0,
-        args=argparse.Namespace(quiet=True, plot_caustics=False, caustic_num_pix=250, caustic_source_redshift=7.0),
+        args=argparse.Namespace(
+            quiet=True,
+            plot_caustics=False,
+            caustic_plot_grid_scale_arcsec=0.2,
+            caustic_source_redshift=9.0,
+        ),
     )
+    assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" not in captured_tasks
 
     captured_tasks.clear()
@@ -1412,8 +1762,34 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         best_eval=SimpleNamespace(loglike=0.0),
         results=results,
         runtime_sec=0.0,
-        args=argparse.Namespace(quiet=True, plot_caustics=True, caustic_num_pix=250, caustic_source_redshift=7.0),
+        args=argparse.Namespace(
+            quiet=True,
+            plot_caustics=False,
+            kappa_true_fits="data/ff_sims/hera/kappa_z9_0.fits",
+            caustic_source_redshift=9.0,
+        ),
     )
+    assert "kappa_comparison" in captured_tasks
+    assert "absolute_magnification" not in captured_tasks
+    assert "caustic_overlay" not in captured_tasks
+
+    captured_tasks.clear()
+    plotting._generate_plots_and_tables(
+        run_dir=tmp_path,
+        state=state,
+        evaluator=evaluator,
+        best_fit=np.empty((0,), dtype=float),
+        best_eval=SimpleNamespace(loglike=0.0),
+        results=results,
+        runtime_sec=0.0,
+        args=argparse.Namespace(
+            quiet=True,
+            plot_caustics=True,
+            caustic_plot_grid_scale_arcsec=0.2,
+            caustic_source_redshift=9.0,
+        ),
+    )
+    assert "absolute_magnification" in captured_tasks
     assert "caustic_overlay" in captured_tasks
 
     captured_tasks.clear()
@@ -1429,11 +1805,175 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
             quiet=True,
             plot_caustics=True,
             quick_diagnostics=True,
-            caustic_num_pix=250,
-            caustic_source_redshift=7.0,
+            caustic_plot_grid_scale_arcsec=0.2,
+            caustic_source_redshift=9.0,
+            kappa_true_fits="data/ff_sims/hera/kappa_z9_0.fits",
         ),
     )
+    assert "kappa_comparison" not in captured_tasks
+    assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" not in captured_tasks
+
+
+def test_subhalo_properties_table_uses_all_potfile_members_and_mass_radii(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = SimpleNamespace(
+        z_lens=0.4,
+        cosmo_config={},
+        parameter_specs=[],
+        packed_lens_spec=SimpleNamespace(
+            component_family=np.asarray([0, 1, 1], dtype=int),
+            x_center_base=np.asarray([0.0, 3.0, 6.0], dtype=float),
+            y_center_base=np.asarray([0.0, 4.0, 8.0], dtype=float),
+        ),
+        scaling_component_records=[
+            {
+                "potfile_id": "members",
+                "potfile_order": 0,
+                "component_index": 1,
+                "catalog_id": "member001",
+                "catalog_mag": 20.0,
+                "x_centre": 3.0,
+                "y_centre": 4.0,
+            },
+            {
+                "potfile_id": "members",
+                "potfile_order": 0,
+                "component_index": 2,
+                "catalog_id": "member002",
+                "catalog_mag": 21.0,
+                "x_centre": 6.0,
+                "y_centre": 8.0,
+            },
+        ],
+    )
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.calls: list[tuple[float, int]] = []
+
+        def mass_3d(self, radius: float, kwargs_lens: list[dict[str, float]], bool_list: list[bool]) -> float:
+            component_index = bool_list.index(True)
+            self.calls.append((float(radius), component_index))
+            return float(kwargs_lens[component_index]["sigma0"]) * float(radius)
+
+    class FakeEvaluator:
+        def __init__(self) -> None:
+            self.state = state
+            self.exact_models_by_z: dict[float, FakeModel] = {}
+            self.model = FakeModel()
+            self.converted: list[np.ndarray] = []
+            self.model_z: list[float] = []
+            self.packed_z: list[float] = []
+
+        def reported_physical_to_latent_parameter_vector(self, theta: np.ndarray) -> np.ndarray:
+            theta_array = np.asarray(theta, dtype=float)
+            self.converted.append(theta_array.copy())
+            return theta_array + 1.0
+
+        def _get_exact_model_solver(self, z_source: float) -> tuple[FakeModel, None]:
+            self.model_z.append(float(z_source))
+            return self.model, None
+
+        def _build_packed_lens_state(self, sample_latent: Any, z_source: float) -> dict[str, float]:
+            self.packed_z.append(float(z_source))
+            return {"latent": float(np.asarray(sample_latent, dtype=float)[0])}
+
+        def _packed_to_kwargs_lens(self, packed_state: dict[str, float]) -> list[dict[str, float]]:
+            assert packed_state == {"latent": 5.0}
+            return [
+                {"sigma0": 1.0, "Ra": 0.1, "Rs": 1.0},
+                {"sigma0": 3.0, "Ra": 0.2, "Rs": 2.0},
+                {"sigma0": 5.0, "Ra": 0.3, "Rs": 4.0},
+            ]
+
+    monkeypatch.setattr(plotting, "critical_surface_density_angle_from_config", lambda *_args, **_kwargs: 10.0)
+    evaluator = FakeEvaluator()
+
+    table = plotting._subhalo_properties_table(
+        state,
+        evaluator,
+        np.asarray([4.0], dtype=float),
+        caustic_source_redshift=9.0,
+    )
+
+    assert table["component_index"].tolist() == [1, 2]
+    assert table["catalog_id"].tolist() == ["member001", "member002"]
+    assert table["radius_arcsec"].tolist() == pytest.approx([5.0, 10.0])
+    assert table["Rs"].tolist() == pytest.approx([2.0, 4.0])
+    assert table["mass_within_Rs_msun"].tolist() == pytest.approx([60.0, 200.0])
+    assert table["mass_within_1e6_Rs_msun"].tolist() == pytest.approx([60.0e6, 200.0e6])
+    assert [float(item[0]) for item in evaluator.converted] == [4.0]
+    assert evaluator.model_z == [9.0]
+    assert evaluator.packed_z == [9.0]
+    assert evaluator.model.calls == [
+        (2.0, 1),
+        (2.0e6, 1),
+        (4.0, 2),
+        (4.0e6, 2),
+    ]
+
+
+def test_subhalo_distribution_plots_write_pdfs_and_mass_function_has_subhalo_mass_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from matplotlib.axes import Axes
+
+    subhalo_df = pd.DataFrame(
+        {
+            "mass_within_Rs_msun": [1.0e10, 3.0e10, 1.0e11],
+            "mass_within_1e6_Rs_msun": [2.0e11, 4.0e11, 1.2e12],
+            "radius_arcsec": [5.0, 15.0, 30.0],
+        }
+    )
+    hist_calls: list[dict[str, Any]] = []
+    original_hist = Axes.hist
+
+    def record_hist(self: Axes, values: Any, *args: Any, **kwargs: Any) -> Any:
+        hist_calls.append(
+            {
+                "values": np.asarray(values, dtype=float).copy(),
+                "label": kwargs.get("label"),
+                "histtype": kwargs.get("histtype"),
+            }
+        )
+        return original_hist(self, values, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "hist", record_hist)
+
+    mass_path = tmp_path / "subhalo_mass_function.pdf"
+    radial_path = tmp_path / "subhalo_radial_distribution.pdf"
+    plotting._plot_subhalo_mass_function(subhalo_df, mass_path)
+    plotting._plot_subhalo_radial_distribution(subhalo_df, radial_path)
+
+    assert mass_path.exists()
+    assert mass_path.stat().st_size > 0
+    assert radial_path.exists()
+    assert radial_path.stat().st_size > 0
+    mass_hist_calls = [call for call in hist_calls if call["label"] is not None]
+    assert [call["label"] for call in mass_hist_calls] == ["Subhalo Mass"]
+    assert [call["histtype"] for call in mass_hist_calls] == ["step"]
+    np.testing.assert_allclose(mass_hist_calls[0]["values"], np.log10(subhalo_df["mass_within_1e6_Rs_msun"]))
+
+
+def test_subhalo_distribution_plots_write_placeholders_without_finite_values(tmp_path: Path) -> None:
+    subhalo_df = pd.DataFrame(
+        {
+            "mass_within_Rs_msun": [np.nan, np.inf],
+            "mass_within_1e6_Rs_msun": [np.nan, -np.inf],
+            "radius_arcsec": [np.nan, np.inf],
+        }
+    )
+    mass_path = tmp_path / "subhalo_mass_function.pdf"
+    radial_path = tmp_path / "subhalo_radial_distribution.pdf"
+
+    plotting._plot_subhalo_mass_function(subhalo_df, mass_path)
+    plotting._plot_subhalo_radial_distribution(subhalo_df, radial_path)
+
+    assert mass_path.exists()
+    assert mass_path.stat().st_size > 0
+    assert radial_path.exists()
+    assert radial_path.stat().st_size > 0
 
 
 def test_run_summary_quality_metrics_from_image_fit_quality() -> None:
@@ -1447,7 +1987,11 @@ def test_run_summary_quality_metrics_from_image_fit_quality() -> None:
             "y_obs_arcsec": [0.0, 0.0, 0.0, 0.0],
             "x_model_arcsec": [1.0, 0.0, 1.0, 10.0],
             "y_model_arcsec": [0.0, 2.0, 1.0, 10.0],
-            "image_sigma_eff_arcsec": [1.0, 1.0, 1.0, 1.0],
+            "sigma_arcsec": [1.0, 1.0, 1.0, 1.0],
+            "image_sigma_eff_arcsec": [10.0, 10.0, 10.0, 10.0],
+            "image_recovery_status": ["recovered", "recovered", "recovered", "not_recovered"],
+            "arc_recovery_status": ["point_recovered", "point_recovered", "point_recovered", "not_recovered"],
+            "arc_supported": [False, False, False, False],
             "exact_image_prediction_failed": [False, False, False, True],
             "covered_xy_1sigma": [True, False, True, False],
         }
@@ -1455,18 +1999,253 @@ def test_run_summary_quality_metrics_from_image_fit_quality() -> None:
 
     summary = plotting._fit_quality_chi_square_summary(image_df, state)
 
-    assert summary["chi_square"] == pytest.approx(7.0)
-    assert summary["valid_image_count"] == 3
-    assert summary["n_data"] == 8
-    assert summary["diagnostic_n_data"] == 6
+    assert summary["headline_chi_square"] == pytest.approx(0.07)
+    assert summary["headline_point_image_count"] == 3
+    assert summary["headline_missing_image_count"] == 1
+    assert summary["headline_n_data"] == 6
+    assert summary["headline_dof"] == 3
+    assert summary["headline_reduced_chi_square"] == pytest.approx(0.07 / 3.0)
+    assert summary["arc_aware_chi_square"] == pytest.approx(0.07)
+    assert summary["arc_aware_point_image_count"] == 3
+    assert summary["arc_aware_arc_supported_image_count"] == 0
+    assert summary["arc_aware_missing_image_count"] == 1
+    assert summary["arc_aware_n_data"] == 6
+    assert summary["arc_aware_dof"] == 3
+    assert summary["arc_aware_reduced_chi_square"] == pytest.approx(0.07 / 3.0)
     assert summary["n_effective_parameters"] == 3
-    assert summary["implicit_source_position_parameters"] == 2
-    assert summary["dof"] == 5
-    assert summary["diagnostic_dof"] == 3
-    assert summary["reduced_chi_square"] == pytest.approx(7.0 / 5.0)
-    assert summary["aic"] == pytest.approx(13.0)
-    assert summary["bic"] == pytest.approx(7.0 + 3.0 * math.log(8.0))
+    assert summary["sampled_non_source_position_parameters"] == 1
+    assert summary["source_position_parameters"] == 2
+    assert summary["chi_square_sigma_basis"] == "image_sigma_eff_arcsec"
+    assert summary["chi_square_sigma_eff_median_arcsec"] == pytest.approx(10.0)
+    assert summary["chi_square_sigma_eff_min_arcsec"] == pytest.approx(10.0)
+    assert summary["chi_square_sigma_eff_max_arcsec"] == pytest.approx(10.0)
+    assert summary["headline_chi_square_red1_total_sigma_arcsec"] == pytest.approx(math.sqrt(7.0 / 3.0))
+    assert summary["arc_aware_chi_square_red1_total_sigma_arcsec"] == pytest.approx(math.sqrt(7.0 / 3.0))
+    assert summary["headline_chi_square_red1_pos_sigma_arcsec"] is None
+    assert summary["arc_aware_chi_square_red1_pos_sigma_arcsec"] is None
+    assert summary["chi_square_red1_calibration_note"] == "post-fit diagnostic; holds image_sigma_int fixed"
     assert summary["covered_xy_1sigma_fraction"] == pytest.approx(2.0 / 3.0)
+    assert "chi_square" not in summary
+    assert "reduced_chi_square" not in summary
+    assert "diagnostic_n_data" not in summary
+    assert "diagnostic_dof" not in summary
+    assert "aic" not in summary
+    assert "bic" not in summary
+
+
+def test_run_summary_arc_aware_chi_square_counts_arc_supported_rows() -> None:
+    state = SimpleNamespace(
+        parameter_specs=[ParameterSpec("p", "p", "mock", 81, "x", "uniform", -1.0, 1.0, 0.1)],
+        family_data=[SimpleNamespace(family_id="1", n_images=4)],
+    )
+    image_df = pd.DataFrame(
+        {
+            "x_obs_arcsec": [0.0, 0.0, 0.0, 0.0],
+            "y_obs_arcsec": [0.0, 0.0, 0.0, 0.0],
+            "x_model_arcsec": [1.0, 0.0, np.nan, np.nan],
+            "y_model_arcsec": [0.0, 2.0, np.nan, np.nan],
+            "sigma_arcsec": [1.0, 2.0, 0.5, 1.0],
+            "image_sigma_eff_arcsec": [1.0, 4.0, 0.25, 100.0],
+            "image_recovery_status": ["recovered", "recovered", "not_recovered", "not_recovered"],
+            "arc_recovery_status": ["point_recovered", "point_recovered", "arc_supported", "not_recovered"],
+            "arc_supported": [False, False, True, False],
+            "arc_aware_image_residual_arcsec": [1.0, 2.0, 0.5, np.nan],
+            "exact_image_prediction_failed": [False, False, True, True],
+        }
+    )
+
+    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+
+    assert summary["headline_chi_square"] == pytest.approx(1.25)
+    assert summary["headline_n_data"] == 4
+    assert summary["headline_dof"] == 1
+    assert summary["headline_reduced_chi_square"] == pytest.approx(1.25)
+    assert summary["headline_missing_image_count"] == 2
+    assert summary["arc_aware_chi_square"] == pytest.approx(5.25)
+    assert summary["arc_aware_n_data"] == 5
+    assert summary["arc_aware_dof"] == 2
+    assert summary["arc_aware_reduced_chi_square"] == pytest.approx(2.625)
+    assert summary["arc_aware_point_image_count"] == 2
+    assert summary["arc_aware_arc_supported_image_count"] == 1
+    assert summary["arc_aware_missing_image_count"] == 1
+    assert summary["chi_square_sigma_eff_median_arcsec"] == pytest.approx(1.0)
+    assert summary["chi_square_sigma_eff_min_arcsec"] == pytest.approx(0.25)
+    assert summary["chi_square_sigma_eff_max_arcsec"] == pytest.approx(4.0)
+    assert summary["headline_chi_square_red1_total_sigma_arcsec"] == pytest.approx(math.sqrt(5.0))
+    assert summary["arc_aware_chi_square_red1_total_sigma_arcsec"] == pytest.approx(math.sqrt(5.25 / 2.0))
+
+
+def test_run_summary_chi_square_requires_image_sigma_eff_arcsec() -> None:
+    state = SimpleNamespace(
+        parameter_specs=[ParameterSpec("p", "p", "mock", 81, "x", "uniform", -1.0, 1.0, 0.1)],
+        family_data=[SimpleNamespace(family_id="1", n_images=1)],
+    )
+    image_df = pd.DataFrame(
+        {
+            "x_obs_arcsec": [0.0],
+            "y_obs_arcsec": [0.0],
+            "x_model_arcsec": [1.0],
+            "y_model_arcsec": [0.0],
+            "sigma_arcsec": [1.0],
+            "image_recovery_status": ["recovered"],
+            "arc_recovery_status": ["point_recovered"],
+            "exact_image_prediction_failed": [False],
+        }
+    )
+
+    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+
+    assert summary["headline_chi_square"] is None
+    assert summary["headline_n_data"] == 0
+    assert summary["arc_aware_chi_square"] is None
+    assert summary["arc_aware_n_data"] == 0
+    assert summary["chi_square_sigma_basis"] == "image_sigma_eff_arcsec"
+    assert summary["headline_chi_square_red1_total_sigma_arcsec"] is None
+    assert summary["headline_chi_square_red1_pos_sigma_arcsec"] is None
+    assert summary["arc_aware_chi_square_red1_total_sigma_arcsec"] is None
+    assert summary["arc_aware_chi_square_red1_pos_sigma_arcsec"] is None
+
+
+def test_run_summary_chi_square_excludes_invalid_image_sigma_eff_rows() -> None:
+    state = SimpleNamespace(
+        parameter_specs=[ParameterSpec("p", "p", "mock", 81, "x", "uniform", -1.0, 1.0, 0.1)],
+        family_data=[SimpleNamespace(family_id="1", n_images=3)],
+    )
+    image_df = pd.DataFrame(
+        {
+            "x_obs_arcsec": [0.0, 0.0, 0.0],
+            "y_obs_arcsec": [0.0, 0.0, 0.0],
+            "x_model_arcsec": [1.0, 2.0, np.nan],
+            "y_model_arcsec": [0.0, 0.0, np.nan],
+            "sigma_arcsec": [0.1, 0.1, 0.1],
+            "image_sigma_eff_arcsec": [0.5, 0.0, np.nan],
+            "image_recovery_status": ["recovered", "recovered", "not_recovered"],
+            "arc_recovery_status": ["point_recovered", "point_recovered", "arc_supported"],
+            "arc_supported": [False, False, True],
+            "arc_aware_image_residual_arcsec": [1.0, 2.0, 0.5],
+            "exact_image_prediction_failed": [False, False, True],
+        }
+    )
+
+    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+
+    assert summary["headline_chi_square"] == pytest.approx(4.0)
+    assert summary["headline_point_image_count"] == 1
+    assert summary["headline_missing_image_count"] == 2
+    assert summary["headline_n_data"] == 2
+    assert summary["arc_aware_chi_square"] == pytest.approx(4.0)
+    assert summary["arc_aware_arc_supported_image_count"] == 0
+    assert summary["arc_aware_missing_image_count"] == 2
+    assert summary["arc_aware_n_data"] == 2
+    assert summary["headline_chi_square_red1_total_sigma_arcsec"] is None
+    assert summary["headline_chi_square_red1_pos_sigma_arcsec"] is None
+
+
+def test_run_summary_chi_square_red1_calibration_solves_pos_sigma_with_intrinsic_scatter() -> None:
+    state = SimpleNamespace(parameter_specs=[], family_data=[])
+    image_df = pd.DataFrame(
+        {
+            "x_obs_arcsec": [0.0, 0.0],
+            "y_obs_arcsec": [0.0, 0.0],
+            "x_model_arcsec": [2.0, np.nan],
+            "y_model_arcsec": [0.0, np.nan],
+            "sigma_arcsec": [1.0, 1.0],
+            "image_sigma_int_arcsec": [1.0, 1.0],
+            "image_sigma_eff_arcsec": [math.sqrt(2.0), math.sqrt(2.0)],
+            "image_recovery_status": ["recovered", "not_recovered"],
+            "arc_recovery_status": ["point_recovered", "arc_supported"],
+            "arc_supported": [False, True],
+            "arc_aware_image_residual_arcsec": [2.0, math.sqrt(5.0)],
+            "exact_image_prediction_failed": [False, True],
+        }
+    )
+
+    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+
+    assert summary["headline_chi_square_red1_total_sigma_arcsec"] == pytest.approx(math.sqrt(2.0))
+    assert summary["headline_chi_square_red1_pos_sigma_arcsec"] == pytest.approx(1.0)
+    assert summary["arc_aware_chi_square_red1_total_sigma_arcsec"] == pytest.approx(math.sqrt(3.0))
+    assert summary["arc_aware_chi_square_red1_pos_sigma_arcsec"] == pytest.approx(math.sqrt(2.0))
+
+
+def test_run_summary_chi_square_red1_pos_sigma_zero_when_intrinsic_scatter_is_sufficient() -> None:
+    state = SimpleNamespace(parameter_specs=[], family_data=[])
+    image_df = pd.DataFrame(
+        {
+            "x_obs_arcsec": [0.0],
+            "y_obs_arcsec": [0.0],
+            "x_model_arcsec": [1.0],
+            "y_model_arcsec": [0.0],
+            "sigma_arcsec": [0.1],
+            "image_sigma_int_arcsec": [1.0],
+            "image_sigma_eff_arcsec": [math.sqrt(1.01)],
+            "image_recovery_status": ["recovered"],
+            "arc_recovery_status": ["point_recovered"],
+            "arc_supported": [False],
+            "exact_image_prediction_failed": [False],
+        }
+    )
+
+    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+
+    assert summary["headline_chi_square_red1_total_sigma_arcsec"] == pytest.approx(math.sqrt(0.5))
+    assert summary["headline_chi_square_red1_pos_sigma_arcsec"] == pytest.approx(0.0)
+    assert summary["arc_aware_chi_square_red1_pos_sigma_arcsec"] == pytest.approx(0.0)
+
+
+def test_run_summary_effective_parameter_count_does_not_double_count_explicit_sources() -> None:
+    specs = [
+        ParameterSpec("halo.x", "halo_x", "mock", 81, "x", "uniform", -1.0, 1.0, 0.1),
+        ParameterSpec(
+            "source.1.beta_x",
+            "source_1_beta_x",
+            "1",
+            0,
+            "beta_x",
+            "uniform",
+            -1.0,
+            1.0,
+            0.1,
+            component_family="source_position",
+        ),
+        ParameterSpec(
+            "source.1.beta_y",
+            "source_1_beta_y",
+            "1",
+            0,
+            "beta_y",
+            "uniform",
+            -1.0,
+            1.0,
+            0.1,
+            component_family="source_position",
+        ),
+        ParameterSpec(
+            "image.sigma_int",
+            "image_sigma_int",
+            "image",
+            0,
+            "sigma_int",
+            "uniform",
+            0.0,
+            1.0,
+            0.1,
+            component_family="image_scatter",
+        ),
+    ]
+    state = SimpleNamespace(
+        parameter_specs=specs,
+        family_data=[
+            SimpleNamespace(family_id="1", n_images=0),
+            SimpleNamespace(family_id="2", n_images=0),
+        ],
+    )
+
+    summary = plotting._fit_quality_chi_square_summary(None, state)
+
+    assert summary["sampled_non_source_position_parameters"] == 2
+    assert summary["source_position_parameters"] == 4
+    assert summary["n_effective_parameters"] == 6
 
 
 def test_image_count_recovery_table_and_plot_write_pdf(tmp_path: Path) -> None:
@@ -1534,6 +2313,94 @@ def test_chain_diagnostics_summary_uses_grouped_samples() -> None:
     assert summary["rhat_worst_parameter"] in {spec.name for spec in specs}
 
 
+def test_chain_health_summary_table_identifies_stuck_chain() -> None:
+    posterior, specs = _synthetic_stuck_chain_posterior()
+
+    table = plotting._chain_health_summary_table(posterior, specs, max_tree_depth=8)
+
+    assert list(table["chain"]) == [1, 2, 3, 4]
+    stuck = table.iloc[0]
+    assert stuck["chain_label"] == "stuck"
+    assert stuck["log_prob_median"] == pytest.approx(-230.0)
+    assert stuck["log_prob_median"] < table.iloc[1]["log_prob_median"]
+    assert stuck["max_tree_depth_saturation_fraction"] == pytest.approx(1.0)
+    assert stuck["image_sigma_int_q50"] == pytest.approx(1.23, abs=0.01)
+    assert table.iloc[1]["image_sigma_int_q50"] == pytest.approx(0.10, abs=0.01)
+
+
+def test_chain_parameter_diagnostics_table_reports_per_chain_quantiles() -> None:
+    posterior, specs = _synthetic_stuck_chain_posterior()
+
+    table = plotting._chain_parameter_diagnostics_table(posterior, specs)
+    sigma_row = table.loc[table["sample_name"] == "image_sigma_int"].iloc[0]
+
+    assert sigma_row["parameter"] == "image.sigma_int"
+    assert sigma_row["chain_1_q50"] == pytest.approx(1.23, abs=0.01)
+    assert sigma_row["chain_2_q50"] == pytest.approx(0.10, abs=0.01)
+    assert sigma_row["chain_median_spread"] > 1.0
+    assert sigma_row["chain_median_standardized_spread"] > 1.0
+
+
+def test_ranked_chain_trace_subset_prefers_worst_non_source_parameters_when_sources_dominate() -> None:
+    posterior, base_specs = _synthetic_stuck_chain_posterior()
+    source_specs = [_source_position_test_spec(index) for index in range(8)]
+    specs = [*base_specs, *source_specs]
+    source_values = np.zeros((posterior.grouped_samples.shape[0], posterior.grouped_samples.shape[1], len(source_specs)))
+    for source_index in range(len(source_specs)):
+        source_values[:, :, source_index] = source_index + np.asarray([0.0, 0.2, 0.4, 0.6])[:, None]
+    grouped = np.concatenate([posterior.grouped_samples, source_values], axis=2)
+    table = plotting._chain_parameter_diagnostics_table(
+        PosteriorResults(
+            samples=grouped.reshape((-1, grouped.shape[-1])),
+            log_prob=posterior.log_prob,
+            accept_prob=posterior.accept_prob,
+            diverging=posterior.diverging,
+            num_steps=posterior.num_steps,
+            warmup_steps=0,
+            sample_steps=grouped.shape[1],
+            num_chains=grouped.shape[0],
+            grouped_samples=grouped,
+            grouped_log_prob=posterior.grouped_log_prob,
+        ),
+        specs,
+    )
+
+    subset = plotting._ranked_chain_trace_subset(grouped, specs, table, max_params=3)
+
+    assert subset is not None
+    _subset_samples, subset_specs = subset
+    assert "image_sigma_int" in {spec.sample_name for spec in subset_specs}
+    assert all(spec.component_family != "source_position" for spec in subset_specs)
+
+
+def test_chain_diagnostic_plots_create_pdfs_and_skip_missing_grouped_samples(tmp_path: Path) -> None:
+    posterior, specs = _synthetic_stuck_chain_posterior()
+    diagnostics = plotting._chain_parameter_diagnostics_table(posterior, specs)
+
+    plotting._plot_chain_health(tmp_path, posterior, specs, max_tree_depth=8)
+    plotting._plot_chain_ranked_trace(tmp_path, posterior.grouped_samples, specs, diagnostics)
+
+    assert (tmp_path / "chain_health.pdf").exists()
+    assert (tmp_path / "chain_ranked_trace.pdf").exists()
+
+    skip_dir = tmp_path / "skip"
+    missing_grouped = PosteriorResults(
+        samples=posterior.samples,
+        log_prob=posterior.log_prob,
+        accept_prob=posterior.accept_prob,
+        diverging=posterior.diverging,
+        num_steps=posterior.num_steps,
+        warmup_steps=0,
+        sample_steps=posterior.sample_steps,
+        num_chains=posterior.num_chains,
+    )
+    plotting._plot_chain_health(skip_dir, missing_grouped, specs, max_tree_depth=8)
+    plotting._plot_chain_ranked_trace(skip_dir, None, specs, diagnostics)
+
+    assert not (skip_dir / "chain_health.pdf").exists()
+    assert not (skip_dir / "chain_ranked_trace.pdf").exists()
+
+
 def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None:
     text = plotting._format_run_summary_text(
         {
@@ -1544,13 +2411,29 @@ def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None
             "n_families": 2,
             "n_images": 6,
             "n_parameters": 4,
-            "chi_square": 12.0,
-            "dof": 4,
-            "diagnostic_n_data": 8,
-            "diagnostic_dof": 2,
-            "reduced_chi_square": 3.0,
-            "aic": 20.0,
-            "bic": 21.0,
+            "headline_chi_square": 12.0,
+            "headline_dof": 4,
+            "headline_reduced_chi_square": 3.0,
+            "arc_aware_chi_square": 9.0,
+            "arc_aware_dof": 5,
+            "arc_aware_reduced_chi_square": 1.8,
+            "arc_aware_arc_supported_image_count": 2,
+            "arc_aware_missing_image_count": 1,
+            "arc_aware_noncritical_support_radius_arcsec": 0.5,
+            "chi_square_sigma_basis": "image_sigma_eff_arcsec",
+            "chi_square_sigma_eff_median_arcsec": 0.59,
+            "chi_square_sigma_eff_min_arcsec": 0.42,
+            "chi_square_sigma_eff_max_arcsec": 0.71,
+            "headline_chi_square_red1_total_sigma_arcsec": 0.6,
+            "headline_chi_square_red1_pos_sigma_arcsec": 0.58,
+            "arc_aware_chi_square_red1_total_sigma_arcsec": 0.59,
+            "arc_aware_chi_square_red1_pos_sigma_arcsec": 0.57,
+            "chi_square_red1_calibration_note": "post-fit diagnostic; holds image_sigma_int fixed",
+            "n_effective_parameters": 4,
+            "fit_quality_reference_sample_kind": "max_likelihood",
+            "fit_quality_reference_sample_index": 7,
+            "fit_quality_reference_source_loglike": -11.0,
+            "fit_quality_reference_log_prob": -12.0,
             "ess_min": 10.0,
             "rhat_max": 1.02,
             "svi_health_warnings": ["near-zero SVI guide spread"],
@@ -1559,12 +2442,26 @@ def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None
 
     assert "Lensing Information" in text
     assert "Quality Of Fit" in text
-    assert "chi_square" in text
-    assert "diagnostic data points" in text
-    assert "diagnostic dof" in text
-    assert "Rhat max" in text
-    assert "SVI health warnings" in text
-    assert "near-zero SVI guide spread" in text
+    assert "headline_chi_square" in text
+    assert "arc_aware_chi_square" in text
+    assert "total image-plane sigma" in text
+    assert "chi-square sigma basis" in text
+    assert "chi-square median sigma arcsec" in text
+    assert "headline red1 total sigma arcsec" in text
+    assert "headline red1 pos_sigma_arcsec" in text
+    assert "arc-aware red1 total sigma arcsec" in text
+    assert "arc-aware red1 pos_sigma_arcsec" in text
+    assert "post-fit diagnostic; holds image_sigma_int fixed" in text
+    assert "N_arc_supported" in text
+    assert "N_missing" in text
+    assert "fit-quality reference" in text
+    assert "arc-aware caveat" in text
+    assert "diagnostic data points" not in text
+    assert "diagnostic dof" not in text
+    assert "AIC" not in text
+    assert "BIC" not in text
+    assert "Rhat max" not in text
+    assert "SVI health warnings" not in text
 
 
 def test_parse_args_caustic_source_redshift_default_and_explicit(monkeypatch: Any) -> None:
@@ -1572,13 +2469,91 @@ def test_parse_args_caustic_source_redshift_default_and_explicit(monkeypatch: An
 
     monkeypatch.setattr(sys, "argv", ["cluster_solver"])
     args = cluster_solver._parse_args()
-    assert args.caustic_source_redshift == pytest.approx(7.0)
+    assert args.caustic_source_redshift == pytest.approx(9.0)
+    assert args.caustic_plot_grid_scale_arcsec == pytest.approx(0.2)
+    assert args.kappa_true_fits is None
+    assert not hasattr(args, "caustic_num_pix")
     assert not hasattr(args, "validate_top_k_families")
     assert not hasattr(args, "validation_approx")
 
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--caustic-source-redshift", "9.5"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--caustic-source-redshift",
+            "9.5",
+            "--kappa-true-fits",
+            "data/ff_sims/hera/kappa_z9_0.fits",
+        ],
+    )
     args = cluster_solver._parse_args()
     assert args.caustic_source_redshift == pytest.approx(9.5)
+    assert args.kappa_true_fits == "data/ff_sims/hera/kappa_z9_0.fits"
+
+
+def test_parse_args_image_catalog_rgb_display_controls(monkeypatch: Any) -> None:
+    from lenscluster import cluster_solver
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver"])
+    args = cluster_solver._parse_args()
+    assert args.image_catalog_family_cutout_rgb_q is None
+    assert args.image_catalog_family_cutout_rgb_stretch is None
+    assert args.image_catalog_family_cutout_rgb_minimum is None
+    assert args.image_catalog_family_cutout_rgb_red_gain is None
+    assert args.image_catalog_family_cutout_rgb_green_gain is None
+    assert args.image_catalog_family_cutout_rgb_blue_gain is None
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--image-catalog-family-cutout-rgb-q",
+            "6.5",
+            "--image-catalog-family-cutout-rgb-stretch",
+            "0.0165",
+            "--image-catalog-family-cutout-rgb-minimum",
+            "-0.001",
+            "--image-catalog-family-cutout-rgb-red-gain",
+            "0.68",
+            "--image-catalog-family-cutout-rgb-green-gain",
+            "0.69",
+            "--image-catalog-family-cutout-rgb-blue-gain",
+            "2.75",
+        ],
+    )
+    args = cluster_solver._parse_args()
+    assert args.image_catalog_family_cutout_rgb_q == pytest.approx(6.5)
+    assert args.image_catalog_family_cutout_rgb_stretch == pytest.approx(0.0165)
+    assert args.image_catalog_family_cutout_rgb_minimum == pytest.approx(-0.001)
+    assert args.image_catalog_family_cutout_rgb_red_gain == pytest.approx(0.68)
+    assert args.image_catalog_family_cutout_rgb_green_gain == pytest.approx(0.69)
+    assert args.image_catalog_family_cutout_rgb_blue_gain == pytest.approx(2.75)
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--image-catalog-family-cutout-rgb-q", "0"])
+    with pytest.raises(SystemExit):
+        cluster_solver._parse_args()
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--image-catalog-family-cutout-rgb-minimum", "nan"])
+    with pytest.raises(SystemExit):
+        cluster_solver._parse_args()
+
+
+def test_parse_args_caustic_plot_grid_scale_and_removed_num_pix(monkeypatch: Any) -> None:
+    from lenscluster import cluster_solver
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--caustic-plot-grid-scale-arcsec", "0.5"])
+    args = cluster_solver._parse_args()
+    assert args.caustic_plot_grid_scale_arcsec == pytest.approx(0.5)
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--caustic-plot-grid-scale-arcsec", "0"])
+    with pytest.raises(SystemExit):
+        cluster_solver._parse_args()
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--caustic-num-pix", "250"])
+    with pytest.raises(SystemExit):
+        cluster_solver._parse_args()
 
 
 def test_parse_args_rejects_removed_main_validation_flags(monkeypatch: Any) -> None:
@@ -1589,6 +2564,14 @@ def test_parse_args_rejects_removed_main_validation_flags(monkeypatch: Any) -> N
         cluster_solver._parse_args()
 
     monkeypatch.setattr(sys, "argv", ["cluster_solver", "--validation-approx", "exact"])
+    with pytest.raises(SystemExit):
+        cluster_solver._parse_args()
+
+
+def test_parse_args_rejects_removed_corner_suppress_fit_markers(monkeypatch: Any) -> None:
+    from lenscluster import cluster_solver
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--corner-suppress-fit-markers"])
     with pytest.raises(SystemExit):
         cluster_solver._parse_args()
 
@@ -1720,7 +2703,7 @@ def test_plot_caustic_overlay_uses_configured_redshift_and_scatter(monkeypatch: 
 
     image_ax = FakeAxis()
     source_ax = FakeAxis()
-    helper_calls: list[tuple[list[dict[str, float]], int, int]] = []
+    helper_calls: list[tuple[list[dict[str, float]], np.ndarray, np.ndarray]] = []
 
     def fake_subplots(*_args: Any, **_kwargs: Any) -> tuple[FakeFig, list[FakeAxis]]:
         return FakeFig(), [image_ax, source_ax]
@@ -1731,7 +2714,9 @@ def test_plot_caustic_overlay_uses_configured_redshift_and_scatter(monkeypatch: 
         x_axis: np.ndarray,
         y_axis: np.ndarray,
     ) -> list[dict[str, np.ndarray]]:
-        helper_calls.append((kwargs_lens, len(x_axis), len(y_axis)))
+        helper_calls.append(
+            (kwargs_lens, np.asarray(x_axis, dtype=float).copy(), np.asarray(y_axis, dtype=float).copy())
+        )
         return [
             {
                 "critical_x": np.asarray([1.0, 2.0], dtype=float),
@@ -1750,20 +2735,317 @@ def test_plot_caustic_overlay_uses_configured_redshift_and_scatter(monkeypatch: 
         tmp_path,
         evaluator,
         np.asarray([4.0], dtype=float),
-        caustic_num_pix=12,
-        caustic_source_redshift=7.0,
+        caustic_plot_grid_scale_arcsec=0.2,
+        caustic_source_redshift=9.0,
     )
 
     assert (tmp_path / "caustic_overlay.pdf").exists()
     assert [float(item[0]) for item in evaluator.converted] == [4.0]
-    assert evaluator.model_z == [7.0]
-    assert evaluator.packed_z == [7.0]
-    assert helper_calls == [([{"latent": 5.0}], 250, 250)]
+    assert evaluator.model_z == [9.0]
+    assert evaluator.packed_z == [9.0]
+    assert len(helper_calls) == 1
+    kwargs_lens, x_axis, y_axis = helper_calls[0]
+    assert kwargs_lens == [{"latent": 5.0}]
+    assert len(x_axis) == 1001
+    assert len(y_axis) == 1001
+    np.testing.assert_allclose([x_axis[0], x_axis[-1]], [-100.0, 100.0])
+    np.testing.assert_allclose([y_axis[0], y_axis[-1]], [-100.0, 100.0])
+    assert x_axis[1] - x_axis[0] == pytest.approx(0.2)
+    assert y_axis[1] - y_axis[0] == pytest.approx(0.2)
     assert len(image_ax.plots) == 1
     assert source_ax.plots == []
     assert len(source_ax.scatters) == 2
     np.testing.assert_allclose(source_ax.scatters[0][0], [0.1, 0.2])
     np.testing.assert_allclose(source_ax.scatters[0][1], [-0.1, -0.2])
+
+
+def test_plot_absolute_magnification_uses_configured_grid_redshift_and_capped_abs(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    state = SimpleNamespace(z_lens=0.3, parameter_specs=[], family_data=[])
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.inputs: list[tuple[np.ndarray, np.ndarray, list[dict[str, float]]]] = []
+
+        def magnification(self, x: Any, y: Any, kwargs_lens: list[dict[str, float]]) -> np.ndarray:
+            x_array = np.asarray(x, dtype=float)
+            y_array = np.asarray(y, dtype=float)
+            self.inputs.append((x_array.copy(), y_array.copy(), kwargs_lens))
+            values = np.zeros_like(x_array)
+            values[0] = -2.0
+            values[1] = 100.0
+            values[2] = np.nan
+            return values
+
+    class FakeEvaluator:
+        def __init__(self) -> None:
+            self.state = state
+            self.exact_models_by_z: dict[float, FakeModel] = {}
+            self.converted: list[np.ndarray] = []
+            self.model_z: list[float] = []
+            self.packed_z: list[float] = []
+            self.model = FakeModel()
+
+        def reported_physical_to_latent_parameter_vector(self, theta: np.ndarray) -> np.ndarray:
+            theta_array = np.asarray(theta, dtype=float)
+            self.converted.append(theta_array.copy())
+            return theta_array + 1.0
+
+        def _get_exact_model_solver(self, z_source: float) -> tuple[FakeModel, None]:
+            self.model_z.append(float(z_source))
+            return self.model, None
+
+        def _build_packed_lens_state(self, sample_latent: Any, z_source: float) -> dict[str, float]:
+            self.packed_z.append(float(z_source))
+            return {"latent": float(np.asarray(sample_latent, dtype=float)[0])}
+
+        def _packed_to_kwargs_lens(self, packed_state: dict[str, float]) -> list[dict[str, float]]:
+            return [packed_state]
+
+    class FakeColorbar:
+        def __init__(self) -> None:
+            self.labels: list[str] = []
+
+        def set_label(self, label: str) -> None:
+            self.labels.append(label)
+
+    class FakeAxis:
+        def __init__(self) -> None:
+            self.imshow_calls: list[tuple[np.ndarray, dict[str, Any]]] = []
+            self.inverted = False
+            self.xlabel: str | None = None
+            self.ylabel: str | None = None
+            self.title: str | None = None
+
+        def imshow(self, data: Any, **kwargs: Any) -> str:
+            self.imshow_calls.append((np.ma.asarray(data).filled(np.nan), dict(kwargs)))
+            return "image"
+
+        def invert_xaxis(self) -> None:
+            self.inverted = True
+
+        def set_xlabel(self, label: str) -> None:
+            self.xlabel = label
+
+        def set_ylabel(self, label: str) -> None:
+            self.ylabel = label
+
+        def set_title(self, title: str) -> None:
+            self.title = title
+
+    class FakeFig:
+        def __init__(self, colorbar: FakeColorbar) -> None:
+            self.colorbar_obj = colorbar
+            self.saved_paths: list[Path] = []
+
+        def colorbar(self, image: Any, ax: FakeAxis, **kwargs: Any) -> FakeColorbar:
+            assert image == "image"
+            assert isinstance(ax, FakeAxis)
+            assert kwargs["fraction"] == pytest.approx(0.046)
+            assert kwargs["pad"] == pytest.approx(0.04)
+            return self.colorbar_obj
+
+        def tight_layout(self) -> None:
+            return None
+
+        def savefig(self, path: Path, **_kwargs: Any) -> None:
+            self.saved_paths.append(Path(path))
+            Path(path).touch()
+
+    axis = FakeAxis()
+    colorbar = FakeColorbar()
+    fig = FakeFig(colorbar)
+
+    monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: (fig, axis))
+    monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
+    evaluator = FakeEvaluator()
+
+    plotting._plot_absolute_magnification(
+        tmp_path,
+        evaluator,
+        np.asarray([4.0], dtype=float),
+        caustic_plot_grid_scale_arcsec=0.2,
+        caustic_source_redshift=9.0,
+    )
+
+    assert (tmp_path / "absolute_magnification.pdf").exists()
+    assert fig.saved_paths == [tmp_path / "absolute_magnification.pdf"]
+    assert [float(item[0]) for item in evaluator.converted] == [4.0]
+    assert evaluator.model_z == [9.0]
+    assert evaluator.packed_z == [9.0]
+    assert len(evaluator.model.inputs) == 1
+    x_input, y_input, kwargs_lens = evaluator.model.inputs[0]
+    assert kwargs_lens == [{"latent": 5.0}]
+    assert x_input.size == 1001 * 1001
+    assert y_input.size == 1001 * 1001
+    np.testing.assert_allclose([np.nanmin(x_input), np.nanmax(x_input)], [-100.0, 100.0])
+    np.testing.assert_allclose([np.nanmin(y_input), np.nanmax(y_input)], [-100.0, 100.0])
+    assert x_input[1] - x_input[0] == pytest.approx(0.2)
+    assert y_input[1001] - y_input[0] == pytest.approx(0.2)
+    assert len(axis.imshow_calls) == 1
+    image_data, image_kwargs = axis.imshow_calls[0]
+    assert image_data.shape == (1001, 1001)
+    assert image_data[0, 0] == pytest.approx(2.0)
+    assert image_data[0, 1] == pytest.approx(plotting.ABSOLUTE_MAGNIFICATION_PLOT_CAP)
+    assert np.isnan(image_data[0, 2])
+    assert image_kwargs["cmap"] == "viridis"
+    assert image_kwargs["vmin"] == pytest.approx(0.0)
+    assert image_kwargs["vmax"] == pytest.approx(plotting.ABSOLUTE_MAGNIFICATION_PLOT_CAP)
+    assert axis.inverted is True
+    assert axis.xlabel == "x [arcsec]"
+    assert axis.ylabel == "y [arcsec]"
+    assert axis.title == "Absolute Magnification (z=9)"
+    assert colorbar.labels == [r"$|\mu|$"]
+
+
+def test_plot_kappa_true_comparison_uses_fits_grid_redshift_and_fixed_limits(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    true_path = tmp_path / "kappa_true.fits"
+    wcs = WCS(naxis=2)
+    wcs.wcs.crpix = [1.0, 1.0]
+    wcs.wcs.crval = [0.0, 0.0]
+    wcs.wcs.cdelt = [1.0 / 3600.0, 1.0 / 3600.0]
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    true_kappa = np.asarray([[1.0, 0.0], [np.nan, 2.0]], dtype=np.float32)
+    fits.PrimaryHDU(true_kappa, header=wcs.to_header()).writeto(true_path)
+
+    state = SimpleNamespace(z_lens=0.3, reference=(3, 0.0, 0.0), parameter_specs=[])
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.inputs: list[tuple[np.ndarray, np.ndarray, list[dict[str, float]]]] = []
+
+        def kappa(self, x: Any, y: Any, kwargs_lens: list[dict[str, float]]) -> np.ndarray:
+            x_array = np.asarray(x, dtype=float)
+            y_array = np.asarray(y, dtype=float)
+            self.inputs.append((x_array.copy(), y_array.copy(), kwargs_lens))
+            return np.asarray([2.0, 2.0, 2.0, 5.0], dtype=float)[: x_array.size]
+
+    class FakeEvaluator:
+        def __init__(self) -> None:
+            self.state = state
+            self.exact_models_by_z: dict[float, FakeModel] = {}
+            self.converted: list[np.ndarray] = []
+            self.model_z: list[float] = []
+            self.packed_z: list[float] = []
+            self.model = FakeModel()
+
+        def reported_physical_to_latent_parameter_vector(self, theta: np.ndarray) -> np.ndarray:
+            theta_array = np.asarray(theta, dtype=float)
+            self.converted.append(theta_array.copy())
+            return theta_array + 1.0
+
+        def _get_exact_model_solver(self, z_source: float) -> tuple[FakeModel, None]:
+            self.model_z.append(float(z_source))
+            return self.model, None
+
+        def _build_packed_lens_state(self, sample_latent: Any, z_source: float) -> dict[str, float]:
+            self.packed_z.append(float(z_source))
+            return {"latent": float(np.asarray(sample_latent, dtype=float)[0])}
+
+        def _packed_to_kwargs_lens(self, packed_state: dict[str, float]) -> list[dict[str, float]]:
+            return [packed_state]
+
+    class FakeColorbar:
+        def __init__(self) -> None:
+            self.labels: list[str] = []
+
+        def set_label(self, label: str) -> None:
+            self.labels.append(label)
+
+    class FakeAxis:
+        def __init__(self) -> None:
+            self.imshow_calls: list[tuple[np.ndarray, dict[str, Any]]] = []
+            self.inverted = False
+            self.xlabel: str | None = None
+            self.ylabel: str | None = None
+            self.title: str | None = None
+
+        def imshow(self, data: Any, **kwargs: Any) -> str:
+            self.imshow_calls.append((np.ma.asarray(data).filled(np.nan), dict(kwargs)))
+            return f"image-{len(self.imshow_calls)}"
+
+        def invert_xaxis(self) -> None:
+            self.inverted = True
+
+        def set_xlabel(self, label: str) -> None:
+            self.xlabel = label
+
+        def set_ylabel(self, label: str) -> None:
+            self.ylabel = label
+
+        def set_title(self, title: str) -> None:
+            self.title = title
+
+    class FakeFig:
+        def __init__(self) -> None:
+            self.colorbars: list[FakeColorbar] = []
+            self.saved_paths: list[Path] = []
+
+        def colorbar(self, image: Any, ax: FakeAxis, **kwargs: Any) -> FakeColorbar:
+            assert image.startswith("image-")
+            assert isinstance(ax, FakeAxis)
+            assert kwargs["fraction"] == pytest.approx(0.046)
+            assert kwargs["pad"] == pytest.approx(0.04)
+            colorbar = FakeColorbar()
+            self.colorbars.append(colorbar)
+            return colorbar
+
+        def tight_layout(self) -> None:
+            return None
+
+        def savefig(self, path: Path, **_kwargs: Any) -> None:
+            self.saved_paths.append(Path(path))
+            Path(path).touch()
+
+    axes = [FakeAxis(), FakeAxis()]
+    fig = FakeFig()
+    monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: (fig, axes))
+    monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
+    evaluator = FakeEvaluator()
+
+    plotting._plot_kappa_true_comparison(
+        tmp_path,
+        evaluator,
+        np.asarray([4.0], dtype=float),
+        true_path,
+        caustic_source_redshift=9.0,
+    )
+
+    assert (tmp_path / "kappa_comparison.pdf").exists()
+    assert fig.saved_paths == [tmp_path / "kappa_comparison.pdf"]
+    assert [float(item[0]) for item in evaluator.converted] == [4.0]
+    assert evaluator.model_z == [9.0]
+    assert evaluator.packed_z == [9.0]
+    assert len(evaluator.model.inputs) == 1
+    _x_input, _y_input, kwargs_lens = evaluator.model.inputs[0]
+    assert kwargs_lens == [{"latent": 5.0}]
+
+    model_data, model_kwargs = axes[0].imshow_calls[0]
+    residual_data, residual_kwargs = axes[1].imshow_calls[0]
+    np.testing.assert_allclose(model_data, [[2.0, 2.0], [2.0, 5.0]])
+    np.testing.assert_allclose(residual_data, [[1.0, np.nan], [np.nan, 1.5]], equal_nan=True)
+    assert model_kwargs["vmin"] == pytest.approx(0.0)
+    assert model_kwargs["vmax"] == pytest.approx(3.0)
+    assert "vmin" not in residual_kwargs
+    assert "vmax" not in residual_kwargs
+    residual_norm = residual_kwargs["norm"]
+    assert isinstance(residual_norm, plotting.TwoSlopeNorm)
+    assert residual_norm.vmin == pytest.approx(-1.0)
+    assert residual_norm.vcenter == pytest.approx(0.0)
+    assert residual_norm.vmax == pytest.approx(2.0)
+    assert axes[0].inverted is True
+    assert axes[1].inverted is True
+    assert axes[0].title == r"Model $\kappa$ (z=9)"
+    assert axes[1].title == r"Fractional $\kappa$ Residual"
+    assert [colorbar.labels for colorbar in fig.colorbars] == [
+        [r"$\kappa_{\rm model}$"],
+        [r"$(\kappa_{\rm model} - \kappa_{\rm true}) / \kappa_{\rm true}$"],
+    ]
 
 
 def test_image_plane_fit_uses_family_colored_observed_cross_and_model_point(monkeypatch: Any, tmp_path: Path) -> None:
@@ -2026,6 +3308,73 @@ def test_fit_quality_diagnostic_plots_write_pdfs_and_merge_tables(tmp_path: Path
         assert path.stat().st_size > 0
 
 
+def test_plot_image_residual_histogram_prefers_q50_and_writes_pdf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_df = pd.DataFrame(
+        {
+            "image_residual_arcsec": [9.0, 9.0, 0.30, 9.0],
+            "image_residual_q50": [0.04, np.nan, 0.08, np.inf],
+        }
+    )
+    path = tmp_path / "image_residual_histogram.pdf"
+    captured: dict[str, Any] = {"vertical_lines": [], "texts": []}
+    original_subplots = plotting.plt.subplots
+
+    def spy_subplots(*args: Any, **kwargs: Any) -> Any:
+        fig, ax = original_subplots(*args, **kwargs)
+        original_hist = ax.hist
+        original_axvline = ax.axvline
+        original_text = ax.text
+
+        def spy_hist(values: Any, *hist_args: Any, **hist_kwargs: Any) -> Any:
+            captured["residual"] = np.asarray(values, dtype=float).copy()
+            return original_hist(values, *hist_args, **hist_kwargs)
+
+        def spy_axvline(x: float = 0, *line_args: Any, **line_kwargs: Any) -> Any:
+            captured["vertical_lines"].append((float(x), line_kwargs.get("label")))
+            return original_axvline(x, *line_args, **line_kwargs)
+
+        def spy_text(*text_args: Any, **text_kwargs: Any) -> Any:
+            if len(text_args) >= 3:
+                captured["texts"].append(str(text_args[2]))
+            return original_text(*text_args, **text_kwargs)
+
+        ax.hist = spy_hist
+        ax.axvline = spy_axvline
+        ax.text = spy_text
+        return fig, ax
+
+    monkeypatch.setattr(plotting.plt, "subplots", spy_subplots)
+
+    plotting._plot_image_residual_histogram(image_df, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+    expected_residual = np.asarray([0.04, 9.0, 0.08, 9.0])
+    expected_rms = float(np.sqrt(np.mean(np.square(expected_residual))))
+    np.testing.assert_allclose(captured["residual"], expected_residual)
+    rms_line = next(x for x, label in captured["vertical_lines"] if label == "total RMS")
+    assert rms_line == pytest.approx(expected_rms)
+    assert any("Total RMS" in text and "N = 4" in text for text in captured["texts"])
+
+
+def test_plot_image_residual_histogram_writes_placeholder_without_finite_values(tmp_path: Path) -> None:
+    image_df = pd.DataFrame(
+        {
+            "image_residual_arcsec": [np.nan, np.inf, -np.inf],
+            "image_residual_q50": [np.nan, np.inf, -np.inf],
+        }
+    )
+    path = tmp_path / "image_residual_histogram.pdf"
+
+    plotting._plot_image_residual_histogram(image_df, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+
+
 def test_exact_vs_approx_prediction_error_skips_missing_rows(tmp_path: Path) -> None:
     family_df = pd.DataFrame(
         {
@@ -2206,12 +3555,25 @@ def test_smc_corner_uses_particle_weights_and_overlays(tmp_path: Path, monkeypat
     assert calls[0][2]["labels"] == ["cosmology.Om0", "cosmology.w0", "halo.x"]
     np.testing.assert_allclose(calls[0][2]["weights"], posterior.sample_weights)
     assert calls[0][2]["plot_datapoints"] is True
-    assert calls[1] == ("lines", [0.30, -1.0, 11.0], {"color": plotting.CORNER_PREVIOUS_STAGE_COLOR})
-    assert calls[2] == ("lines", [0.33, -0.9, 13.0], {"color": plotting.CORNER_BEST_FIT_COLOR})
-    assert calls[3] == (
+    assert calls[1] == (
+        "points",
+        [[0.30, -1.0, 11.0]],
+        {
+            "marker": "x",
+            "color": plotting.CORNER_PREVIOUS_STAGE_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
+    )
+    assert calls[2] == (
         "points",
         [[0.33, -0.9, 13.0]],
-        {"marker": "s", "color": plotting.CORNER_BEST_FIT_COLOR},
+        {
+            "marker": "x",
+            "color": plotting.CORNER_BEST_FIT_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
     )
     assert (tmp_path / "smc_corner.pdf").exists()
 

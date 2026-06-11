@@ -9,7 +9,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-literature-family-cutouts")
 
@@ -21,9 +21,7 @@ import numpy as np
 import pandas as pd
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
-from astropy.stats import sigma_clipped_stats
 from astropy.table import Table
-from astropy.visualization import make_lupton_rgb
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 from matplotlib.backends.backend_pdf import PdfPages
@@ -31,14 +29,26 @@ from matplotlib.patches import Circle
 import astropy.units as u
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+REPO_ROOT = SCRIPT_DIR.parent
+for import_path in (SCRIPT_DIR, REPO_ROOT / "src"):
+    if str(import_path) not in sys.path:
+        sys.path.insert(0, str(import_path))
 
 from analyze_literature_family_diagnostics import (  # noqa: E402
     load_pagul_catalog,
     match_literature_images_to_pagul,
 )
 from compare_hff_to_literature import LiteratureCatalog, discover_literature_catalogs  # noqa: E402
+from lenscluster.rgb import (  # noqa: E402
+    DEFAULT_RGB_CHANNEL_GAINS,
+    DEFAULT_RGB_MINIMUM,
+    DEFAULT_RGB_Q,
+    DEFAULT_RGB_STRETCH,
+    RGBDisplayConfig,
+    build_rgb_display_from_band_images,
+    make_natural_rgb,
+    trim_to_common_shape,
+)
 
 
 DEFAULT_LITERATURE_ROOT = Path("data") / "literature_lenstool_models"
@@ -57,6 +67,8 @@ IMAGE_SCALE_CHOICES = ("auto", "30mas", "60mas")
 DEFAULT_CUTOUT_SIZE_ARCSEC = 10.0
 DEFAULT_FAMILIES_PER_PAGE = 6
 DEFAULT_MAX_IMAGES_PER_FAMILY = 5
+FAMILY_CUTOUT_DETAIL_COLUMNS = 3
+MIN_OVERVIEW_SIZE_ARCSEC = 40.0
 DEFAULT_PAGUL_MATCH_RADIUS_ARCSEC = 0.5
 DEFAULT_PAGUL_MARKER_RADIUS_ARCSEC = 0.2
 LITERATURE_MARKER_COLOR = "0.72"
@@ -68,10 +80,11 @@ PAGUL_MARKER_ZORDER = 7
 PAGE_FACE_COLOR = "black"
 AXIS_FACE_COLOR = "black"
 CUTOUT_PANEL_SIZE_INCH = 3.2
-CUTOUT_LABEL_FONT_SIZE = 5.2
-CUTOUT_FAMILY_LABEL_FONT_SIZE = 6.0
-CUTOUT_HFF_LABEL_FONT_SIZE = 4.9
-CUTOUT_LEGEND_FONT_SIZE = 4.6
+CUTOUT_FIGURE_DPI = 300
+CUTOUT_LABEL_FONT_SIZE = 8.0
+CUTOUT_FAMILY_LABEL_FONT_SIZE = 8.8
+CUTOUT_HFF_LABEL_FONT_SIZE = 7.6
+CUTOUT_LEGEND_FONT_SIZE = 8.0
 CUTOUT_TEXT_BBOX = {"facecolor": "black", "alpha": 0.45, "edgecolor": "none", "pad": 0.9}
 QUALITY_ORDER = ("Platinum", "Gold", "Silver", "Bronze")
 QUALITY_COLORS = {
@@ -83,9 +96,12 @@ QUALITY_COLORS = {
 UNKNOWN_QUALITY_COLOR = "0.82"
 PANEL_SPACING = 0.015
 FIGURE_MARGIN = 0.005
-SAVEFIG_KWARGS = {"bbox_inches": "tight", "pad_inches": 0.02}
-RGB_STRETCH_SIGMA = 6.0
-RGB_Q = 10
+SAVEFIG_KWARGS = {"bbox_inches": "tight", "pad_inches": 0.02, "dpi": CUTOUT_FIGURE_DPI}
+RGB_RED_GAIN = DEFAULT_RGB_CHANNEL_GAINS["red"]
+RGB_GREEN_GAIN = DEFAULT_RGB_CHANNEL_GAINS["green"]
+RGB_BLUE_GAIN = DEFAULT_RGB_CHANNEL_GAINS["blue"]
+RGB_STRETCH = DEFAULT_RGB_STRETCH
+RGB_Q = DEFAULT_RGB_Q
 PAGUL_COLOR_BLUE_BAND = "F814W"
 PAGUL_COLOR_RED_BAND = "F160W"
 PAGUL_SECOND_COLOR_BLUE_BAND = "F606W"
@@ -114,7 +130,9 @@ DOWNLOAD_COMMAND_TEMPLATE = (
 CLUSTER_IMAGE_TOKENS = {
     "a2744": ("a2744", "abell2744"),
     "a370": ("a370", "abell370"),
+    "ares": ("ares",),
     "as1063": ("as1063", "abells1063", "rxcj2248"),
+    "hera": ("hera",),
     "m0416": ("m0416", "macs0416"),
     "m0717": ("m0717", "macs0717"),
     "m1149": ("m1149", "macs1149"),
@@ -129,6 +147,19 @@ class BandImage:
     shape: tuple[int, int]
     wcs: WCS
     pixel_scale_arcsec: float
+
+
+@dataclass(frozen=True)
+class CutoutWindow:
+    npix: int
+    x0: int
+    y0: int
+    src_x0: int
+    src_y0: int
+    src_x1: int
+    src_y1: int
+    dst_x0: int
+    dst_y0: int
 
 
 def _safe_filename(value: str) -> str:
@@ -221,6 +252,7 @@ def find_rgb_band_paths(
         raise ValueError(f"Unsupported image scale {image_scale!r}. Valid choices: {IMAGE_SCALE_CHOICES}.")
     root = Path(image_dir)
     tokens = tuple(token.lower() for token in _cluster_tokens(cluster))
+    root_has_cluster_token = any(token in str(root).lower() for token in tokens)
     result: dict[str, Path] = {}
     missing: list[str] = []
 
@@ -232,7 +264,7 @@ def find_rgb_band_paths(
                 if not path.is_file() or not _fits_like(path):
                     continue
                 haystack = str(path.relative_to(root)).lower()
-                if band_token in haystack and any(token in haystack for token in tokens):
+                if band_token in haystack and (root_has_cluster_token or any(token in haystack for token in tokens)):
                     candidates.append(path)
         if not candidates:
             missing.append(str(band))
@@ -276,76 +308,132 @@ def load_rgb_metadata(paths_by_band: dict[str, Path], bands: Sequence[str] = DEF
     return {str(band): load_band_metadata(str(band), paths_by_band[str(band)]) for band in bands}
 
 
-def extract_band_cutout(image: BandImage, coord: SkyCoord, *, cutout_size_arcsec: float) -> np.ndarray:
+def _cutout_npixels(image: BandImage, *, cutout_size_arcsec: float) -> int:
     if cutout_size_arcsec <= 0.0:
         raise ValueError("cutout_size_arcsec must be positive.")
-    npix = max(1, int(math.ceil(float(cutout_size_arcsec) / image.pixel_scale_arcsec)))
+    return max(1, int(math.ceil(float(cutout_size_arcsec) / image.pixel_scale_arcsec)))
+
+
+def _clamped_cutout_origin(raw_origin: int, npix: int, image_size: int) -> int:
+    if image_size >= npix:
+        return int(np.clip(raw_origin, 0, image_size - npix))
+    return int(np.clip(raw_origin, image_size - npix, 0))
+
+
+def _cutout_window(image: BandImage, coord: SkyCoord, *, cutout_size_arcsec: float) -> CutoutWindow | None:
+    npix = _cutout_npixels(image, cutout_size_arcsec=cutout_size_arcsec)
     center_x, center_y = image.wcs.world_to_pixel(coord)
+    if not all(np.isfinite(value) for value in (center_x, center_y)):
+        return None
     x_center = int(round(float(center_x)))
     y_center = int(round(float(center_y)))
     half = npix // 2
-    x0 = x_center - half
-    y0 = y_center - half
+    raw_x0 = x_center - half
+    raw_y0 = y_center - half
+    raw_x1 = raw_x0 + npix
+    raw_y1 = raw_y0 + npix
+    ny, nx = image.shape
+    if raw_x0 >= nx or raw_x1 <= 0 or raw_y0 >= ny or raw_y1 <= 0:
+        return None
+
+    x0 = _clamped_cutout_origin(raw_x0, npix, nx)
+    y0 = _clamped_cutout_origin(raw_y0, npix, ny)
     x1 = x0 + npix
     y1 = y0 + npix
-    ny, nx = image.shape
     src_x0 = max(0, x0)
     src_y0 = max(0, y0)
     src_x1 = min(nx, x1)
     src_y1 = min(ny, y1)
-    cutout = np.full((npix, npix), np.nan, dtype=np.float32)
     if src_x0 >= src_x1 or src_y0 >= src_y1:
+        return None
+    return CutoutWindow(
+        npix=npix,
+        x0=x0,
+        y0=y0,
+        src_x0=src_x0,
+        src_y0=src_y0,
+        src_x1=src_x1,
+        src_y1=src_y1,
+        dst_x0=src_x0 - x0,
+        dst_y0=src_y0 - y0,
+    )
+
+
+def extract_band_cutout(image: BandImage, coord: SkyCoord, *, cutout_size_arcsec: float) -> np.ndarray:
+    npix = _cutout_npixels(image, cutout_size_arcsec=cutout_size_arcsec)
+    cutout = np.full((npix, npix), np.nan, dtype=np.float32)
+    window = _cutout_window(image, coord, cutout_size_arcsec=cutout_size_arcsec)
+    if window is None:
         return cutout
 
     with fits.open(image.path, memmap=True) as hdul:
-        data = hdul[image.hdu_index].section[src_y0:src_y1, src_x0:src_x1]
+        data = hdul[image.hdu_index].section[window.src_y0 : window.src_y1, window.src_x0 : window.src_x1]
         values = np.asarray(data, dtype=np.float32)
 
-    dst_x0 = src_x0 - x0
-    dst_y0 = src_y0 - y0
-    cutout[dst_y0 : dst_y0 + values.shape[0], dst_x0 : dst_x0 + values.shape[1]] = values
+    cutout[
+        window.dst_y0 : window.dst_y0 + values.shape[0],
+        window.dst_x0 : window.dst_x0 + values.shape[1],
+    ] = values
     return cutout
 
 
 def _trim_to_common_shape(arrays: Iterable[np.ndarray]) -> list[np.ndarray]:
-    valid = [np.asarray(array) for array in arrays if np.asarray(array).ndim == 2]
-    if not valid:
-        return []
-    min_y = min(array.shape[0] for array in valid)
-    min_x = min(array.shape[1] for array in valid)
-    return [array[:min_y, :min_x] for array in valid]
+    return trim_to_common_shape([np.asarray(array) for array in arrays])
 
 
-def _channel_stats(data: np.ndarray) -> tuple[float, float]:
-    finite = np.asarray(data, dtype=float)
-    finite = finite[np.isfinite(finite)]
-    if finite.size == 0:
-        return 0.0, 1.0
-    _mean, median, std = sigma_clipped_stats(finite, sigma=3.0, maxiters=5)
-    std = float(std) if np.isfinite(std) and float(std) > 0.0 else float(np.nanstd(finite))
-    if not np.isfinite(std) or std <= 0.0:
-        std = 1.0
-    return float(median), std
+def build_rgb_display(
+    band_images: Mapping[str, BandImage],
+    *,
+    bands: Sequence[str] = DEFAULT_BANDS,
+    q: float = DEFAULT_RGB_Q,
+    stretch: float = DEFAULT_RGB_STRETCH,
+    channel_gains: Mapping[str, float] = DEFAULT_RGB_CHANNEL_GAINS,
+    minimum: float = DEFAULT_RGB_MINIMUM,
+) -> RGBDisplayConfig:
+    return build_rgb_display_from_band_images(
+        band_images,
+        bands=bands,
+        q=q,
+        stretch=stretch,
+        channel_gains=channel_gains,
+        minimum=minimum,
+    )
 
 
-def make_rgb_cutout(cutouts_by_band: dict[str, np.ndarray], bands: Sequence[str] = DEFAULT_BANDS) -> np.ndarray:
-    blue, green, red = _trim_to_common_shape([cutouts_by_band[str(bands[0])], cutouts_by_band[str(bands[1])], cutouts_by_band[str(bands[2])]])
-    r_med, r_std = _channel_stats(red)
-    g_med, g_std = _channel_stats(green)
-    b_med, b_std = _channel_stats(blue)
-    r_scaled = (red - r_med) * (g_std / max(r_std, 1.0e-12))
-    g_scaled = green - g_med
-    b_scaled = (blue - b_med) * (g_std / max(b_std, 1.0e-12)) * 1.2
-    stretch = max(g_std * RGB_STRETCH_SIGMA, 1.0e-8)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        return make_lupton_rgb(
-            np.nan_to_num(r_scaled, nan=0.0),
-            np.nan_to_num(g_scaled, nan=0.0),
-            np.nan_to_num(b_scaled, nan=0.0),
-            minimum=0.0,
-            stretch=stretch,
-            Q=RGB_Q,
-        )
+def make_rgb_cutout(
+    cutouts_by_band: dict[str, np.ndarray],
+    bands: Sequence[str] = DEFAULT_BANDS,
+    *,
+    rgb_display: RGBDisplayConfig | None = None,
+) -> np.ndarray:
+    return make_natural_rgb(cutouts_by_band, bands=bands, display=rgb_display)
+
+
+def _draw_rgb_cutout(
+    ax: plt.Axes,
+    band_images: dict[str, BandImage],
+    bands: Sequence[str],
+    rgb_display: RGBDisplayConfig,
+    center_coord: SkyCoord,
+    *,
+    cutout_size_arcsec: float,
+) -> np.ndarray:
+    cutouts = {
+        str(band): extract_band_cutout(band_images[str(band)], center_coord, cutout_size_arcsec=cutout_size_arcsec)
+        for band in bands
+    }
+    rgb = make_rgb_cutout(cutouts, bands=bands, rgb_display=rgb_display)
+    height, width = rgb.shape[:2]
+    ax.imshow(
+        rgb,
+        origin="lower",
+        interpolation="bilinear",
+        extent=(-0.5, width - 0.5, -0.5, height - 0.5),
+    )
+    ax.set_xlim(-0.5, width - 0.5)
+    ax.set_ylim(-0.5, height - 0.5)
+    ax.set_autoscale_on(False)
+    return rgb
 
 
 def _quality_key(value: object) -> str:
@@ -402,6 +490,80 @@ def _format_redshift(value: object) -> str:
 
 def _row_coord(row: pd.Series) -> SkyCoord:
     return SkyCoord(ra=float(row["ra"]) * u.deg, dec=float(row["dec"]) * u.deg, frame="icrs")
+
+
+def _safe_row_coord(row: pd.Series) -> SkyCoord | None:
+    try:
+        coord = _row_coord(row)
+    except (KeyError, TypeError, ValueError):
+        return None
+    pixel_ra = float(coord.ra.deg)
+    pixel_dec = float(coord.dec.deg)
+    if not np.isfinite(pixel_ra) or not np.isfinite(pixel_dec):
+        return None
+    return coord
+
+
+def _pixel_to_skycoord(image: BandImage, x_pixel: float, y_pixel: float) -> SkyCoord | None:
+    try:
+        coord = image.wcs.pixel_to_world(float(x_pixel), float(y_pixel))
+    except Exception:
+        return None
+    try:
+        skycoord = coord if isinstance(coord, SkyCoord) else SkyCoord(coord)
+    except Exception:
+        return None
+    if not np.isfinite(float(skycoord.ra.deg)) or not np.isfinite(float(skycoord.dec.deg)):
+        return None
+    return skycoord
+
+
+def _coords_from_rows(rows: pd.DataFrame, *, include_pagul: bool = False) -> list[SkyCoord]:
+    coords: list[SkyCoord] = []
+    for _, row in rows.iterrows():
+        coord = _safe_row_coord(row)
+        if coord is not None:
+            coords.append(coord)
+        if include_pagul:
+            pagul_coord = _pagul_coord(row)
+            if pagul_coord is not None:
+                coords.append(pagul_coord)
+    return coords
+
+
+def _overview_geometry_for_coords(
+    image: BandImage,
+    coords: Sequence[SkyCoord],
+    *,
+    minimum_side_arcsec: float = MIN_OVERVIEW_SIZE_ARCSEC,
+) -> tuple[SkyCoord, float]:
+    pixels: list[tuple[float, float]] = []
+    for coord in coords:
+        try:
+            x_pixel, y_pixel = image.wcs.world_to_pixel(coord)
+        except Exception:
+            continue
+        if np.isfinite(x_pixel) and np.isfinite(y_pixel):
+            pixels.append((float(x_pixel), float(y_pixel)))
+    if pixels:
+        pixel_array = np.asarray(pixels, dtype=float)
+        x_min, y_min = np.min(pixel_array, axis=0)
+        x_max, y_max = np.max(pixel_array, axis=0)
+        x_center = 0.5 * (x_min + x_max)
+        y_center = 0.5 * (y_min + y_max)
+        span_arcsec = float(max(x_max - x_min, y_max - y_min) * image.pixel_scale_arcsec)
+    else:
+        ny, nx = image.shape
+        x_center = 0.5 * float(nx - 1)
+        y_center = 0.5 * float(ny - 1)
+        span_arcsec = 0.0
+    center_coord = _pixel_to_skycoord(image, x_center, y_center)
+    if center_coord is None and coords:
+        center_coord = coords[0]
+    if center_coord is None:
+        center_coord = SkyCoord(ra=0.0 * u.deg, dec=0.0 * u.deg, frame="icrs")
+    padding = max(2.0, 0.15 * span_arcsec)
+    return center_coord, max(float(minimum_side_arcsec), span_arcsec + 2.0 * padding)
 
 
 def _ab_magnitude(flux_values: object) -> np.ndarray:
@@ -794,8 +956,6 @@ def _format_cutout_crms(value: object) -> str:
 
 def _format_family_label(family_id: str, family: pd.DataFrame, max_images_per_family: int) -> str:
     family_label = f"Family {family_id} ({len(family)} images)"
-    if len(family) > max_images_per_family:
-        family_label += f", first {max_images_per_family}"
     if "pagul_family_color_rms" in family.columns:
         family_label += f"\n{_format_cutout_crms(family['pagul_family_color_rms'].iloc[0])}"
     return family_label
@@ -859,16 +1019,14 @@ def _cutout_pixel_position(
 ) -> tuple[float, float, float] | None:
     if cutout_size_arcsec <= 0.0:
         return None
-    npix = max(1, int(math.ceil(float(cutout_size_arcsec) / image.pixel_scale_arcsec)))
-    center_x, center_y = image.wcs.world_to_pixel(center_coord)
-    target_x, target_y = image.wcs.world_to_pixel(target_coord)
-    if not all(np.isfinite(value) for value in (center_x, center_y, target_x, target_y)):
+    window = _cutout_window(image, center_coord, cutout_size_arcsec=cutout_size_arcsec)
+    if window is None:
         return None
-    half = npix // 2
-    x0 = int(round(float(center_x))) - half
-    y0 = int(round(float(center_y))) - half
+    target_x, target_y = image.wcs.world_to_pixel(target_coord)
+    if not all(np.isfinite(value) for value in (target_x, target_y)):
+        return None
     marker_radius_pix = DEFAULT_PAGUL_MARKER_RADIUS_ARCSEC / image.pixel_scale_arcsec
-    return float(target_x) - float(x0), float(target_y) - float(y0), marker_radius_pix
+    return float(target_x) - float(window.x0), float(target_y) - float(window.y0), marker_radius_pix
 
 
 def _draw_marker(
@@ -882,7 +1040,7 @@ def _draw_marker(
     edgecolor: str,
     alpha: float = 0.70,
     linestyle: str = "-",
-    linewidth: float = 0.75,
+    linewidth: float = 1.1,
     zorder: float = 5,
 ) -> None:
     marker = _cutout_pixel_position(
@@ -933,8 +1091,32 @@ def _draw_pagul_marker(
         edgecolor=PAGUL_MARKER_COLOR,
         alpha=PAGUL_MARKER_ALPHA,
         linestyle="--",
-        linewidth=0.85,
+        linewidth=1.15,
         zorder=PAGUL_MARKER_ZORDER,
+    )
+
+
+def _draw_literature_marker_at(
+    ax: plt.Axes,
+    image: BandImage,
+    center_coord: SkyCoord,
+    target_coord: SkyCoord,
+    *,
+    cutout_size_arcsec: float,
+    rendered_shape: tuple[int, int],
+) -> None:
+    _draw_marker(
+        ax,
+        image,
+        center_coord,
+        target_coord,
+        cutout_size_arcsec=cutout_size_arcsec,
+        rendered_shape=rendered_shape,
+        edgecolor=LITERATURE_MARKER_COLOR,
+        alpha=LITERATURE_MARKER_ALPHA,
+        linestyle="-",
+        linewidth=1.1,
+        zorder=LITERATURE_MARKER_ZORDER,
     )
 
 
@@ -946,33 +1128,30 @@ def _draw_literature_marker(
     cutout_size_arcsec: float,
     rendered_shape: tuple[int, int],
 ) -> None:
-    _draw_marker(
+    _draw_literature_marker_at(
         ax,
         image,
         center_coord,
         center_coord,
         cutout_size_arcsec=cutout_size_arcsec,
         rendered_shape=rendered_shape,
-        edgecolor=LITERATURE_MARKER_COLOR,
-        alpha=LITERATURE_MARKER_ALPHA,
-        linestyle="-",
-        linewidth=0.75,
-        zorder=LITERATURE_MARKER_ZORDER,
     )
 
 
-def _draw_marker_legend(ax: plt.Axes) -> None:
+def _draw_marker_legend(ax: plt.Axes, *, include_pagul: bool = True) -> None:
     legend_bbox = {"facecolor": "black", "alpha": 0.38, "edgecolor": "none", "pad": 0.45}
-    entries = (
-        ("lit", LITERATURE_MARKER_COLOR, "-", LITERATURE_MARKER_ALPHA, LITERATURE_MARKER_ZORDER, 0.955),
-        ("Pagul", PAGUL_MARKER_COLOR, "--", PAGUL_MARKER_ALPHA, PAGUL_MARKER_ZORDER, 0.905),
-    )
+    entries = [
+        ("lit", LITERATURE_MARKER_COLOR, "-", LITERATURE_MARKER_ALPHA, LITERATURE_MARKER_ZORDER),
+    ]
+    if include_pagul:
+        entries.append(("Pagul", PAGUL_MARKER_COLOR, "--", PAGUL_MARKER_ALPHA, PAGUL_MARKER_ZORDER))
+    y_values = [0.105, 0.055] if include_pagul else [0.065]
     ax.text(
-        0.802,
-        0.982,
-        " \n ",
+        0.782,
+        0.14 if include_pagul else 0.095,
+        " \n " if include_pagul else " ",
         transform=ax.transAxes,
-        va="top",
+        va="bottom",
         ha="left",
         fontsize=CUTOUT_LEGEND_FONT_SIZE,
         color="white",
@@ -980,15 +1159,15 @@ def _draw_marker_legend(ax: plt.Axes) -> None:
         clip_on=True,
         bbox=legend_bbox,
     )
-    for label, color, linestyle, alpha, zorder, y in entries:
+    for (label, color, linestyle, alpha, zorder), y in zip(entries, y_values):
         ax.add_patch(
             Circle(
-                (0.825, y),
-                radius=0.012,
+                (0.812, y),
+                radius=0.014,
                 transform=ax.transAxes,
                 edgecolor=color,
                 facecolor="none",
-                linewidth=0.7,
+                linewidth=1.0,
                 linestyle=linestyle,
                 alpha=alpha,
                 zorder=zorder,
@@ -996,7 +1175,7 @@ def _draw_marker_legend(ax: plt.Axes) -> None:
             )
         )
         ax.text(
-            0.852,
+            0.845,
             y,
             label,
             transform=ax.transAxes,
@@ -1035,6 +1214,173 @@ def _style_cutout_axis(ax: plt.Axes) -> None:
         spine.set_linewidth(0.35)
 
 
+def _draw_literature_cluster_overview_panel(
+    ax: plt.Axes,
+    band_images: dict[str, BandImage],
+    bands: Sequence[str],
+    rgb_display: RGBDisplayConfig,
+    data: pd.DataFrame,
+) -> None:
+    display_image = band_images[str(bands[-1])]
+    center_coord, cutout_size_arcsec = _overview_geometry_for_coords(
+        display_image,
+        _coords_from_rows(data, include_pagul=False),
+    )
+    rgb = _draw_rgb_cutout(
+        ax,
+        band_images,
+        bands,
+        rgb_display,
+        center_coord,
+        cutout_size_arcsec=cutout_size_arcsec,
+    )
+    for _, image_row in data.iterrows():
+        coord = _safe_row_coord(image_row)
+        if coord is None:
+            continue
+        _draw_literature_marker_at(
+            ax,
+            display_image,
+            center_coord,
+            coord,
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rgb.shape[:2],
+        )
+    _draw_marker_legend(ax, include_pagul=False)
+
+
+def _draw_literature_family_overview_panel(
+    ax: plt.Axes,
+    band_images: dict[str, BandImage],
+    bands: Sequence[str],
+    rgb_display: RGBDisplayConfig,
+    family_id: str,
+    family: pd.DataFrame,
+    *,
+    max_images_per_family: int,
+) -> None:
+    display_image = band_images[str(bands[-1])]
+    center_coord, cutout_size_arcsec = _overview_geometry_for_coords(
+        display_image,
+        _coords_from_rows(family, include_pagul=True),
+    )
+    rgb = _draw_rgb_cutout(
+        ax,
+        band_images,
+        bands,
+        rgb_display,
+        center_coord,
+        cutout_size_arcsec=cutout_size_arcsec,
+    )
+    for _, image_row in family.iterrows():
+        coord = _safe_row_coord(image_row)
+        if coord is None:
+            continue
+        _draw_literature_marker_at(
+            ax,
+            display_image,
+            center_coord,
+            coord,
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rgb.shape[:2],
+        )
+        _draw_pagul_marker(
+            ax,
+            display_image,
+            image_row,
+            center_coord,
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rgb.shape[:2],
+        )
+    ax.text(
+        0.035,
+        0.965,
+        _format_family_label(family_id, family, max_images_per_family),
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=CUTOUT_FAMILY_LABEL_FONT_SIZE,
+        color="white",
+        linespacing=0.95,
+        clip_on=True,
+        bbox=CUTOUT_TEXT_BBOX,
+    )
+    _draw_marker_legend(ax, include_pagul=True)
+
+
+def _draw_literature_detail_panel(
+    ax: plt.Axes,
+    band_images: dict[str, BandImage],
+    bands: Sequence[str],
+    rgb_display: RGBDisplayConfig,
+    image_row: pd.Series,
+    *,
+    cutout_size_arcsec: float,
+) -> None:
+    coord = _safe_row_coord(image_row)
+    if coord is None:
+        ax.set_axis_off()
+        return
+    display_image = band_images[str(bands[-1])]
+    rgb = _draw_rgb_cutout(
+        ax,
+        band_images,
+        bands,
+        rgb_display,
+        coord,
+        cutout_size_arcsec=cutout_size_arcsec,
+    )
+    _draw_literature_marker(
+        ax,
+        display_image,
+        coord,
+        cutout_size_arcsec=cutout_size_arcsec,
+        rendered_shape=rgb.shape[:2],
+    )
+    _draw_pagul_marker(
+        ax,
+        display_image,
+        image_row,
+        coord,
+        cutout_size_arcsec=cutout_size_arcsec,
+        rendered_shape=rgb.shape[:2],
+    )
+    quality = _quality_text(image_row.get("catalog_quality", ""))
+    quality_suffix = f" {quality}" if quality else ""
+    label = f"{image_row.get('literature_id', '')}  {_format_redshift(image_row.get('catalog_z'))}{quality_suffix}"
+    pagul_label = _format_pagul_match(image_row)
+    if pagul_label:
+        label = f"{label}\n{pagul_label}"
+    ax.text(
+        0.04,
+        0.94,
+        label,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=CUTOUT_LABEL_FONT_SIZE,
+        color="white",
+        linespacing=0.95,
+        clip_on=True,
+        bbox=_quality_text_bbox(image_row.get("catalog_quality", "")),
+    )
+    hff_label = _format_hff_diagnostics(image_row)
+    if hff_label:
+        ax.text(
+            0.96,
+            0.06,
+            hff_label,
+            transform=ax.transAxes,
+            va="bottom",
+            ha="right",
+            fontsize=CUTOUT_HFF_LABEL_FONT_SIZE,
+            color="white",
+            linespacing=0.92,
+            clip_on=True,
+            bbox=CUTOUT_TEXT_BBOX,
+        )
+
+
 def write_family_cutout_pdf(
     catalog: LiteratureCatalog,
     band_images: dict[str, BandImage],
@@ -1054,89 +1400,66 @@ def write_family_cutout_pdf(
     output = Path(output).with_suffix(".pdf")
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    rgb_display = build_rgb_display(band_images, bands=bands)
     family_ids = _family_ids_in_catalog_order(catalog.data)
-    n_pages = int(math.ceil(len(family_ids) / int(families_per_page)))
+    detail_cols = FAMILY_CUTOUT_DETAIL_COLUMNS
     with PdfPages(output) as pdf:
-        for page_index in range(n_pages):
-            page_family_ids = family_ids[page_index * families_per_page : (page_index + 1) * families_per_page]
-            n_rows = len(page_family_ids)
-            fig, axes = plt.subplots(
-                n_rows,
-                max_images_per_family,
-                figsize=_figure_size(n_rows, max_images_per_family),
-                squeeze=False,
-            )
+        fig = plt.figure(figsize=_figure_size(detail_cols, detail_cols), dpi=CUTOUT_FIGURE_DPI)
+        _style_cutout_figure(fig)
+        grid = fig.add_gridspec(detail_cols, detail_cols)
+        cluster_ax = fig.add_subplot(grid[:, :])
+        _style_cutout_axis(cluster_ax)
+        _draw_literature_cluster_overview_panel(
+            cluster_ax,
+            band_images,
+            bands,
+            rgb_display,
+            catalog.data.reset_index(drop=True),
+        )
+        pdf.savefig(fig, facecolor=fig.get_facecolor(), **SAVEFIG_KWARGS)
+        plt.close(fig)
+
+        for family_id in family_ids:
+            family = catalog.data.loc[catalog.data["family_id"].astype(str) == str(family_id)].reset_index(drop=True)
+            overview_units = detail_cols
+            detail_rows = max(1, int(math.ceil(float(len(family)) / float(detail_cols))))
+            n_rows = overview_units + detail_rows
+            fig = plt.figure(figsize=_figure_size(n_rows, detail_cols), dpi=CUTOUT_FIGURE_DPI)
             _style_cutout_figure(fig)
-            for row_index, family_id in enumerate(page_family_ids):
-                family = catalog.data.loc[catalog.data["family_id"].astype(str) == str(family_id)]
-                shown = family.head(max_images_per_family).reset_index(drop=True)
-                for col_index in range(max_images_per_family):
-                    ax = axes[row_index, col_index]
-                    _style_cutout_axis(ax)
-                    if col_index >= len(shown):
-                        ax.set_axis_off()
-                        continue
-                    image_row = shown.iloc[col_index]
-                    coord = _row_coord(image_row)
-                    cutouts = {
-                        str(band): extract_band_cutout(band_images[str(band)], coord, cutout_size_arcsec=cutout_size_arcsec)
-                        for band in bands
-                    }
-                    rgb = make_rgb_cutout(cutouts, bands=bands)
-                    ax.imshow(rgb, origin="lower", interpolation="nearest")
-                    _draw_literature_marker(
-                        ax,
-                        band_images[str(bands[-1])],
-                        coord,
-                        cutout_size_arcsec=cutout_size_arcsec,
-                        rendered_shape=rgb.shape[:2],
-                    )
-                    _draw_pagul_marker(
-                        ax,
-                        band_images[str(bands[-1])],
-                        image_row,
-                        coord,
-                        cutout_size_arcsec=cutout_size_arcsec,
-                        rendered_shape=rgb.shape[:2],
-                    )
-                    _draw_marker_legend(ax)
-                    quality = _quality_text(image_row.get("catalog_quality", ""))
-                    quality_suffix = f" {quality}" if quality else ""
-                    label = f"{image_row.get('literature_id', '')}  {_format_redshift(image_row.get('catalog_z'))}{quality_suffix}"
-                    pagul_label = _format_pagul_match(image_row)
-                    if pagul_label:
-                        label = f"{label}\n{pagul_label}"
-                    ax.text(
-                        0.04,
-                        0.94,
-                        label,
-                        transform=ax.transAxes,
-                        va="top",
-                        ha="left",
-                        fontsize=CUTOUT_LABEL_FONT_SIZE,
-                        color="white",
-                        linespacing=0.95,
-                        clip_on=True,
-                        bbox=_quality_text_bbox(image_row.get("catalog_quality", "")),
-                    )
-                    hff_label = _format_hff_diagnostics(image_row)
-                    if hff_label:
-                        ax.text(
-                            0.96,
-                            0.06,
-                            hff_label,
-                            transform=ax.transAxes,
-                            va="bottom",
-                            ha="right",
-                            fontsize=CUTOUT_HFF_LABEL_FONT_SIZE,
-                            color="white",
-                            linespacing=0.92,
-                            clip_on=True,
-                            bbox=CUTOUT_TEXT_BBOX,
-                        )
+            grid = fig.add_gridspec(n_rows, detail_cols)
+            overview_ax = fig.add_subplot(grid[:overview_units, :])
+            _style_cutout_axis(overview_ax)
+            _draw_literature_family_overview_panel(
+                overview_ax,
+                band_images,
+                bands,
+                rgb_display,
+                str(family_id),
+                family,
+                max_images_per_family=max_images_per_family,
+            )
+            for panel_index, image_row in family.iterrows():
+                detail_row = overview_units + int(panel_index) // detail_cols
+                detail_col = int(panel_index) % detail_cols
+                ax = fig.add_subplot(grid[detail_row, detail_col])
+                _style_cutout_axis(ax)
+                _draw_literature_detail_panel(
+                    ax,
+                    band_images,
+                    bands,
+                    rgb_display,
+                    image_row,
+                    cutout_size_arcsec=cutout_size_arcsec,
+                )
+            for blank_index in range(len(family), detail_rows * detail_cols):
+                detail_row = overview_units + blank_index // detail_cols
+                detail_col = blank_index % detail_cols
+                ax = fig.add_subplot(grid[detail_row, detail_col])
+                _style_cutout_axis(ax)
+                ax.set_axis_off()
             pdf.savefig(fig, facecolor=fig.get_facecolor(), **SAVEFIG_KWARGS)
             plt.close(fig)
-    return n_pages
+    return 1 + len(family_ids)
 
 
 def run(

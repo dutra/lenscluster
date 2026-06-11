@@ -401,6 +401,49 @@ def _empty_images_df() -> pd.DataFrame:
     )
 
 
+ARC_CONSTRAINT_COLUMNS = [
+    "arc_has_constraint",
+    "arc_anchor_ra",
+    "arc_anchor_dec",
+    "arc_tangent_angle_rad",
+    "arc_curvature_arcsec_inv",
+    "arc_sigma_tangent_angle_rad",
+    "arc_sigma_curvature_arcsec_inv",
+    "arc_reliability",
+    "arc_catalog_reference",
+    "arc_catalog_source",
+]
+
+
+def _empty_arc_constraints_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "image_label",
+            "arc_anchor_ra",
+            "arc_anchor_dec",
+            "arc_tangent_angle_rad",
+            "arc_curvature_arcsec_inv",
+            "arc_sigma_tangent_angle_rad",
+            "arc_sigma_curvature_arcsec_inv",
+            "arc_reliability",
+            "arc_catalog_reference",
+            "arc_catalog_source",
+        ]
+    )
+
+
+def _images_df_with_empty_arc_columns(images_df: pd.DataFrame) -> pd.DataFrame:
+    result = images_df.copy()
+    if "arc_has_constraint" not in result.columns:
+        result["arc_has_constraint"] = False
+    for column in ARC_CONSTRAINT_COLUMNS:
+        if column == "arc_has_constraint":
+            result[column] = result[column].fillna(False).astype(bool)
+        elif column not in result.columns:
+            result[column] = np.nan
+    return result
+
+
 def _split_image_label(image_label: str) -> tuple[str, str]:
     label = image_label.strip()
     match = STRICT_IMAGE_LABEL_RE.fullmatch(label)
@@ -487,6 +530,131 @@ def _load_multiple_images_catalog(
     return result
 
 
+def _load_arc_constraints_catalog(
+    filepath: str | Path,
+    par_reference: tuple[int, float, float] | None,
+) -> pd.DataFrame:
+    path = Path(filepath)
+    header_reference: int | None = None
+    rows: list[list[str]] = []
+
+    with path.open(encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = _parse_reference_header_tokens(line)
+            if parts is not None:
+                if len(parts) < 2:
+                    raise ValueError(f"Invalid #REFERENCE header in '{path}'.")
+                header_reference = int(parts[1])
+                continue
+            if line.startswith("#"):
+                continue
+            rows.append(line.split())
+
+    if header_reference is None:
+        raise ValueError(f"Missing #REFERENCE header in '{path}'.")
+
+    if not rows:
+        return _empty_arc_constraints_df()
+
+    if min(len(row) for row in rows) < 7:
+        raise ValueError(
+            f"Arc catalog '{path}' has rows with fewer than 7 required columns: "
+            "image_label x_anchor y_anchor tangent_angle_rad curvature_arcsec_inv "
+            "sigma_tangent_angle_rad sigma_curvature_arcsec_inv [reliability]."
+        )
+    if max(len(row) for row in rows) > 8:
+        raise ValueError(f"Arc catalog '{path}' has rows with more than 8 columns.")
+
+    padded_rows = [row + ["1.0"] * (8 - len(row)) for row in rows]
+    df = pd.DataFrame(
+        padded_rows,
+        columns=[
+            "image_label",
+            "coord_1",
+            "coord_2",
+            "arc_tangent_angle_rad",
+            "arc_curvature_arcsec_inv",
+            "arc_sigma_tangent_angle_rad",
+            "arc_sigma_curvature_arcsec_inv",
+            "arc_reliability",
+        ],
+    )
+    df["image_label"] = df["image_label"].astype(str)
+    for image_label in df["image_label"]:
+        try:
+            _split_image_label(image_label)
+        except ValueError as exc:
+            raise ValueError(f"{exc} in arc catalog {path}.") from exc
+    for column in [
+        "coord_1",
+        "coord_2",
+        "arc_tangent_angle_rad",
+        "arc_curvature_arcsec_inv",
+        "arc_sigma_tangent_angle_rad",
+        "arc_sigma_curvature_arcsec_inv",
+        "arc_reliability",
+    ]:
+        df[column] = pd.to_numeric(df[column], errors="raise")
+
+    numeric_columns = [
+        "coord_1",
+        "coord_2",
+        "arc_tangent_angle_rad",
+        "arc_curvature_arcsec_inv",
+        "arc_sigma_tangent_angle_rad",
+        "arc_sigma_curvature_arcsec_inv",
+        "arc_reliability",
+    ]
+    finite_mask = np.isfinite(df[numeric_columns].to_numpy(dtype=float)).all(axis=1)
+    if not bool(np.all(finite_mask)):
+        bad_labels = df.loc[~finite_mask, "image_label"].astype(str).tolist()
+        raise ValueError(f"Arc catalog '{path}' has non-finite numeric values for labels {bad_labels}.")
+    if (df["arc_sigma_tangent_angle_rad"].to_numpy(dtype=float) <= 0.0).any():
+        bad_labels = df.loc[df["arc_sigma_tangent_angle_rad"].to_numpy(dtype=float) <= 0.0, "image_label"].astype(str).tolist()
+        raise ValueError(f"Arc catalog '{path}' has non-positive tangent sigma for labels {bad_labels}.")
+    if (df["arc_sigma_curvature_arcsec_inv"].to_numpy(dtype=float) <= 0.0).any():
+        bad_labels = df.loc[
+            df["arc_sigma_curvature_arcsec_inv"].to_numpy(dtype=float) <= 0.0,
+            "image_label",
+        ].astype(str).tolist()
+        raise ValueError(f"Arc catalog '{path}' has non-positive curvature sigma for labels {bad_labels}.")
+    if (df["arc_curvature_arcsec_inv"].to_numpy(dtype=float) < 0.0).any():
+        bad_labels = df.loc[df["arc_curvature_arcsec_inv"].to_numpy(dtype=float) < 0.0, "image_label"].astype(str).tolist()
+        raise ValueError(f"Arc catalog '{path}' has negative curvature magnitudes for labels {bad_labels}.")
+
+    if header_reference == 0:
+        df["arc_anchor_ra"] = df["coord_1"]
+        df["arc_anchor_dec"] = df["coord_2"]
+    elif header_reference == 3:
+        if par_reference is None:
+            raise ValueError(
+                f"Cannot interpret #REFERENCE 3 coordinates in '{path}' without a runmode.reference in the .par file."
+            )
+        _, ra0_deg, dec0_deg = par_reference
+        converted = df.apply(
+            lambda row: _offsets_to_radec(row["coord_1"], row["coord_2"], ra0_deg, dec0_deg),
+            axis=1,
+            result_type="expand",
+        )
+        df["arc_anchor_ra"] = converted[0]
+        df["arc_anchor_dec"] = converted[1]
+    else:
+        raise ValueError(f"Unsupported #REFERENCE value {header_reference} in '{path}'.")
+
+    duplicate_mask = df["image_label"].duplicated(keep=False)
+    if bool(duplicate_mask.any()):
+        labels = sorted(df.loc[duplicate_mask, "image_label"].astype(str).unique().tolist())
+        raise ValueError(f"Arc catalog '{path}' has duplicate constraints for image labels {labels}.")
+
+    df["arc_reliability"] = df["arc_reliability"].clip(0.0, 1.0)
+    df["arc_catalog_reference"] = header_reference
+    df["arc_catalog_source"] = str(path)
+    return df.loc[:, _empty_arc_constraints_df().columns].reset_index(drop=True)
+
+
 def _resolve_catalog_path(path_value: Any, base_dir: Path) -> Path | None:
     if not isinstance(path_value, str):
         return None
@@ -525,6 +693,67 @@ def _extract_image_catalog_paths(parsed: dict[str, Any], base_dir: Path) -> list
             add_candidate(multfile_value)
 
     return discovered_paths
+
+
+def _extract_arc_catalog_paths(parsed: dict[str, Any], base_dir: Path) -> list[Path]:
+    discovered_paths: list[Path] = []
+    seen_paths: set[Path] = set()
+
+    def add_candidate(candidate: Any) -> None:
+        resolved = _resolve_catalog_path(candidate, base_dir)
+        if resolved is None or resolved in seen_paths:
+            return
+        seen_paths.add(resolved)
+        discovered_paths.append(resolved)
+
+    image_block = parsed.get("image")
+    if isinstance(image_block, dict):
+        arcfile_value = image_block.get("arcfile")
+        if isinstance(arcfile_value, list) and len(arcfile_value) >= 2:
+            add_candidate(arcfile_value[1])
+        elif isinstance(arcfile_value, str):
+            add_candidate(arcfile_value)
+
+    return discovered_paths
+
+
+def _merge_arc_constraints(
+    images_df: pd.DataFrame,
+    arc_frames: list[pd.DataFrame],
+    *,
+    source_label: str | Path | list[Path],
+) -> pd.DataFrame:
+    if images_df.empty:
+        if any(not frame.empty for frame in arc_frames):
+            raise ValueError(f"Arc constraints were provided in {source_label}, but no multiple-image catalog rows exist.")
+        return _images_df_with_empty_arc_columns(images_df)
+    if not arc_frames:
+        return _images_df_with_empty_arc_columns(images_df)
+
+    arcs_df = pd.concat(arc_frames, axis=0, ignore_index=True)
+    if arcs_df.empty:
+        return _images_df_with_empty_arc_columns(images_df)
+    duplicate_mask = arcs_df["image_label"].duplicated(keep=False)
+    if bool(duplicate_mask.any()):
+        labels = sorted(arcs_df.loc[duplicate_mask, "image_label"].astype(str).unique().tolist())
+        raise ValueError(f"Duplicate arc constraints across arc catalogs for image labels {labels}.")
+
+    known_labels = set(images_df["image_label"].astype(str).tolist())
+    arc_labels = set(arcs_df["image_label"].astype(str).tolist())
+    unknown_labels = sorted(arc_labels - known_labels)
+    if unknown_labels:
+        raise ValueError(
+            f"Arc catalog {source_label} references unknown image_label values {unknown_labels}; "
+            "each arc row must match an existing multiple-image catalog row."
+        )
+
+    result = images_df.merge(arcs_df, how="left", on="image_label", validate="one_to_one")
+    result["arc_has_constraint"] = result["arc_tangent_angle_rad"].notna()
+    for column in ARC_CONSTRAINT_COLUMNS:
+        if column not in result.columns:
+            result[column] = np.nan if column != "arc_has_constraint" else False
+    result["arc_has_constraint"] = result["arc_has_constraint"].fillna(False).astype(bool)
+    return result
 
 
 def _resolve_potfile_catalog_path(filein_value: Any, base_dir: Path) -> Path | None:
@@ -863,6 +1092,9 @@ def load_best_par(
         _validate_image_family_redshifts(images_df, image_catalog_paths)
     else:
         images_df = _empty_images_df()
+    arc_catalog_paths = _extract_arc_catalog_paths(parsed, path.parent)
+    arc_frames = [_load_arc_constraints_catalog(arc_catalog_path, par_reference) for arc_catalog_path in arc_catalog_paths]
+    images_df = _merge_arc_constraints(images_df, arc_frames, source_label=arc_catalog_paths)
 
     potentials_df = _enrich_potentials_with_images(potentials_df, images_df)
 

@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -64,7 +64,9 @@ from .jax_cosmology import (
 import matplotlib
 
 matplotlib.use("Agg")
+from matplotlib.colors import TwoSlopeNorm
 from matplotlib.path import Path as MplPath
+from matplotlib.ticker import AutoMinorLocator
 from matplotlib import pyplot as plt
 
 from .mock_cluster import (
@@ -86,7 +88,13 @@ from .mock_cluster import (
     _image_count_requirement_text,
     _lenstool_ellipticite_to_axis_ratio,
     _sample_point_in_caustic,
+    _subhalo_mass_luminosity_exponent,
     generate_single_bcg_mock,
+)
+from .image_diagnostics import (
+    exact_details_hard_failed as _exact_details_hard_failed,
+    family_image_recovery_rows as _family_image_recovery_rows,
+    image_count_recovery_table as _image_count_recovery_table,
 )
 from .plotting import (
     _best_fit_values_for_specs,
@@ -94,6 +102,9 @@ from .plotting import (
     _corner_without_source_positions,
     _plot_corner,
     _plot_cosmology_corner,
+    _plot_critical_arc_recovery_by_family as _shared_plot_critical_arc_recovery_by_family,
+    _plot_critical_arc_support_histogram as _shared_plot_critical_arc_support_histogram,
+    _plot_critical_arc_support_phase_space as _shared_plot_critical_arc_support_phase_space,
     _plot_potfile_corner,
     _scaling_parameter_subset,
 )
@@ -101,6 +112,7 @@ from .utils import (
     close_debug_log as _close_debug_log,
     configure_debug_log as _configure_debug_log,
     fmt_seconds as _fmt_seconds,
+    jax_cpu_worker_count,
     log_exception as _log_exception,
     log_message as _log,
     log_stage_banner as _log_stage_banner,
@@ -109,6 +121,7 @@ from .utils import (
 
 FIT_METHOD_SVI = "svi"
 FIT_METHOD_SVI_NUTS = "svi+nuts"
+FIT_METHOD_NUTS = "nuts"
 FIT_METHOD_NS = "ns"
 FIT_METHOD_SMC = "smc"
 SOLVER_FIT_MODE_SEQUENTIAL = "sequential"
@@ -120,14 +133,16 @@ JAX_DEVICE_CHOICES = (JAX_DEVICE_AUTO, JAX_DEVICE_CPU, JAX_DEVICE_GPU)
 IMAGE_PLANE_MODE_NONE = "none"
 IMAGE_PLANE_MODE_LOCAL_JACOBIAN = "local-jacobian"
 IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA = "linearized-forward-beta-image-plane"
-IMAGE_PLANE_MODE_MARGINAL = "marginal-image-plane"
-EVIDENCE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE = "linearized-marginal-beta-image-plane"
+IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED = "linearized-forward-beta-blocked-image-plane"
+IMAGE_PLANE_MODE_FORWARD_METRIC = "forward-metric-image-plane"
+IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA = "anchored-solved-forward-beta-image-plane"
+IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE = "critical-arc-mixture-image-plane"
+IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA = "fold-regularized-forward-beta-image-plane"
 EVIDENCE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE = "linearized-forward-beta-image-plane"
 EVIDENCE_LIKELIHOOD_MODES = (
-    EVIDENCE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE,
     EVIDENCE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
 )
-DEFAULT_EVIDENCE_LIKELIHOOD_MODE = EVIDENCE_LIKELIHOOD_LINEARIZED_MARGINAL_BETA_IMAGE_PLANE
+DEFAULT_EVIDENCE_LIKELIHOOD_MODE = EVIDENCE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
 DEFAULT_SMC_PARTICLES = 4096
 DEFAULT_SMC_MCMC_KERNEL = "rmh"
 SMC_MCMC_KERNELS = ("rmh", "mala")
@@ -136,9 +151,10 @@ DEFAULT_SMC_TARGET_ESS_FRAC = 0.8
 DEFAULT_SMC_MAX_TEMPERATURE_STEPS = 256
 DEFAULT_SMC_RMH_SCALE = 1.0
 DEFAULT_SMC_MALA_STEP_SIZE = 0.05
-DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC = 0.3
+DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC = 2.0
+DEFAULT_IMAGE_SIGMA_INT_LOWER_ARCSEC = 1.0e-3
 DEFAULT_IMAGE_SIGMA_INT_UPPER_ARCSEC = 2.0
-DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC = 0.0
+DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC = 1.0e-3
 IMAGE_PLANE_SCATTER_PRIOR_LOG_UNIFORM = "log-uniform"
 IMAGE_PLANE_SCATTER_PRIOR_LOGNORMAL = "lognormal"
 IMAGE_PLANE_SCATTER_PRIORS = (
@@ -152,8 +168,26 @@ DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC = 0.30
 DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC = 0.10
 DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS = 0.05
 DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN = 0.05
+
+
 DEFAULT_LIKELIHOOD_STABILIZER_MAX_GAIN = 0.0
 DEFAULT_LIKELIHOOD_STABILIZER_MAX_RESIDUAL_ARCSEC = 0.0
+DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS = 3
+DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC = 0.3
+DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE = 1.0e-3
+DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_ABSOLUTE = 1.0e-6
+DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC = 5.0
+DEFAULT_CRITICAL_ARC_BASE_PROB = 0.10
+DEFAULT_CRITICAL_ARC_MAX_PROB = 0.80
+DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD = 0.20
+DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS = 0.05
+DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE = 1.0e-3
+DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE = 1.0e-6
+DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC = 20.0
+DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC = 0.5
+DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC = 5.0
+DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC = 0.1
+DEFAULT_FOLD_CURVATURE_ARCSEC_INV = 1.0
 LIKELIHOOD_STABILIZER_RESIDUAL_LOSS_GAUSSIAN = "gaussian"
 LIKELIHOOD_STABILIZER_RESIDUAL_LOSS_STUDENT_T = "student-t"
 LIKELIHOOD_STABILIZER_RESIDUAL_LOSSES = (
@@ -230,6 +264,150 @@ class _ValidationRecoveryProgress:
         self._progress.advance(task_id)
 
 
+class _ValidationMockProgress:
+    def __init__(self, args: argparse.Namespace | None = None) -> None:
+        self.args = args
+        self.enabled = not bool(getattr(args, "quiet", False))
+        self._progress_cm: Progress | None = None
+        self._progress: Progress | None = None
+        self._redshift_task: int | None = None
+        self._family_task: int | None = None
+
+    def __enter__(self) -> "_ValidationMockProgress":
+        if not self.enabled:
+            return self
+        self._progress_cm = Progress(
+            TextColumn("{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            transient=True,
+        )
+        self._progress = self._progress_cm.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        if self._progress_cm is not None:
+            return bool(self._progress_cm.__exit__(exc_type, exc, traceback))
+        return False
+
+    def callback(self, event: str, payload: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        if event == "subhalos_complete":
+            _log(
+                self.args,
+                (
+                    "[load] mock subhalos "
+                    f"selected={int(payload.get('selected_subhalos', 0))}/{int(payload.get('requested_subhalos', 0))} "
+                    f"parent_candidates={int(payload.get('parent_count', 0))} "
+                    f"observable={int(payload.get('observable_count', 0))} "
+                    f"retries={int(payload.get('retry_count', 0))} "
+                    f"mag_cut<={float(payload.get('mag_faint_limit', np.nan)):.4g}"
+                ),
+            )
+        elif event == "redshift_start":
+            self._ensure_redshift_task(int(payload.get("redshift_count", 0)))
+            self._update_redshift(payload, prefix="mock caustics")
+        elif event == "redshift_complete":
+            self._ensure_redshift_task(int(payload.get("redshift_count", 0)))
+            self._update_redshift(payload, prefix="mock caustics")
+            if self._progress is not None and self._redshift_task is not None:
+                self._progress.advance(self._redshift_task)
+        elif event == "family_start":
+            self._ensure_family_task(int(payload.get("family_count", 0)))
+            self._update_family(payload, image_count=None)
+        elif event == "family_queue_start":
+            _log(
+                self.args,
+                (
+                    "[load] mock image queue "
+                    f"families={int(payload.get('family_count', 0))} "
+                    f"workers={int(payload.get('image_solver_workers', 0))} "
+                    f"max_attempts={int(payload.get('max_attempts', 0))} "
+                    f"queued={int(payload.get('queued_families', 0))}"
+                ),
+            )
+        elif event == "family_attempt":
+            self._ensure_family_task(int(payload.get("family_count", 0)))
+            self._update_family(payload, image_count=int(payload.get("image_count", 0)))
+        elif event == "family_accept":
+            self._ensure_family_task(int(payload.get("family_count", 0)))
+            self._update_family(payload, image_count=int(payload.get("image_count", 0)), accepted=True)
+            if self._progress is not None and self._family_task is not None:
+                self._progress.advance(self._family_task)
+        elif event == "outputs_start":
+            _log(
+                self.args,
+                (
+                    "[load] writing mock outputs "
+                    f"families={int(payload.get('family_count', 0))} "
+                    f"images={int(payload.get('image_count', 0))} "
+                    f"subhalos={int(payload.get('subhalo_count', 0))}"
+                ),
+            )
+        elif event == "outputs_complete":
+            _log(
+                self.args,
+                (
+                    "[load] mock outputs complete "
+                    f"images={int(payload.get('image_count', 0))} "
+                    f"par={payload.get('par_path')} "
+                    f"catalog={payload.get('image_catalog_path')} "
+                    f"truth={payload.get('truth_path')}"
+                ),
+            )
+
+    def _ensure_redshift_task(self, total: int) -> None:
+        if self._progress is None or self._redshift_task is not None:
+            return
+        self._redshift_task = self._progress.add_task("mock caustics: starting", total=max(0, int(total)))
+
+    def _ensure_family_task(self, total: int) -> None:
+        if self._progress is None or self._family_task is not None:
+            return
+        self._family_task = self._progress.add_task("mock families: starting", total=max(0, int(total)))
+
+    def _update_redshift(self, payload: dict[str, Any], *, prefix: str) -> None:
+        if self._progress is None or self._redshift_task is None:
+            return
+        grid = int(payload.get("caustic_grid_pixels", 0))
+        self._progress.update(
+            self._redshift_task,
+            description=(
+                f"{prefix}: z={float(payload.get('z_source', np.nan)):.4g} "
+                f"{int(payload.get('redshift_index', 0))}/{int(payload.get('redshift_count', 0))} "
+                f"components={int(payload.get('lens_component_count', 0))} grid={grid}x{grid} "
+                f"contours={int(payload.get('caustic_count', 0))}"
+            ),
+        )
+
+    def _update_family(
+        self,
+        payload: dict[str, Any],
+        *,
+        image_count: int | None,
+        accepted: bool = False,
+    ) -> None:
+        if self._progress is None or self._family_task is None:
+            return
+        image_text = "images=na" if image_count is None else f"images={int(image_count)}"
+        status = "accepted" if accepted else "search"
+        attempt = int(payload.get("attempt", 0))
+        max_attempts = int(payload.get("max_attempts", 0))
+        attempt_text = "attempt=0/0" if attempt <= 0 and max_attempts <= 0 else f"attempt={attempt}/{max_attempts}"
+        self._progress.update(
+            self._family_task,
+            description=(
+                f"mock families: {status} "
+                f"{int(payload.get('family_index', 0))}/{int(payload.get('family_count', 0))} "
+                f"class={payload.get('caustic_class', 'unknown')} "
+                f"z={float(payload.get('z_source', np.nan)):.4g} "
+                f"{attempt_text} {image_text}"
+            ),
+        )
+
+
 CHIRES_COLUMNS = (
     "index",
     "family_id",
@@ -250,6 +428,7 @@ CHIRES_COLUMNS = (
 @dataclass(frozen=True)
 class ValidationStageFitControls:
     fit_method: str
+    svi_steps: int
     warmup: int
     samples: int
     max_tree_depth: int
@@ -257,6 +436,7 @@ class ValidationStageFitControls:
     def to_json(self) -> dict[str, str | int]:
         return {
             "fit_method": self.fit_method,
+            "svi_steps": self.svi_steps,
             "warmup": self.warmup,
             "samples": self.samples,
             "max_tree_depth": self.max_tree_depth,
@@ -496,6 +676,13 @@ def _artifact_parameter_names(state: Any) -> list[str]:
     return [str(spec.name) for spec in state.parameter_specs]
 
 
+def _artifact_arg(artifact_args: dict[str, Any] | None, name: str, default: Any) -> Any:
+    if not artifact_args:
+        return default
+    value = artifact_args.get(name, default)
+    return default if value is None else value
+
+
 def _recovered_model_tables(
     state: Any,
     best_fit_physical: np.ndarray,
@@ -503,25 +690,121 @@ def _recovered_model_tables(
     *,
     quick_diagnostics: bool = False,
     progress: _ValidationRecoveryProgress | None = None,
+    artifact_args: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     import jax.numpy as jnp
 
     from .cluster_solver import (
         DEFAULT_ACTIVE_SCALING_GALAXIES,
+        DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
+        DEFAULT_ACTIVE_SCALING_MIN,
+        DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_ABSOLUTE,
+        DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE,
+        DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS,
+        DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC,
+        DEFAULT_CRITICAL_ARC_BASE_PROB,
+        DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE,
+        DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE,
+        DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC,
+        DEFAULT_CRITICAL_ARC_MAX_PROB,
+        DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
+        DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+        DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+        DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
         DEFAULT_MATCH_TOLERANCE,
         DEFAULT_REFRESH_EVERY,
         DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
+        DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
+        SAMPLE_LIKELIHOOD_SOURCE,
         ClusterJAXEvaluator,
         _convert_theta_to_latent,
     )
 
     evaluator = ClusterJAXEvaluator(
         state=state,
-        match_tolerance_arcsec=DEFAULT_MATCH_TOLERANCE,
-        sampling_engine="full",
-        active_scaling_galaxies=DEFAULT_ACTIVE_SCALING_GALAXIES,
-        refresh_every=DEFAULT_REFRESH_EVERY,
-        refresh_param_drift_frac=DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
+        match_tolerance_arcsec=float(_artifact_arg(artifact_args, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE)),
+        sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full")),
+        active_scaling_galaxies=_artifact_arg(artifact_args, "active_scaling_galaxies", DEFAULT_ACTIVE_SCALING_GALAXIES),
+        active_scaling_selection=str(_artifact_arg(artifact_args, "active_scaling_selection", "adaptive")),
+        active_scaling_cumulative_fraction=float(
+            _artifact_arg(artifact_args, "active_scaling_cumulative_fraction", DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION)
+        ),
+        active_scaling_min=int(_artifact_arg(artifact_args, "active_scaling_min", DEFAULT_ACTIVE_SCALING_MIN)),
+        refresh_every=int(_artifact_arg(artifact_args, "refresh_every", DEFAULT_REFRESH_EVERY)),
+        refresh_param_drift_frac=float(_artifact_arg(artifact_args, "refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
+        source_plane_covariance_floor=float(_artifact_arg(artifact_args, "source_plane_covariance_floor", 1.0e-6)),
+        source_plane_outlier_sigma_arcsec=float(
+            _artifact_arg(artifact_args, "source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
+        ),
+        sample_likelihood_mode=str(_artifact_arg(artifact_args, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)),
+        image_plane_newton_steps=int(_artifact_arg(artifact_args, "image_plane_newton_steps", 0)),
+        anchored_image_plane_solve_steps=int(
+            _artifact_arg(artifact_args, "anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)
+        ),
+        anchored_image_plane_trust_radius_arcsec=float(
+            _artifact_arg(
+                artifact_args,
+                "anchored_image_plane_trust_radius_arcsec",
+                DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC,
+            )
+        ),
+        anchored_image_plane_lm_damping_relative=float(
+            _artifact_arg(
+                artifact_args,
+                "anchored_image_plane_lm_damping_relative",
+                DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE,
+            )
+        ),
+        anchored_image_plane_lm_damping_absolute=float(
+            _artifact_arg(
+                artifact_args,
+                "anchored_image_plane_lm_damping_absolute",
+                DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_ABSOLUTE,
+            )
+        ),
+        critical_arc_critical_direction_sigma_arcsec=float(
+            _artifact_arg(artifact_args, "critical_arc_critical_direction_sigma_arcsec", DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)
+        ),
+        critical_arc_base_prob=float(_artifact_arg(artifact_args, "critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)),
+        critical_arc_max_prob=float(_artifact_arg(artifact_args, "critical_arc_max_prob", DEFAULT_CRITICAL_ARC_MAX_PROB)),
+        critical_arc_singular_threshold=float(
+            _artifact_arg(artifact_args, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)
+        ),
+        critical_arc_singular_softness=float(
+            _artifact_arg(artifact_args, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
+        ),
+        critical_arc_lm_damping_relative=float(
+            _artifact_arg(artifact_args, "critical_arc_lm_damping_relative", DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE)
+        ),
+        critical_arc_lm_damping_absolute=float(
+            _artifact_arg(artifact_args, "critical_arc_lm_damping_absolute", DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE)
+        ),
+        critical_arc_lm_trust_radius_arcsec=float(
+            _artifact_arg(artifact_args, "critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
+        ),
+        arc_aware_noncritical_support_radius_arcsec=float(
+            _artifact_arg(
+                artifact_args,
+                "arc_aware_noncritical_support_radius_arcsec",
+                DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
+            )
+        ),
+        arc_aware_max_arclength_arcsec=float(
+            _artifact_arg(artifact_args, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
+        ),
+        arc_aware_curve_step_arcsec=float(
+            _artifact_arg(artifact_args, "arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)
+        ),
+        fold_curvature_arcsec_inv=float(
+            _artifact_arg(artifact_args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
+        ),
+        image_plane_scatter_floor_arcsec=float(
+            _artifact_arg(artifact_args, "image_plane_scatter_floor_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC)
+        ),
+        fixed_image_sigma_int_arcsec=_artifact_arg(artifact_args, "fix_image_sigma_int_arcsec", None),
+        evidence_source_prior_sigma_arcsec=_artifact_arg(artifact_args, "evidence_source_prior_sigma_arcsec", None),
+        evidence_source_prior_mean_x_arcsec=float(_artifact_arg(artifact_args, "evidence_source_prior_mean_x_arcsec", 0.0)),
+        evidence_source_prior_mean_y_arcsec=float(_artifact_arg(artifact_args, "evidence_source_prior_mean_y_arcsec", 0.0)),
         quick_diagnostics=bool(quick_diagnostics),
     )
     if hasattr(evaluator, "reported_physical_to_latent_parameter_vector"):
@@ -532,6 +815,15 @@ def _recovered_model_tables(
     image_rows: list[dict[str, Any]] = []
     source_rows: list[dict[str, Any]] = []
     best_predictions = evaluator.evaluate(best_fit_latent).family_predictions
+    image_sigma_int = 0.0
+    if hasattr(evaluator, "_image_sigma_int_numpy"):
+        try:
+            image_sigma_int = float(evaluator._image_sigma_int_numpy(best_fit_latent))
+        except Exception:
+            image_sigma_int = 0.0
+    if not np.isfinite(image_sigma_int):
+        image_sigma_int = 0.0
+    covariance_floor = max(float(getattr(evaluator, "source_plane_covariance_floor", 0.0)), 0.0)
     progress_task = progress.add_subtask("recovered models: families", total=len(state.family_data)) if progress else None
     for family in state.family_data:
         if progress:
@@ -554,41 +846,39 @@ def _recovered_model_tables(
         for label, value in zip(family_images["image_label"].astype(str), mu):
             magnification_rows.append({"image_label": label, "magnification_recovered": float(value)})
         prediction = best_predictions.get(str(family.family_id), {})
-        exact_details: dict[str, Any] = {}
+        exact_details: dict[str, Any] | None = None
+        unavailable_reason = "quick_diagnostics" if quick_diagnostics else "exact_prediction_failed"
+        unavailable_status = "unknown" if quick_diagnostics else "not_recovered"
         if not quick_diagnostics:
             try:
                 exact_details = evaluator._exact_family_prediction_details(best_fit_latent, family)
             except Exception:
-                exact_details = {"failed": True}
-        x_pred = np.asarray(exact_details.get("x_pred", np.full(family.n_images, np.nan)), dtype=float)
-        y_pred = np.asarray(exact_details.get("y_pred", np.full(family.n_images, np.nan)), dtype=float)
-        for label, x_obs, y_obs, x_model, y_model in zip(
-            family.image_labels,
-            family.x_obs,
-            family.y_obs,
-            x_pred,
-            y_pred,
-        ):
-            residual = math.hypot(float(x_model - x_obs), float(y_model - y_obs)) if np.isfinite(x_model + y_model) else np.nan
-            image_rows.append(
-                {
-                    "image_label": str(label),
-                    "family_id": str(family.family_id),
-                    "x_obs_arcsec": float(x_obs),
-                    "y_obs_arcsec": float(y_obs),
-                    "x_model_arcsec": float(x_model),
-                    "y_model_arcsec": float(y_model),
-                    "image_residual_arcsec": float(residual),
-                }
-            )
+                unavailable_reason = "exact_prediction_exception"
+                unavailable_status = "unknown"
+        sigma_arcsec = float(getattr(family, "sigma_arcsec", np.nan))
+        sigma_eff = np.sqrt(sigma_arcsec**2 + image_sigma_int**2 + covariance_floor) if np.isfinite(sigma_arcsec) else np.nan
+        family_image_rows, _extra_rows, _count_info = _family_image_recovery_rows(
+            family,
+            exact_details,
+            sigma_arcsec=sigma_arcsec,
+            image_sigma_int_arcsec=image_sigma_int,
+            image_sigma_eff_arcsec=float(sigma_eff),
+            unavailable_reason=unavailable_reason,
+            unavailable_status=unavailable_status,
+        )
+        image_rows.extend(family_image_rows)
         source_rows.append(
             {
                 "family_id": str(family.family_id),
                 "source_x_recovered": float(prediction.get("source_x", np.nan)),
                 "source_y_recovered": float(prediction.get("source_y", np.nan)),
                 "source_plane_rms_arcsec": float(prediction.get("source_plane_rms", np.nan)),
-                "exact_image_rms_arcsec": float(exact_details.get("exact_image_rms", np.nan)),
-                "failed": bool(prediction.get("failed", False) or exact_details.get("failed", False)),
+                "exact_image_rms_arcsec": float(exact_details.get("exact_image_rms", np.nan)) if isinstance(exact_details, dict) else np.nan,
+                "arc_aware_image_rms_arcsec": float(exact_details.get("arc_aware_image_rms_arcsec", np.nan)) if isinstance(exact_details, dict) else np.nan,
+                "arc_aware_recovered_image_count": int(exact_details.get("arc_aware_recovered_image_count", 0)) if isinstance(exact_details, dict) else 0,
+                "arc_aware_missing_image_count": int(exact_details.get("arc_aware_missing_image_count", family.n_images)) if isinstance(exact_details, dict) else int(family.n_images),
+                "arc_supported_image_count": int(exact_details.get("arc_supported_image_count", 0)) if isinstance(exact_details, dict) else 0,
+                "failed": bool(prediction.get("failed", False) or (exact_details.get("failed", False) if isinstance(exact_details, dict) else True)),
             }
         )
         if progress:
@@ -645,7 +935,11 @@ _VALIDATION_STAGE_ORDER = (
     "stage2_joint",
     "stage3_image_plane",
     "stage4_linearized_image_plane",
-    "stage4_marginal_image_plane",
+    "stage4_blocked_linearized_image_plane",
+    "stage4_forward_metric_image_plane",
+    "stage4_anchored_solved_image_plane",
+    "stage4_critical_arc_mixture_image_plane",
+    "stage4_fold_regularized_image_plane",
 )
 
 
@@ -941,17 +1235,34 @@ def _posterior_prediction_uncertainty_tables(
     images: pd.DataFrame,
     *,
     max_draws: int = 8,
-    max_workers: int = 1,
     posterior_diagnostic_mode: str = POSTERIOR_DIAGNOSTIC_MODE_EXACT,
     progress: _ValidationRecoveryProgress | None = None,
+    artifact_args: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     import jax.numpy as jnp
 
     from .cluster_solver import (
         DEFAULT_ACTIVE_SCALING_GALAXIES,
+        DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
+        DEFAULT_ACTIVE_SCALING_MIN,
+        DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_ABSOLUTE,
+        DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE,
+        DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS,
+        DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC,
+        DEFAULT_CRITICAL_ARC_BASE_PROB,
+        DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE,
+        DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE,
+        DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC,
+        DEFAULT_CRITICAL_ARC_MAX_PROB,
+        DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
+        DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+        DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+        DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
         DEFAULT_MATCH_TOLERANCE,
         DEFAULT_REFRESH_EVERY,
         DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
+        DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
+        SAMPLE_LIKELIHOOD_SOURCE,
         ClusterJAXEvaluator,
         _convert_theta_to_latent,
     )
@@ -974,16 +1285,96 @@ def _posterior_prediction_uncertainty_tables(
     def make_evaluator() -> Any:
         return ClusterJAXEvaluator(
             state=state,
-            match_tolerance_arcsec=DEFAULT_MATCH_TOLERANCE,
-            sampling_engine="full",
-            active_scaling_galaxies=DEFAULT_ACTIVE_SCALING_GALAXIES,
-            refresh_every=DEFAULT_REFRESH_EVERY,
-            refresh_param_drift_frac=DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
+            match_tolerance_arcsec=float(_artifact_arg(artifact_args, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE)),
+            sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full")),
+            active_scaling_galaxies=_artifact_arg(artifact_args, "active_scaling_galaxies", DEFAULT_ACTIVE_SCALING_GALAXIES),
+            active_scaling_selection=str(_artifact_arg(artifact_args, "active_scaling_selection", "adaptive")),
+            active_scaling_cumulative_fraction=float(
+                _artifact_arg(artifact_args, "active_scaling_cumulative_fraction", DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION)
+            ),
+            active_scaling_min=int(_artifact_arg(artifact_args, "active_scaling_min", DEFAULT_ACTIVE_SCALING_MIN)),
+            refresh_every=int(_artifact_arg(artifact_args, "refresh_every", DEFAULT_REFRESH_EVERY)),
+            refresh_param_drift_frac=float(_artifact_arg(artifact_args, "refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
+            source_plane_covariance_floor=float(_artifact_arg(artifact_args, "source_plane_covariance_floor", 1.0e-6)),
+            source_plane_outlier_sigma_arcsec=float(
+                _artifact_arg(artifact_args, "source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
+            ),
+            sample_likelihood_mode=str(_artifact_arg(artifact_args, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)),
+            image_plane_newton_steps=int(_artifact_arg(artifact_args, "image_plane_newton_steps", 0)),
+            anchored_image_plane_solve_steps=int(
+                _artifact_arg(artifact_args, "anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)
+            ),
+            anchored_image_plane_trust_radius_arcsec=float(
+                _artifact_arg(
+                    artifact_args,
+                    "anchored_image_plane_trust_radius_arcsec",
+                    DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC,
+                )
+            ),
+            anchored_image_plane_lm_damping_relative=float(
+                _artifact_arg(
+                    artifact_args,
+                    "anchored_image_plane_lm_damping_relative",
+                    DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE,
+                )
+            ),
+            anchored_image_plane_lm_damping_absolute=float(
+                _artifact_arg(
+                    artifact_args,
+                    "anchored_image_plane_lm_damping_absolute",
+                    DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_ABSOLUTE,
+                )
+            ),
+            critical_arc_critical_direction_sigma_arcsec=float(
+                _artifact_arg(artifact_args, "critical_arc_critical_direction_sigma_arcsec", DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)
+            ),
+            critical_arc_base_prob=float(_artifact_arg(artifact_args, "critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)),
+            critical_arc_max_prob=float(_artifact_arg(artifact_args, "critical_arc_max_prob", DEFAULT_CRITICAL_ARC_MAX_PROB)),
+            critical_arc_singular_threshold=float(
+                _artifact_arg(artifact_args, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)
+            ),
+            critical_arc_singular_softness=float(
+                _artifact_arg(artifact_args, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
+            ),
+            critical_arc_lm_damping_relative=float(
+                _artifact_arg(artifact_args, "critical_arc_lm_damping_relative", DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE)
+            ),
+            critical_arc_lm_damping_absolute=float(
+                _artifact_arg(artifact_args, "critical_arc_lm_damping_absolute", DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE)
+            ),
+            critical_arc_lm_trust_radius_arcsec=float(
+                _artifact_arg(artifact_args, "critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
+            ),
+            arc_aware_noncritical_support_radius_arcsec=float(
+                _artifact_arg(
+                    artifact_args,
+                    "arc_aware_noncritical_support_radius_arcsec",
+                    DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
+                )
+            ),
+            arc_aware_max_arclength_arcsec=float(
+                _artifact_arg(artifact_args, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
+            ),
+            arc_aware_curve_step_arcsec=float(
+                _artifact_arg(artifact_args, "arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)
+            ),
+            fold_curvature_arcsec_inv=float(
+                _artifact_arg(artifact_args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
+            ),
+            image_plane_scatter_floor_arcsec=float(
+                _artifact_arg(artifact_args, "image_plane_scatter_floor_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC)
+            ),
+            fixed_image_sigma_int_arcsec=_artifact_arg(artifact_args, "fix_image_sigma_int_arcsec", None),
+            evidence_source_prior_sigma_arcsec=_artifact_arg(artifact_args, "evidence_source_prior_sigma_arcsec", None),
+            evidence_source_prior_mean_x_arcsec=float(_artifact_arg(artifact_args, "evidence_source_prior_mean_x_arcsec", 0.0)),
+            evidence_source_prior_mean_y_arcsec=float(_artifact_arg(artifact_args, "evidence_source_prior_mean_y_arcsec", 0.0)),
         )
 
     evaluator = make_evaluator()
-    worker_count = min(max(1, int(max_workers)), max(1, len(state.family_data))) if use_exact_predictions else 1
+    worker_count = min(max(1, int(jax_cpu_worker_count())), max(1, len(state.family_data)))
     thread_local = threading.local()
+    worker_evaluators: list[Any] = []
+    worker_lock = threading.Lock()
 
     def family_task_evaluator() -> Any:
         if worker_count <= 1:
@@ -992,6 +1383,8 @@ def _posterior_prediction_uncertainty_tables(
         if local_evaluator is None:
             local_evaluator = make_evaluator()
             thread_local.evaluator = local_evaluator
+            with worker_lock:
+                worker_evaluators.append(local_evaluator)
         return local_evaluator
 
     family_ids = [str(family.family_id) for family in state.family_data]
@@ -1009,10 +1402,12 @@ def _posterior_prediction_uncertainty_tables(
     x_by_label: dict[str, list[float]] = {}
     y_by_label: dict[str, list[float]] = {}
     residual_by_label: dict[str, list[float]] = {}
+    arc_residual_by_label: dict[str, list[float]] = {}
     source_x_by_family: dict[str, list[float]] = {}
     source_y_by_family: dict[str, list[float]] = {}
     source_rms_by_family: dict[str, list[float]] = {}
     exact_rms_by_family: dict[str, list[float]] = {}
+    arc_rms_by_family: dict[str, list[float]] = {}
     exact_failed_families: set[str] = set()
 
     n_draws = int(sample_array.shape[0])
@@ -1047,14 +1442,39 @@ def _posterior_prediction_uncertainty_tables(
         task_prediction = dict(prediction)
         exact_failed = False
         if use_exact_predictions and not skip_exact:
-            exact_prediction = task_evaluator._exact_family_prediction(sample_latent, family)
-            if exact_prediction is None:
-                exact_failed = True
+            if hasattr(task_evaluator, "_exact_family_prediction_details"):
+                try:
+                    exact_details = task_evaluator._exact_family_prediction_details(sample_latent, family)
+                except Exception:
+                    exact_details = None
+                if exact_details is None:
+                    exact_failed = True
+                else:
+                    exact_failed = _exact_details_hard_failed(exact_details)
+                    image_rows, _extra_rows, _count_info = _family_image_recovery_rows(family, exact_details)
+                    task_prediction["x_pred"] = np.asarray(
+                        [row["x_model_arcsec"] for row in image_rows],
+                        dtype=float,
+                    )
+                    task_prediction["y_pred"] = np.asarray(
+                        [row["y_model_arcsec"] for row in image_rows],
+                        dtype=float,
+                    )
+                    task_prediction["arc_aware_residuals"] = np.asarray(
+                        [row.get("arc_aware_image_residual_arcsec", np.nan) for row in image_rows],
+                        dtype=float,
+                    )
+                    task_prediction["exact_image_rms"] = float(exact_details.get("exact_image_rms", np.nan))
+                    task_prediction["arc_aware_image_rms"] = float(exact_details.get("arc_aware_image_rms_arcsec", np.nan))
             else:
-                x_pred_exact, y_pred_exact, exact_rms = exact_prediction
-                task_prediction["x_pred"] = x_pred_exact
-                task_prediction["y_pred"] = y_pred_exact
-                task_prediction["exact_image_rms"] = exact_rms
+                exact_prediction = task_evaluator._exact_family_prediction(sample_latent, family)
+                if exact_prediction is None:
+                    exact_failed = True
+                else:
+                    x_pred_exact, y_pred_exact, exact_rms = exact_prediction
+                    task_prediction["x_pred"] = x_pred_exact
+                    task_prediction["y_pred"] = y_pred_exact
+                    task_prediction["exact_image_rms"] = exact_rms
         x_pred = np.asarray(task_prediction.get("x_pred", np.full(family.n_images, np.nan)), dtype=float)
         y_pred = np.asarray(task_prediction.get("y_pred", np.full(family.n_images, np.nan)), dtype=float)
         residuals = np.asarray(
@@ -1066,6 +1486,12 @@ def _posterior_prediction_uncertainty_tables(
             ],
             dtype=float,
         )
+        arc_aware_residuals = np.asarray(
+            task_prediction.get("arc_aware_residuals", np.full(family.n_images, np.nan)),
+            dtype=float,
+        ).reshape(-1)
+        if arc_aware_residuals.shape != (family.n_images,):
+            arc_aware_residuals = np.full(family.n_images, np.nan, dtype=float)
         return {
             "family_id": family_id,
             "image_labels": [str(label) for label in family.image_labels],
@@ -1074,10 +1500,12 @@ def _posterior_prediction_uncertainty_tables(
             "x_pred": x_pred,
             "y_pred": y_pred,
             "residuals": residuals,
+            "arc_aware_residuals": arc_aware_residuals,
             "source_x": float(task_prediction.get("source_x", np.nan)),
             "source_y": float(task_prediction.get("source_y", np.nan)),
             "source_plane_rms": float(task_prediction.get("source_plane_rms", np.nan)),
             "exact_image_rms": float(task_prediction.get("exact_image_rms", np.nan)),
+            "arc_aware_image_rms": float(task_prediction.get("arc_aware_image_rms", np.nan)),
             "exact_failed": exact_failed,
         }
 
@@ -1085,11 +1513,12 @@ def _posterior_prediction_uncertainty_tables(
         family_id = str(result["family_id"])
         for label, value in zip(result["magnification_labels"], result["magnification"]):
             mag_by_label.setdefault(str(label), []).append(float(value))
-        for label, x_model, y_model, residual in zip(
+        for label, x_model, y_model, residual, arc_residual in zip(
             result["image_labels"],
             result["x_pred"],
             result["y_pred"],
             result["residuals"],
+            result["arc_aware_residuals"],
         ):
             label = str(label)
             if not use_exact_predictions and not np.isfinite(float(x_model) + float(y_model) + float(residual)):
@@ -1097,10 +1526,12 @@ def _posterior_prediction_uncertainty_tables(
             x_by_label.setdefault(label, []).append(float(x_model))
             y_by_label.setdefault(label, []).append(float(y_model))
             residual_by_label.setdefault(label, []).append(float(residual))
+            arc_residual_by_label.setdefault(label, []).append(float(arc_residual))
         source_x_by_family.setdefault(family_id, []).append(float(result["source_x"]))
         source_y_by_family.setdefault(family_id, []).append(float(result["source_y"]))
         source_rms_by_family.setdefault(family_id, []).append(float(result["source_plane_rms"]))
         exact_rms_by_family.setdefault(family_id, []).append(float(result["exact_image_rms"]))
+        arc_rms_by_family.setdefault(family_id, []).append(float(result["arc_aware_image_rms"]))
 
     executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=worker_count) if worker_count > 1 else None
     try:
@@ -1174,6 +1605,11 @@ def _posterior_prediction_uncertainty_tables(
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
+        for local_evaluator in worker_evaluators:
+            if hasattr(local_evaluator, "release_runtime_caches"):
+                local_evaluator.release_runtime_caches()
+        if hasattr(evaluator, "release_runtime_caches"):
+            evaluator.release_runtime_caches()
 
     mag_rows: list[dict[str, Any]] = []
     for label, values in mag_by_label.items():
@@ -1188,10 +1624,11 @@ def _posterior_prediction_uncertainty_tables(
         )
 
     image_rows: list[dict[str, Any]] = []
-    for label in sorted(set(x_by_label) | set(y_by_label) | set(residual_by_label)):
+    for label in sorted(set(x_by_label) | set(y_by_label) | set(residual_by_label) | set(arc_residual_by_label)):
         x16, x50, x84 = summary_fn(x_by_label.get(label, []))
         y16, y50, y84 = summary_fn(y_by_label.get(label, []))
         r16, r50, r84 = summary_fn(residual_by_label.get(label, []))
+        arc_r16, arc_r50, arc_r84 = summary_fn(arc_residual_by_label.get(label, []))
         image_rows.append(
             {
                 "image_label": label,
@@ -1204,6 +1641,9 @@ def _posterior_prediction_uncertainty_tables(
                 "image_residual_q16": r16,
                 "image_residual_q50": r50,
                 "image_residual_q84": r84,
+                "arc_aware_image_residual_q16": arc_r16,
+                "arc_aware_image_residual_q50": arc_r50,
+                "arc_aware_image_residual_q84": arc_r84,
             }
         )
 
@@ -1213,6 +1653,7 @@ def _posterior_prediction_uncertainty_tables(
         sy16, sy50, sy84 = summary_fn(source_y_by_family.get(family_id, []))
         sr16, sr50, sr84 = summary_fn(source_rms_by_family.get(family_id, []))
         er16, er50, er84 = summary_fn(exact_rms_by_family.get(family_id, []))
+        ar16, ar50, ar84 = summary_fn(arc_rms_by_family.get(family_id, []))
         source_rows.append(
             {
                 "family_id": family_id,
@@ -1228,6 +1669,9 @@ def _posterior_prediction_uncertainty_tables(
                 "exact_image_rms_q16": er16,
                 "exact_image_rms_q50": er50,
                 "exact_image_rms_q84": er84,
+                "arc_aware_image_rms_q16": ar16,
+                "arc_aware_image_rms_q50": ar50,
+                "arc_aware_image_rms_q84": ar84,
             }
         )
     return pd.DataFrame(mag_rows), pd.DataFrame(image_rows), pd.DataFrame(source_rows)
@@ -1520,29 +1964,41 @@ def _mass_and_surface_density_profiles_for_samples(
     cosmo = FlatLambdaCDM(H0=70.0, Om0=0.3)
     z_lens = float(config["z_lens"])
     z_source = float(config["source_redshift"])
-    model = LensModel(
-        lens_model_list=list(state.lens_model_list),
-        z_lens=z_lens,
-        z_source=z_source,
-        cosmo=cosmo,
-    )
+
+    def make_model() -> LensModel:
+        return LensModel(
+            lens_model_list=list(state.lens_model_list),
+            z_lens=z_lens,
+            z_source=z_source,
+            cosmo=cosmo,
+        )
+
     sigma_crit_angle = critical_surface_density_angle_from_config(z_lens, z_source, cosmo_config)
-    evaluator = ClusterJAXEvaluator(
-        state=state,
-        match_tolerance_arcsec=DEFAULT_MATCH_TOLERANCE,
-        sampling_engine="full",
-        active_scaling_galaxies=DEFAULT_ACTIVE_SCALING_GALAXIES,
-        active_scaling_selection="adaptive",
-        active_scaling_cumulative_fraction=DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
-        active_scaling_min=DEFAULT_ACTIVE_SCALING_MIN,
-        refresh_every=DEFAULT_REFRESH_EVERY,
-        refresh_param_drift_frac=DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
-    )
+
+    def make_evaluator() -> Any:
+        return ClusterJAXEvaluator(
+            state=state,
+            match_tolerance_arcsec=DEFAULT_MATCH_TOLERANCE,
+            sampling_engine="full",
+            active_scaling_galaxies=DEFAULT_ACTIVE_SCALING_GALAXIES,
+            active_scaling_selection="adaptive",
+            active_scaling_cumulative_fraction=DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
+            active_scaling_min=DEFAULT_ACTIVE_SCALING_MIN,
+            refresh_every=DEFAULT_REFRESH_EVERY,
+            refresh_param_drift_frac=DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
+        )
+
+    truth_model = make_model()
     group_indices, display_names = _mass_profile_component_groups(state)
     truth_kwargs_by_z = truth.get("kwargs_lens_by_source_redshift", {})
     truth_kwargs = truth_kwargs_by_z.get(f"{z_source:.8f}", truth.get("kwargs_lens", []))
 
-    def alpha_magnitude(kwargs_lens: list[dict[str, float]], radius: float, indices: list[int]) -> float:
+    def alpha_magnitude(
+        model: LensModel,
+        kwargs_lens: list[dict[str, float]],
+        radius: float,
+        indices: list[int],
+    ) -> float:
         if not indices:
             return 0.0
         alpha_x, alpha_y = model.alpha(np.asarray([radius]), np.asarray([0.0]), kwargs_lens, k=indices)
@@ -1554,24 +2010,42 @@ def _mass_and_surface_density_profiles_for_samples(
     mass_values_by_group_radius = empty_group_radius_values()
     surface_values_by_group_radius = empty_group_radius_values()
     sample_array = np.asarray(samples, dtype=float)
+    n_draws = int(sample_array.shape[0])
+    worker_count = min(max(1, int(jax_cpu_worker_count())), max(1, n_draws))
     progress_task = (
-        progress.add_subtask("profile bands: posterior draws", total=int(sample_array.shape[0]))
+        progress.add_subtask("profile bands: posterior draws", total=n_draws)
         if progress
         else None
     )
-    for sample_index, sample in enumerate(sample_array, start=1):
-        if progress:
-            progress.update_subtask(
-                progress_task,
-                f"profile bands: draw={sample_index}/{int(sample_array.shape[0])}",
-            )
+    worker_local = threading.local()
+    worker_evaluators: list[Any] = []
+    worker_lock = threading.Lock()
+    serial_evaluator: Any | None = None
+
+    def worker_context() -> tuple[LensModel, Any]:
+        cached = getattr(worker_local, "profile_context", None)
+        if cached is None:
+            cached = (make_model(), make_evaluator())
+            worker_local.profile_context = cached
+            with worker_lock:
+                worker_evaluators.append(cached[1])
+        return cached
+
+    def sample_profile_values(
+        sample_index: int,
+        sample: np.ndarray,
+        model: LensModel,
+        evaluator: Any,
+    ) -> tuple[int, dict[tuple[str, float], float], dict[tuple[str, float], float]]:
         sample_latent = _convert_theta_to_latent(sample, state.parameter_specs)
         packed_state = evaluator._build_packed_lens_state(jnp.asarray(sample_latent, dtype=jnp.float64), z_source)
         kwargs_lens = evaluator._packed_to_kwargs_lens(packed_state)
+        mass_values: dict[tuple[str, float], float] = {}
+        surface_values: dict[tuple[str, float], float] = {}
         for radius in radii_arcsec:
             radius_f = float(radius)
             for group, indices in group_indices.items():
-                mass_values_by_group_radius[(group, radius_f)].append(alpha_magnitude(kwargs_lens, radius_f, indices))
+                mass_values[(group, radius_f)] = alpha_magnitude(model, kwargs_lens, radius_f, indices)
         for group, indices in group_indices.items():
             values = _annular_surface_density_msun_per_arcsec2(
                 model,
@@ -1581,14 +2055,66 @@ def _mass_and_surface_density_profiles_for_samples(
                 sigma_crit_angle,
             )
             for radius, value in zip(radii_arcsec, values):
-                surface_values_by_group_radius[(group, float(radius))].append(float(value))
-        if progress:
-            progress.advance_subtask(progress_task)
-    evaluator.release_runtime_caches()
+                surface_values[(group, float(radius))] = float(value)
+        return sample_index, mass_values, surface_values
+
+    def threaded_sample_profile_values(
+        sample_index: int,
+        sample: np.ndarray,
+    ) -> tuple[int, dict[tuple[str, float], float], dict[tuple[str, float], float]]:
+        model, evaluator = worker_context()
+        return sample_profile_values(sample_index, sample, model, evaluator)
+
+    def merge_sample_result(
+        result: tuple[int, dict[tuple[str, float], float], dict[tuple[str, float], float]],
+    ) -> None:
+        _sample_index, mass_values, surface_values = result
+        for key, value in mass_values.items():
+            mass_values_by_group_radius[key].append(float(value))
+        for key, value in surface_values.items():
+            surface_values_by_group_radius[key].append(float(value))
+
+    try:
+        if worker_count <= 1 or n_draws <= 1:
+            serial_evaluator = make_evaluator()
+            for sample_index, sample in enumerate(sample_array, start=1):
+                if progress:
+                    progress.update_subtask(
+                        progress_task,
+                        f"profile bands: draw={sample_index}/{n_draws}",
+                    )
+                merge_sample_result(sample_profile_values(sample_index, sample, truth_model, serial_evaluator))
+                if progress:
+                    progress.advance_subtask(progress_task)
+        else:
+            results_by_index: dict[int, tuple[int, dict[tuple[str, float], float], dict[tuple[str, float], float]]] = {}
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_by_index = {
+                    executor.submit(threaded_sample_profile_values, sample_index, sample): sample_index
+                    for sample_index, sample in enumerate(sample_array, start=1)
+                }
+                for future in as_completed(future_by_index):
+                    sample_index = future_by_index[future]
+                    if progress:
+                        progress.update_subtask(
+                            progress_task,
+                            f"profile bands: draw={sample_index}/{n_draws} workers={worker_count}",
+                        )
+                    results_by_index[sample_index] = future.result()
+                    if progress:
+                        progress.advance_subtask(progress_task)
+            for sample_index in range(1, n_draws + 1):
+                merge_sample_result(results_by_index[sample_index])
+    finally:
+        if serial_evaluator is not None and hasattr(serial_evaluator, "release_runtime_caches"):
+            serial_evaluator.release_runtime_caches()
+        for local_evaluator in worker_evaluators:
+            if hasattr(local_evaluator, "release_runtime_caches"):
+                local_evaluator.release_runtime_caches()
 
     truth_surface_values_by_group = {
         group: _annular_surface_density_msun_per_arcsec2(
-            model,
+            truth_model,
             truth_kwargs,
             indices,
             radii_arcsec,
@@ -1608,7 +2134,7 @@ def _mass_and_surface_density_profiles_for_samples(
             mass_q16, mass_median, mass_q84 = (
                 np.quantile(mass_finite, [0.16, 0.5, 0.84]) if mass_finite.size else (np.nan, np.nan, np.nan)
             )
-            mass_truth = alpha_magnitude(truth_kwargs, radius_f, indices)
+            mass_truth = alpha_magnitude(truth_model, truth_kwargs, radius_f, indices)
             mass_rows.append(
                 {
                     "radius_arcsec": radius_f,
@@ -1651,6 +2177,7 @@ def _recovered_caustic_contours_by_z(
     truth: dict[str, Any],
     z_keys: list[str],
     *,
+    caustic_grid_scale_arcsec: float | None = None,
     progress: _ValidationRecoveryProgress | None = None,
 ) -> dict[str, list[CausticContour]]:
     import jax.numpy as jnp
@@ -1666,7 +2193,10 @@ def _recovered_caustic_contours_by_z(
         _convert_theta_to_latent,
     )
 
-    config = _caustic_config_from_truth(truth)
+    config = _plot_caustic_config_from_truth(
+        truth,
+        caustic_grid_scale_arcsec=caustic_grid_scale_arcsec,
+    )
     evaluator = ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=DEFAULT_MATCH_TOLERANCE,
@@ -1704,6 +2234,67 @@ def _recovered_caustic_contours_by_z(
     return contours_by_z
 
 
+def _plot_caustic_config_from_truth(
+    truth: dict[str, Any],
+    *,
+    caustic_grid_scale_arcsec: float | None = None,
+) -> SingleBCGMockConfig:
+    config = _caustic_config_from_truth(truth)
+    if caustic_grid_scale_arcsec is None:
+        return config
+    return replace(config, caustic_grid_scale_arcsec=float(caustic_grid_scale_arcsec))
+
+
+def _truth_caustic_contours_by_z_for_plot(
+    state: Any,
+    truth: dict[str, Any],
+    z_keys: list[str],
+    *,
+    caustic_grid_scale_arcsec: float | None = None,
+    progress: _ValidationRecoveryProgress | None = None,
+) -> dict[str, list[CausticContour]]:
+    config = _plot_caustic_config_from_truth(
+        truth,
+        caustic_grid_scale_arcsec=caustic_grid_scale_arcsec,
+    )
+    raw_config = truth.get("config", {})
+    truth_config = raw_config if isinstance(raw_config, dict) else {}
+    z_lens = float(truth_config.get("z_lens", config.z_lens))
+    lens_model_list = list(truth.get("lens_model_list", getattr(state, "lens_model_list", [])))
+    truth_kwargs_by_z = truth.get("kwargs_lens_by_source_redshift", {})
+    if not lens_model_list:
+        return {}
+    cosmo = FlatLambdaCDM(H0=70.0, Om0=0.3)
+    contours_by_z: dict[str, list[CausticContour]] = {}
+    progress_task = progress.add_subtask("truth plot caustics: redshifts", total=len(z_keys)) if progress else None
+    for z_key in z_keys:
+        if progress:
+            progress.update_subtask(progress_task, f"truth plot caustics: z={z_key}")
+        try:
+            z_source = float(z_key)
+        except (TypeError, ValueError):
+            if progress:
+                progress.advance_subtask(progress_task)
+            continue
+        kwargs_lens = (
+            truth_kwargs_by_z.get(f"{z_source:.8f}", truth.get("kwargs_lens", []))
+            if isinstance(truth_kwargs_by_z, dict)
+            else truth.get("kwargs_lens", [])
+        )
+        model = LensModel(
+            lens_model_list=lens_model_list,
+            z_lens=z_lens,
+            z_source=z_source,
+            cosmo=cosmo,
+        )
+        contours = _compute_tangential_caustic_contours(model, kwargs_lens, config)
+        if contours:
+            contours_by_z[str(z_key)] = contours
+        if progress:
+            progress.advance_subtask(progress_task)
+    return contours_by_z
+
+
 def _caustic_contour_payload(contours_by_z: dict[str, list[CausticContour]]) -> dict[str, list[dict[str, Any]]]:
     return {
         str(z_source): [_validation_jsonable(contour) for contour in contours]
@@ -1716,7 +2307,10 @@ def _recovery_payload_from_tables(
     run_dir: Path,
     output_dir: Path,
     posterior_diagnostic_draws: int,
-    posterior_diagnostic_workers: int,
+    recovery_profile_draws: int,
+    recovery_profile_draws_effective: int,
+    recovery_profile_mode: str,
+    diagnostic_worker_count: int,
     posterior_diagnostic_mode: str,
     quick_diagnostics: bool,
     samples: np.ndarray,
@@ -1740,7 +2334,10 @@ def _recovery_payload_from_tables(
         "output_dir": output_dir,
         "posterior_diagnostics": {
             "draws": int(posterior_diagnostic_draws),
-            "workers": int(posterior_diagnostic_workers),
+            "recovery_profile_draws": int(recovery_profile_draws),
+            "recovery_profile_draws_effective": int(recovery_profile_draws_effective),
+            "recovery_profile_mode": str(recovery_profile_mode),
+            "workers": int(diagnostic_worker_count),
             "mode": str(posterior_diagnostic_mode),
             "quick_diagnostics": bool(quick_diagnostics),
         },
@@ -1773,8 +2370,9 @@ def write_recovery_outputs(
     *,
     output_dir: str | Path | None = None,
     posterior_diagnostic_draws: int = 8,
-    posterior_diagnostic_workers: int = 1,
+    recovery_profile_draws: int = RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
     posterior_diagnostic_mode: str = POSTERIOR_DIAGNOSTIC_MODE_EXACT,
+    critical_caustic_plot_grid_scale_arcsec: float = DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC,
     quick_diagnostics: bool = False,
     progress_args: argparse.Namespace | None = None,
     recovery_payload: dict[str, Any] | None = None,
@@ -1784,6 +2382,7 @@ def write_recovery_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
     phase_args: argparse.Namespace | None = None
     posterior_diagnostic_mode = str(posterior_diagnostic_mode)
+    recovery_profile_draws = int(recovery_profile_draws)
     if quick_diagnostics:
         posterior_diagnostic_mode = POSTERIOR_DIAGNOSTIC_MODE_APPROXIMATE
         _log_validation_approximation_items(
@@ -1793,6 +2392,7 @@ def write_recovery_outputs(
                 "exact image-position validation skipped"
             ],
         )
+    diagnostic_worker_count = max(1, int(jax_cpu_worker_count()))
     if posterior_diagnostic_mode == POSTERIOR_DIAGNOSTIC_MODE_APPROXIMATE:
         _log_validation_approximation_items(
             progress_args,
@@ -1830,6 +2430,12 @@ def write_recovery_outputs(
         )
         samples = np.asarray(arrays["samples"], dtype=float)
         best_fit = np.asarray(arrays["best_fit"], dtype=float)
+        if recovery_profile_draws <= 0:
+            recovery_profile_mode = "best_fit"
+            recovery_profile_draws_effective = 1
+        else:
+            recovery_profile_mode = "posterior"
+            recovery_profile_draws_effective = min(int(samples.shape[0]), int(recovery_profile_draws))
         parameter_names = _artifact_parameter_names(state)
         truth_values = _parameter_truth_with_source_positions(truth)
         best_fit_values = _best_fit_values_for_specs(state.parameter_specs, best_fit)
@@ -1853,6 +2459,7 @@ def write_recovery_outputs(
                 images,
                 quick_diagnostics=bool(quick_diagnostics),
                 progress=recovery_progress,
+                artifact_args=_saved_args,
             ),
         )
         mag_uncertainty_df, image_uncertainty_df, source_uncertainty_df = run_recovery_phase(
@@ -1863,9 +2470,9 @@ def write_recovery_outputs(
                 samples,
                 images,
                 max_draws=int(posterior_diagnostic_draws),
-                max_workers=int(posterior_diagnostic_workers),
                 posterior_diagnostic_mode=posterior_diagnostic_mode,
                 progress=recovery_progress,
+                artifact_args=_saved_args,
             ),
         )
 
@@ -1914,13 +2521,17 @@ def write_recovery_outputs(
             "validation.recovery.truth_caustics",
             lambda: _caustic_contours_by_z_from_truth(truth),
         )
-        recovered_caustics_by_z: dict[str, list[CausticContour]] = {}
+        truth_plot_caustics_by_z: dict[str, list[CausticContour]] = {}
+        recovered_plot_caustics_by_z: dict[str, list[CausticContour]] = {}
         has_mass_profile_truth = "config" in truth and (
             "kwargs_lens" in truth or "kwargs_lens_by_source_redshift" in truth
         )
         if has_mass_profile_truth:
             profile_radii_arcsec = np.asarray([2.0, 5.0, 10.0, 20.0, 40.0], dtype=float)
-            profile_samples = _capped_evenly_spaced_posterior_draws(samples)
+            if recovery_profile_draws <= 0:
+                profile_samples = best_fit.reshape(1, -1)
+            else:
+                profile_samples = _capped_evenly_spaced_posterior_draws(samples, max_draws=recovery_profile_draws)
             mass_profile_df, surface_density_df = run_recovery_phase(
                 "mass/surface profile bands",
                 "validation.recovery.mass_surface_density_profiles",
@@ -1932,23 +2543,37 @@ def write_recovery_outputs(
                     progress=recovery_progress,
                 ),
             )
-            truth_caustics_z7 = _select_critical_caustic_plot_contours(truth_caustics_by_z)
-            if truth_caustics_z7:
+            truth_caustics_z9 = _select_critical_caustic_plot_contours(truth_caustics_by_z)
+            if truth_caustics_z9:
                 try:
-                    recovered_caustics_by_z = run_recovery_phase(
+                    plot_caustic_z_keys = sorted(truth_caustics_z9)
+                    truth_plot_caustics_by_z = run_recovery_phase(
+                        "truth plot caustics",
+                        "validation.recovery.truth_plot_caustics",
+                        lambda: _truth_caustic_contours_by_z_for_plot(
+                            state,
+                            truth,
+                            plot_caustic_z_keys,
+                            caustic_grid_scale_arcsec=float(critical_caustic_plot_grid_scale_arcsec),
+                            progress=recovery_progress,
+                        ),
+                    )
+                    recovered_plot_caustics_by_z = run_recovery_phase(
                         "recovered caustics",
                         "validation.recovery.recovered_caustics",
                         lambda: _recovered_caustic_contours_by_z(
                             state,
                             best_fit,
                             truth,
-                            sorted(truth_caustics_z7),
+                            plot_caustic_z_keys,
+                            caustic_grid_scale_arcsec=float(critical_caustic_plot_grid_scale_arcsec),
                             progress=recovery_progress,
                         ),
                     )
                 except Exception as exc:  # pragma: no cover - defensive plotting fallback
                     print(f"[validation:critical-caustic] skipped recovered caustic computation: {exc}")
-                    recovered_caustics_by_z = {}
+                    truth_plot_caustics_by_z = {}
+                    recovered_plot_caustics_by_z = {}
 
         def build_summary() -> tuple[dict[str, float], dict[str, tuple[float, float]]]:
             summary_payload = {
@@ -1957,6 +2582,9 @@ def write_recovery_outputs(
                 "parameter_coverage_68_fraction": float(np.mean(parameter_df["covered_68"])),
                 "n_images": len(magnification_df),
                 "median_image_residual_arcsec": _nanmedian_no_warning(image_df["image_residual_arcsec"]),
+                "median_arc_aware_image_residual_arcsec": _nanmedian_no_warning(image_df["arc_aware_image_residual_arcsec"])
+                if "arc_aware_image_residual_arcsec" in image_df
+                else np.nan,
                 "median_source_position_error_arcsec": _nanmedian_no_warning(source_df["source_position_error_arcsec"])
                 if "source_position_error_arcsec" in source_df
                 else np.nan,
@@ -1981,10 +2609,16 @@ def write_recovery_outputs(
             "surface_density_plot": output_dir / "surface_density_recovery.pdf",
             "critical_caustic_plot": output_dir / "critical_caustic_recovery.pdf",
             "magnification_plot": output_dir / "magnification_recovery.pdf",
+            "absolute_magnification_plot": output_dir / "absolute_magnification_recovery.pdf",
             "image_recovery_plot": output_dir / "image_recovery.pdf",
+            "image_residual_histogram_plot": output_dir / "image_residual_histogram.pdf",
             "source_recovery_plot": output_dir / "source_recovery.pdf",
-            "subhalo_population_plot": output_dir / "subhalo_population.pdf",
+            "subhalo_recovery_shmf_plot": output_dir / "subhalo_recovery_shmf.pdf",
+            "subhalo_recovery_radial_plot": output_dir / "subhalo_recovery_radial.pdf",
             "summary_plot": output_dir / "validation_summary.pdf",
+            "critical_arc_support_histogram_plot": output_dir / "critical_arc_support_histogram.pdf",
+            "critical_arc_support_phase_space_plot": output_dir / "critical_arc_support_phase_space.pdf",
+            "critical_arc_recovery_by_family_plot": output_dir / "critical_arc_recovery_by_family.pdf",
         }
         run_recovery_phase(
             "corner plot",
@@ -2074,15 +2708,15 @@ def write_recovery_outputs(
             )
         else:
             paths.pop("surface_density_plot", None)
-        truth_caustics_z7 = _select_critical_caustic_plot_contours(truth_caustics_by_z)
-        recovered_caustics_z7 = _select_critical_caustic_plot_contours(recovered_caustics_by_z)
-        if truth_caustics_z7 and recovered_caustics_z7:
+        truth_caustics_z9 = _select_critical_caustic_plot_contours(truth_plot_caustics_by_z)
+        recovered_caustics_z9 = _select_critical_caustic_plot_contours(recovered_plot_caustics_by_z)
+        if truth_caustics_z9 and recovered_caustics_z9:
             run_recovery_phase(
                 "critical caustic plot",
                 "validation.recovery.plot_critical_caustic",
                 lambda: _plot_critical_caustic_recovery(
-                    truth_caustics_z7,
-                    recovered_caustics_z7,
+                    truth_caustics_z9,
+                    recovered_caustics_z9,
                     images,
                     image_df,
                     source_df,
@@ -2097,24 +2731,88 @@ def write_recovery_outputs(
             "validation.recovery.plot_magnification",
             lambda: _plot_magnification_recovery(magnification_df, paths["magnification_plot"]),
         )
+        absolute_magnification_grid = run_recovery_phase(
+            "absolute magnification grid",
+            "validation.recovery.absolute_magnification_grid",
+            lambda: _absolute_magnification_recovery_grid(
+                state,
+                best_fit,
+                truth,
+                grid_scale_arcsec=float(critical_caustic_plot_grid_scale_arcsec),
+            ),
+        )
+        run_recovery_phase(
+            "absolute magnification plot",
+            "validation.recovery.plot_absolute_magnification",
+            lambda: _plot_absolute_magnification_recovery(
+                absolute_magnification_grid,
+                paths["absolute_magnification_plot"],
+            ),
+        )
         run_recovery_phase(
             "image recovery plot",
             "validation.recovery.plot_image",
             lambda: _plot_image_recovery(image_df, paths["image_recovery_plot"]),
         )
         run_recovery_phase(
+            "image residual histogram",
+            "validation.recovery.plot_image_residual_histogram",
+            lambda: _plot_image_residual_histogram(
+                image_df,
+                paths["image_residual_histogram_plot"],
+            ),
+        )
+        critical_arc_image_count_df = _image_count_recovery_table(state, image_df)
+        run_recovery_phase(
+            "critical-arc support histogram",
+            "validation.recovery.plot_critical_arc_support_histogram",
+            lambda: _plot_critical_arc_support_histogram(
+                image_df,
+                paths["critical_arc_support_histogram_plot"],
+            ),
+        )
+        run_recovery_phase(
+            "critical-arc support phase space",
+            "validation.recovery.plot_critical_arc_support_phase_space",
+            lambda: _plot_critical_arc_support_phase_space(
+                image_df,
+                paths["critical_arc_support_phase_space_plot"],
+            ),
+        )
+        run_recovery_phase(
+            "critical-arc recovery by family",
+            "validation.recovery.plot_critical_arc_recovery_by_family",
+            lambda: _plot_critical_arc_recovery_by_family(
+                critical_arc_image_count_df,
+                paths["critical_arc_recovery_by_family_plot"],
+            ),
+        )
+        run_recovery_phase(
             "source recovery plot",
             "validation.recovery.plot_source",
             lambda: _plot_source_recovery(source_df, paths["source_recovery_plot"]),
         )
+        recovered_subhalo_df = run_recovery_phase(
+            "recovered subhalo masses",
+            "validation.recovery.recovered_subhalo_masses",
+            lambda: _recovered_subhalo_mass_table(state, best_fit, truth),
+        )
         run_recovery_phase(
-            "subhalo population plot",
-            "validation.recovery.plot_subhalo_population",
-            lambda: _plot_subhalo_population(
-                pd.DataFrame(truth.get("subhalos", [])),
-                images,
-                parameter_df,
-                paths["subhalo_population_plot"],
+            "subhalo SHMF recovery plot",
+            "validation.recovery.plot_subhalo_recovery_shmf",
+            lambda: _plot_subhalo_recovery_shmf(
+                truth,
+                recovered_subhalo_df,
+                paths["subhalo_recovery_shmf_plot"],
+            ),
+        )
+        run_recovery_phase(
+            "subhalo radial recovery plot",
+            "validation.recovery.plot_subhalo_recovery_radial",
+            lambda: _plot_subhalo_recovery_radial(
+                truth,
+                recovered_subhalo_df,
+                paths["subhalo_recovery_radial_plot"],
             ),
         )
         run_recovery_phase(
@@ -2130,7 +2828,10 @@ def write_recovery_outputs(
                         run_dir=run_dir,
                         output_dir=output_dir,
                         posterior_diagnostic_draws=int(posterior_diagnostic_draws),
-                        posterior_diagnostic_workers=int(posterior_diagnostic_workers),
+                        recovery_profile_draws=int(recovery_profile_draws),
+                        recovery_profile_draws_effective=int(recovery_profile_draws_effective),
+                        recovery_profile_mode=recovery_profile_mode,
+                        diagnostic_worker_count=int(diagnostic_worker_count),
                         posterior_diagnostic_mode=posterior_diagnostic_mode,
                         quick_diagnostics=bool(quick_diagnostics),
                         samples=samples,
@@ -2145,8 +2846,8 @@ def write_recovery_outputs(
                         surface_density_df=surface_density_df,
                         summary=summary,
                         summary_uncertainty=summary_uncertainty,
-                        truth_caustics_by_z=truth_caustics_by_z,
-                        recovered_caustics_by_z=recovered_caustics_by_z,
+                        truth_caustics_by_z=truth_plot_caustics_by_z,
+                        recovered_caustics_by_z=recovered_plot_caustics_by_z,
                         output_paths=paths,
                     )
                 )
@@ -2155,8 +2856,22 @@ def write_recovery_outputs(
 
 
 PARAMETER_RECOVERY_LOG_ABS_FLOOR = 1.0e-4
-CRITICAL_CAUSTIC_RECOVERY_SOURCE_REDSHIFT = 7.0
+CRITICAL_CAUSTIC_RECOVERY_SOURCE_REDSHIFT = 9.0
 CRITICAL_CAUSTIC_RECOVERY_REDSHIFT_TOL = 1.0e-6
+ABSOLUTE_MAGNIFICATION_RECOVERY_CAP = 25.0
+
+
+@dataclass(frozen=True)
+class _AbsoluteMagnificationRecoveryGrid:
+    x_axis_arcsec: np.ndarray
+    y_axis_arcsec: np.ndarray
+    truth_abs_mu_raw: np.ndarray
+    recovered_abs_mu_raw: np.ndarray
+    truth_abs_mu: np.ndarray
+    recovered_abs_mu: np.ndarray
+    residual_abs_mu: np.ndarray
+    z_source: float
+    cap: float
 
 
 def _log10_abs_parameter_values(values: np.ndarray, floor: float = PARAMETER_RECOVERY_LOG_ABS_FLOOR) -> np.ndarray:
@@ -2350,6 +3065,11 @@ def _summary_uncertainty(
         return (min(low, high), max(low, high)) if np.isfinite(low + high) else (low, high)
 
     image_interval = interval_from_columns(image_df, "image_residual_q16", "image_residual_q84")
+    arc_image_interval = interval_from_columns(
+        image_df,
+        "arc_aware_image_residual_q16",
+        "arc_aware_image_residual_q84",
+    )
     source_interval = interval_from_columns(source_df, "source_position_error_q16", "source_position_error_q84")
     mag_interval = interval_from_columns(
         magnification_df,
@@ -2372,6 +3092,7 @@ def _summary_uncertainty(
     parity_mean = float(np.nanmean(parity_values)) if parity_values.size else np.nan
     return {
         "median_image_residual_arcsec": image_interval,
+        "median_arc_aware_image_residual_arcsec": arc_image_interval,
         "median_source_position_error_arcsec": source_interval,
         "median_abs_magnification_frac_error": mag_interval,
         "parameter_coverage_68_fraction": (np.nan, np.nan) if not np.isfinite(coverage_se) else (coverage_mean - coverage_se, coverage_mean + coverage_se),
@@ -2605,23 +3326,275 @@ def _plot_magnification_recovery(magnification_df: pd.DataFrame, path: Path) -> 
     plt.close(fig)
 
 
+def _capped_absolute_magnification(values: np.ndarray, cap: float = ABSOLUTE_MAGNIFICATION_RECOVERY_CAP) -> np.ndarray:
+    if float(cap) <= 0.0:
+        raise ValueError("cap must be positive.")
+    array = np.asarray(values, dtype=float)
+    return np.minimum(np.abs(array), float(cap))
+
+
+def _finite_source_redshifts_from_mapping(mapping: Any) -> list[float]:
+    if not isinstance(mapping, dict):
+        return []
+    redshifts: list[float] = []
+    for key, value in mapping.items():
+        if value is None:
+            continue
+        try:
+            z_source = float(key)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(z_source):
+            redshifts.append(float(z_source))
+    return redshifts
+
+
+def _absolute_magnification_grid_source_redshift(truth: dict[str, Any]) -> float:
+    redshifts = _finite_source_redshifts_from_mapping(truth.get("kwargs_lens_by_source_redshift", {}))
+    if not redshifts:
+        redshifts = _finite_source_redshifts_from_mapping(truth.get("caustics_by_source_redshift", {}))
+    if redshifts:
+        z_array = np.asarray(redshifts, dtype=float)
+        z9_distance = np.abs(z_array - CRITICAL_CAUSTIC_RECOVERY_SOURCE_REDSHIFT)
+        z9_matches = z9_distance <= CRITICAL_CAUSTIC_RECOVERY_REDSHIFT_TOL
+        if np.any(z9_matches):
+            return float(z_array[np.where(z9_matches)[0][np.argmin(z9_distance[z9_matches])]])
+        return float(np.nanmax(z_array))
+
+    raw_config = truth.get("config", {})
+    truth_config = raw_config if isinstance(raw_config, dict) else {}
+    try:
+        z_source = float(truth_config["source_redshift"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Cannot determine source redshift for absolute magnification recovery plot.") from exc
+    if not np.isfinite(z_source):
+        raise ValueError("Source redshift for absolute magnification recovery plot must be finite.")
+    return float(z_source)
+
+
+def _truth_kwargs_for_source_redshift(truth: dict[str, Any], z_source: float) -> list[dict[str, Any]]:
+    truth_kwargs_by_z = truth.get("kwargs_lens_by_source_redshift", {})
+    if isinstance(truth_kwargs_by_z, dict):
+        for key in (f"{float(z_source):.8f}", str(float(z_source)), str(z_source)):
+            if key in truth_kwargs_by_z:
+                return list(truth_kwargs_by_z[key])
+        for key, kwargs_lens in truth_kwargs_by_z.items():
+            try:
+                key_z = float(key)
+            except (TypeError, ValueError):
+                continue
+            if abs(key_z - float(z_source)) <= CRITICAL_CAUSTIC_RECOVERY_REDSHIFT_TOL:
+                return list(kwargs_lens)
+    return list(truth.get("kwargs_lens", []))
+
+
+def _absolute_magnification_grid_axes(
+    truth: dict[str, Any],
+    *,
+    grid_scale_arcsec: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    config = _plot_caustic_config_from_truth(
+        truth,
+        caustic_grid_scale_arcsec=grid_scale_arcsec,
+    )
+    compute_window = float(config.caustic_compute_window_arcsec)
+    grid_scale = float(config.caustic_grid_scale_arcsec)
+    if compute_window <= 0.0 or grid_scale <= 0.0:
+        raise ValueError("Magnification map window and grid scale must be positive.")
+    num_pix = max(16, int(math.ceil(compute_window / grid_scale)) + 1)
+    if num_pix % 2 == 0:
+        num_pix += 1
+    x_axis = np.linspace(-0.5 * compute_window, 0.5 * compute_window, num_pix)
+    y_axis = np.linspace(-0.5 * compute_window, 0.5 * compute_window, num_pix)
+    return x_axis.astype(float), y_axis.astype(float)
+
+
+def _absolute_magnification_recovery_grid(
+    state: Any,
+    best_fit_physical: np.ndarray,
+    truth: dict[str, Any],
+    *,
+    grid_scale_arcsec: float | None = None,
+    cap: float = ABSOLUTE_MAGNIFICATION_RECOVERY_CAP,
+) -> _AbsoluteMagnificationRecoveryGrid:
+    import jax.numpy as jnp
+
+    from .cluster_solver import (
+        DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
+        DEFAULT_ACTIVE_SCALING_GALAXIES,
+        DEFAULT_ACTIVE_SCALING_MIN,
+        DEFAULT_MATCH_TOLERANCE,
+        DEFAULT_REFRESH_EVERY,
+        DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
+        ClusterJAXEvaluator,
+        _convert_theta_to_latent,
+    )
+
+    z_source = _absolute_magnification_grid_source_redshift(truth)
+    x_axis, y_axis = _absolute_magnification_grid_axes(
+        truth,
+        grid_scale_arcsec=grid_scale_arcsec,
+    )
+    xx, yy = np.meshgrid(x_axis, y_axis)
+    flat_x = xx.reshape(-1)
+    flat_y = yy.reshape(-1)
+
+    config = _plot_caustic_config_from_truth(
+        truth,
+        caustic_grid_scale_arcsec=grid_scale_arcsec,
+    )
+    raw_config = truth.get("config", {})
+    truth_config = raw_config if isinstance(raw_config, dict) else {}
+    z_lens = float(truth_config.get("z_lens", config.z_lens))
+    lens_model_list = list(truth.get("lens_model_list", getattr(state, "lens_model_list", [])))
+    if not lens_model_list:
+        raise ValueError("Cannot plot absolute magnification recovery without lens model components.")
+
+    truth_model = LensModel(
+        lens_model_list=lens_model_list,
+        z_lens=z_lens,
+        z_source=z_source,
+        cosmo=FlatLambdaCDM(H0=70.0, Om0=0.3),
+    )
+    truth_kwargs = _truth_kwargs_for_source_redshift(truth, z_source)
+    truth_mu = np.asarray(
+        truth_model.magnification(flat_x, flat_y, truth_kwargs),
+        dtype=float,
+    ).reshape(xx.shape)
+
+    evaluator = ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=DEFAULT_MATCH_TOLERANCE,
+        sampling_engine="full",
+        active_scaling_galaxies=DEFAULT_ACTIVE_SCALING_GALAXIES,
+        active_scaling_selection="adaptive",
+        active_scaling_cumulative_fraction=DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
+        active_scaling_min=DEFAULT_ACTIVE_SCALING_MIN,
+        refresh_every=DEFAULT_REFRESH_EVERY,
+        refresh_param_drift_frac=DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
+    )
+    if hasattr(evaluator, "reported_physical_to_latent_parameter_vector"):
+        best_fit_latent = evaluator.reported_physical_to_latent_parameter_vector(np.asarray(best_fit_physical, dtype=float))
+    else:
+        best_fit_latent = _convert_theta_to_latent(np.asarray(best_fit_physical, dtype=float), state.parameter_specs)
+    recovered_model, _solver = evaluator._get_exact_model_solver(z_source)
+    packed_state = evaluator._build_packed_lens_state(jnp.asarray(best_fit_latent, dtype=jnp.float64), z_source)
+    recovered_kwargs = evaluator._packed_to_kwargs_lens(packed_state)
+    recovered_mu = np.asarray(
+        recovered_model.magnification(flat_x, flat_y, recovered_kwargs),
+        dtype=float,
+    ).reshape(xx.shape)
+
+    truth_abs_mu_raw = np.abs(np.asarray(truth_mu, dtype=float))
+    recovered_abs_mu_raw = np.abs(np.asarray(recovered_mu, dtype=float))
+    truth_abs_mu = np.minimum(truth_abs_mu_raw, float(cap))
+    recovered_abs_mu = np.minimum(recovered_abs_mu_raw, float(cap))
+    return _AbsoluteMagnificationRecoveryGrid(
+        x_axis_arcsec=x_axis,
+        y_axis_arcsec=y_axis,
+        truth_abs_mu_raw=truth_abs_mu_raw,
+        recovered_abs_mu_raw=recovered_abs_mu_raw,
+        truth_abs_mu=truth_abs_mu,
+        recovered_abs_mu=recovered_abs_mu,
+        residual_abs_mu=recovered_abs_mu_raw - truth_abs_mu_raw,
+        z_source=float(z_source),
+        cap=float(cap),
+    )
+
+
+def _plot_absolute_magnification_recovery(
+    grid: _AbsoluteMagnificationRecoveryGrid,
+    path: Path,
+) -> None:
+    extent = [
+        float(grid.x_axis_arcsec[0]),
+        float(grid.x_axis_arcsec[-1]),
+        float(grid.y_axis_arcsec[0]),
+        float(grid.y_axis_arcsec[-1]),
+    ]
+    fig, axes = plt.subplots(2, 1, sharex=True, figsize=(6.2, 8.6))
+    recovered_image = axes[0].imshow(
+        np.ma.masked_invalid(grid.recovered_abs_mu),
+        origin="lower",
+        extent=extent,
+        cmap="viridis",
+        vmin=0.0,
+        vmax=float(grid.cap),
+        aspect="equal",
+    )
+    recovered_colorbar = fig.colorbar(recovered_image, ax=axes[0], fraction=0.046, pad=0.04)
+    recovered_colorbar.set_label(r"$|\mu_{\rm rec}|$")
+
+    residual_values = np.asarray(grid.residual_abs_mu, dtype=float)
+    residual_norm = TwoSlopeNorm(vmin=-25.0, vcenter=0.0, vmax=25.0)
+    residual_image = axes[1].imshow(
+        np.ma.masked_invalid(residual_values),
+        origin="lower",
+        extent=extent,
+        cmap="RdBu",
+        norm=residual_norm,
+        aspect="equal",
+    )
+    residual_colorbar = fig.colorbar(residual_image, ax=axes[1], fraction=0.046, pad=0.04)
+    residual_colorbar.set_label(r"$|\mu_{\rm rec}| - |\mu_{\rm truth}|$")
+
+    for ax in axes:
+        ax.invert_xaxis()
+        ax.set_ylabel("y [arcsec]")
+    axes[0].tick_params(axis="x", labelbottom=False)
+    axes[1].set_xlabel("x [arcsec]")
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_value_with_fallback(df: pd.DataFrame, column: str, fallback_column: str | None = None) -> np.ndarray:
+    if column in df.columns:
+        values = pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
+    else:
+        values = np.full(len(df), np.nan, dtype=float)
+    if fallback_column is not None and fallback_column in df.columns:
+        fallback = pd.to_numeric(df[fallback_column], errors="coerce").to_numpy(dtype=float)
+        values = np.where(np.isfinite(values), values, fallback)
+    return values
+
+
 def _plot_image_recovery(image_df: pd.DataFrame, path: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     ax = axes[0]
-    ax.scatter(image_df["x_obs_arcsec"], image_df["y_obs_arcsec"], color="black", s=22, label="observed")
+    if "image_recovery_status" in image_df.columns:
+        status = image_df["image_recovery_status"].fillna("unknown").astype(str).to_numpy()
+        x_obs = image_df["x_obs_arcsec"].to_numpy(dtype=float)
+        y_obs = image_df["y_obs_arcsec"].to_numpy(dtype=float)
+        recovered = status == "recovered"
+        not_recovered = status == "not_recovered"
+        unknown = ~(recovered | not_recovered)
+        if recovered.any():
+            ax.scatter(x_obs[recovered], y_obs[recovered], color="tab:green", marker="x", s=24, label="observed recovered")
+        if not_recovered.any():
+            ax.scatter(x_obs[not_recovered], y_obs[not_recovered], color="tab:red", marker="x", s=24, label="observed not recovered")
+        if unknown.any():
+            ax.scatter(x_obs[unknown], y_obs[unknown], color="black", s=22, label="observed")
+    else:
+        ax.scatter(image_df["x_obs_arcsec"], image_df["y_obs_arcsec"], color="black", s=22, label="observed")
     if {"x_model_q16", "x_model_q50", "x_model_q84", "y_model_q16", "y_model_q50", "y_model_q84"}.issubset(image_df.columns):
-        x_model = image_df["x_model_q50"].to_numpy(dtype=float)
-        y_model = image_df["y_model_q50"].to_numpy(dtype=float)
+        x_model = _plot_value_with_fallback(image_df, "x_model_q50", "x_model_arcsec")
+        y_model = _plot_value_with_fallback(image_df, "y_model_q50", "y_model_arcsec")
+        finite_model = np.isfinite(x_model) & np.isfinite(y_model)
+        x16 = _plot_value_with_fallback(image_df, "x_model_q16")
+        x84 = _plot_value_with_fallback(image_df, "x_model_q84")
+        y16 = _plot_value_with_fallback(image_df, "y_model_q16")
+        y84 = _plot_value_with_fallback(image_df, "y_model_q84")
         ax.errorbar(
-            x_model,
-            y_model,
+            x_model[finite_model],
+            y_model[finite_model],
             xerr=[
-                np.maximum(0.0, x_model - image_df["x_model_q16"].to_numpy(dtype=float)),
-                np.maximum(0.0, image_df["x_model_q84"].to_numpy(dtype=float) - x_model),
+                np.where(np.isfinite(x16), np.maximum(0.0, x_model - x16), 0.0)[finite_model],
+                np.where(np.isfinite(x84), np.maximum(0.0, x84 - x_model), 0.0)[finite_model],
             ],
             yerr=[
-                np.maximum(0.0, y_model - image_df["y_model_q16"].to_numpy(dtype=float)),
-                np.maximum(0.0, image_df["y_model_q84"].to_numpy(dtype=float) - y_model),
+                np.where(np.isfinite(y16), np.maximum(0.0, y_model - y16), 0.0)[finite_model],
+                np.where(np.isfinite(y84), np.maximum(0.0, y84 - y_model), 0.0)[finite_model],
             ],
             fmt="o",
             color="tab:blue",
@@ -2632,7 +3605,8 @@ def _plot_image_recovery(image_df: pd.DataFrame, path: Path) -> None:
     else:
         x_model = image_df["x_model_arcsec"].to_numpy(dtype=float)
         y_model = image_df["y_model_arcsec"].to_numpy(dtype=float)
-        ax.scatter(image_df["x_model_arcsec"], image_df["y_model_arcsec"], color="tab:blue", s=18, label="model")
+        finite_model = np.isfinite(x_model) & np.isfinite(y_model)
+        ax.scatter(x_model[finite_model], y_model[finite_model], color="tab:blue", s=18, label="model")
     for row, x_fit, y_fit in zip(image_df.itertuples(index=False), x_model, y_model):
         if np.isfinite(x_fit) and np.isfinite(y_fit):
             ax.plot([row.x_obs_arcsec, x_fit], [row.y_obs_arcsec, y_fit], color="0.6", lw=0.8)
@@ -2642,32 +3616,143 @@ def _plot_image_recovery(image_df: pd.DataFrame, path: Path) -> None:
     ax.set_title("Image positions")
     ax.legend(loc="best", fontsize=8)
 
-    residual = (
-        image_df["image_residual_q50"].to_numpy(dtype=float)
-        if "image_residual_q50" in image_df
-        else image_df["image_residual_arcsec"].to_numpy(dtype=float)
-    )
+    residual = _plot_value_with_fallback(image_df, "image_residual_q50", "image_residual_arcsec")
     x_index = np.arange(len(image_df))
     if {"image_residual_q16", "image_residual_q84"}.issubset(image_df.columns):
+        finite_residual = np.isfinite(residual)
+        r16 = _plot_value_with_fallback(image_df, "image_residual_q16")
+        r84 = _plot_value_with_fallback(image_df, "image_residual_q84")
         axes[1].errorbar(
-            x_index,
-            residual,
+            x_index[finite_residual],
+            residual[finite_residual],
             yerr=[
-                np.maximum(0.0, residual - image_df["image_residual_q16"].to_numpy(dtype=float)),
-                np.maximum(0.0, image_df["image_residual_q84"].to_numpy(dtype=float) - residual),
+                np.where(np.isfinite(r16), np.maximum(0.0, residual - r16), 0.0)[finite_residual],
+                np.where(np.isfinite(r84), np.maximum(0.0, r84 - residual), 0.0)[finite_residual],
             ],
             fmt="o",
             color="tab:blue",
             ecolor="tab:blue",
         )
     else:
-        axes[1].scatter(x_index, residual, color="tab:blue")
+        finite_residual = np.isfinite(residual)
+        axes[1].scatter(x_index[finite_residual], residual[finite_residual], color="tab:blue")
+    arc_residual = _plot_value_with_fallback(
+        image_df,
+        "arc_aware_image_residual_q50",
+        "arc_aware_image_residual_arcsec",
+    )
+    finite_arc_residual = np.isfinite(arc_residual)
+    if np.any(finite_arc_residual):
+        axes[1].scatter(
+            x_index[finite_arc_residual],
+            arc_residual[finite_arc_residual],
+            color="tab:olive",
+            marker="x",
+            s=28,
+            label="arc-aware",
+        )
     axes[1].set_xlabel("image index")
     axes[1].set_ylabel("image residual [arcsec]")
     axes[1].set_title("Image residuals with 1 sigma intervals")
+    axes[1].legend(loc="best", fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
+
+
+def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
+    residual = _plot_value_with_fallback(image_df, "image_residual_q50", "image_residual_arcsec")
+    residual = residual[np.isfinite(residual)]
+    arc_residual = _plot_value_with_fallback(
+        image_df,
+        "arc_aware_image_residual_q50",
+        "arc_aware_image_residual_arcsec",
+    )
+    arc_residual = arc_residual[np.isfinite(arc_residual)]
+    if residual.size == 0 and arc_residual.size == 0:
+        _write_placeholder_plot(
+            path,
+            "Image residual histogram",
+            "No finite image residuals are available.",
+        )
+        return
+
+    fig, ax = plt.subplots(figsize=(6.2, 4.2))
+    bin_count = 30
+    total_rms = float(np.sqrt(np.mean(np.square(residual)))) if residual.size else np.nan
+    arc_total_rms = float(np.sqrt(np.mean(np.square(arc_residual)))) if arc_residual.size else np.nan
+    if residual.size:
+        ax.hist(residual, bins=bin_count, color="tab:blue", alpha=0.55, label="strict")
+        ax.axvline(
+            float(np.nanmedian(residual)),
+            color="tab:blue",
+            linestyle="--",
+            linewidth=1.2,
+            label="strict median",
+        )
+        ax.axvline(
+            total_rms,
+            color="tab:red",
+            linestyle="-.",
+            linewidth=1.2,
+            label="strict RMS",
+        )
+    if arc_residual.size:
+        ax.hist(arc_residual, bins=bin_count, color="tab:olive", alpha=0.45, label="arc-aware")
+        ax.axvline(
+            arc_total_rms,
+            color="tab:green",
+            linestyle="-.",
+            linewidth=1.2,
+            label="arc-aware RMS",
+        )
+    rms_annotation = (
+        f"Strict RMS = {total_rms:.3g} arcsec, N = {residual.size}\n"
+        f"Arc-aware RMS = {arc_total_rms:.3g} arcsec, N = {arc_residual.size}"
+    )
+    ax.text(
+        0.98,
+        0.95,
+        rms_annotation,
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=8,
+        bbox={
+            "boxstyle": "round,pad=0.3",
+            "facecolor": "white",
+            "edgecolor": "0.6",
+            "alpha": 0.9,
+        },
+    )
+    ax.set_xlabel("image residual [arcsec]")
+    ax.set_ylabel("N images")
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_critical_arc_support_histogram(image_df: pd.DataFrame, path: Path) -> None:
+    _shared_plot_critical_arc_support_histogram(
+        image_df,
+        path,
+        curve_support_radius_arcsec=0.5,
+        singular_threshold=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+    )
+
+
+def _plot_critical_arc_support_phase_space(image_df: pd.DataFrame, path: Path) -> None:
+    _shared_plot_critical_arc_support_phase_space(
+        image_df,
+        path,
+        curve_support_radius_arcsec=0.5,
+        singular_threshold=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+    )
+
+
+def _plot_critical_arc_recovery_by_family(image_count_df: pd.DataFrame, path: Path) -> None:
+    _shared_plot_critical_arc_recovery_by_family(image_count_df, path)
 
 
 def _plot_source_recovery(source_df: pd.DataFrame, path: Path) -> None:
@@ -2760,34 +3845,655 @@ def _plot_source_recovery(source_df: pd.DataFrame, path: Path) -> None:
     plt.close(fig)
 
 
-def _plot_subhalo_population(
-    subhalo_df: pd.DataFrame,
-    images: pd.DataFrame,
-    parameter_df: pd.DataFrame,
-    path: Path,
-) -> None:
-    del parameter_df
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.scatter(images["x_obs_arcsec"], images["y_obs_arcsec"], color="black", marker="x", s=26, label="images")
-    if not subhalo_df.empty:
-        sizes = 12.0 + 80.0 * np.sqrt(subhalo_df["luminosity_ratio"].to_numpy(dtype=float))
-        scatter = ax.scatter(
-            subhalo_df["x_arcsec"],
-            subhalo_df["y_arcsec"],
-            s=sizes,
-            c=subhalo_df["catalog_mag"],
-            cmap="viridis_r",
-            alpha=0.75,
-            label="subhalos",
+def _write_placeholder_plot(path: Path, title: str, message: str) -> None:
+    fig, ax = plt.subplots(figsize=(6.5, 4.0))
+    ax.axis("off")
+    ax.set_title(title)
+    ax.text(0.5, 0.5, message, ha="center", va="center", wrap=True, transform=ax.transAxes)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_subhalo_selection(truth: dict[str, Any], path: Path) -> None:
+    selection = truth.get("subhalo_selection", {}) if isinstance(truth, dict) else {}
+    if not isinstance(selection, dict):
+        selection = {}
+    candidates = selection.get("candidates", [])
+    if not isinstance(candidates, list) or not candidates:
+        _write_placeholder_plot(
+            path,
+            "Subhalo selection",
+            "No parent-population data are available for this mock.",
         )
-        fig.colorbar(scatter, ax=ax, label="member magnitude")
+        return
+
+    candidate_df = pd.DataFrame(candidates)
+    required_columns = {"subhalo_mass_msun", "catalog_mag", "selected"}
+    if not required_columns.issubset(candidate_df.columns):
+        _write_placeholder_plot(
+            path,
+            "Subhalo selection",
+            "Subhalo selection data are incomplete.",
+        )
+        return
+
+    mass = pd.to_numeric(candidate_df["subhalo_mass_msun"], errors="coerce").to_numpy(dtype=float)
+    magnitude = pd.to_numeric(candidate_df["catalog_mag"], errors="coerce").to_numpy(dtype=float)
+    selected = candidate_df["selected"].fillna(False).astype(bool).to_numpy()
+    passes_mag_cut = (
+        candidate_df["passes_mag_cut"].fillna(False).astype(bool).to_numpy()
+        if "passes_mag_cut" in candidate_df.columns
+        else np.isfinite(magnitude)
+    )
+    finite = np.isfinite(mass) & (mass > 0.0) & np.isfinite(magnitude)
+    if not np.any(finite):
+        _write_placeholder_plot(
+            path,
+            "Subhalo selection",
+            "No finite subhalo candidate masses are available.",
+        )
+        return
+
+    mass = mass[finite]
+    magnitude = magnitude[finite]
+    selected = selected[finite]
+    passes_mag_cut = passes_mag_cut[finite]
+    log_mass = np.log10(mass)
+    log_min = float(np.nanmin(log_mass))
+    log_max = float(np.nanmax(log_mass))
+    if not np.isfinite(log_min) or not np.isfinite(log_max):
+        _write_placeholder_plot(path, "Subhalo selection", "No finite subhalo log masses are available.")
+        return
+    if log_max <= log_min:
+        log_min -= 0.25
+        log_max += 0.25
+    n_bins = int(np.clip(np.sqrt(len(log_mass)), 6, 18))
+    bins = np.linspace(log_min, log_max, n_bins + 1)
+    parent_counts, _ = np.histogram(log_mass, bins=bins)
+    selected_counts, _ = np.histogram(log_mass[selected], bins=bins)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    schechter_alpha = float(selection.get("schechter_alpha", SingleBCGMockConfig().subhalo_schechter_alpha))
+    mass_ref = float(selection.get("mass_ref", SingleBCGMockConfig().subhalo_mass_ref))
+    exponent = float(
+        selection.get("mass_luminosity_exponent", _subhalo_mass_luminosity_exponent(SingleBCGMockConfig()))
+    )
+    center_mass = np.power(10.0, centers)
+    center_luminosity = np.power(center_mass / mass_ref, 1.0 / exponent)
+    analytic = np.power(center_luminosity, schechter_alpha + 1.0) * np.exp(-center_luminosity)
+    analytic_label = fr"Schechter $\alpha={schechter_alpha:.2g}$"
+    analytic = analytic / np.sum(analytic) * float(len(log_mass)) if np.sum(analytic) > 0.0 else analytic
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8))
+    hist_ax, mag_ax = axes
+    hist_ax.hist(log_mass, bins=bins, histtype="stepfilled", alpha=0.25, color="tab:blue", label="parent candidates")
+    hist_ax.hist(log_mass[selected], bins=bins, histtype="step", color="tab:red", linewidth=2.0, label="selected")
+    hist_ax.plot(centers, analytic, color="black", linestyle="--", linewidth=1.2, label=analytic_label)
+    if np.any(selected):
+        rug_y = max(float(np.nanmax(parent_counts)) if parent_counts.size else 1.0, 1.0) * 1.25
+        hist_ax.scatter(log_mass[selected], np.full(np.count_nonzero(selected), rug_y), marker="v", s=22, color="tab:red")
+    hist_ax.set_yscale("log")
+    hist_ax.set_xlabel(r"$\log_{10}(M_{\rm sub}/M_\odot)$")
+    hist_ax.set_ylabel(r"$dN/d\log_{10}M$")
+    hist_ax.set_title("Parent Schechter LF draw")
+    hist_ax.legend(loc="best", fontsize=8)
+
+    unselected = ~selected
+    mag_ax.scatter(
+        mass[unselected & ~passes_mag_cut],
+        magnitude[unselected & ~passes_mag_cut],
+        s=16,
+        color="0.75",
+        alpha=0.7,
+        label="rejected by mag cut",
+    )
+    mag_ax.scatter(
+        mass[unselected & passes_mag_cut],
+        magnitude[unselected & passes_mag_cut],
+        s=18,
+        color="tab:blue",
+        alpha=0.65,
+        label="observable parent",
+    )
+    if np.any(selected):
+        mag_ax.scatter(
+            mass[selected],
+            magnitude[selected],
+            s=44,
+            facecolors="none",
+            edgecolors="tab:red",
+            linewidths=1.3,
+            label="selected",
+        )
+    faint_limit = float(selection.get("mag_faint_limit", np.nan))
+    if np.isfinite(faint_limit):
+        mag_ax.axhline(faint_limit, color="black", linestyle="--", linewidth=1.0, label="faint limit")
+    mag_ax.set_xscale("log")
+    mag_ax.invert_yaxis()
+    mag_ax.set_xlabel(r"$M_{\rm sub}\ [M_\odot]$")
+    mag_ax.set_ylabel("catalog magnitude")
+    mag_ax.set_title("Count-matched selection")
+    mag_ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def _positive_finite_series(df: pd.DataFrame, column: str) -> np.ndarray:
+    if column not in df.columns:
+        return np.empty((0,), dtype=float)
+    values = pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
+    return values[np.isfinite(values) & (values > 0.0)]
+
+
+def _updated_component_values(base: Any, param_index: Any, best_fit: np.ndarray) -> np.ndarray:
+    values = np.asarray(base, dtype=float).copy()
+    indices = np.asarray(param_index, dtype=int)
+    best_fit_values = np.asarray(best_fit, dtype=float).reshape(-1)
+    if values.shape != indices.shape:
+        values = np.broadcast_to(values, indices.shape).astype(float, copy=True)
+    valid = (indices >= 0) & (indices < best_fit_values.size)
+    if np.any(valid):
+        values[valid] = best_fit_values[indices[valid]]
+    return values
+
+
+def _truth_scaling_reference_value(
+    truth: dict[str, Any],
+    potfile_id: str,
+    field: str,
+    fallback: float,
+) -> float:
+    parameter_truth = truth.get("parameter_truth", {}) if isinstance(truth, dict) else {}
+    if isinstance(parameter_truth, dict):
+        for key in (f"{potfile_id}.{field}", f"potfile.{field}"):
+            if key not in parameter_truth:
+                continue
+            try:
+                value = float(parameter_truth[key])
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value) and value > 0.0:
+                return value
+    return float(fallback)
+
+
+def _truth_subhalo_mass_ref(truth: dict[str, Any]) -> float:
+    selection = truth.get("subhalo_selection", {}) if isinstance(truth, dict) else {}
+    config = truth.get("config", {}) if isinstance(truth, dict) else {}
+    candidates = (
+        selection.get("mass_ref")
+        if isinstance(selection, dict)
+        else None,
+        config.get("subhalo_mass_ref") if isinstance(config, dict) else None,
+        SingleBCGMockConfig().subhalo_mass_ref,
+    )
+    for candidate in candidates:
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value) and value > 0.0:
+            return value
+    return float(SingleBCGMockConfig().subhalo_mass_ref)
+
+
+def _finite_float_or_nan(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return parsed if np.isfinite(parsed) else float("nan")
+
+
+def _recovered_subhalo_mass_table(state: Any, best_fit: np.ndarray, truth: dict[str, Any]) -> pd.DataFrame:
+    packed = getattr(state, "packed_lens_spec", None)
+    if packed is None:
+        return pd.DataFrame()
+    component_family = np.asarray(getattr(packed, "component_family", []), dtype=int)
+    if component_family.size == 0:
+        return pd.DataFrame()
+    scaling_indices = np.where(component_family == 1)[0].astype(int)
+    if scaling_indices.size == 0:
+        return pd.DataFrame()
+
+    x_center_base = np.asarray(getattr(packed, "x_center_base", np.full(component_family.size, np.nan)), dtype=float)
+    y_center_base = np.asarray(getattr(packed, "y_center_base", np.full(component_family.size, np.nan)), dtype=float)
+    record_by_component = {
+        int(record["component_index"]): dict(record)
+        for record in getattr(state, "scaling_component_records", []) or []
+        if isinstance(record, dict) and "component_index" in record
+    }
+    best_fit_values = np.asarray(best_fit, dtype=float).reshape(-1)
+    luminosity_ratio = np.asarray(getattr(packed, "luminosity_ratio", []), dtype=float)
+    sigma_ref = _updated_component_values(
+        getattr(packed, "sigma_ref_base", np.zeros(component_family.size, dtype=float)),
+        getattr(packed, "sigma_ref_param_index", np.full(component_family.size, -1, dtype=int)),
+        best_fit_values,
+    )
+    cut_ref = _updated_component_values(
+        getattr(packed, "cut_ref_base", np.zeros(component_family.size, dtype=float)),
+        getattr(packed, "cut_ref_param_index", np.full(component_family.size, -1, dtype=int)),
+        best_fit_values,
+    )
+    vdslope = _updated_component_values(
+        getattr(packed, "vdslope_base", np.full(component_family.size, 4.0, dtype=float)),
+        getattr(packed, "vdslope_param_index", np.full(component_family.size, -1, dtype=int)),
+        best_fit_values,
+    )
+    slope = _updated_component_values(
+        getattr(packed, "slope_base", np.full(component_family.size, 4.0, dtype=float)),
+        getattr(packed, "slope_param_index", np.full(component_family.size, -1, dtype=int)),
+        best_fit_values,
+    )
+    mass_ref = _truth_subhalo_mass_ref(truth)
+    rows: list[dict[str, Any]] = []
+    for component_index in scaling_indices:
+        if component_index >= luminosity_ratio.size:
+            continue
+        luminosity = float(luminosity_ratio[component_index])
+        sigma_value = float(sigma_ref[component_index])
+        cut_value = float(cut_ref[component_index])
+        vdslope_value = float(vdslope[component_index])
+        slope_value = float(slope[component_index])
+        if not (
+            np.isfinite(luminosity)
+            and luminosity > 0.0
+            and np.isfinite(sigma_value)
+            and sigma_value > 0.0
+            and np.isfinite(cut_value)
+            and cut_value > 0.0
+            and np.isfinite(vdslope_value)
+            and vdslope_value > 0.0
+            and np.isfinite(slope_value)
+            and slope_value > 0.0
+        ):
+            continue
+        record = record_by_component.get(int(component_index), {})
+        potfile_id = str(record.get("potfile_id", "potfile"))
+        x_arcsec = _finite_float_or_nan(record.get("x_centre"))
+        y_arcsec = _finite_float_or_nan(record.get("y_centre"))
+        if (not np.isfinite(x_arcsec)) and component_index < x_center_base.size:
+            x_arcsec = _finite_float_or_nan(x_center_base[component_index])
+        if (not np.isfinite(y_arcsec)) and component_index < y_center_base.size:
+            y_arcsec = _finite_float_or_nan(y_center_base[component_index])
+        recovered_radius = float(np.hypot(x_arcsec, y_arcsec)) if np.isfinite(x_arcsec) and np.isfinite(y_arcsec) else float("nan")
+        truth_sigma_ref = _truth_scaling_reference_value(truth, potfile_id, "sigma", float(sigma_value))
+        truth_cut_ref = _truth_scaling_reference_value(truth, potfile_id, "cutkpc", float(cut_value))
+        normalization = 1.0
+        if np.isfinite(truth_sigma_ref) and truth_sigma_ref > 0.0:
+            normalization *= (sigma_value / truth_sigma_ref) ** 2
+        if np.isfinite(truth_cut_ref) and truth_cut_ref > 0.0:
+            normalization *= cut_value / truth_cut_ref
+        exponent = 2.0 / vdslope_value + 2.0 / slope_value
+        mass = mass_ref * normalization * luminosity**exponent
+        if not (np.isfinite(mass) and mass > 0.0):
+            continue
+        rows.append(
+            {
+                "component_index": int(component_index),
+                "potfile_id": potfile_id,
+                "catalog_id": str(record.get("catalog_id", f"component{component_index}")),
+                "x_arcsec": float(x_arcsec),
+                "y_arcsec": float(y_arcsec),
+                "recovered_radius_arcsec": recovered_radius,
+                "luminosity_ratio": luminosity,
+                "sigma_ref": sigma_value,
+                "cut_ref_kpc": cut_value,
+                "vdslope": vdslope_value,
+                "slope": slope_value,
+                "mass_normalization_ratio": float(normalization),
+                "recovered_subhalo_mass_msun": float(mass),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _finite_nonnegative_series(df: pd.DataFrame, column: str) -> np.ndarray:
+    if column not in df.columns:
+        return np.empty((0,), dtype=float)
+    values = pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
+    return values[np.isfinite(values) & (values >= 0.0)]
+
+
+def _finite_radius_from_xy(df: pd.DataFrame, x_column: str, y_column: str) -> np.ndarray:
+    if not {x_column, y_column}.issubset(df.columns):
+        return np.empty((0,), dtype=float)
+    x_values = pd.to_numeric(df[x_column], errors="coerce").to_numpy(dtype=float)
+    y_values = pd.to_numeric(df[y_column], errors="coerce").to_numpy(dtype=float)
+    finite = np.isfinite(x_values) & np.isfinite(y_values)
+    if not np.any(finite):
+        return np.empty((0,), dtype=float)
+    radii = np.hypot(x_values[finite], y_values[finite])
+    return radii[np.isfinite(radii) & (radii >= 0.0)]
+
+
+def _subhalo_log_mass_bins(*mass_arrays: np.ndarray) -> np.ndarray | None:
+    positive_arrays = [np.asarray(values, dtype=float) for values in mass_arrays if np.asarray(values).size]
+    positive_arrays = [values[np.isfinite(values) & (values > 0.0)] for values in positive_arrays]
+    positive_arrays = [values for values in positive_arrays if values.size]
+    if not positive_arrays:
+        return None
+    all_mass = np.concatenate(positive_arrays)
+    log_mass = np.log10(all_mass)
+    log_min = float(np.nanmin(log_mass))
+    log_max = float(np.nanmax(log_mass))
+    if not np.isfinite(log_min) or not np.isfinite(log_max):
+        return None
+    if log_max <= log_min:
+        log_min -= 0.25
+        log_max += 0.25
+    n_bins = int(np.clip(np.sqrt(max(int(all_mass.size), 1)), 6, 18))
+    return np.linspace(log_min, log_max, n_bins + 1)
+
+
+def _subhalo_linear_bins(*value_arrays: np.ndarray) -> np.ndarray | None:
+    finite_arrays = [np.asarray(values, dtype=float) for values in value_arrays if np.asarray(values).size]
+    finite_arrays = [values[np.isfinite(values) & (values >= 0.0)] for values in finite_arrays]
+    finite_arrays = [values for values in finite_arrays if values.size]
+    if not finite_arrays:
+        return None
+    all_values = np.concatenate(finite_arrays)
+    value_min = float(np.nanmin(all_values))
+    value_max = float(np.nanmax(all_values))
+    if not np.isfinite(value_min) or not np.isfinite(value_max):
+        return None
+    if value_max <= value_min:
+        padding = max(0.5, 0.1 * max(abs(value_min), 1.0))
+        value_min = max(0.0, value_min - padding)
+        value_max += padding
+    n_bins = int(np.clip(np.sqrt(max(int(all_values.size), 1)), 6, 18))
+    return np.linspace(value_min, value_max, n_bins + 1)
+
+
+def _plot_subhalo_recovery_shmf(truth: dict[str, Any], recovered_subhalo_df: pd.DataFrame, path: Path) -> None:
+    truth_subhalo_df = pd.DataFrame(truth.get("subhalos", [])) if isinstance(truth, dict) else pd.DataFrame()
+    truth_mass = _positive_finite_series(truth_subhalo_df, "subhalo_mass_msun")
+    recovered_mass = _positive_finite_series(recovered_subhalo_df, "recovered_subhalo_mass_msun")
+    selection = truth.get("subhalo_selection", {}) if isinstance(truth, dict) else {}
+    if not isinstance(selection, dict):
+        selection = {}
+    if truth_mass.size == 0 or recovered_mass.size == 0:
+        _write_placeholder_plot(
+            path,
+            "Recovered SHMF",
+            "Selected truth and recovered subhalo masses are required for this comparison.",
+        )
+        return
+
+    bins = _subhalo_log_mass_bins(truth_mass, recovered_mass)
+    if bins is None:
+        _write_placeholder_plot(path, "Recovered SHMF", "No finite subhalo log masses are available.")
+        return
+    truth_log_mass = np.log10(truth_mass)
+    recovered_log_mass = np.log10(recovered_mass)
+    bin_width = float(np.mean(np.diff(bins)))
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.8))
+    ax.hist(
+        truth_log_mass,
+        bins=bins,
+        weights=np.full(truth_log_mass.size, 1.0 / bin_width),
+        histtype="stepfilled",
+        color="lightgray",
+        alpha=0.8,
+        label="Truth subhalos",
+    )
+    ax.hist(
+        recovered_log_mass,
+        bins=bins,
+        weights=np.full(recovered_log_mass.size, 1.0 / bin_width),
+        histtype="step",
+        color="tab:blue",
+        linewidth=2.0,
+        label="recovered subhalos",
+    )
+    schechter_alpha = float(selection.get("schechter_alpha", SingleBCGMockConfig().subhalo_schechter_alpha))
+    mass_ref = float(selection.get("mass_ref", SingleBCGMockConfig().subhalo_mass_ref))
+    exponent = float(
+        selection.get("mass_luminosity_exponent", _subhalo_mass_luminosity_exponent(SingleBCGMockConfig()))
+    )
+    if (
+        np.isfinite(schechter_alpha)
+        and np.isfinite(mass_ref)
+        and mass_ref > 0.0
+        and np.isfinite(exponent)
+        and exponent > 0.0
+    ):
+        log_mass_grid = np.linspace(float(bins[0]), float(bins[-1]), 256)
+        mass_grid = np.power(10.0, log_mass_grid)
+        luminosity_grid = np.power(mass_grid / mass_ref, 1.0 / exponent)
+        schechter_density = np.power(luminosity_grid, schechter_alpha + 1.0) * np.exp(-luminosity_grid)
+        schechter_norm = float(np.trapezoid(schechter_density, log_mass_grid))
+        if np.isfinite(schechter_norm) and schechter_norm > 0.0:
+            schechter_density = schechter_density / schechter_norm * float(truth_log_mass.size)
+            ax.plot(
+                log_mass_grid,
+                schechter_density,
+                color="black",
+                linestyle="--",
+                linewidth=1.3,
+                label=fr"Schechter $\alpha={schechter_alpha:.2g}$",
+            )
+    ax.set_yscale("log")
+    ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+    ax.tick_params(axis="x", which="minor", length=3.0)
+    ax.tick_params(axis="both", which="major", labelsize=12)
+    ax.set_xlabel(r"$\log_{10}(M_{\rm sub}/M_\odot)$", fontsize=14)
+    ax.set_ylabel(r"$dN/d\log_{10}M$", fontsize=14)
+    ax.legend(loc="upper left", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_subhalo_recovery_radial(truth: dict[str, Any], recovered_subhalo_df: pd.DataFrame, path: Path) -> None:
+    truth_subhalo_df = pd.DataFrame(truth.get("subhalos", [])) if isinstance(truth, dict) else pd.DataFrame()
+    truth_radius = _finite_radius_from_xy(truth_subhalo_df, "x_arcsec", "y_arcsec")
+    recovered_radius = _finite_nonnegative_series(recovered_subhalo_df, "recovered_radius_arcsec")
+    if truth_radius.size == 0 or recovered_radius.size == 0:
+        _write_placeholder_plot(
+            path,
+            "Recovered subhalo radial distribution",
+            "Selected truth and recovered subhalo radii are required for this comparison.",
+        )
+        return
+
+    bins = _subhalo_linear_bins(truth_radius, recovered_radius)
+    if bins is None:
+        _write_placeholder_plot(path, "Recovered subhalo radial distribution", "No finite subhalo radii are available.")
+        return
+    bin_width = float(np.mean(np.diff(bins)))
+    if not np.isfinite(bin_width) or bin_width <= 0.0:
+        _write_placeholder_plot(path, "Recovered subhalo radial distribution", "Subhalo radial bins are invalid.")
+        return
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.8))
+    ax.hist(
+        truth_radius,
+        bins=bins,
+        weights=np.full(truth_radius.size, 1.0 / bin_width),
+        histtype="stepfilled",
+        color="lightgray",
+        alpha=0.8,
+        label="Truth subhalos",
+    )
+    ax.hist(
+        recovered_radius,
+        bins=bins,
+        weights=np.full(recovered_radius.size, 1.0 / bin_width),
+        histtype="step",
+        color="tab:blue",
+        linewidth=2.0,
+        label="recovered subhalos",
+    )
+    ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+    ax.tick_params(axis="x", which="minor", length=3.0)
+    ax.tick_params(axis="both", which="major", labelsize=12)
+    ax.set_xlabel(r"$R_{\rm sub}$ [arcsec]", fontsize=14)
+    ax.set_ylabel(r"$dN/dR$ [arcsec$^{-1}$]", fontsize=14)
+    ax.legend(loc="upper left", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_prefit_subhalo_spatial_distribution(subhalo_df: pd.DataFrame, images: pd.DataFrame, path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(6, 5))
+    plotted = False
+    if {"x_obs_arcsec", "y_obs_arcsec"}.issubset(images.columns):
+        image_x = pd.to_numeric(images["x_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
+        image_y = pd.to_numeric(images["y_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
+        finite_images = np.isfinite(image_x) & np.isfinite(image_y)
+        if np.any(finite_images):
+            ax.scatter(image_x[finite_images], image_y[finite_images], color="black", marker="x", s=26, label="images")
+            plotted = True
+
+    if {"x_arcsec", "y_arcsec"}.issubset(subhalo_df.columns):
+        subhalo_x = pd.to_numeric(subhalo_df["x_arcsec"], errors="coerce").to_numpy(dtype=float)
+        subhalo_y = pd.to_numeric(subhalo_df["y_arcsec"], errors="coerce").to_numpy(dtype=float)
+        finite_subhalos = np.isfinite(subhalo_x) & np.isfinite(subhalo_y)
+        if np.any(finite_subhalos):
+            sizes = np.full(np.count_nonzero(finite_subhalos), 34.0, dtype=float)
+            if "luminosity_ratio" in subhalo_df.columns:
+                luminosity = pd.to_numeric(subhalo_df["luminosity_ratio"], errors="coerce").to_numpy(dtype=float)
+                luminosity = luminosity[finite_subhalos]
+                finite_luminosity = np.isfinite(luminosity) & (luminosity > 0.0)
+                if np.any(finite_luminosity):
+                    sizes[finite_luminosity] = 12.0 + 80.0 * np.sqrt(luminosity[finite_luminosity])
+            if "catalog_mag" in subhalo_df.columns:
+                magnitude = pd.to_numeric(subhalo_df["catalog_mag"], errors="coerce").to_numpy(dtype=float)
+                magnitude = magnitude[finite_subhalos]
+                if np.any(np.isfinite(magnitude)):
+                    scatter = ax.scatter(
+                        subhalo_x[finite_subhalos],
+                        subhalo_y[finite_subhalos],
+                        s=sizes,
+                        c=magnitude,
+                        cmap="viridis_r",
+                        alpha=0.75,
+                        label="subhalos",
+                    )
+                    fig.colorbar(scatter, ax=ax, label="member magnitude")
+                else:
+                    ax.scatter(
+                        subhalo_x[finite_subhalos],
+                        subhalo_y[finite_subhalos],
+                        s=sizes,
+                        color="tab:purple",
+                        alpha=0.75,
+                        label="subhalos",
+                    )
+            else:
+                ax.scatter(
+                    subhalo_x[finite_subhalos],
+                    subhalo_y[finite_subhalos],
+                    s=sizes,
+                    color="tab:purple",
+                    alpha=0.75,
+                    label="subhalos",
+                )
+            plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        _write_placeholder_plot(
+            path,
+            "Pre-fit subhalo spatial distribution",
+            "No finite image or subhalo positions are available for this mock.",
+        )
+        return
     ax.scatter([0.0], [0.0], color="tab:red", marker="+", s=80, label="BCG")
     ax.invert_xaxis()
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("x [arcsec]")
     ax.set_ylabel("y [arcsec]")
-    ax.set_title("Subhalo field")
+    ax.set_title("Pre-fit subhalo field")
     ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def _select_prefit_critical_line_contours(
+    contours_by_z: dict[str, list[CausticContour]],
+) -> dict[str, list[CausticContour]]:
+    z9_contours = _select_critical_caustic_plot_contours(contours_by_z)
+    if z9_contours:
+        return z9_contours
+    selected_key: str | None = None
+    selected_z = -np.inf
+    for z_key, contours in contours_by_z.items():
+        if not contours:
+            continue
+        try:
+            z_source = float(z_key)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(z_source) and z_source > selected_z:
+            selected_key = str(z_key)
+            selected_z = z_source
+    return {selected_key: contours_by_z[selected_key]} if selected_key is not None else {}
+
+
+def _plot_prefit_critical_lines(truth: dict[str, Any], path: Path) -> None:
+    contours_by_z = _select_prefit_critical_line_contours(_caustic_contours_by_z_from_truth(truth))
+    if not contours_by_z:
+        _write_placeholder_plot(
+            path,
+            "Pre-fit critical lines",
+            "No truth critical-line contours are available for this mock.",
+        )
+        return
+
+    z_label = next(iter(contours_by_z))
+    try:
+        z_display = f"{float(z_label):.4g}"
+    except (TypeError, ValueError):
+        z_display = str(z_label)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.2))
+    image_ax, source_ax = axes
+    class_colors = {"primary": "black", "subhalo": "tab:purple"}
+    labeled_lines: set[str] = set()
+    labeled_caustics: set[str] = set()
+    for contours in contours_by_z.values():
+        for contour in contours:
+            caustic_class = str(contour.caustic_class)
+            color = class_colors.get(caustic_class, "0.35")
+            line_label = f"{caustic_class} critical line"
+            image_ax.plot(
+                contour.critical_x,
+                contour.critical_y,
+                color=color,
+                lw=0.9,
+                alpha=0.8,
+                label=line_label if line_label not in labeled_lines else None,
+            )
+            labeled_lines.add(line_label)
+            caustic_label = f"{caustic_class} caustic"
+            source_ax.scatter(
+                contour.beta_x,
+                contour.beta_y,
+                color=color,
+                s=2.0,
+                alpha=0.6,
+                linewidths=0.0,
+                label=caustic_label if caustic_label not in labeled_caustics else None,
+            )
+            labeled_caustics.add(caustic_label)
+
+    image_ax.invert_xaxis()
+    image_ax.set_aspect("equal", adjustable="box")
+    image_ax.set_xlabel("x [arcsec]")
+    image_ax.set_ylabel("y [arcsec]")
+    image_ax.set_title(fr"Truth image plane, $z_s={z_display}$")
+    image_ax.legend(loc="best", fontsize=7)
+    source_ax.set_aspect("equal", adjustable="box")
+    source_ax.set_xlabel(r"$\beta_x$ [arcsec]")
+    source_ax.set_ylabel(r"$\beta_y$ [arcsec]")
+    source_ax.set_title(fr"Truth source plane, $z_s={z_display}$")
+    source_ax.legend(loc="best", fontsize=7)
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -2897,6 +4603,7 @@ def _plot_critical_caustic_recovery(
 def _plot_validation_summary(summary: dict[str, float], uncertainty: dict[str, tuple[float, float]], path: Path) -> None:
     labels = [
         "median image residual",
+        "median arc-aware residual",
         "median source error",
         "median |mu| frac. error",
         "parameter 1 sigma coverage",
@@ -2904,6 +4611,7 @@ def _plot_validation_summary(summary: dict[str, float], uncertainty: dict[str, t
     ]
     values = [
         summary["median_image_residual_arcsec"],
+        summary.get("median_arc_aware_image_residual_arcsec", np.nan),
         summary["median_source_position_error_arcsec"],
         summary["median_abs_magnification_frac_error"],
         summary["parameter_coverage_68_fraction"],
@@ -2911,6 +4619,7 @@ def _plot_validation_summary(summary: dict[str, float], uncertainty: dict[str, t
     ]
     keys = [
         "median_image_residual_arcsec",
+        "median_arc_aware_image_residual_arcsec",
         "median_source_position_error_arcsec",
         "median_abs_magnification_frac_error",
         "parameter_coverage_68_fraction",
@@ -2918,7 +4627,7 @@ def _plot_validation_summary(summary: dict[str, float], uncertainty: dict[str, t
     ]
     fig, ax = plt.subplots(figsize=(7, 4))
     y = np.arange(len(labels))
-    ax.barh(y, values, color=["tab:blue", "tab:cyan", "tab:purple", "tab:green", "tab:orange"], alpha=0.85)
+    ax.barh(y, values, color=["tab:blue", "tab:olive", "tab:cyan", "tab:purple", "tab:green", "tab:orange"], alpha=0.85)
     for idx, (key, value) in enumerate(zip(keys, values)):
         low, high = uncertainty.get(key, (np.nan, np.nan))
         if np.isfinite(value) and np.isfinite(low) and np.isfinite(high):
@@ -2956,15 +4665,46 @@ def _validation_stage_arg_values(value: Any, *, flag_name: str) -> list[Any]:
 
 
 def _validation_linearized_stage_enabled(args: argparse.Namespace) -> bool:
-    return str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) == IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA
+    return str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) in {
+        IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
+    }
 
 
-def _validation_marginal_image_plane_stage_enabled(args: argparse.Namespace) -> bool:
-    return str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) == IMAGE_PLANE_MODE_MARGINAL
+def _validation_blocked_linearized_stage_enabled(args: argparse.Namespace) -> bool:
+    return (
+        str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE))
+        == IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED
+    )
+
+
+def _validation_forward_metric_stage_enabled(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) == IMAGE_PLANE_MODE_FORWARD_METRIC
+
+
+def _validation_anchored_solved_stage_enabled(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) == IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA
+
+
+def _validation_critical_arc_mixture_stage_enabled(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) == IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
+
+
+def _validation_fold_regularized_stage_enabled(args: argparse.Namespace) -> bool:
+    return (
+        str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE))
+        == IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA
+    )
 
 
 def _validation_stage4_enabled(args: argparse.Namespace) -> bool:
-    return _validation_linearized_stage_enabled(args) or _validation_marginal_image_plane_stage_enabled(args)
+    return (
+        _validation_linearized_stage_enabled(args)
+        or _validation_forward_metric_stage_enabled(args)
+        or _validation_anchored_solved_stage_enabled(args)
+        or _validation_critical_arc_mixture_stage_enabled(args)
+        or _validation_fold_regularized_stage_enabled(args)
+    )
 
 
 def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[str, ValidationStageFitControls]:
@@ -2978,6 +4718,24 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             raise SystemExit(f"{flag_name} must be one of {', '.join(JAX_DEVICE_CHOICES)}.")
     if bool(getattr(args, "resume_fast", False)) and solver_fit_mode != SOLVER_FIT_MODE_SEQUENTIAL:
         raise SystemExit("--resume-fast is only valid with --solver-fit-mode sequential.")
+    if bool(getattr(args, "start_at_stage3", False)):
+        if solver_fit_mode != SOLVER_FIT_MODE_SEQUENTIAL:
+            raise SystemExit("--start-at-stage3 is only valid with --solver-fit-mode sequential.")
+        if mode not in {
+            IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
+            IMAGE_PLANE_MODE_FORWARD_METRIC,
+            IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+            IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        }:
+            raise SystemExit("--start-at-stage3 requires a stage-3-capable --image-plane-mode.")
+        if bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)):
+            raise SystemExit(
+                "--start-at-stage3 requires stage 3 and is incompatible with "
+                "--skip-stage3-image-plane-local-jacobian."
+            )
     ns_num_live_points = getattr(args, "ns_num_live_points", None)
     if ns_num_live_points is not None and int(ns_num_live_points) <= 0:
         raise SystemExit("--ns-num-live-points must be positive when provided.")
@@ -3033,13 +4791,15 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     ]
     if any(value < 0 for value in max_tree_depths):
         raise SystemExit("--max-tree-depth values must be non-negative.")
-    if float(getattr(args, "image_plane_scatter_upper_arcsec", DEFAULT_IMAGE_SIGMA_INT_UPPER_ARCSEC)) <= 0.0:
-        raise SystemExit("--image-plane-scatter-upper-arcsec must be positive.")
-    if (
-        not np.isfinite(float(getattr(args, "image_plane_scatter_floor_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC)))
-        or float(getattr(args, "image_plane_scatter_floor_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC)) < 0.0
-    ):
-        raise SystemExit("--image-plane-scatter-floor-arcsec must be non-negative.")
+    image_scatter_floor = float(getattr(args, "image_plane_scatter_floor_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC))
+    if not np.isfinite(image_scatter_floor) or image_scatter_floor <= 0.0:
+        raise SystemExit("--image-plane-scatter-floor-arcsec must be positive.")
+    image_scatter_upper = float(getattr(args, "image_plane_scatter_upper_arcsec", DEFAULT_IMAGE_SIGMA_INT_UPPER_ARCSEC))
+    if not np.isfinite(image_scatter_upper) or image_scatter_upper <= image_scatter_floor:
+        raise SystemExit(
+            "--image-plane-scatter-upper-arcsec must be greater than "
+            "--image-plane-scatter-floor-arcsec."
+        )
     if str(getattr(args, "image_plane_scatter_prior", DEFAULT_IMAGE_PLANE_SCATTER_PRIOR)) not in IMAGE_PLANE_SCATTER_PRIORS:
         raise SystemExit(
             "--image-plane-scatter-prior must be one of "
@@ -3050,11 +4810,28 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         or float(getattr(args, "image_plane_scatter_prior_median_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_MEDIAN_ARCSEC)) <= 0.0
     ):
         raise SystemExit("--image-plane-scatter-prior-median-arcsec must be positive.")
+    image_scatter_prior = str(getattr(args, "image_plane_scatter_prior", DEFAULT_IMAGE_PLANE_SCATTER_PRIOR))
+    image_scatter_prior_median = float(
+        getattr(args, "image_plane_scatter_prior_median_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_MEDIAN_ARCSEC)
+    )
+    if (
+        image_scatter_prior == IMAGE_PLANE_SCATTER_PRIOR_LOGNORMAL
+        and not (image_scatter_floor < image_scatter_prior_median < image_scatter_upper)
+    ):
+        raise SystemExit(
+            "--image-plane-scatter-prior-median-arcsec must be between "
+            "--image-plane-scatter-floor-arcsec and --image-plane-scatter-upper-arcsec for lognormal scatter priors."
+        )
     if (
         not np.isfinite(float(getattr(args, "image_plane_scatter_prior_log_sigma", DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_LOG_SIGMA)))
         or float(getattr(args, "image_plane_scatter_prior_log_sigma", DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_LOG_SIGMA)) <= 0.0
     ):
         raise SystemExit("--image-plane-scatter-prior-log-sigma must be positive.")
+    fixed_image_sigma_int = getattr(args, "fix_image_sigma_int_arcsec", None)
+    if fixed_image_sigma_int is not None and (
+        not np.isfinite(float(fixed_image_sigma_int)) or float(fixed_image_sigma_int) < 0.0
+    ):
+        raise SystemExit("--fix-image-sigma-int-arcsec must be finite and nonnegative.")
     image_presence_penalty_weight = getattr(args, "image_presence_penalty_weight", None)
     if image_presence_penalty_weight is not None and (
         not np.isfinite(float(image_presence_penalty_weight)) or float(image_presence_penalty_weight) < 0.0
@@ -3100,12 +4877,92 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         or float(getattr(args, "likelihood_stabilizer_student_t_nu", DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU)) <= 0.0
     ):
         raise SystemExit("--likelihood-stabilizer-student-t-nu must be positive.")
-    if bool(getattr(args, "fit_cosmology_all_stages", False)) and not bool(getattr(args, "fit_cosmology_flat_wcdm", False)):
-        raise SystemExit("--fit-cosmology-all-stages requires --fit-cosmology-flat-wcdm.")
-    if solver_fit_mode == SOLVER_FIT_MODE_EVIDENCE_NS:
-        sampled_source_evidence = (
-            evidence_likelihood_mode == EVIDENCE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
+    anchored_solve_steps = int(
+        getattr(args, "anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)
+    )
+    if anchored_solve_steps < 0:
+        raise SystemExit("--anchored-image-plane-solve-steps must be non-negative.")
+    anchored_trust_radius = float(
+        getattr(args, "anchored_image_plane_trust_radius_arcsec", DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC)
+    )
+    if not np.isfinite(anchored_trust_radius) or anchored_trust_radius <= 0.0:
+        raise SystemExit("--anchored-image-plane-trust-radius-arcsec must be finite and positive.")
+    anchored_lm_relative = float(
+        getattr(args, "anchored_image_plane_lm_damping_relative", DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE)
+    )
+    if not np.isfinite(anchored_lm_relative) or anchored_lm_relative <= 0.0:
+        raise SystemExit("--anchored-image-plane-lm-damping-relative must be finite and positive.")
+    anchored_lm_absolute = float(
+        getattr(args, "anchored_image_plane_lm_damping_absolute", DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_ABSOLUTE)
+    )
+    if not np.isfinite(anchored_lm_absolute) or anchored_lm_absolute <= 0.0:
+        raise SystemExit("--anchored-image-plane-lm-damping-absolute must be finite and positive.")
+    critical_arc_critical_direction_sigma = float(
+        getattr(args, "critical_arc_critical_direction_sigma_arcsec", DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)
+    )
+    if not np.isfinite(critical_arc_critical_direction_sigma) or critical_arc_critical_direction_sigma <= 0.0:
+        raise SystemExit("--critical-arc-critical-direction-sigma-arcsec must be finite and positive.")
+    critical_arc_base_prob = float(getattr(args, "critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB))
+    critical_arc_max_prob = float(getattr(args, "critical_arc_max_prob", DEFAULT_CRITICAL_ARC_MAX_PROB))
+    if (
+        not np.isfinite(critical_arc_base_prob)
+        or not np.isfinite(critical_arc_max_prob)
+        or critical_arc_base_prob < 0.0
+        or critical_arc_max_prob > 1.0
+        or critical_arc_base_prob > critical_arc_max_prob
+    ):
+        raise SystemExit("--critical-arc-base-prob and --critical-arc-max-prob must satisfy 0 <= base <= max <= 1.")
+    critical_arc_singular_threshold = float(
+        getattr(args, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)
+    )
+    if not np.isfinite(critical_arc_singular_threshold) or critical_arc_singular_threshold <= 0.0:
+        raise SystemExit("--critical-arc-singular-threshold must be finite and positive.")
+    critical_arc_singular_softness = float(
+        getattr(args, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
+    )
+    if not np.isfinite(critical_arc_singular_softness) or critical_arc_singular_softness <= 0.0:
+        raise SystemExit("--critical-arc-singular-softness must be finite and positive.")
+    critical_arc_lm_relative = float(
+        getattr(args, "critical_arc_lm_damping_relative", DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE)
+    )
+    if not np.isfinite(critical_arc_lm_relative) or critical_arc_lm_relative <= 0.0:
+        raise SystemExit("--critical-arc-lm-damping-relative must be finite and positive.")
+    critical_arc_lm_absolute = float(
+        getattr(args, "critical_arc_lm_damping_absolute", DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE)
+    )
+    if not np.isfinite(critical_arc_lm_absolute) or critical_arc_lm_absolute <= 0.0:
+        raise SystemExit("--critical-arc-lm-damping-absolute must be finite and positive.")
+    critical_arc_lm_trust_radius = float(
+        getattr(args, "critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
+    )
+    if not np.isfinite(critical_arc_lm_trust_radius) or critical_arc_lm_trust_radius <= 0.0:
+        raise SystemExit("--critical-arc-lm-trust-radius-arcsec must be finite and positive.")
+    arc_aware_noncritical_support_radius = float(
+        getattr(
+            args,
+            "arc_aware_noncritical_support_radius_arcsec",
+            DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
         )
+    )
+    if not np.isfinite(arc_aware_noncritical_support_radius) or arc_aware_noncritical_support_radius <= 0.0:
+        raise SystemExit("--arc-aware-noncritical-support-radius-arcsec must be finite and positive.")
+    arc_aware_max_arclength = float(
+        getattr(args, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
+    )
+    if not np.isfinite(arc_aware_max_arclength) or arc_aware_max_arclength <= 0.0:
+        raise SystemExit("--arc-aware-max-arclength-arcsec must be finite and positive.")
+    arc_aware_curve_step = float(getattr(args, "arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC))
+    if not np.isfinite(arc_aware_curve_step) or arc_aware_curve_step <= 0.0:
+        raise SystemExit("--arc-aware-curve-step-arcsec must be finite and positive.")
+    fold_curvature = float(getattr(args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV))
+    if not np.isfinite(fold_curvature) or fold_curvature <= 0.0:
+        raise SystemExit("--fold-curvature-arcsec-inv must be finite and positive.")
+    if solver_fit_mode == SOLVER_FIT_MODE_EVIDENCE_NS:
+        if bool(getattr(args, "potfile_mass_size_reparam", False)):
+            raise SystemExit(
+                "--potfile-mass-size-reparam is only supported with NumPyro SVI/NUTS samplers, "
+                "not --solver-fit-mode evidence-ns."
+            )
         if evidence_prior_sigma is None:
             raise SystemExit("--solver-fit-mode evidence-ns requires --evidence-source-prior-sigma-arcsec.")
         if mode != IMAGE_PLANE_MODE_NONE:
@@ -3114,43 +4971,32 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             raise SystemExit("--sampling-engine active_subset is not valid with --solver-fit-mode evidence-ns.")
         if bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)):
             raise SystemExit("--skip-stage3-image-plane-local-jacobian is not valid with --solver-fit-mode evidence-ns.")
-        if int(getattr(args, "image_plane_newton_steps", 0)) != 0 and not sampled_source_evidence:
-            raise SystemExit(
-                "--image-plane-newton-steps is only valid with --solver-fit-mode evidence-ns "
-                "--evidence-likelihood-mode linearized-forward-beta-image-plane."
-            )
         if (
-            sampled_source_evidence
-            and str(getattr(args, "sampling_engine", "full")) == "refreshing_surrogate"
+            str(getattr(args, "sampling_engine", "full")) == "refreshing_surrogate"
             and int(getattr(args, "image_plane_newton_steps", 0)) > 0
         ):
             raise SystemExit(
                 "--sampling-engine refreshing_surrogate with linearized-forward-beta-image-plane "
                 "requires --image-plane-newton-steps 0."
             )
-        if (
-            str(getattr(args, "source_position_parameterization", "prior-whitened")) != "prior-whitened"
-            and not sampled_source_evidence
-        ):
-            raise SystemExit(
-                "--source-position-parameterization is only valid with --solver-fit-mode evidence-ns "
-                "--evidence-likelihood-mode linearized-forward-beta-image-plane."
-            )
         controls = {
             "stage2": ValidationStageFitControls(
                 fit_method=FIT_METHOD_NS,
+                svi_steps=0,
                 warmup=0,
                 samples=0,
                 max_tree_depth=int(max_tree_depths[0]),
             ),
             "stage3": ValidationStageFitControls(
                 fit_method=FIT_METHOD_NS,
+                svi_steps=0,
                 warmup=0,
                 samples=0,
                 max_tree_depth=int(max_tree_depths[0]),
             ),
             "stage4": ValidationStageFitControls(
                 fit_method=FIT_METHOD_NS,
+                svi_steps=0,
                 warmup=0,
                 samples=0,
                 max_tree_depth=int(max_tree_depths[0]),
@@ -3159,12 +5005,42 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         return controls
     if evidence_likelihood_mode != DEFAULT_EVIDENCE_LIKELIHOOD_MODE:
         raise SystemExit("--evidence-likelihood-mode is only valid with --solver-fit-mode evidence-ns.")
+    if mode in {
+        IMAGE_PLANE_MODE_FORWARD_METRIC,
+        IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+    }:
+        if int(getattr(args, "image_plane_newton_steps", 0)) != 0:
+            raise SystemExit(f"--image-plane-newton-steps must be 0 for --image-plane-mode {mode}.")
+        if str(getattr(args, "source_position_parameterization", "prior-whitened")) == "conditional-whitened":
+            raise SystemExit(
+                "--source-position-parameterization conditional-whitened is not supported with "
+                f"--image-plane-mode {mode}."
+            )
+    if (
+        mode == IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA
+        and str(getattr(args, "sampling_engine", "full")) == "refreshing_surrogate"
+        and anchored_solve_steps > 0
+    ):
+        raise SystemExit(
+            "--sampling-engine refreshing_surrogate is not supported with "
+            "--image-plane-mode anchored-solved-forward-beta-image-plane unless "
+            "--anchored-image-plane-solve-steps is 0."
+        )
 
     fit_methods = [
         str(value)
         for value in _validation_stage_arg_values(
             getattr(args, "fit_method", FIT_METHOD_SVI_NUTS),
             flag_name="--fit-method",
+        )
+    ]
+    svi_steps = [
+        int(value)
+        for value in _validation_stage_arg_values(
+            getattr(args, "svi_steps", 1000),
+            flag_name="--svi-steps",
         )
     ]
     warmups = [
@@ -3183,28 +5059,45 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     ]
 
     invalid_fit_methods = sorted(
-        set(fit_methods).difference({FIT_METHOD_SVI, FIT_METHOD_SVI_NUTS, FIT_METHOD_NS, FIT_METHOD_SMC})
+        set(fit_methods).difference({FIT_METHOD_SVI, FIT_METHOD_SVI_NUTS, FIT_METHOD_NUTS, FIT_METHOD_NS, FIT_METHOD_SMC})
     )
     if invalid_fit_methods:
         raise SystemExit(f"--fit-method has unsupported value(s): {', '.join(invalid_fit_methods)}")
     if any(value == FIT_METHOD_NS for value in fit_methods):
         raise SystemExit("--fit-method ns is only valid with --solver-fit-mode evidence-ns.")
+    if any(value <= 0 for value in svi_steps):
+        raise SystemExit("--svi-steps values must be positive.")
     if any(value < 0 for value in warmups):
         raise SystemExit("--warmup values must be non-negative.")
     if any(value <= 0 for value in samples):
         raise SystemExit("--samples values must be positive.")
+    if getattr(args, "blocked_nuts_cycles", None) is not None and int(args.blocked_nuts_cycles) <= 0:
+        raise SystemExit("--blocked-nuts-cycles must be positive when provided.")
+    if getattr(args, "blocked_nuts_pilot_warmup", None) is not None and int(args.blocked_nuts_pilot_warmup) < 0:
+        raise SystemExit("--blocked-nuts-pilot-warmup must be non-negative when provided.")
 
-    max_value_count = max(len(fit_methods), len(warmups), len(samples), len(max_tree_depths))
+    max_value_count = max(len(fit_methods), len(svi_steps), len(warmups), len(samples), len(max_tree_depths))
     has_stage_specific_values = max_value_count >= 2
     has_three_stage_values = max_value_count == 3
     has_stage3_or_stage4 = mode in {
         IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
         IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
-        IMAGE_PLANE_MODE_MARGINAL,
+        IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
+        IMAGE_PLANE_MODE_FORWARD_METRIC,
+        IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
     }
     has_stage4 = _validation_stage4_enabled(args)
     stage3_active = mode == IMAGE_PLANE_MODE_LOCAL_JACOBIAN or (
-        mode in {IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA, IMAGE_PLANE_MODE_MARGINAL}
+        mode in {
+            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
+            IMAGE_PLANE_MODE_FORWARD_METRIC,
+            IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+            IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        }
         and not bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False))
     )
     if bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)) and not has_stage4:
@@ -3222,12 +5115,12 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         )
     if has_stage_specific_values and not has_stage3_or_stage4:
         raise SystemExit(
-            "Two-value --fit-method, --warmup, --samples, or --max-tree-depth is only valid with "
+            "Two-value --fit-method, --svi-steps, --warmup, --samples, or --max-tree-depth is only valid with "
             "an image-plane mode."
         )
     if has_three_stage_values and not has_stage4:
         raise SystemExit(
-            "Three-value --fit-method, --warmup, --samples, or --max-tree-depth is only valid with "
+            "Three-value --fit-method, --svi-steps, --warmup, --samples, or --max-tree-depth is only valid with "
             "a final stage-4 image-plane mode."
         )
     if float(getattr(args, "linearized_beta_prior_sigma_arcsec", DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC)) <= 0.0:
@@ -3247,22 +5140,32 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     controls = {
         "stage2": ValidationStageFitControls(
             fit_method=str(stage_value(fit_methods, 0)),
+            svi_steps=int(stage_value(svi_steps, 0)),
             warmup=int(stage_value(warmups, 0)),
             samples=int(stage_value(samples, 0)),
             max_tree_depth=int(stage_value(max_tree_depths, 0)),
         ),
         "stage3": ValidationStageFitControls(
             fit_method=str(stage_value(fit_methods, 1)),
+            svi_steps=int(stage_value(svi_steps, 1)),
             warmup=int(stage_value(warmups, 1)),
             samples=int(stage_value(samples, 1)),
             max_tree_depth=int(stage_value(max_tree_depths, 1)),
         ),
         "stage4": ValidationStageFitControls(
             fit_method=str(stage4_value(fit_methods)),
+            svi_steps=int(stage4_value(svi_steps)),
             warmup=int(stage4_value(warmups)),
             samples=int(stage4_value(samples)),
             max_tree_depth=int(stage4_value(max_tree_depths)),
         ),
+    }
+    stage4_direct_sampler_modes = {
+        IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_FORWARD_METRIC,
+        IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
     }
     smc_stages: list[str] = []
     if controls["stage2"].fit_method == FIT_METHOD_SMC:
@@ -3271,9 +5174,29 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         smc_stages.append("stage3")
     if has_stage4 and controls["stage4"].fit_method == FIT_METHOD_SMC:
         smc_stages.append("stage4")
+    nuts_stages: list[str] = []
+    if controls["stage2"].fit_method == FIT_METHOD_NUTS:
+        nuts_stages.append("stage2")
+    if stage3_active and controls["stage3"].fit_method == FIT_METHOD_NUTS:
+        nuts_stages.append("stage3")
+    if has_stage4 and controls["stage4"].fit_method == FIT_METHOD_NUTS:
+        nuts_stages.append("stage4")
+    if _validation_blocked_linearized_stage_enabled(args) and controls["stage4"].fit_method != FIT_METHOD_SVI_NUTS:
+        raise SystemExit(
+            "--image-plane-mode linearized-forward-beta-blocked-image-plane requires "
+            "stage-4 --fit-method svi+nuts."
+        )
     if smc_stages:
-        if smc_stages != ["stage4"] or not _validation_linearized_stage_enabled(args):
-            raise SystemExit("--fit-method smc is only valid for explicit-beta sequential stage 4.")
+        if smc_stages != ["stage4"] or str(mode) not in stage4_direct_sampler_modes:
+            raise SystemExit("--fit-method smc is only valid for non-blocked stage 4 image-plane modes.")
+    if nuts_stages:
+        if nuts_stages != ["stage4"] or str(mode) not in stage4_direct_sampler_modes:
+            raise SystemExit("--fit-method nuts is only valid for non-blocked stage 4 image-plane modes.")
+    if bool(getattr(args, "potfile_mass_size_reparam", False)):
+        if _validation_blocked_linearized_stage_enabled(args):
+            raise SystemExit("--potfile-mass-size-reparam is not supported with blocked linearized stage 4 NUTS.")
+        if smc_stages:
+            raise SystemExit("--potfile-mass-size-reparam is only supported with NumPyro SVI/NUTS samplers, not --fit-method smc.")
     return controls
 
 
@@ -3289,10 +5212,18 @@ def _validation_root(args: argparse.Namespace) -> Path:
 def _validation_final_stage_name(args: argparse.Namespace) -> str:
     if str(getattr(args, "solver_fit_mode", SOLVER_FIT_MODE_SEQUENTIAL)) == SOLVER_FIT_MODE_EVIDENCE_NS:
         return "fit"
+    if _validation_blocked_linearized_stage_enabled(args):
+        return "stage4_blocked_linearized_image_plane"
+    if _validation_forward_metric_stage_enabled(args):
+        return "stage4_forward_metric_image_plane"
+    if _validation_anchored_solved_stage_enabled(args):
+        return "stage4_anchored_solved_image_plane"
+    if _validation_critical_arc_mixture_stage_enabled(args):
+        return "stage4_critical_arc_mixture_image_plane"
+    if _validation_fold_regularized_stage_enabled(args):
+        return "stage4_fold_regularized_image_plane"
     if _validation_linearized_stage_enabled(args):
         return "stage4_linearized_image_plane"
-    if _validation_marginal_image_plane_stage_enabled(args):
-        return "stage4_marginal_image_plane"
     if str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) == IMAGE_PLANE_MODE_LOCAL_JACOBIAN:
         return "stage3_image_plane"
     return "stage2_joint"
@@ -3330,11 +5261,42 @@ def _validation_recovery_output_paths(output_dir: str | Path) -> dict[str, Path]
         "parameter_recovery_log_plot": root / "parameter_recovery_log.pdf",
         "parameter_recovery_linear_plot": root / "parameter_recovery_linear.pdf",
         "magnification_plot": root / "magnification_recovery.pdf",
+        "absolute_magnification_plot": root / "absolute_magnification_recovery.pdf",
         "image_recovery_plot": root / "image_recovery.pdf",
+        "image_residual_histogram_plot": root / "image_residual_histogram.pdf",
         "source_recovery_plot": root / "source_recovery.pdf",
-        "subhalo_population_plot": root / "subhalo_population.pdf",
+        "subhalo_recovery_shmf_plot": root / "subhalo_recovery_shmf.pdf",
+        "subhalo_recovery_radial_plot": root / "subhalo_recovery_radial.pdf",
         "summary_plot": root / "validation_summary.pdf",
     }
+
+
+def _validation_prefit_output_paths(output_dir: str | Path) -> dict[str, Path]:
+    root = Path(output_dir)
+    return {
+        "subhalo_shmf_plot": root / "subhalo_shmf.pdf",
+        "prefit_subhalo_spatial_distribution_plot": root / "prefit_subhalo_spatial_distribution.pdf",
+        "prefit_critical_lines_plot": root / "prefit_critical_lines.pdf",
+    }
+
+
+def write_prefit_validation_diagnostics(
+    truth: dict[str, Any],
+    images: pd.DataFrame,
+    output_dir: str | Path,
+) -> dict[str, Path]:
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    paths = _validation_prefit_output_paths(root)
+    subhalo_df = pd.DataFrame(truth.get("subhalos", [])) if isinstance(truth, dict) else pd.DataFrame()
+    _plot_subhalo_selection(truth, paths["subhalo_shmf_plot"])
+    _plot_prefit_subhalo_spatial_distribution(
+        subhalo_df,
+        pd.DataFrame(images),
+        paths["prefit_subhalo_spatial_distribution_plot"],
+    )
+    _plot_prefit_critical_lines(truth, paths["prefit_critical_lines_plot"])
+    return paths
 
 
 def _validation_realization_complete(realization_dir: str | Path) -> bool:
@@ -3541,11 +5503,11 @@ def write_validation_results_json(
 
 def _format_stage_controls_for_log(controls: dict[str, ValidationStageFitControls]) -> str:
     return (
-        f"stage2={controls['stage2'].fit_method}/warmup={controls['stage2'].warmup}/"
+        f"stage2={controls['stage2'].fit_method}/svi_steps={controls['stage2'].svi_steps}/warmup={controls['stage2'].warmup}/"
         f"samples={controls['stage2'].samples}/max_tree_depth={controls['stage2'].max_tree_depth} "
-        f"stage3={controls['stage3'].fit_method}/warmup={controls['stage3'].warmup}/"
+        f"stage3={controls['stage3'].fit_method}/svi_steps={controls['stage3'].svi_steps}/warmup={controls['stage3'].warmup}/"
         f"samples={controls['stage3'].samples}/max_tree_depth={controls['stage3'].max_tree_depth} "
-        f"stage4={controls['stage4'].fit_method}/warmup={controls['stage4'].warmup}/"
+        f"stage4={controls['stage4'].fit_method}/svi_steps={controls['stage4'].svi_steps}/warmup={controls['stage4'].warmup}/"
         f"samples={controls['stage4'].samples}/max_tree_depth={controls['stage4'].max_tree_depth}"
     )
 
@@ -3585,8 +5547,19 @@ def _validation_configured_approximation_items(args: argparse.Namespace) -> list
         items.append("image_plane_mode=local-jacobian local Jacobian likelihood")
     elif image_plane_mode == IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA:
         items.append("image_plane_mode=linearized-forward-beta-image-plane linearized image-plane likelihood")
-    elif image_plane_mode == IMAGE_PLANE_MODE_MARGINAL:
-        items.append("image_plane_mode=marginal-image-plane marginalized linearized image-plane likelihood")
+    elif image_plane_mode == IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED:
+        items.append("image_plane_mode=linearized-forward-beta-blocked-image-plane blocked linearized image-plane likelihood")
+    elif image_plane_mode == IMAGE_PLANE_MODE_FORWARD_METRIC:
+        items.append("image_plane_mode=forward-metric-image-plane current forward image covariance")
+    elif image_plane_mode == IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA:
+        items.append("image_plane_mode=anchored-solved-forward-beta-image-plane fixed-step anchored image solve")
+    elif image_plane_mode == IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE:
+        items.append("image_plane_mode=critical-arc-mixture-image-plane anchored point/arc mixture likelihood")
+    elif image_plane_mode == IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA:
+        items.append(
+            "image_plane_mode=fold-regularized-forward-beta-image-plane "
+            f"fold_curvature_arcsec_inv={float(getattr(args, 'fold_curvature_arcsec_inv', DEFAULT_FOLD_CURVATURE_ARCSEC_INV)):.4g}"
+        )
 
     evidence_likelihood_mode = str(
         getattr(args, "evidence_likelihood_mode", DEFAULT_EVIDENCE_LIKELIHOOD_MODE)
@@ -3595,7 +5568,15 @@ def _validation_configured_approximation_items(args: argparse.Namespace) -> list
         items.append(f"evidence_likelihood_mode={evidence_likelihood_mode} linearized evidence target")
 
     uses_explicit_source_positions = (
-        image_plane_mode == IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA
+        image_plane_mode
+        in {
+            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
+            IMAGE_PLANE_MODE_FORWARD_METRIC,
+            IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+            IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        }
         or (
             solver_fit_mode == SOLVER_FIT_MODE_EVIDENCE_NS
             and evidence_likelihood_mode == EVIDENCE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
@@ -3638,12 +5619,20 @@ def _log_validation_runtime_summary(args: argparse.Namespace, controls: dict[str
     )
     _log(
         args,
-        (
-            f"[validation] n_primary_families={args.n_primary_families} "
-            f"n_subhalo_families={args.n_subhalo_families} n_subhalos={args.n_subhalos} "
-            f"source_redshifts={args.source_redshifts} pos_sigma={args.pos_sigma_arcsec} "
-            f"min_images_per_family={getattr(args, 'min_images_per_family', 3)} "
-            f"max_images_per_family={getattr(args, 'max_images_per_family', None)} "
+            (
+                f"[validation] n_primary_families={args.n_primary_families} "
+                f"n_subhalo_families={args.n_subhalo_families} n_subhalos={args.n_subhalos} "
+                f"subhalo_schechter_alpha={getattr(args, 'subhalo_schechter_alpha', SingleBCGMockConfig().subhalo_schechter_alpha)} "
+                f"primary_source_redshifts={args.primary_source_redshifts} "
+                f"subhalo_source_redshifts={args.subhalo_source_redshifts} pos_sigma={args.pos_sigma_arcsec} "
+                f"min_images_per_family={getattr(args, 'min_images_per_family', 3)} "
+                f"max_images_per_family={getattr(args, 'max_images_per_family', None)} "
+                f"primary_image_min_distance_arcsec="
+                f"{getattr(args, 'primary_image_min_distance_arcsec', SingleBCGMockConfig().primary_image_min_distance_arcsec)} "
+                f"subhalo_image_min_distance_arcsec="
+                f"{getattr(args, 'subhalo_image_min_distance_arcsec', SingleBCGMockConfig().subhalo_image_min_distance_arcsec)} "
+                f"bcg_position_prior_half_width_arcsec="
+                f"{getattr(args, 'bcg_position_prior_half_width_arcsec', SingleBCGMockConfig().bcg_position_prior_half_width_arcsec)} "
             f"solver_fit_mode={getattr(args, 'solver_fit_mode', SOLVER_FIT_MODE_SEQUENTIAL)} "
             f"image_plane_mode={getattr(args, 'image_plane_mode', IMAGE_PLANE_MODE_NONE)} "
             f"skip_stage3_image_plane_local_jacobian={getattr(args, 'skip_stage3_image_plane_local_jacobian', False)} "
@@ -3654,9 +5643,7 @@ def _log_validation_runtime_summary(args: argparse.Namespace, controls: dict[str
             f"evidence_source_prior_mean=({getattr(args, 'evidence_source_prior_mean_x_arcsec', 0.0)},"
             f"{getattr(args, 'evidence_source_prior_mean_y_arcsec', 0.0)}) "
             f"fit_cosmology_flat_wcdm={bool(getattr(args, 'fit_cosmology_flat_wcdm', False))} "
-            f"fit_cosmology_all_stages={bool(getattr(args, 'fit_cosmology_all_stages', False))} "
             f"{_format_stage_controls_for_log(controls)} chains={args.chains} "
-            f"fit_quality_workers={int(getattr(args, 'fit_quality_workers', 1))} "
             f"sampling_engine={args.sampling_engine} skip_plots={args.skip_plots} "
             f"quick_diagnostics={bool(getattr(args, 'quick_diagnostics', False))} "
             f"write_stage3_recovery={bool(getattr(args, 'write_stage3_recovery', False))}"
@@ -3671,17 +5658,64 @@ def _validate_validation_args(args: argparse.Namespace) -> None:
         raise SystemExit("--n-subhalo-families must be non-negative.")
     if int(getattr(args, "n_primary_families", 0)) + int(getattr(args, "n_subhalo_families", 0)) <= 0:
         raise SystemExit("At least one source family is required.")
+    if int(getattr(args, "n_subhalos", 0)) < 0:
+        raise SystemExit("--n-subhalos must be non-negative.")
+    if int(getattr(args, "subhalo_parent_factor", SingleBCGMockConfig().subhalo_parent_factor)) <= 0:
+        raise SystemExit("--subhalo-parent-factor must be positive.")
+    subhalo_schechter_alpha = float(
+        getattr(args, "subhalo_schechter_alpha", SingleBCGMockConfig().subhalo_schechter_alpha)
+    )
+    if not np.isfinite(subhalo_schechter_alpha) or subhalo_schechter_alpha <= -1.0:
+        raise SystemExit("--subhalo-schechter-alpha must be greater than -1.")
+    if not np.isfinite(float(getattr(args, "subhalo_mag_faint_limit", SingleBCGMockConfig().subhalo_mag_faint_limit))):
+        raise SystemExit("--subhalo-mag-faint-limit must be finite.")
+    subhalo_mass_min = float(getattr(args, "subhalo_mass_min", SingleBCGMockConfig().subhalo_mass_min))
+    subhalo_mass_max = float(getattr(args, "subhalo_mass_max", SingleBCGMockConfig().subhalo_mass_max))
+    subhalo_mass_ref = float(getattr(args, "subhalo_mass_ref", SingleBCGMockConfig().subhalo_mass_ref))
+    if not np.isfinite(subhalo_mass_min) or subhalo_mass_min <= 0.0:
+        raise SystemExit("--subhalo-mass-min must be positive and finite.")
+    if not np.isfinite(subhalo_mass_max) or subhalo_mass_max <= subhalo_mass_min:
+        raise SystemExit("--subhalo-mass-max must be finite and greater than --subhalo-mass-min.")
+    if not np.isfinite(subhalo_mass_ref) or subhalo_mass_ref <= 0.0:
+        raise SystemExit("--subhalo-mass-ref must be positive and finite.")
     if int(getattr(args, "min_images_per_family", 3)) < 2:
         raise SystemExit("--min-images-per-family must be at least 2.")
     max_images_per_family = getattr(args, "max_images_per_family", None)
     if max_images_per_family is not None and int(max_images_per_family) < int(getattr(args, "min_images_per_family", 3)):
         raise SystemExit("--max-images-per-family must be at least --min-images-per-family.")
-    if int(getattr(args, "fit_quality_workers", 1)) <= 0:
-        raise SystemExit("--fit-quality-workers must be positive.")
+    primary_image_min_distance_arcsec = float(
+        getattr(
+            args,
+            "primary_image_min_distance_arcsec",
+            SingleBCGMockConfig().primary_image_min_distance_arcsec,
+        )
+    )
+    if not np.isfinite(primary_image_min_distance_arcsec) or primary_image_min_distance_arcsec <= 0.0:
+        raise SystemExit("--primary-image-min-distance-arcsec must be positive and finite.")
+    subhalo_image_min_distance_arcsec = float(
+        getattr(
+            args,
+            "subhalo_image_min_distance_arcsec",
+            SingleBCGMockConfig().subhalo_image_min_distance_arcsec,
+        )
+    )
+    if not np.isfinite(subhalo_image_min_distance_arcsec) or subhalo_image_min_distance_arcsec <= 0.0:
+        raise SystemExit("--subhalo-image-min-distance-arcsec must be positive and finite.")
+    bcg_position_prior_half_width_arcsec = float(
+        getattr(
+            args,
+            "bcg_position_prior_half_width_arcsec",
+            SingleBCGMockConfig().bcg_position_prior_half_width_arcsec,
+        )
+    )
+    if not np.isfinite(bcg_position_prior_half_width_arcsec) or bcg_position_prior_half_width_arcsec <= 0.0:
+        raise SystemExit("--bcg-position-prior-half-width-arcsec must be positive and finite.")
     if float(getattr(args, "caustic_compute_window_arcsec", DEFAULT_CAUSTIC_COMPUTE_WINDOW_ARCSEC)) <= 0.0:
         raise SystemExit("--caustic-compute-window-arcsec must be positive.")
     if float(getattr(args, "caustic_grid_scale_arcsec", DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC)) <= 0.0:
         raise SystemExit("--caustic-grid-scale-arcsec must be positive.")
+    if float(getattr(args, "critical_caustic_plot_grid_scale_arcsec", DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC)) <= 0.0:
+        raise SystemExit("--critical-caustic-plot-grid-scale-arcsec must be positive.")
     if float(getattr(args, "caustic_min_area_arcsec2", DEFAULT_CAUSTIC_MIN_AREA_ARCSEC2)) <= 0.0:
         raise SystemExit("--caustic-min-area-arcsec2 must be positive.")
     if float(getattr(args, "caustic_boundary_margin_arcsec", DEFAULT_CAUSTIC_BOUNDARY_MARGIN_ARCSEC)) < 0.0:
@@ -3693,6 +5727,13 @@ def _validate_validation_args(args: argparse.Namespace) -> None:
             raise SystemExit("--write-stage3-recovery requires a stage 4 --image-plane-mode.")
         if bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)):
             raise SystemExit("--write-stage3-recovery requires stage 3; remove --skip-stage3-image-plane-local-jacobian.")
+    if bool(getattr(args, "quick_diagnostics", False)) and bool(getattr(args, "exact_image_diagnostics_stage3", False)):
+        raise SystemExit("--exact-image-diagnostics-stage3 cannot be combined with --quick-diagnostics.")
+    fixed_image_sigma_int = getattr(args, "fix_image_sigma_int_arcsec", None)
+    if fixed_image_sigma_int is not None and (
+        not np.isfinite(float(fixed_image_sigma_int)) or float(fixed_image_sigma_int) < 0.0
+    ):
+        raise SystemExit("--fix-image-sigma-int-arcsec must be finite and nonnegative.")
 
 
 def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: argparse.Namespace) -> Path:
@@ -3710,8 +5751,6 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         run_name,
         "--fit-mode",
         solver_fit_mode,
-        "--svi-steps",
-        str(args.svi_steps),
         "--chains",
         str(args.chains),
         "--image-plane-scatter-upper-arcsec",
@@ -3764,8 +5803,7 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(args.seed),
         "--target-accept",
         str(args.target_accept),
-        "--fit-quality-workers",
-        str(getattr(args, "fit_quality_workers", 1)),
+        "--dense-mass" if bool(getattr(args, "dense_mass", True)) else "--no-dense-mass",
         "--jax-default-device",
         str(getattr(args, "jax_default_device", JAX_DEVICE_AUTO)),
         "--smc-device",
@@ -3785,7 +5823,12 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         "--smc-mala-step-size",
         str(getattr(args, "smc_mala_step_size", DEFAULT_SMC_MALA_STEP_SIZE)),
     ]
+    _append_stage_option(cmd, "--svi-steps", args.svi_steps)
     _append_stage_option(cmd, "--max-tree-depth", args.max_tree_depth)
+    if bool(getattr(args, "potfile_mass_size_reparam", False)):
+        cmd.append("--potfile-mass-size-reparam")
+    if getattr(args, "fix_image_sigma_int_arcsec", None) is not None:
+        cmd.extend(["--fix-image-sigma-int-arcsec", str(float(args.fix_image_sigma_int_arcsec))])
     if getattr(args, "image_presence_penalty_weight", None) is not None:
         cmd.extend(["--image-presence-penalty-weight", str(args.image_presence_penalty_weight)])
     if solver_fit_mode == SOLVER_FIT_MODE_SEQUENTIAL:
@@ -3798,20 +5841,130 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
                 str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)),
                 "--image-plane-newton-steps",
                 str(getattr(args, "image_plane_newton_steps", 0)),
+                "--anchored-image-plane-solve-steps",
+                str(getattr(args, "anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)),
+                "--anchored-image-plane-trust-radius-arcsec",
+                str(
+                    getattr(
+                        args,
+                        "anchored_image_plane_trust_radius_arcsec",
+                        DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC,
+                    )
+                ),
+                "--anchored-image-plane-lm-damping-relative",
+                str(
+                    getattr(
+                        args,
+                        "anchored_image_plane_lm_damping_relative",
+                        DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE,
+                    )
+                ),
+                "--anchored-image-plane-lm-damping-absolute",
+                str(
+                    getattr(
+                        args,
+                        "anchored_image_plane_lm_damping_absolute",
+                        DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_ABSOLUTE,
+                    )
+                ),
+                "--critical-arc-critical-direction-sigma-arcsec",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_critical_direction_sigma_arcsec",
+                        DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+                    )
+                ),
+                "--critical-arc-base-prob",
+                str(getattr(args, "critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)),
+                "--critical-arc-max-prob",
+                str(getattr(args, "critical_arc_max_prob", DEFAULT_CRITICAL_ARC_MAX_PROB)),
+                "--critical-arc-singular-threshold",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_singular_threshold",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+                    )
+                ),
+                "--critical-arc-singular-softness",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_singular_softness",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
+                    )
+                ),
+                "--critical-arc-lm-damping-relative",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_lm_damping_relative",
+                        DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE,
+                    )
+                ),
+                "--critical-arc-lm-damping-absolute",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_lm_damping_absolute",
+                        DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE,
+                    )
+                ),
+                "--critical-arc-lm-trust-radius-arcsec",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_lm_trust_radius_arcsec",
+                        DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC,
+                    )
+                ),
+                "--arc-aware-noncritical-support-radius-arcsec",
+                str(
+                    getattr(
+                        args,
+                        "arc_aware_noncritical_support_radius_arcsec",
+                        DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
+                    )
+                ),
+                "--arc-aware-max-arclength-arcsec",
+                str(
+                    getattr(
+                        args,
+                        "arc_aware_max_arclength_arcsec",
+                        DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC,
+                    )
+                ),
+                "--arc-aware-curve-step-arcsec",
+                str(
+                    getattr(
+                        args,
+                        "arc_aware_curve_step_arcsec",
+                        DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC,
+                    )
+                ),
+                "--fold-curvature-arcsec-inv",
+                str(getattr(args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)),
                 "--linearized-beta-prior-sigma-arcsec",
                 str(getattr(args, "linearized_beta_prior_sigma_arcsec", DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC)),
                 "--source-position-parameterization",
                 str(getattr(args, "source_position_parameterization", "prior-whitened")),
             ]
         )
+        if getattr(args, "blocked_nuts_cycles", None) is not None:
+            cmd.extend(["--blocked-nuts-cycles", str(args.blocked_nuts_cycles)])
+        if getattr(args, "blocked_nuts_pilot_warmup", None) is not None:
+            cmd.extend(["--blocked-nuts-pilot-warmup", str(args.blocked_nuts_pilot_warmup)])
     if bool(getattr(args, "fit_cosmology_flat_wcdm", False)):
         cmd.append("--fit-cosmology-flat-wcdm")
-    if bool(getattr(args, "fit_cosmology_all_stages", False)):
-        cmd.append("--fit-cosmology-all-stages")
+    if solver_fit_mode == SOLVER_FIT_MODE_SEQUENTIAL and bool(getattr(args, "start_at_stage3", False)):
+        cmd.append("--start-at-stage3")
     if solver_fit_mode == SOLVER_FIT_MODE_SEQUENTIAL and bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)):
         cmd.append("--skip-stage3-image-plane-local-jacobian")
     if bool(getattr(args, "quick_diagnostics", False)):
         cmd.append("--quick-diagnostics")
+    if bool(getattr(args, "exact_image_diagnostics_stage3", False)):
+        cmd.append("--exact-image-diagnostics-stage3")
     if solver_fit_mode == SOLVER_FIT_MODE_EVIDENCE_NS:
         evidence_likelihood_mode = str(
             getattr(args, "evidence_likelihood_mode", DEFAULT_EVIDENCE_LIKELIHOOD_MODE)
@@ -3838,15 +5991,14 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
                 str(getattr(args, "evidence_source_prior_mean_y_arcsec", 0.0)),
             ]
         )
-        if evidence_likelihood_mode == EVIDENCE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE:
-            cmd.extend(
-                [
-                    "--image-plane-newton-steps",
-                    str(getattr(args, "image_plane_newton_steps", 0)),
-                    "--source-position-parameterization",
-                    str(getattr(args, "source_position_parameterization", "prior-whitened")),
-                ]
-            )
+        cmd.extend(
+            [
+                "--image-plane-newton-steps",
+                str(getattr(args, "image_plane_newton_steps", 0)),
+                "--source-position-parameterization",
+                str(getattr(args, "source_position_parameterization", "prior-whitened")),
+            ]
+        )
     if args.active_scaling_galaxies is not None:
         cmd.append("--active-scaling-galaxies")
         cmd.extend(str(value) for value in args.active_scaling_galaxies)
@@ -3915,10 +6067,15 @@ def run_single_bcg_validation(args: argparse.Namespace) -> list[dict[str, Path]]
     _configure_debug_log(args, str(args.run_name), root)
     _log_validation_runtime_summary(args, controls)
     outputs: list[dict[str, Path]] = []
-    source_redshifts = _run_logged_phase(
+    primary_source_redshifts = _run_logged_phase(
         args,
-        "validation.parse_source_redshifts",
-        lambda: _parse_source_redshifts(args.source_redshifts, fallback=float(args.source_redshift)),
+        "validation.parse_primary_source_redshifts",
+        lambda: _parse_source_redshifts(args.primary_source_redshifts, fallback=float(args.source_redshift)),
+    )
+    subhalo_source_redshifts = _run_logged_phase(
+        args,
+        "validation.parse_subhalo_source_redshifts",
+        lambda: _parse_source_redshifts(args.subhalo_source_redshifts, fallback=float(args.source_redshift)),
     )
     total_start = time.time()
     for realization in range(int(args.realizations)):
@@ -3944,10 +6101,20 @@ def run_single_bcg_validation(args: argparse.Namespace) -> list[dict[str, Path]]
             n_subhalo_families=int(args.n_subhalo_families),
             min_images_per_family=int(args.min_images_per_family),
             max_images_per_family=getattr(args, "max_images_per_family", None),
+            primary_image_min_distance_arcsec=float(args.primary_image_min_distance_arcsec),
+            subhalo_image_min_distance_arcsec=float(args.subhalo_image_min_distance_arcsec),
+            bcg_position_prior_half_width_arcsec=float(args.bcg_position_prior_half_width_arcsec),
             source_redshift=float(args.source_redshift),
-            source_redshifts=source_redshifts,
+            primary_source_redshifts=primary_source_redshifts,
+            subhalo_source_redshifts=subhalo_source_redshifts,
             source_sigma_int_arcsec=float(args.source_sigma_int_arcsec),
             n_subhalos=int(args.n_subhalos),
+            subhalo_schechter_alpha=float(args.subhalo_schechter_alpha),
+            subhalo_parent_factor=int(args.subhalo_parent_factor),
+            subhalo_mag_faint_limit=float(args.subhalo_mag_faint_limit),
+            subhalo_mass_min=float(args.subhalo_mass_min),
+            subhalo_mass_max=float(args.subhalo_mass_max),
+            subhalo_mass_ref=float(args.subhalo_mass_ref),
             subhalo_sigma_scatter_dex=float(args.subhalo_sigma_scatter_dex),
             subhalo_cut_scatter_dex=float(args.subhalo_cut_scatter_dex),
             caustic_compute_window_arcsec=float(args.caustic_compute_window_arcsec),
@@ -3961,7 +6128,11 @@ def run_single_bcg_validation(args: argparse.Namespace) -> list[dict[str, Path]]
                 f"[load] generating mock primary_families={config.n_primary_families} "
                 f"subhalo_families={config.n_subhalo_families} subhalos={config.n_subhalos} "
                 f"image_count={_image_count_requirement_text(config.min_images_per_family, config.max_images_per_family)} "
-                f"source_redshifts={','.join(f'{value:.4g}' for value in source_redshifts)}"
+                f"primary_image_min_distance={config.primary_image_min_distance_arcsec:.4g} "
+                f"subhalo_image_min_distance={config.subhalo_image_min_distance_arcsec:.4g} "
+                f"bcg_position_prior_half_width={config.bcg_position_prior_half_width_arcsec:.4g} "
+                f"primary_source_redshifts={','.join(f'{value:.4g}' for value in primary_source_redshifts)} "
+                f"subhalo_source_redshifts={','.join(f'{value:.4g}' for value in subhalo_source_redshifts)}"
             ),
         )
         mock_dir = realization_dir / "mock"
@@ -3975,12 +6146,14 @@ def run_single_bcg_validation(args: argparse.Namespace) -> list[dict[str, Path]]
             )
             _log(args, f"[resume] reusing mock seed={seed} dir={mock_dir}")
         else:
-            paths, images, _truth = _run_logged_phase(
-                args,
-                "validation.generate_single_bcg_mock",
-                lambda: generate_single_bcg_mock(mock_dir, config),
-                detail=f"seed={seed}",
-            )
+            with _ValidationMockProgress(args) as mock_progress:
+                progress_callback = mock_progress.callback if mock_progress.enabled else None
+                paths, images, _truth = _run_logged_phase(
+                    args,
+                    "validation.generate_single_bcg_mock",
+                    lambda: generate_single_bcg_mock(mock_dir, config, progress_callback=progress_callback),
+                    detail=f"seed={seed}",
+                )
         _log(
             args,
             (
@@ -3990,6 +6163,13 @@ def run_single_bcg_validation(args: argparse.Namespace) -> list[dict[str, Path]]
         )
         if bool(getattr(args, "resume", False)):
             _log(args, f"[resume] refreshing validation outputs seed={seed} dir={realization_dir}")
+        _log(args, f"[output] writing pre-fit diagnostics to {realization_dir}")
+        prefit_output_paths = _run_logged_phase(
+            args,
+            "validation.write_prefit_diagnostics",
+            lambda: write_prefit_validation_diagnostics(_truth, images, realization_dir),
+            detail=f"seed={seed}",
+        )
         solver_run_name = "fit"
         solver_run_dir = _run_cluster_solver(paths.par_path, realization_dir / "solver", solver_run_name, args)
         _log(args, f"[output] writing recovery outputs from {solver_run_dir} to {realization_dir}")
@@ -4003,16 +6183,20 @@ def run_single_bcg_validation(args: argparse.Namespace) -> list[dict[str, Path]]
                 paths.mock_images_path,
                 output_dir=realization_dir,
                 posterior_diagnostic_draws=int(args.posterior_diagnostic_draws),
-                posterior_diagnostic_workers=int(getattr(args, "posterior_diagnostic_workers", 1)),
                 posterior_diagnostic_mode=str(
                     getattr(args, "posterior_diagnostic_mode", POSTERIOR_DIAGNOSTIC_MODE_EXACT)
                 ),
+                critical_caustic_plot_grid_scale_arcsec=float(
+                    getattr(args, "critical_caustic_plot_grid_scale_arcsec", DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC)
+                ),
+                recovery_profile_draws=int(getattr(args, "recovery_profile_draws", RECOVERY_PROFILE_POSTERIOR_DRAW_CAP)),
                 quick_diagnostics=bool(getattr(args, "quick_diagnostics", False)),
                 progress_args=args,
                 recovery_payload=recovery_payload,
             ),
             detail=f"seed={seed}",
         )
+        output_paths.update(prefit_output_paths)
         stage3_recovery_payload: dict[str, Any] | None = None
         if bool(getattr(args, "write_stage3_recovery", False)):
             stage3_run_dir = solver_run_dir.parent / "stage3_image_plane"
@@ -4030,10 +6214,13 @@ def run_single_bcg_validation(args: argparse.Namespace) -> list[dict[str, Path]]
                     paths.mock_images_path,
                     output_dir=stage3_recovery_dir,
                     posterior_diagnostic_draws=int(args.posterior_diagnostic_draws),
-                    posterior_diagnostic_workers=int(getattr(args, "posterior_diagnostic_workers", 1)),
                     posterior_diagnostic_mode=str(
                         getattr(args, "posterior_diagnostic_mode", POSTERIOR_DIAGNOSTIC_MODE_EXACT)
                     ),
+                    critical_caustic_plot_grid_scale_arcsec=float(
+                        getattr(args, "critical_caustic_plot_grid_scale_arcsec", DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC)
+                    ),
+                    recovery_profile_draws=int(getattr(args, "recovery_profile_draws", RECOVERY_PROFILE_POSTERIOR_DRAW_CAP)),
                     quick_diagnostics=bool(getattr(args, "quick_diagnostics", False)),
                     progress_args=args,
                     recovery_payload=stage3_recovery_payload,
@@ -4100,6 +6287,7 @@ def _parse_source_redshifts(raw: str | None, *, fallback: float) -> tuple[float,
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Mock-recovery validation suite for lenscluster.")
+    mock_defaults = SingleBCGMockConfig()
     parser.add_argument("--mock", choices=("single-bcg",), default="single-bcg")
     parser.add_argument("--output-dir", default="validation_runs")
     parser.add_argument("--run-name", default="single_bcg_recovery")
@@ -4124,11 +6312,56 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional maximum accepted image multiplicity per generated mock family. Use 'none' for unlimited.",
     )
+    parser.add_argument(
+        "--primary-image-min-distance-arcsec",
+        type=float,
+        default=mock_defaults.primary_image_min_distance_arcsec,
+        help="Minimum separation passed to mock image finding for primary/main-halo source families.",
+    )
+    parser.add_argument(
+        "--subhalo-image-min-distance-arcsec",
+        type=float,
+        default=mock_defaults.subhalo_image_min_distance_arcsec,
+        help="Minimum separation passed to mock image finding for subhalo source families.",
+    )
+    parser.add_argument(
+        "--bcg-position-prior-half-width-arcsec",
+        type=float,
+        default=mock_defaults.bcg_position_prior_half_width_arcsec,
+        help="Half-width of the generated Lenstool prior box for the BCG x/y centre.",
+    )
     parser.add_argument("--caustic-compute-window-arcsec", type=float, default=DEFAULT_CAUSTIC_COMPUTE_WINDOW_ARCSEC)
     parser.add_argument("--caustic-grid-scale-arcsec", type=float, default=DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC)
+    parser.add_argument(
+        "--critical-caustic-plot-grid-scale-arcsec",
+        type=float,
+        default=DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC,
+        help="Grid scale for one-redshift critical-line/caustic recovery plots; independent of mock source-placement caustics.",
+    )
     parser.add_argument("--caustic-min-area-arcsec2", type=float, default=DEFAULT_CAUSTIC_MIN_AREA_ARCSEC2)
     parser.add_argument("--caustic-boundary-margin-arcsec", type=float, default=DEFAULT_CAUSTIC_BOUNDARY_MARGIN_ARCSEC)
     parser.add_argument("--n-subhalos", type=int, default=0)
+    parser.add_argument(
+        "--subhalo-schechter-alpha",
+        type=float,
+        default=mock_defaults.subhalo_schechter_alpha,
+        help="Schechter luminosity-function alpha for dN/dL proportional to L^alpha exp(-L).",
+    )
+    parser.add_argument(
+        "--subhalo-parent-factor",
+        type=int,
+        default=mock_defaults.subhalo_parent_factor,
+        help="Parent candidate multiplier before selecting n_subhalos that pass the magnitude cut.",
+    )
+    parser.add_argument(
+        "--subhalo-mag-faint-limit",
+        type=float,
+        default=mock_defaults.subhalo_mag_faint_limit,
+        help="Faint magnitude selection limit applied before subhalo count-matching.",
+    )
+    parser.add_argument("--subhalo-mass-min", type=float, default=mock_defaults.subhalo_mass_min)
+    parser.add_argument("--subhalo-mass-max", type=float, default=mock_defaults.subhalo_mass_max)
+    parser.add_argument("--subhalo-mass-ref", type=float, default=mock_defaults.subhalo_mass_ref)
     parser.add_argument(
         "--subhalo-sigma-scatter-dex",
         type=float,
@@ -4143,9 +6376,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--source-redshift", type=float, default=2.0)
     parser.add_argument(
-        "--source-redshifts",
+        "--primary-source-redshifts",
         default="1.5,2.0,3.0",
-        help="Comma-separated source redshifts cycled across mock families. Empty string falls back to --source-redshift.",
+        help=(
+            "Comma-separated source redshifts cycled across primary-caustic mock families. "
+            "Empty string falls back to --source-redshift."
+        ),
+    )
+    parser.add_argument(
+        "--subhalo-source-redshifts",
+        default="1.5,2.0,3.0",
+        help=(
+            "Comma-separated source redshifts cycled across subhalo-caustic mock families. "
+            "Empty string falls back to --source-redshift."
+        ),
     )
     parser.add_argument("--source-sigma-int-arcsec", type=float, default=0.05)
     parser.add_argument("--pos-sigma-arcsec", type=float, default=0.15)
@@ -4158,12 +6402,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fit-method",
         nargs="+",
-        choices=(FIT_METHOD_SVI, FIT_METHOD_SVI_NUTS, FIT_METHOD_NS, FIT_METHOD_SMC),
+        choices=(FIT_METHOD_SVI, FIT_METHOD_SVI_NUTS, FIT_METHOD_NUTS, FIT_METHOD_NS, FIT_METHOD_SMC),
         default=[FIT_METHOD_SVI_NUTS],
-        metavar="{svi,svi+nuts,ns,smc}",
+        metavar="{svi,svi+nuts,nuts,ns,smc}",
         help=(
             "Sequential solver fit method. Pass one value for all sampled stages, two values for "
             "stage2_joint and stage3_image_plane, or three values when stage 4 is enabled. "
+            "NUTS-only and SMC are accepted only for non-blocked stage 4 image-plane modes. "
             "Ignored for --solver-fit-mode evidence-ns, which always uses nested sampling internally."
         ),
     )
@@ -4173,7 +6418,11 @@ def _build_parser() -> argparse.ArgumentParser:
             IMAGE_PLANE_MODE_NONE,
             IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
             IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
-            IMAGE_PLANE_MODE_MARGINAL,
+            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
+            IMAGE_PLANE_MODE_FORWARD_METRIC,
+            IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+            IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
         ),
         default=IMAGE_PLANE_MODE_NONE,
         help="Optional solver image-plane refinement mode.",
@@ -4182,6 +6431,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--skip-stage3-image-plane-local-jacobian",
         action="store_true",
         help="Skip solver stage 3 before a final stage 4 image-plane mode.",
+    )
+    parser.add_argument(
+        "--start-at-stage3",
+        action="store_true",
+        help="Start sequential solver validation at stage3_image_plane; with --resume-fast, reuse stage 3 artifacts for later stages.",
     )
     parser.add_argument(
         "--write-stage3-recovery",
@@ -4194,6 +6448,105 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=(0, 1, 2, 3),
         default=0,
         help="Additional stage-4 Newton updates after the initial local linear solve.",
+    )
+    parser.add_argument(
+        "--anchored-image-plane-solve-steps",
+        type=int,
+        default=DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS,
+        help=(
+            "Fixed damped Newton/LM iterations per observed image for anchored-solved stage 4. "
+            "Use 0 for the fast observed-anchor linearized LM approximation."
+        ),
+    )
+    parser.add_argument(
+        "--anchored-image-plane-trust-radius-arcsec",
+        type=float,
+        default=DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC,
+        help="Smooth per-iteration image-plane trust radius for anchored-solved stage 4.",
+    )
+    parser.add_argument(
+        "--anchored-image-plane-lm-damping-relative",
+        type=float,
+        default=DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE,
+        help="Relative LM damping added to A.T A in anchored-solved stage 4.",
+    )
+    parser.add_argument(
+        "--anchored-image-plane-lm-damping-absolute",
+        type=float,
+        default=DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_ABSOLUTE,
+        help="Absolute LM damping added to A.T A in anchored-solved stage 4.",
+    )
+    parser.add_argument(
+        "--critical-arc-critical-direction-sigma-arcsec",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+        help="Broad along-arc image-plane sigma for critical-arc mixture stage 4.",
+    )
+    parser.add_argument(
+        "--critical-arc-base-prob",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_BASE_PROB,
+        help="Baseline prior probability that a catalog row is a critical-arc support point.",
+    )
+    parser.add_argument(
+        "--critical-arc-max-prob",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_MAX_PROB,
+        help="Maximum prior probability for the critical-arc branch near singular local Jacobians.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-threshold",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+        help="Smallest-singular-value threshold where the critical-arc branch prior starts increasing.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-softness",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
+        help="Softness for the critical-arc prior transition as the smallest singular value approaches zero.",
+    )
+    parser.add_argument(
+        "--critical-arc-lm-damping-relative",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE,
+        help="Relative LM damping added to A.T A for critical-arc mixture image-plane displacements.",
+    )
+    parser.add_argument(
+        "--critical-arc-lm-damping-absolute",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE,
+        help="Absolute LM damping added to A.T A for critical-arc mixture image-plane displacements.",
+    )
+    parser.add_argument(
+        "--critical-arc-lm-trust-radius-arcsec",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC,
+        help="Large smooth finite guard radius for critical-arc mixture LM image-plane displacements.",
+    )
+    parser.add_argument(
+        "--arc-aware-noncritical-support-radius-arcsec",
+        type=float,
+        default=DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
+        help="Maximum support-curve distance for arc-aware image recovery validation.",
+    )
+    parser.add_argument(
+        "--arc-aware-max-arclength-arcsec",
+        type=float,
+        default=DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC,
+        help="Maximum traced arclength in each direction for arc-aware image recovery validation.",
+    )
+    parser.add_argument(
+        "--arc-aware-curve-step-arcsec",
+        type=float,
+        default=DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC,
+        help="Curve tracing step size for arc-aware image recovery validation.",
+    )
+    parser.add_argument(
+        "--fold-curvature-arcsec-inv",
+        type=float,
+        default=DEFAULT_FOLD_CURVATURE_ARCSEC_INV,
+        help="Fallback local fold curvature scale in arcsec^-1 for direct fold-regularized helper use.",
     )
     parser.add_argument(
         "--linearized-beta-prior-sigma-arcsec",
@@ -4230,6 +6583,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--image-plane-scatter-prior-log-sigma",
         type=float,
         default=DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_LOG_SIGMA,
+    )
+    parser.add_argument(
+        "--fix-image-sigma-int-arcsec",
+        type=float,
+        default=None,
+        help="Use deterministic intrinsic image-plane scatter instead of sampling image.sigma_int.",
     )
     parser.add_argument("--image-presence-penalty-weight", type=float, default=None)
     parser.add_argument(
@@ -4286,7 +6645,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_EVIDENCE_LIKELIHOOD_MODE,
         help="One-shot evidence likelihood target passed through to cluster_solver.",
     )
-    parser.add_argument("--svi-steps", type=int, default=1000)
+    parser.add_argument(
+        "--svi-steps",
+        type=int,
+        nargs="+",
+        default=[1000],
+        help="Solver SVI steps. Accepts one value or staged values through optional stage 3/stage 4.",
+    )
     parser.add_argument(
         "--warmup",
         type=int,
@@ -4329,12 +6694,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fit-cosmology-flat-wcdm",
         action="store_true",
-        help="Forward solver sampling of flat wCDM Omega_m,w0 in the final fitting stage by default.",
-    )
-    parser.add_argument(
-        "--fit-cosmology-all-stages",
-        action="store_true",
-        help="With --fit-cosmology-flat-wcdm, forward all-stage sequential cosmology sampling to the solver.",
+        help="Forward solver sampling of flat wCDM Omega_m,w0 in every executed sequential fitting stage.",
     )
     parser.add_argument(
         "--active-scaling-galaxies",
@@ -4364,23 +6724,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=8,
         help=(
             "Maximum posterior draws used for image/source validation uncertainty bars; "
-            "mass-profile and surface-density bands use a fixed capped posterior subsample."
+            "mass-profile and surface-density bands are controlled by --recovery-profile-draws."
         ),
     )
     parser.add_argument(
-        "--posterior-diagnostic-workers",
+        "--recovery-profile-draws",
         type=int,
-        default=1,
+        default=RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
         help=(
-            "Thread workers for posterior image/source validation uncertainty families. "
-            "Use 1 for serial behavior."
+            "Maximum posterior draws used for mass-profile and surface-density recovery bands; "
+            "0 or negative uses the best-fit profile only."
         ),
-    )
-    parser.add_argument(
-        "--fit-quality-workers",
-        type=int,
-        default=1,
-        help="Worker threads for the underlying solver's fit-quality diagnostics.",
     )
     parser.add_argument(
         "--posterior-diagnostic-mode",
@@ -4399,7 +6753,32 @@ def _build_parser() -> argparse.ArgumentParser:
             "validation and use approximate median +/- std posterior diagnostics."
         ),
     )
+    parser.add_argument(
+        "--exact-image-diagnostics-stage3",
+        action="store_true",
+        help=(
+            "Pass through to the sequential solver to run exact image matching and residual diagnostics for "
+            "stage3_image_plane even when a stage 4 image-plane stage is enabled."
+        ),
+    )
     parser.add_argument("--target-accept", type=float, default=0.85)
+    parser.add_argument(
+        "--dense-mass",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use dense mass-matrix adaptation for solver NumPyro NUTS. Pass --no-dense-mass for diagonal mass.",
+    )
+    parser.add_argument(
+        "--potfile-mass-size-reparam",
+        action="store_true",
+        default=False,
+        help=(
+            "Forward solver opt-in potfile sigma/cutkpc mass-size reparameterization. "
+            "Supported for NumPyro SVI/NUTS solver paths only."
+        ),
+    )
+    parser.add_argument("--blocked-nuts-cycles", type=int, default=None)
+    parser.add_argument("--blocked-nuts-pilot-warmup", type=int, default=None)
     parser.add_argument(
         "--max-tree-depth",
         type=int,

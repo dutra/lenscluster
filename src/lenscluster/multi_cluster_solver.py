@@ -95,6 +95,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             single.IMAGE_PLANE_MODE_NONE,
             single.IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
             single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+            single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
         ),
         default=single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
         help="Likelihood used for the joint final stage.",
@@ -212,6 +213,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=single.DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_LOG_SIGMA,
     )
+    parser.add_argument(
+        "--fix-image-sigma-int-arcsec",
+        type=float,
+        default=None,
+        help="Use deterministic intrinsic image-plane scatter instead of sampling image.sigma_int.",
+    )
     parser.add_argument("--image-presence-penalty-weight", type=float, default=None)
     parser.add_argument(
         "--image-presence-match-radius-arcsec",
@@ -262,6 +269,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-tree-depth", type=int, default=single.DEFAULT_MAX_TREE_DEPTH)
     parser.add_argument("--target-accept", type=float, default=single.DEFAULT_TARGET_ACCEPT)
     parser.add_argument("--initial-step-size", type=float, default=single.DEFAULT_INITIAL_STEP_SIZE)
+    parser.add_argument(
+        "--dense-mass",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use dense mass-matrix adaptation for NumPyro NUTS. Pass --no-dense-mass for diagonal mass.",
+    )
+    parser.add_argument(
+        "--potfile-mass-size-reparam",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt in to the single-cluster potfile sigma/cutkpc mass-size reparameterization for each "
+            "NumPyro SVI/NUTS local model."
+        ),
+    )
+    parser.add_argument("--blocked-nuts-cycles", type=int, default=None)
+    parser.add_argument("--blocked-nuts-pilot-warmup", type=int, default=None)
     parser.add_argument("--nuts-init-boundary-frac", type=float, default=single.DEFAULT_NUTS_INIT_BOUNDARY_FRAC)
     parser.add_argument("--nuts-init-jitter-frac", type=float, default=single.DEFAULT_NUTS_INIT_JITTER_FRAC)
     parser.add_argument("--svi-steps", type=int, default=single.DEFAULT_SVI_STEPS)
@@ -286,19 +310,38 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit("--likelihood-stabilizer-max-gain must be non-negative.")
     if (
         not np.isfinite(float(args.image_plane_scatter_floor_arcsec))
-        or float(args.image_plane_scatter_floor_arcsec) < 0.0
+        or float(args.image_plane_scatter_floor_arcsec) <= 0.0
     ):
-        raise SystemExit("--image-plane-scatter-floor-arcsec must be non-negative.")
+        raise SystemExit("--image-plane-scatter-floor-arcsec must be positive.")
+    image_scatter_floor = float(args.image_plane_scatter_floor_arcsec)
+    image_scatter_upper = float(args.image_plane_scatter_upper_arcsec)
+    if not np.isfinite(image_scatter_upper) or image_scatter_upper <= image_scatter_floor:
+        raise SystemExit(
+            "--image-plane-scatter-upper-arcsec must be greater than "
+            "--image-plane-scatter-floor-arcsec."
+        )
     if (
         not np.isfinite(float(args.image_plane_scatter_prior_median_arcsec))
         or float(args.image_plane_scatter_prior_median_arcsec) <= 0.0
     ):
         raise SystemExit("--image-plane-scatter-prior-median-arcsec must be positive.")
     if (
+        str(args.image_plane_scatter_prior) == single.IMAGE_PLANE_SCATTER_PRIOR_LOGNORMAL
+        and not (image_scatter_floor < float(args.image_plane_scatter_prior_median_arcsec) < image_scatter_upper)
+    ):
+        raise SystemExit(
+            "--image-plane-scatter-prior-median-arcsec must be between "
+            "--image-plane-scatter-floor-arcsec and --image-plane-scatter-upper-arcsec for lognormal scatter priors."
+        )
+    if (
         not np.isfinite(float(args.image_plane_scatter_prior_log_sigma))
         or float(args.image_plane_scatter_prior_log_sigma) <= 0.0
     ):
         raise SystemExit("--image-plane-scatter-prior-log-sigma must be positive.")
+    if args.fix_image_sigma_int_arcsec is not None and (
+        not np.isfinite(float(args.fix_image_sigma_int_arcsec)) or float(args.fix_image_sigma_int_arcsec) < 0.0
+    ):
+        raise SystemExit("--fix-image-sigma-int-arcsec must be finite and nonnegative.")
     if (
         not np.isfinite(float(args.likelihood_stabilizer_max_residual_arcsec))
         or float(args.likelihood_stabilizer_max_residual_arcsec) < 0.0
@@ -306,6 +349,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit("--likelihood-stabilizer-max-residual-arcsec must be non-negative.")
     if not np.isfinite(float(args.likelihood_stabilizer_student_t_nu)) or float(args.likelihood_stabilizer_student_t_nu) <= 0.0:
         raise SystemExit("--likelihood-stabilizer-student-t-nu must be positive.")
+    if args.blocked_nuts_cycles is not None and int(args.blocked_nuts_cycles) <= 0:
+        raise SystemExit("--blocked-nuts-cycles must be positive when provided.")
+    if args.blocked_nuts_pilot_warmup is not None and int(args.blocked_nuts_pilot_warmup) < 0:
+        raise SystemExit("--blocked-nuts-pilot-warmup must be non-negative when provided.")
+    if bool(getattr(args, "potfile_mass_size_reparam", False)) and (
+        str(args.image_plane_mode) == single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED
+    ):
+        raise SystemExit("--potfile-mass-size-reparam is not supported with blocked linearized stage 4 NUTS.")
     try:
         single._cosmology_init_overrides_from_args(args)
     except ValueError as exc:
@@ -340,7 +391,10 @@ def _parse_cluster_inputs(cluster_values: list[list[str]]) -> list[ClusterInput]
 
 
 def _sample_likelihood_mode_from_image_plane_mode(image_plane_mode: str) -> str:
-    if str(image_plane_mode) == single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA:
+    if str(image_plane_mode) in {
+        single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+        single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
+    }:
         return single.SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
     if str(image_plane_mode) == single.IMAGE_PLANE_MODE_LOCAL_JACOBIAN:
         return single.SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
@@ -670,7 +724,10 @@ def _run_joint_inference(
             svi_diagnostics,
             chain_seeds=svi_chain_seeds,
         )
-        posterior = single._run_numpyro_nuts_sampler(args, state, evaluator, sample_model, nuts_init)
+        if single._blocked_linearized_stage_enabled(args):
+            posterior = single._run_blocked_numpyro_nuts_sampler(args, state, evaluator, nuts_init)
+        else:
+            posterior = single._run_numpyro_nuts_sampler(args, state, evaluator, sample_model, nuts_init)
         usable, reason = single._nuts_posterior_is_usable(posterior)
         log_prob = np.asarray(posterior.log_prob, dtype=float)
         if usable and posterior.samples.size and log_prob.size and np.isfinite(log_prob).any():
@@ -1167,6 +1224,7 @@ def _write_outputs(
         "n_parameters": len(state.parameter_specs),
         "n_cosmology_parameters": len(cosmo_specs),
         "fit_method": args.fit_method,
+        "potfile_mass_size_reparam": bool(getattr(args, "potfile_mass_size_reparam", False)),
         "sampler": posterior_physical.sampler,
         "warmup": int(args.warmup),
         "samples": int(args.samples),

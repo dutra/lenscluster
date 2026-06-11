@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl_lenscluster_validation")
 os.environ.setdefault("NUMBA_CACHE_DIR", f"/tmp/numba_cache_{os.getuid()}")
@@ -17,6 +20,7 @@ from astropy.cosmology import FlatLambdaCDM
 from lenstronomy.LensModel.lens_model import LensModel
 from lenstronomy.LensModel.Solver.lens_equation_solver import LensEquationSolver
 from matplotlib.path import Path as MplPath
+from scipy.special import gammainc, gammaincinv
 from skimage.measure import find_contours
 
 from .jax_cosmology import (
@@ -24,12 +28,27 @@ from .jax_cosmology import (
     flat_wcdm_config,
     kpc_per_arcsec_from_config,
 )
+from .utils import jax_cpu_worker_count
 
 ORIGINAL_DPIE_PROFILE_NAME = "DPIE_NIE"
 DEFAULT_CAUSTIC_COMPUTE_WINDOW_ARCSEC = 160.0
 DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC = 0.2
 DEFAULT_CAUSTIC_MIN_AREA_ARCSEC2 = 1.0e-5
 DEFAULT_CAUSTIC_BOUNDARY_MARGIN_ARCSEC = 0.5
+DEFAULT_PRIMARY_IMAGE_MIN_DISTANCE_ARCSEC = 3.0
+DEFAULT_SUBHALO_IMAGE_MIN_DISTANCE_ARCSEC = 1.0
+DEFAULT_BCG_POSITION_PRIOR_HALF_WIDTH_ARCSEC = 8.0
+SUBHALO_SELECTION_MAX_ATTEMPTS = 5
+MockProgressCallback = Callable[[str, dict[str, Any]], None]
+
+
+def _emit_mock_progress(
+    progress_callback: MockProgressCallback | None,
+    event: str,
+    **payload: Any,
+) -> None:
+    if progress_callback is not None:
+        progress_callback(event, payload)
 
 
 @dataclass(frozen=True)
@@ -72,22 +91,30 @@ class SingleBCGMockConfig:
     pos_sigma_arcsec: float = 0.15
     seed: int = 12345
     source_redshift: float = 2.0
-    source_redshifts: tuple[float, ...] = (1.5, 2.0, 3.0)
+    primary_source_redshifts: tuple[float, ...] = (1.5, 2.0, 3.0)
+    subhalo_source_redshifts: tuple[float, ...] = (1.5, 2.0, 3.0)
     source_sigma_int_arcsec: float = 0.05
     n_primary_families: int = 20
     n_subhalo_families: int = 0
     min_images_per_family: int = 3
     max_images_per_family: int | None = None
+    primary_image_min_distance_arcsec: float = DEFAULT_PRIMARY_IMAGE_MIN_DISTANCE_ARCSEC
+    subhalo_image_min_distance_arcsec: float = DEFAULT_SUBHALO_IMAGE_MIN_DISTANCE_ARCSEC
+    bcg_position_prior_half_width_arcsec: float = DEFAULT_BCG_POSITION_PRIOR_HALF_WIDTH_ARCSEC
     max_sources_to_try: int = 400
     caustic_compute_window_arcsec: float = DEFAULT_CAUSTIC_COMPUTE_WINDOW_ARCSEC
     caustic_grid_scale_arcsec: float = DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC
     caustic_min_area_arcsec2: float = DEFAULT_CAUSTIC_MIN_AREA_ARCSEC2
     caustic_boundary_margin_arcsec: float = DEFAULT_CAUSTIC_BOUNDARY_MARGIN_ARCSEC
     n_subhalos: int = 0
+    subhalo_schechter_alpha: float = -0.7
+    subhalo_parent_factor: int = 1000
+    subhalo_mag_faint_limit: float = 24.0
+    subhalo_mass_min: float = 1.0e9
+    subhalo_mass_max: float = 1.0e13
+    subhalo_mass_ref: float = 1.0e12
     subhalo_field_radius_arcsec: float = 65.0
     subhalo_mag0: float = 17.0
-    subhalo_mag_mean: float = 20.5
-    subhalo_mag_sigma: float = 1.1
     subhalo_sigma_ref: float = 245.0
     subhalo_sigma_ref_std: float = 35.0
     subhalo_sigma_scatter_dex: float = 0.07
@@ -96,8 +123,8 @@ class SingleBCGMockConfig:
     subhalo_cut_lower_arcsec: float = 8.0
     subhalo_cut_upper_arcsec: float = 80.0
     subhalo_cut_scatter_dex: float = 0.20
-    subhalo_vdslope: float = 3.33333
-    subhalo_slope: float = 3.33333
+    subhalo_vdslope: float = 4.0
+    subhalo_slope: float = 4.0
     halo: DPIETruth = DPIETruth(
         potential_id="halo",
         x_centre=0.0,
@@ -147,7 +174,8 @@ def _axis_ratio_to_lenstool_ellipticite(q: float) -> float:
 def _config_to_jsonable(config: SingleBCGMockConfig, kpc_per_arcsec: float) -> dict[str, Any]:
     payload = asdict(config)
     payload["n_families"] = int(config.n_families)
-    payload["source_redshifts"] = [float(value) for value in config.source_redshifts]
+    payload["primary_source_redshifts"] = [float(value) for value in config.primary_source_redshifts]
+    payload["subhalo_source_redshifts"] = [float(value) for value in config.subhalo_source_redshifts]
     payload["subhalo_sigma_log_scatter"] = _dex_scatter_to_ln(config.subhalo_sigma_scatter_dex)
     payload["subhalo_cut_log_scatter"] = _dex_scatter_to_ln(config.subhalo_cut_scatter_dex)
     for component_name in ("halo", "bcg"):
@@ -159,6 +187,239 @@ def _config_to_jsonable(config: SingleBCGMockConfig, kpc_per_arcsec: float) -> d
 
 def _dex_scatter_to_ln(scatter_dex: float) -> float:
     return float(np.log(10.0) * max(float(scatter_dex), 0.0))
+
+
+def _sample_truncated_schechter_luminosities(
+    rng: np.random.Generator,
+    n_samples: int,
+    *,
+    luminosity_min: float,
+    luminosity_max: float,
+    alpha: float,
+) -> np.ndarray:
+    n_samples = int(n_samples)
+    if n_samples <= 0:
+        return np.empty(0, dtype=float)
+    luminosity_min = float(luminosity_min)
+    luminosity_max = float(luminosity_max)
+    alpha = float(alpha)
+    if (
+        not np.isfinite(luminosity_min)
+        or not np.isfinite(luminosity_max)
+        or luminosity_min <= 0.0
+        or luminosity_max <= luminosity_min
+    ):
+        raise ValueError("Schechter luminosity bounds must satisfy 0 < luminosity_min < luminosity_max.")
+    if not np.isfinite(alpha) or alpha <= -1.0:
+        raise ValueError("Schechter alpha must be finite and greater than -1 for a log-space peak.")
+    shape = alpha + 1.0
+    cdf_min = float(gammainc(shape, luminosity_min))
+    cdf_max = float(gammainc(shape, luminosity_max))
+    if not np.isfinite(cdf_min) or not np.isfinite(cdf_max) or cdf_max <= cdf_min:
+        raise ValueError("Schechter luminosity bounds produce an invalid truncated CDF range.")
+    u = rng.random(n_samples)
+    return np.asarray(gammaincinv(shape, cdf_min + u * (cdf_max - cdf_min)), dtype=float)
+
+
+def _subhalo_mass_luminosity_exponent(config: SingleBCGMockConfig) -> float:
+    vdslope = float(config.subhalo_vdslope)
+    slope = float(config.subhalo_slope)
+    if not np.isfinite(vdslope) or not np.isfinite(slope) or vdslope <= 0.0 or slope <= 0.0:
+        raise ValueError("Subhalo luminosity-mass conversion requires positive finite vdslope and slope.")
+    exponent = 2.0 / vdslope + 2.0 / slope
+    if not np.isfinite(exponent) or exponent <= 0.0:
+        raise ValueError("Subhalo mass-luminosity exponent must be positive and finite.")
+    return float(exponent)
+
+
+def _subhalo_luminosity_ratio_from_mass(
+    mass_msun: float | np.ndarray,
+    config: SingleBCGMockConfig,
+) -> np.ndarray:
+    mass = np.asarray(mass_msun, dtype=float)
+    mass_ref = float(config.subhalo_mass_ref)
+    if not np.isfinite(mass_ref) or mass_ref <= 0.0:
+        raise ValueError("Subhalo reference mass must be positive and finite.")
+    exponent = _subhalo_mass_luminosity_exponent(config)
+    return np.power(mass / mass_ref, 1.0 / exponent)
+
+
+def _subhalo_mass_from_luminosity_ratio(
+    luminosity_ratio: float | np.ndarray,
+    config: SingleBCGMockConfig,
+) -> np.ndarray:
+    luminosity = np.asarray(luminosity_ratio, dtype=float)
+    mass_ref = float(config.subhalo_mass_ref)
+    if not np.isfinite(mass_ref) or mass_ref <= 0.0:
+        raise ValueError("Subhalo reference mass must be positive and finite.")
+    exponent = _subhalo_mass_luminosity_exponent(config)
+    return mass_ref * np.power(luminosity, exponent)
+
+
+def _subhalo_magnitude_from_luminosity_ratio(
+    luminosity_ratio: float | np.ndarray,
+    config: SingleBCGMockConfig,
+) -> np.ndarray:
+    luminosity = np.asarray(luminosity_ratio, dtype=float)
+    return float(config.subhalo_mag0) - 2.5 * np.log10(luminosity)
+
+
+def _subhalo_magnitude_from_mass(
+    mass_msun: float | np.ndarray,
+    config: SingleBCGMockConfig,
+) -> np.ndarray:
+    luminosity_ratio = _subhalo_luminosity_ratio_from_mass(mass_msun, config)
+    return _subhalo_magnitude_from_luminosity_ratio(luminosity_ratio, config)
+
+
+def _subhalo_selection_payload(
+    config: SingleBCGMockConfig,
+    masses: np.ndarray,
+    magnitudes: np.ndarray,
+    luminosities: np.ndarray,
+    parent_rank: np.ndarray,
+    passes_mag_cut: np.ndarray,
+    selected_indices: list[int],
+    extra_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    selected_member_ids = {
+        int(candidate_index): f"member{member_index + 1:03d}"
+        for member_index, candidate_index in enumerate(selected_indices)
+    }
+    candidates: list[dict[str, Any]] = []
+    for idx in range(int(masses.size)):
+        selected = idx in selected_member_ids
+        row = {
+            "subhalo_candidate_index": int(idx),
+            "subhalo_mass_msun": float(masses[idx]),
+            "catalog_mag": float(magnitudes[idx]),
+            "luminosity_ratio": float(luminosities[idx]),
+            "subhalo_parent_rank": int(parent_rank[idx]),
+            "passes_mag_cut": bool(passes_mag_cut[idx]),
+            "selected": bool(selected),
+        }
+        if selected:
+            row["selected_member_id"] = selected_member_ids[idx]
+        candidates.append(row)
+    payload = {
+        "schechter_alpha": float(config.subhalo_schechter_alpha),
+        "luminosity_star": 1.0,
+        "mass_min": float(config.subhalo_mass_min),
+        "mass_max": float(config.subhalo_mass_max),
+        "mass_ref": float(config.subhalo_mass_ref),
+        "mag_faint_limit": float(config.subhalo_mag_faint_limit),
+        "parent_count": int(masses.size),
+        "selected_count": int(len(selected_indices)),
+        "mass_luminosity_exponent": _subhalo_mass_luminosity_exponent(config),
+        "candidates": candidates,
+    }
+    if extra_metadata:
+        payload.update(extra_metadata)
+    return payload
+
+
+def _subhalo_schechter_luminosity_bounds(config: SingleBCGMockConfig) -> tuple[float, float]:
+    mass_min = float(config.subhalo_mass_min)
+    mass_max = float(config.subhalo_mass_max)
+    if not np.isfinite(mass_min) or not np.isfinite(mass_max) or mass_min <= 0.0 or mass_max <= mass_min:
+        raise ValueError("Schechter mass bounds must satisfy 0 < mass_min < mass_max.")
+    mass_ref = float(config.subhalo_mass_ref)
+    if not np.isfinite(mass_ref) or mass_ref <= 0.0:
+        raise ValueError("Subhalo reference mass must be positive and finite.")
+    exponent = _subhalo_mass_luminosity_exponent(config)
+    luminosity_min = float((mass_min / mass_ref) ** (1.0 / exponent))
+    luminosity_max = float((mass_max / mass_ref) ** (1.0 / exponent))
+    if not np.isfinite(luminosity_min) or not np.isfinite(luminosity_max) or luminosity_max <= luminosity_min:
+        raise ValueError("Schechter luminosity bounds derived from mass bounds are invalid.")
+    return luminosity_min, luminosity_max
+
+
+def _generate_schechter_subhalo_candidates(
+    config: SingleBCGMockConfig,
+    rng: np.random.Generator,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    n_subhalos = int(config.n_subhalos)
+    if n_subhalos <= 0:
+        return [], None
+    parent_factor = int(config.subhalo_parent_factor)
+    if parent_factor <= 0:
+        raise ValueError("subhalo_parent_factor must be positive.")
+    alpha = float(config.subhalo_schechter_alpha)
+    if not np.isfinite(alpha) or alpha <= -1.0:
+        raise ValueError("subhalo_schechter_alpha must be finite and greater than -1.")
+    base_parent_count = max(n_subhalos, parent_factor * n_subhalos)
+    faint_limit = float(config.subhalo_mag_faint_limit)
+    if not np.isfinite(faint_limit):
+        raise ValueError("subhalo_mag_faint_limit must be finite.")
+    luminosity_min, luminosity_max = _subhalo_schechter_luminosity_bounds(config)
+    luminosity_peak = alpha + 1.0
+    mass_peak = float(_subhalo_mass_from_luminosity_ratio(luminosity_peak, config))
+    last_parent_count = base_parent_count
+    for attempt in range(SUBHALO_SELECTION_MAX_ATTEMPTS):
+        parent_count = base_parent_count * (2**attempt)
+        last_parent_count = parent_count
+        luminosities = _sample_truncated_schechter_luminosities(
+            rng,
+            parent_count,
+            luminosity_min=luminosity_min,
+            luminosity_max=luminosity_max,
+            alpha=alpha,
+        )
+        masses = np.asarray(_subhalo_mass_from_luminosity_ratio(luminosities, config), dtype=float)
+        magnitudes = np.asarray(_subhalo_magnitude_from_luminosity_ratio(luminosities, config), dtype=float)
+        finite = np.isfinite(masses) & np.isfinite(magnitudes) & np.isfinite(luminosities) & (luminosities > 0.0)
+        observable = finite & (magnitudes <= faint_limit)
+        brightness_order = np.argsort(magnitudes, kind="stable")
+        parent_rank = np.empty(parent_count, dtype=int)
+        parent_rank[brightness_order] = np.arange(1, parent_count + 1)
+        observable_indices = np.flatnonzero(observable)
+        selected_indices = (
+            [int(idx) for idx in rng.choice(observable_indices, size=n_subhalos, replace=False)]
+            if observable_indices.size >= n_subhalos
+            else []
+        )
+        if len(selected_indices) == n_subhalos:
+            selection_payload = _subhalo_selection_payload(
+                config,
+                masses,
+                magnitudes,
+                luminosities,
+                parent_rank,
+                observable,
+                selected_indices,
+                extra_metadata={
+                    "luminosity_min": float(luminosity_min),
+                    "luminosity_max": float(luminosity_max),
+                    "luminosity_peak": float(luminosity_peak),
+                    "mass_peak": float(mass_peak),
+                    "schechter_shape": float(alpha + 1.0),
+                },
+            )
+            return [
+                {
+                    "subhalo_candidate_index": int(idx),
+                    "catalog_mag": float(magnitudes[idx]),
+                    "luminosity_ratio": float(luminosities[idx]),
+                    "subhalo_mass_msun": float(masses[idx]),
+                    "subhalo_parent_rank": int(parent_rank[idx]),
+                    "selected_by_mag_cut": True,
+                }
+                for idx in selected_indices
+            ], selection_payload
+    raise RuntimeError(
+        "Failed to select "
+        f"{n_subhalos} Schechter subhalos brighter than mag {faint_limit:.6g} "
+        f"after drawing up to {last_parent_count} parent candidates. "
+        "Increase --subhalo-parent-factor, relax --subhalo-mag-faint-limit, "
+        "or adjust the Schechter mass bounds."
+    )
+
+
+def _generate_subhalo_candidates(
+    config: SingleBCGMockConfig,
+    rng: np.random.Generator,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    return _generate_schechter_subhalo_candidates(config, rng)
 
 
 def _scaled_subhalo_params(row: dict[str, Any], config: SingleBCGMockConfig) -> DPIETruth:
@@ -181,46 +442,55 @@ def _scaled_subhalo_params(row: dict[str, Any], config: SingleBCGMockConfig) -> 
     )
 
 
-def _generate_subhalo_catalog(config: SingleBCGMockConfig, rng: np.random.Generator) -> list[dict[str, Any]]:
+def _generate_subhalo_catalog_payload(
+    config: SingleBCGMockConfig,
+    rng: np.random.Generator,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     if config.n_subhalos <= 0:
-        return []
+        return [], None
+    candidates, subhalo_selection = _generate_subhalo_candidates(config, rng)
     rows: list[dict[str, Any]] = []
-    # A compact projected member distribution: many faint galaxies at large radius,
-    # with a few bright perturbers deliberately allowed near the strong-lensing zone.
-    for idx in range(config.n_subhalos):
+    # A compact projected member distribution, with a few selected candidates
+    # deliberately allowed near the strong-lensing zone.
+    for idx, candidate in enumerate(candidates):
         if idx < min(4, config.n_subhalos):
             radius = rng.uniform(4.0, 18.0)
-            mag = rng.normal(config.subhalo_mag0 + 1.4, 0.45)
         else:
             radius = min(config.subhalo_field_radius_arcsec, rng.gamma(shape=2.0, scale=14.0) + 3.0)
-            mag = rng.normal(config.subhalo_mag_mean, config.subhalo_mag_sigma)
         theta = rng.uniform(0.0, 2.0 * np.pi)
         x_arcsec = float(radius * np.cos(theta))
         y_arcsec = float(radius * np.sin(theta))
         q = float(rng.uniform(0.65, 1.0))
         ellipticite = _axis_ratio_to_lenstool_ellipticite(q)
         angle_pos = float(rng.uniform(-90.0, 90.0))
-        mag = float(np.clip(mag, config.subhalo_mag0 - 0.2, config.subhalo_mag0 + 6.0))
-        luminosity_ratio = float(10.0 ** (-0.4 * (mag - config.subhalo_mag0)))
+        mag = float(candidate["catalog_mag"])
+        luminosity_ratio = float(candidate["luminosity_ratio"])
         sigma_log_offset = float(rng.normal(0.0, _dex_scatter_to_ln(config.subhalo_sigma_scatter_dex)))
         cut_log_offset = float(rng.normal(0.0, _dex_scatter_to_ln(config.subhalo_cut_scatter_dex)))
-        rows.append(
-            {
-                "id": f"member{idx + 1:03d}",
-                "x_arcsec": x_arcsec,
-                "y_arcsec": y_arcsec,
-                "catalog_a": 0.3734,
-                "catalog_b": 0.3734 * q,
-                "catalog_theta": angle_pos,
-                "catalog_mag": mag,
-                "catalog_lum": luminosity_ratio,
-                "ellipticite": ellipticite,
-                "angle_pos": angle_pos,
-                "luminosity_ratio": luminosity_ratio,
-                "sigma_log_offset": sigma_log_offset,
-                "cut_log_offset": cut_log_offset,
-            }
-        )
+        row = {
+            "id": f"member{idx + 1:03d}",
+            "x_arcsec": x_arcsec,
+            "y_arcsec": y_arcsec,
+            "catalog_a": 0.3734,
+            "catalog_b": 0.3734 * q,
+            "catalog_theta": angle_pos,
+            "catalog_mag": mag,
+            "catalog_lum": luminosity_ratio,
+            "ellipticite": ellipticite,
+            "angle_pos": angle_pos,
+            "luminosity_ratio": luminosity_ratio,
+            "sigma_log_offset": sigma_log_offset,
+            "cut_log_offset": cut_log_offset,
+        }
+        for key in ("subhalo_candidate_index", "subhalo_mass_msun", "subhalo_parent_rank", "selected_by_mag_cut"):
+            if key in candidate:
+                row[key] = candidate[key]
+        rows.append(row)
+    return rows, subhalo_selection
+
+
+def _generate_subhalo_catalog(config: SingleBCGMockConfig, rng: np.random.Generator) -> list[dict[str, Any]]:
+    rows, _subhalo_selection = _generate_subhalo_catalog_payload(config, rng)
     return rows
 
 
@@ -331,7 +601,8 @@ def _write_single_bcg_par(
     images: pd.DataFrame,
     subhalos: list[dict[str, Any]] | None = None,
 ) -> None:
-    def potential_block(component: DPIETruth) -> str:
+    def potential_block(component: DPIETruth, position_prior_half_width_arcsec: float) -> str:
+        half_width = float(position_prior_half_width_arcsec)
         return f"""
 potentiel {component.potential_id}
     profil      81
@@ -346,8 +617,8 @@ potentiel {component.potential_id}
     end
 
 limit {component.potential_id}
-    x_centre    1 {component.x_centre - 8.0:.8f} {component.x_centre + 8.0:.8f} 0.05
-    y_centre    1 {component.y_centre - 8.0:.8f} {component.y_centre + 8.0:.8f} 0.05
+    x_centre    1 {component.x_centre - half_width:.8f} {component.x_centre + half_width:.8f} 0.05
+    y_centre    1 {component.y_centre - half_width:.8f} {component.y_centre + half_width:.8f} 0.05
     ellipticite 1 0.0 0.75 0.02
     angle_pos   1 -90.0 90.0 0.5
     core_radius 1 {max(0.001, component.core_radius_arcsec * 0.2):.8f} {component.core_radius_arcsec * 3.0:.8f} 0.02
@@ -399,8 +670,8 @@ grille
     nlens_opt {nlens_opt}
     nombre 256
     end
-{potential_block(config.halo)}
-{potential_block(config.bcg)}
+{potential_block(config.halo, DEFAULT_BCG_POSITION_PRIOR_HALF_WIDTH_ARCSEC)}
+{potential_block(config.bcg, config.bcg_position_prior_half_width_arcsec)}
 {potfile_block}
 champ
     dmax {champ_dmax}
@@ -664,9 +935,48 @@ def _caustic_contours_by_z_from_truth(truth: dict[str, Any]) -> dict[str, list[C
     return parsed
 
 
-def _family_source_redshifts(config: SingleBCGMockConfig) -> tuple[float, ...]:
-    values = tuple(float(value) for value in config.source_redshifts if np.isfinite(float(value)) and float(value) > config.z_lens)
-    return values if values else (float(config.source_redshift),)
+def _valid_source_redshifts(values: tuple[float, ...], config: SingleBCGMockConfig) -> tuple[float, ...]:
+    parsed = tuple(
+        float(value)
+        for value in values
+        if np.isfinite(float(value)) and float(value) > float(config.z_lens)
+    )
+    return parsed if parsed else (float(config.source_redshift),)
+
+
+def _family_source_redshifts(config: SingleBCGMockConfig, caustic_class: str) -> tuple[float, ...]:
+    raw_values = (
+        config.subhalo_source_redshifts
+        if str(caustic_class) == "subhalo"
+        else config.primary_source_redshifts
+    )
+    return _valid_source_redshifts(raw_values, config)
+
+
+def _mock_image_min_distance_arcsec(config: SingleBCGMockConfig, caustic_class: str) -> float:
+    caustic_class = str(caustic_class)
+    if caustic_class == "primary":
+        value = float(config.primary_image_min_distance_arcsec)
+    elif caustic_class == "subhalo":
+        value = float(config.subhalo_image_min_distance_arcsec)
+    else:
+        raise ValueError(f"Unknown mock caustic class {caustic_class!r}.")
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(f"Mock image min_distance for {caustic_class} families must be positive and finite.")
+    return value
+
+
+def _ordered_unique_source_redshifts(*groups: tuple[float, ...]) -> tuple[float, ...]:
+    seen: set[float] = set()
+    ordered: list[float] = []
+    for group in groups:
+        for value in group:
+            z_source = float(value)
+            if z_source in seen:
+                continue
+            seen.add(z_source)
+            ordered.append(z_source)
+    return tuple(ordered)
 
 
 def _image_count_requirement_text(min_images: int, max_images: int | None) -> str:
@@ -709,6 +1019,7 @@ def generate_single_bcg_mock(
     config: SingleBCGMockConfig | None = None,
     *,
     overwrite: bool = True,
+    progress_callback: MockProgressCallback | None = None,
 ) -> tuple[MockClusterPaths, pd.DataFrame, dict[str, Any]]:
     """Generate a deterministic single-BCG mock cluster on disk."""
     config = config or SingleBCGMockConfig()
@@ -726,9 +1037,59 @@ def generate_single_bcg_mock(
     cosmo_config = flat_wcdm_config(h0=70.0, om0=0.3)
     cosmo = FlatLambdaCDM(H0=70.0, Om0=0.3)
     kpc_per_arcsec = kpc_per_arcsec_from_config(config.z_lens, cosmo_config)
-    subhalos = _generate_subhalo_catalog(config, rng)
+    _emit_mock_progress(
+        progress_callback,
+        "subhalos_start",
+        requested_subhalos=int(config.n_subhalos),
+        parent_factor=int(config.subhalo_parent_factor),
+        mag_faint_limit=float(config.subhalo_mag_faint_limit),
+    )
+    subhalos, subhalo_selection = _generate_subhalo_catalog_payload(config, rng)
+    observable_count = 0
+    parent_count = 0
+    retry_count = 0
+    if subhalo_selection is not None:
+        parent_count = int(subhalo_selection.get("parent_count", 0))
+        observable_count = int(
+            sum(1 for candidate in subhalo_selection.get("candidates", []) if candidate.get("passes_mag_cut"))
+        )
+        base_parent_count = max(int(config.n_subhalos), int(config.subhalo_parent_factor) * int(config.n_subhalos))
+        if parent_count > 0 and base_parent_count > 0:
+            retry_count = max(0, int(round(math.log2(parent_count / base_parent_count))))
+    _emit_mock_progress(
+        progress_callback,
+        "subhalos_complete",
+        requested_subhalos=int(config.n_subhalos),
+        selected_subhalos=int(len(subhalos)),
+        parent_count=parent_count,
+        observable_count=observable_count,
+        retry_count=retry_count,
+        mag_faint_limit=float(config.subhalo_mag_faint_limit),
+    )
     subhalo_components = [_scaled_subhalo_params(row, config) for row in subhalos]
-    source_redshifts = _family_source_redshifts(config)
+    primary_source_redshifts = _family_source_redshifts(config, "primary")
+    subhalo_source_redshifts = _family_source_redshifts(config, "subhalo")
+    primary_family_redshifts = tuple(
+        primary_source_redshifts[index % len(primary_source_redshifts)]
+        for index in range(int(config.n_primary_families))
+    )
+    subhalo_family_redshifts = tuple(
+        subhalo_source_redshifts[index % len(subhalo_source_redshifts)]
+        for index in range(int(config.n_subhalo_families))
+    )
+    needed_source_redshifts = _ordered_unique_source_redshifts(
+        primary_family_redshifts,
+        subhalo_family_redshifts,
+    )
+    redshift_index_by_value = {float(z): index + 1 for index, z in enumerate(needed_source_redshifts)}
+    caustic_num_pix = 0
+    if float(config.caustic_compute_window_arcsec) > 0.0 and float(config.caustic_grid_scale_arcsec) > 0.0:
+        caustic_num_pix = max(
+            16,
+            int(math.ceil(float(config.caustic_compute_window_arcsec) / float(config.caustic_grid_scale_arcsec))) + 1,
+        )
+        if caustic_num_pix % 2 == 0:
+            caustic_num_pix += 1
     model_cache: dict[float, tuple[LensModel, LensEquationSolver, list[dict[str, float]]]] = {}
     caustic_cache: dict[float, list[CausticContour]] = {}
 
@@ -742,59 +1103,300 @@ def generate_single_bcg_mock(
     def get_caustics(z_source: float) -> list[CausticContour]:
         z_key = float(z_source)
         if z_key not in caustic_cache:
+            _emit_mock_progress(
+                progress_callback,
+                "redshift_start",
+                z_source=z_key,
+                redshift_index=int(redshift_index_by_value.get(z_key, len(caustic_cache) + 1)),
+                redshift_count=int(len(needed_source_redshifts)),
+                lens_component_count=int(2 + len(subhalo_components)),
+                caustic_compute_window_arcsec=float(config.caustic_compute_window_arcsec),
+                caustic_grid_scale_arcsec=float(config.caustic_grid_scale_arcsec),
+                caustic_grid_pixels=int(caustic_num_pix),
+            )
             model, _solver, kwargs_lens = get_model(z_key)
-            caustic_cache[z_key] = _compute_tangential_caustic_contours(model, kwargs_lens, config)
+            contours = _compute_tangential_caustic_contours(model, kwargs_lens, config)
+            caustic_cache[z_key] = contours
+            _emit_mock_progress(
+                progress_callback,
+                "redshift_complete",
+                z_source=z_key,
+                redshift_index=int(redshift_index_by_value.get(z_key, len(caustic_cache))),
+                redshift_count=int(len(needed_source_redshifts)),
+                lens_component_count=int(2 + len(subhalo_components)),
+                caustic_compute_window_arcsec=float(config.caustic_compute_window_arcsec),
+                caustic_grid_scale_arcsec=float(config.caustic_grid_scale_arcsec),
+                caustic_grid_pixels=int(caustic_num_pix),
+                caustic_count=int(len(contours)),
+                primary_caustic_count=int(sum(1 for contour in contours if contour.caustic_class == "primary")),
+                subhalo_caustic_count=int(sum(1 for contour in contours if contour.caustic_class == "subhalo")),
+            )
         return caustic_cache[z_key]
 
     image_rows: list[dict[str, Any]] = []
     source_rows: list[dict[str, Any]] = []
-    target_classes = ["primary"] * int(config.n_primary_families) + ["subhalo"] * int(config.n_subhalo_families)
-    for caustic_class in target_classes:
-        z_source = source_redshifts[len(source_rows) % len(source_redshifts)]
-        model, solver, kwargs_lens = get_model(z_source)
-        contours = get_caustics(z_source)
+    target_families = [("primary", z_source) for z_source in primary_family_redshifts] + [
+        ("subhalo", z_source) for z_source in subhalo_family_redshifts
+    ]
+    image_solver_worker_count = max(1, int(jax_cpu_worker_count()))
+    worker_local = threading.local()
+
+    @dataclass
+    class FamilySearchState:
+        family_index: int
+        family_id: str
+        caustic_class: str
+        z_source: float
+        contours: list[CausticContour]
+        image_min_distance_arcsec: float
+        max_attempts: int
+        inside_caustic: bool
+        candidate_rng: np.random.Generator
+        observation_rng: np.random.Generator
+        next_attempt_index: int = 1
         accepted: tuple[float, float, CausticContour, np.ndarray, np.ndarray] | None = None
-        inside_caustic = config.max_images_per_family is None or int(config.max_images_per_family) > 3
-        for _attempt in range(max(1, int(config.max_sources_to_try))):
-            beta_x, beta_y, contour = _sample_caustic_source_candidate(
-                contours,
-                caustic_class,
-                rng,
-                inside_caustic=inside_caustic,
+
+    def get_worker_model(z_source: float) -> tuple[LensModel, LensEquationSolver, list[dict[str, float]]]:
+        z_key = float(z_source)
+        worker_model_cache = getattr(worker_local, "model_cache", None)
+        if worker_model_cache is None:
+            worker_model_cache = {}
+            worker_local.model_cache = worker_model_cache
+        if z_key not in worker_model_cache:
+            worker_model, worker_kwargs_lens = _mock_model_and_kwargs(
+                config,
+                subhalo_components,
+                z_key,
+                cosmo,
+                cosmo_config,
             )
-            x_img, y_img = solver.image_position_from_source(
+            worker_model_cache[z_key] = (worker_model, LensEquationSolver(worker_model), worker_kwargs_lens)
+        return worker_model_cache[z_key]
+
+    def solve_candidate_images(
+        z_source: float,
+        attempt_index: int,
+        beta_x: float,
+        beta_y: float,
+        contour: CausticContour,
+        image_min_distance_arcsec: float,
+    ) -> tuple[int, float, float, CausticContour, np.ndarray, np.ndarray]:
+        _model, solver, kwargs_lens = get_worker_model(z_source)
+        x_img, y_img = solver.image_position_from_source(
+            beta_x,
+            beta_y,
+            kwargs_lens,
+            solver="lenstronomy",
+            search_window=80.0,
+            min_distance=float(image_min_distance_arcsec),
+            num_iter_max=300,
+            precision_limit=1.0e-8,
+        )
+        x_arr, y_arr = _deduplicate_images(np.asarray(x_img, dtype=float), np.asarray(y_img, dtype=float))
+        return int(attempt_index), float(beta_x), float(beta_y), contour, x_arr, y_arr
+
+    for z_source in needed_source_redshifts:
+        get_caustics(float(z_source))
+
+    max_attempts = max(1, int(config.max_sources_to_try))
+    family_count = int(len(target_families))
+    max_queue_workers = min(image_solver_worker_count, family_count) if family_count else 0
+    if family_count:
+        family_seed_values = rng.integers(
+            0,
+            np.iinfo(np.int64).max,
+            size=(family_count, 2),
+            dtype=np.int64,
+        )
+    else:
+        family_seed_values = np.empty((0, 2), dtype=np.int64)
+    family_states: list[FamilySearchState] = []
+    for family_index, (caustic_class, z_source) in enumerate(target_families, start=1):
+        contours = get_caustics(float(z_source))
+        inside_caustic = config.max_images_per_family is None or int(config.max_images_per_family) > 3
+        family_state = FamilySearchState(
+            family_index=int(family_index),
+            family_id=str(family_index),
+            caustic_class=str(caustic_class),
+            z_source=float(z_source),
+            contours=contours,
+            image_min_distance_arcsec=_mock_image_min_distance_arcsec(config, str(caustic_class)),
+            max_attempts=max_attempts,
+            inside_caustic=inside_caustic,
+            candidate_rng=np.random.default_rng(int(family_seed_values[family_index - 1, 0])),
+            observation_rng=np.random.default_rng(int(family_seed_values[family_index - 1, 1])),
+        )
+        family_states.append(family_state)
+        _emit_mock_progress(
+            progress_callback,
+            "family_start",
+            family_index=int(family_index),
+            family_count=int(family_count),
+            caustic_class=str(caustic_class),
+            z_source=float(z_source),
+            max_attempts=int(max_attempts),
+            image_min_distance_arcsec=float(family_state.image_min_distance_arcsec),
+            image_solver_workers=int(max_queue_workers),
+            queued_families=int(family_count),
+        )
+
+    _emit_mock_progress(
+        progress_callback,
+        "family_queue_start",
+        family_count=int(family_count),
+        image_solver_workers=int(max_queue_workers),
+        max_attempts=int(max_attempts),
+        queued_families=int(family_count),
+    )
+
+    def sample_candidate_attempt(state: FamilySearchState) -> tuple[int, float, float, CausticContour]:
+        attempt_index = int(state.next_attempt_index)
+        beta_x, beta_y, contour = _sample_caustic_source_candidate(
+            state.contours,
+            state.caustic_class,
+            state.candidate_rng,
+            inside_caustic=state.inside_caustic,
+        )
+        state.next_attempt_index += 1
+        return int(attempt_index), float(beta_x), float(beta_y), contour
+
+    def fail_family(state: FamilySearchState) -> RuntimeError:
+        _emit_mock_progress(
+            progress_callback,
+            "family_fail",
+            family_index=int(state.family_index),
+            family_count=int(family_count),
+            caustic_class=str(state.caustic_class),
+            z_source=float(state.z_source),
+            max_attempts=int(state.max_attempts),
+            image_min_distance_arcsec=float(state.image_min_distance_arcsec),
+            image_solver_workers=int(max_queue_workers),
+        )
+        return RuntimeError(
+            f"Failed to generate a {state.caustic_class} source with "
+            f"{_image_count_requirement_text(config.min_images_per_family, config.max_images_per_family)} "
+            f"at z_source={state.z_source:.6g} after "
+            f"{config.max_sources_to_try} attempts."
+        )
+
+    if family_states:
+        pending_families: deque[FamilySearchState] = deque(family_states)
+        in_flight: dict[Future[Any], tuple[FamilySearchState, tuple[int, float, float, CausticContour]]] = {}
+        accepted_family_count = 0
+        executor = ThreadPoolExecutor(max_workers=max_queue_workers)
+
+        def schedule_next_family_attempt(state: FamilySearchState) -> None:
+            if state.next_attempt_index > state.max_attempts:
+                raise fail_family(state)
+            candidate = sample_candidate_attempt(state)
+            attempt_index, beta_x, beta_y, contour = candidate
+            future = executor.submit(
+                solve_candidate_images,
+                state.z_source,
+                attempt_index,
                 beta_x,
                 beta_y,
-                kwargs_lens,
-                solver="lenstronomy",
-                search_window=80.0,
-                min_distance=0.05,
-                num_iter_max=300,
-                precision_limit=1.0e-8,
+                contour,
+                state.image_min_distance_arcsec,
             )
-            x_arr, y_arr = _deduplicate_images(np.asarray(x_img, dtype=float), np.asarray(y_img, dtype=float))
-            if _image_count_within_requirement(
-                len(x_arr),
-                int(config.min_images_per_family),
-                config.max_images_per_family,
-            ):
-                accepted = (float(beta_x), float(beta_y), contour, x_arr, y_arr)
-                break
-        if accepted is None:
+            in_flight[future] = (state, candidate)
+
+        def fill_worker_queue() -> None:
+            while pending_families and len(in_flight) < max_queue_workers:
+                state = pending_families.popleft()
+                if state.accepted is not None:
+                    continue
+                schedule_next_family_attempt(state)
+
+        def shutdown_executor(*, wait_for_running: bool, cancel_futures: bool = False) -> None:
+            shutdown = getattr(executor, "shutdown", None)
+            if shutdown is None:
+                return
+            try:
+                shutdown(wait=wait_for_running, cancel_futures=cancel_futures)
+            except TypeError:
+                shutdown(wait=wait_for_running)
+
+        try:
+            fill_worker_queue()
+            while in_flight:
+                done_futures, _pending_futures = wait(set(in_flight), return_when=FIRST_COMPLETED)
+                for future in done_futures:
+                    state, candidate = in_flight.pop(future)
+                    attempt_index, beta_x, beta_y, contour = candidate
+                    _result_attempt, _beta_x, _beta_y, _contour, x_arr, y_arr = future.result()
+                    accepted_attempt = _image_count_within_requirement(
+                        len(x_arr),
+                        int(config.min_images_per_family),
+                        config.max_images_per_family,
+                    )
+                    _emit_mock_progress(
+                        progress_callback,
+                        "family_attempt",
+                        family_index=int(state.family_index),
+                        family_count=int(family_count),
+                        caustic_class=str(state.caustic_class),
+                        z_source=float(state.z_source),
+                        attempt=int(attempt_index),
+                        max_attempts=int(state.max_attempts),
+                        image_count=int(len(x_arr)),
+                        accepted=bool(accepted_attempt),
+                        image_min_distance_arcsec=float(state.image_min_distance_arcsec),
+                        image_solver_workers=int(max_queue_workers),
+                        queued_families=int(len(pending_families)),
+                        in_flight_families=int(len(in_flight)),
+                        accepted_families=int(accepted_family_count),
+                    )
+                    if accepted_attempt:
+                        state.accepted = (float(beta_x), float(beta_y), contour, x_arr, y_arr)
+                        accepted_family_count += 1
+                        _emit_mock_progress(
+                            progress_callback,
+                            "family_accept",
+                            family_index=int(state.family_index),
+                            family_count=int(family_count),
+                            caustic_class=str(state.caustic_class),
+                            z_source=float(state.z_source),
+                            attempt=int(attempt_index),
+                            max_attempts=int(state.max_attempts),
+                            image_count=int(len(x_arr)),
+                            image_min_distance_arcsec=float(state.image_min_distance_arcsec),
+                            caustic_index=int(contour.caustic_index),
+                            caustic_area_arcsec2=float(contour.caustic_area_arcsec2),
+                            image_solver_workers=int(max_queue_workers),
+                            queued_families=int(len(pending_families)),
+                            in_flight_families=int(len(in_flight)),
+                            accepted_families=int(accepted_family_count),
+                        )
+                    elif state.next_attempt_index <= state.max_attempts:
+                        pending_families.append(state)
+                    else:
+                        for pending_future in in_flight:
+                            pending_future.cancel()
+                        raise fail_family(state)
+                fill_worker_queue()
+        except BaseException:
+            for pending_future in in_flight:
+                pending_future.cancel()
+            shutdown_executor(wait_for_running=False, cancel_futures=True)
+            raise
+        else:
+            shutdown_executor(wait_for_running=True)
+
+    for state in sorted(family_states, key=lambda item: item.family_index):
+        if state.accepted is None:
             raise RuntimeError(
-                f"Failed to generate a {caustic_class} source with "
-                f"{_image_count_requirement_text(config.min_images_per_family, config.max_images_per_family)} "
-                f"at z_source={z_source:.6g} after "
-                f"{config.max_sources_to_try} attempts."
+                f"Generated {len(source_rows)} multiply imaged families, fewer than requested {config.n_families}."
             )
-        beta_x, beta_y, contour, x_arr, y_arr = accepted
-        family_id = str(len(source_rows) + 1)
+        beta_x, beta_y, contour, x_arr, y_arr = state.accepted
+        family_id = state.family_id
+        model, _solver, kwargs_lens = get_model(state.z_source)
         source_rows.append(
             {
                 "family_id": family_id,
                 "beta_x": float(beta_x),
                 "beta_y": float(beta_y),
-                "z_source": float(z_source),
+                "z_source": float(state.z_source),
                 "n_images": int(len(x_arr)),
                 "caustic_class": str(contour.caustic_class),
                 "caustic_index": int(contour.caustic_index),
@@ -804,15 +1406,15 @@ def generate_single_bcg_mock(
         )
         magnification = np.asarray(model.magnification(x_arr, y_arr, kwargs_lens), dtype=float)
         for image_index, (x_true, y_true, mu_true) in enumerate(zip(x_arr, y_arr, magnification), start=1):
-            x_obs = float(x_true + rng.normal(0.0, config.pos_sigma_arcsec))
-            y_obs = float(y_true + rng.normal(0.0, config.pos_sigma_arcsec))
+            x_obs = float(x_true + state.observation_rng.normal(0.0, config.pos_sigma_arcsec))
+            y_obs = float(y_true + state.observation_rng.normal(0.0, config.pos_sigma_arcsec))
             image_id = _lowercase_image_suffix(image_index)
             image_rows.append(
                 {
                     "image_label": f"{family_id}.{image_id}",
                     "family_id": family_id,
                     "image_id": image_id,
-                    "z_source": float(z_source),
+                    "z_source": float(state.z_source),
                     "x_true_arcsec": float(x_true),
                     "y_true_arcsec": float(y_true),
                     "x_obs_arcsec": x_obs,
@@ -829,6 +1431,14 @@ def generate_single_bcg_mock(
         )
 
     images = pd.DataFrame(image_rows)
+    _emit_mock_progress(
+        progress_callback,
+        "outputs_start",
+        output_dir=str(root),
+        family_count=int(len(source_rows)),
+        image_count=int(len(image_rows)),
+        subhalo_count=int(len(subhalos)),
+    )
     image_catalog_path.write_text(
         "#REFERENCE 3\n"
         + "\n".join(
@@ -865,37 +1475,90 @@ def generate_single_bcg_mock(
         "subhalo_components": [asdict(component) for component in subhalo_components],
         "caustics_by_source_redshift": {
             f"{z:.8f}": [_caustic_contour_to_json(contour) for contour in get_caustics(float(z))]
-            for z in source_redshifts
+            for z in needed_source_redshifts
         },
         "lens_model_list": [ORIGINAL_DPIE_PROFILE_NAME, ORIGINAL_DPIE_PROFILE_NAME]
         + [ORIGINAL_DPIE_PROFILE_NAME for _ in subhalo_components],
         "kwargs_lens": get_model(float(config.source_redshift))[2],
-        "kwargs_lens_by_source_redshift": {f"{z:.8f}": get_model(float(z))[2] for z in source_redshifts},
+        "kwargs_lens_by_source_redshift": {f"{z:.8f}": get_model(float(z))[2] for z in needed_source_redshifts},
     }
+    if subhalo_selection is not None:
+        truth_payload["subhalo_selection"] = subhalo_selection
     truth_path.write_text(json.dumps(truth_payload, indent=2), encoding="utf-8")
     mock_images_path.write_text(json.dumps(image_rows, indent=2), encoding="utf-8")
+    _emit_mock_progress(
+        progress_callback,
+        "outputs_complete",
+        output_dir=str(root),
+        par_path=str(par_path),
+        image_catalog_path=str(image_catalog_path),
+        member_catalog_path=str(member_catalog_path) if subhalos else None,
+        truth_path=str(truth_path),
+        mock_images_path=str(mock_images_path),
+        family_count=int(len(source_rows)),
+        image_count=int(len(image_rows)),
+        subhalo_count=int(len(subhalos)),
+    )
     return MockClusterPaths(root, par_path, image_catalog_path, truth_path, mock_images_path), images, truth_payload
+
+
+def _source_redshift_tuple_from_config(raw: Any, default: tuple[float, ...]) -> tuple[float, ...]:
+    try:
+        if isinstance(raw, str):
+            values = tuple(float(item.strip()) for item in raw.split(",") if item.strip())
+        else:
+            values = tuple(float(value) for value in raw)
+    except (TypeError, ValueError):
+        return default
+    return values if values else default
 
 
 def _caustic_config_from_truth(truth: dict[str, Any]) -> SingleBCGMockConfig:
     raw = truth.get("config", {})
     config = raw if isinstance(raw, dict) else {}
     defaults = SingleBCGMockConfig()
-    source_redshifts_raw = config.get("source_redshifts", defaults.source_redshifts)
-    try:
-        source_redshifts = tuple(float(value) for value in source_redshifts_raw)
-    except TypeError:
-        source_redshifts = defaults.source_redshifts
+    legacy_source_redshifts_raw = config.get("source_redshifts", defaults.primary_source_redshifts)
+    primary_source_redshifts = _source_redshift_tuple_from_config(
+        config.get("primary_source_redshifts", legacy_source_redshifts_raw),
+        defaults.primary_source_redshifts,
+    )
+    subhalo_source_redshifts = _source_redshift_tuple_from_config(
+        config.get("subhalo_source_redshifts", legacy_source_redshifts_raw),
+        defaults.subhalo_source_redshifts,
+    )
     max_images_raw = config.get("max_images_per_family", defaults.max_images_per_family)
     max_images_per_family = None if max_images_raw is None else int(max_images_raw)
     return SingleBCGMockConfig(
         z_lens=float(config.get("z_lens", defaults.z_lens)),
         source_redshift=float(config.get("source_redshift", defaults.source_redshift)),
-        source_redshifts=source_redshifts,
+        primary_source_redshifts=primary_source_redshifts,
+        subhalo_source_redshifts=subhalo_source_redshifts,
         n_primary_families=int(config.get("n_primary_families", defaults.n_primary_families)),
         n_subhalo_families=int(config.get("n_subhalo_families", defaults.n_subhalo_families)),
         min_images_per_family=int(config.get("min_images_per_family", defaults.min_images_per_family)),
         max_images_per_family=max_images_per_family,
+        primary_image_min_distance_arcsec=float(
+            config.get("primary_image_min_distance_arcsec", defaults.primary_image_min_distance_arcsec)
+        ),
+        subhalo_image_min_distance_arcsec=float(
+            config.get("subhalo_image_min_distance_arcsec", defaults.subhalo_image_min_distance_arcsec)
+        ),
+        bcg_position_prior_half_width_arcsec=float(
+            config.get("bcg_position_prior_half_width_arcsec", defaults.bcg_position_prior_half_width_arcsec)
+        ),
+        n_subhalos=int(config.get("n_subhalos", defaults.n_subhalos)),
+        subhalo_schechter_alpha=float(
+            config.get("subhalo_schechter_alpha", defaults.subhalo_schechter_alpha)
+        ),
+        subhalo_parent_factor=int(config.get("subhalo_parent_factor", defaults.subhalo_parent_factor)),
+        subhalo_mag_faint_limit=float(config.get("subhalo_mag_faint_limit", defaults.subhalo_mag_faint_limit)),
+        subhalo_mass_min=float(config.get("subhalo_mass_min", defaults.subhalo_mass_min)),
+        subhalo_mass_max=float(config.get("subhalo_mass_max", defaults.subhalo_mass_max)),
+        subhalo_mass_ref=float(config.get("subhalo_mass_ref", defaults.subhalo_mass_ref)),
+        subhalo_sigma_scatter_dex=float(
+            config.get("subhalo_sigma_scatter_dex", defaults.subhalo_sigma_scatter_dex)
+        ),
+        subhalo_cut_scatter_dex=float(config.get("subhalo_cut_scatter_dex", defaults.subhalo_cut_scatter_dex)),
         caustic_compute_window_arcsec=float(
             config.get("caustic_compute_window_arcsec", defaults.caustic_compute_window_arcsec)
         ),

@@ -49,6 +49,7 @@ from plot_literature_family_cutouts import (  # noqa: E402
     _format_number,
     _style_cutout_axis,
     _style_cutout_figure,
+    build_rgb_display,
     extract_band_cutout,
     find_rgb_band_paths,
     load_rgb_metadata,
@@ -60,12 +61,36 @@ DEFAULT_MATCH_RADIUS_ARCSEC = 0.5
 DEFAULT_IMAGES_PER_PAGE = 12
 TABLES_DIR_NAME = "tables"
 ARTIFACTS_DIR_NAME = "artifacts"
+IMAGE_FIT_QUALITY_CSV_NAME = "image_fit_quality.csv"
 EXTRA_IMAGES_CSV_NAME = "image_recovery_extra_images.csv"
 DEFAULT_OUTPUT_NAME = "extra_image_cutouts.pdf"
+DEFAULT_EXTRAS_OUTPUT_NAME = "extra_image_redshift_marked_cutouts.pdf"
 DEFAULT_MATCHES_NAME = "extra_image_cutout_matches.csv"
+REQUIRED_IMAGE_FIT_COLUMNS = ("family_id", "image_label", "x_obs_arcsec", "y_obs_arcsec", "image_recovery_status")
 REQUIRED_EXTRA_COLUMNS = ("family_id", "extra_image_index", "x_model_arcsec", "y_model_arcsec")
+STATUS_OBSERVED = "OBSERVED"
+STATUS_RECOVERED = "RECOVERED"
+STATUS_MISSING = "MISSING"
+STATUS_EXTRA = "EXTRA"
+STATUS_LABEL_COLORS = {
+    STATUS_OBSERVED: "#00e5ff",
+    STATUS_RECOVERED: "#43d463",
+    STATUS_MISSING: "#ff4d5e",
+    STATUS_EXTRA: "#ffdf4d",
+}
+STATUS_LABEL_FONT_SIZE = 7.0
+STATUS_TEXT_BBOX = {"facecolor": "black", "alpha": 0.62, "edgecolor": "none", "pad": 0.55}
+DETAIL_TEXT_Y = 0.78
+OBSERVED_MARKER_COLOR = STATUS_LABEL_COLORS[STATUS_OBSERVED]
+RECOVERED_MARKER_COLOR = STATUS_LABEL_COLORS[STATUS_RECOVERED]
+MISSING_MARKER_COLOR = STATUS_LABEL_COLORS[STATUS_MISSING]
 EXTRA_MARKER_COLOR = "#ffdf4d"
 MASTER_MARKER_COLOR = "#00d5ff"
+LABEL_COLOR_DEFAULT = "white"
+LABEL_COLOR_SPECZ_MATCH = "#43d463"
+LABEL_COLOR_PHOTOZ_MATCH = "#4da3ff"
+SPECZ_LABEL_DELTA_MAX = 0.1
+PHOTOZ_LABEL_DELTA_MAX = 0.5
 CLUSTER_ALIASES = {
     "a307": "a370",
     "a370": "a370",
@@ -106,8 +131,16 @@ def extra_images_csv_path(stage_dir: Path) -> Path:
     return resolve_stage_dir(stage_dir) / TABLES_DIR_NAME / EXTRA_IMAGES_CSV_NAME
 
 
+def image_fit_quality_csv_path(stage_dir: Path) -> Path:
+    return resolve_stage_dir(stage_dir) / TABLES_DIR_NAME / IMAGE_FIT_QUALITY_CSV_NAME
+
+
 def default_output_path(stage_dir: Path) -> Path:
     return resolve_stage_dir(stage_dir) / TABLES_DIR_NAME / DEFAULT_OUTPUT_NAME
+
+
+def default_extras_output_path(stage_dir: Path) -> Path:
+    return resolve_stage_dir(stage_dir) / TABLES_DIR_NAME / DEFAULT_EXTRAS_OUTPUT_NAME
 
 
 def default_matches_output_path(stage_dir: Path) -> Path:
@@ -232,29 +265,107 @@ def infer_cluster(stage_dir: Path, reference: ReferenceFrame | None = None) -> s
     return "a370"
 
 
-def load_extra_images(extra_images_csv: Path, reference: ReferenceFrame) -> pd.DataFrame:
-    data = pd.read_csv(extra_images_csv)
-    missing = [column for column in REQUIRED_EXTRA_COLUMNS if column not in data.columns]
-    if missing:
-        raise ValueError(f"{extra_images_csv} is missing required columns: {missing}")
+def _read_csv_allow_empty(path: Path) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
+def _add_offset_radec_columns(
+    data: pd.DataFrame,
+    reference: ReferenceFrame,
+    *,
+    x_column: str,
+    y_column: str,
+    ra_column: str,
+    dec_column: str,
+) -> pd.DataFrame:
     data = data.copy()
     ra_values: list[float] = []
     dec_values: list[float] = []
     for row in data.itertuples(index=False):
-        ra, dec = offsets_to_radec(
-            getattr(row, "x_model_arcsec"),
-            getattr(row, "y_model_arcsec"),
-            ra0_deg=reference.ra0_deg,
-            dec0_deg=reference.dec0_deg,
-        )
+        x_value = _safe_float(getattr(row, x_column))
+        y_value = _safe_float(getattr(row, y_column))
+        if np.isfinite(x_value) and np.isfinite(y_value):
+            ra, dec = offsets_to_radec(
+                x_value,
+                y_value,
+                ra0_deg=reference.ra0_deg,
+                dec0_deg=reference.dec0_deg,
+            )
+        else:
+            ra, dec = float("nan"), float("nan")
         ra_values.append(ra)
         dec_values.append(dec)
-    data["ra"] = ra_values
-    data["dec"] = dec_values
+    data[ra_column] = ra_values
+    data[dec_column] = dec_values
+    return data
+
+
+def _empty_extra_images() -> pd.DataFrame:
+    return pd.DataFrame(columns=[*REQUIRED_EXTRA_COLUMNS, "ra", "dec", "extra_label"])
+
+
+def load_extra_images(extra_images_csv: Path, reference: ReferenceFrame) -> pd.DataFrame:
+    data = _read_csv_allow_empty(extra_images_csv)
+    if data.empty and not set(REQUIRED_EXTRA_COLUMNS).issubset(data.columns):
+        return _empty_extra_images()
+    missing = [column for column in REQUIRED_EXTRA_COLUMNS if column not in data.columns]
+    if missing:
+        raise ValueError(f"{extra_images_csv} is missing required columns: {missing}")
+    data = _add_offset_radec_columns(
+        data,
+        reference,
+        x_column="x_model_arcsec",
+        y_column="y_model_arcsec",
+        ra_column="ra",
+        dec_column="dec",
+    )
     data["extra_label"] = [
         f"{family}.extra{int(index)}"
         for family, index in zip(data["family_id"].astype(str), data["extra_image_index"], strict=True)
     ]
+    return data
+
+
+def _model_position_from_row(row: pd.Series) -> tuple[float, float]:
+    x_model = _safe_float(row.get("x_model_q50"))
+    y_model = _safe_float(row.get("y_model_q50"))
+    if np.isfinite(x_model) and np.isfinite(y_model):
+        return x_model, y_model
+    return _safe_float(row.get("x_model_arcsec")), _safe_float(row.get("y_model_arcsec"))
+
+
+def load_image_fit_quality(image_fit_csv: Path, reference: ReferenceFrame) -> pd.DataFrame:
+    data = _read_csv_allow_empty(image_fit_csv)
+    missing = [column for column in REQUIRED_IMAGE_FIT_COLUMNS if column not in data.columns]
+    if missing:
+        raise ValueError(f"{image_fit_csv} is missing required columns: {missing}")
+    data = _add_offset_radec_columns(
+        data,
+        reference,
+        x_column="x_obs_arcsec",
+        y_column="y_obs_arcsec",
+        ra_column="observed_ra",
+        dec_column="observed_dec",
+    )
+    model_x_values: list[float] = []
+    model_y_values: list[float] = []
+    for _, row in data.iterrows():
+        x_model, y_model = _model_position_from_row(row)
+        model_x_values.append(x_model)
+        model_y_values.append(y_model)
+    data["x_model_cutout_arcsec"] = model_x_values
+    data["y_model_cutout_arcsec"] = model_y_values
+    data = _add_offset_radec_columns(
+        data,
+        reference,
+        x_column="x_model_cutout_arcsec",
+        y_column="y_model_cutout_arcsec",
+        ra_column="model_ra",
+        dec_column="model_dec",
+    )
     return data
 
 
@@ -288,6 +399,11 @@ def _match_columns(row: pd.Series, master_row: pd.Series | None, separation_arcs
     return result
 
 
+def _empty_match_columns(extra_images: pd.DataFrame) -> list[str]:
+    empty_row = pd.Series({column: np.nan for column in extra_images.columns})
+    return list(_match_columns(empty_row, None, None))
+
+
 def match_extra_images_to_master(
     extra_images: pd.DataFrame,
     master: pd.DataFrame,
@@ -298,6 +414,8 @@ def match_extra_images_to_master(
     extra_images = extra_images.reset_index(drop=True)
     master = master.reset_index(drop=True)
     matches: dict[int, tuple[int, float]] = {}
+    if extra_images.empty:
+        return pd.DataFrame(columns=_empty_match_columns(extra_images))
 
     if not extra_images.empty and not master.empty:
         extra_ra = pd.to_numeric(extra_images["ra"], errors="coerce").to_numpy(dtype=float)
@@ -361,6 +479,138 @@ def _panel_label(row: pd.Series) -> str:
     )
 
 
+def _within_redshift_delta(value: Any, reference: Any, max_delta: float) -> bool:
+    numeric = _safe_float(value)
+    reference_numeric = _safe_float(reference)
+    if not np.isfinite(numeric) or not np.isfinite(reference_numeric):
+        return False
+    return abs(numeric - reference_numeric) <= float(max_delta) + 1.0e-12
+
+
+def _panel_label_color(row: pd.Series) -> str:
+    if not bool(row.get("matched", False)):
+        return LABEL_COLOR_DEFAULT
+    z_source = row.get("z_source")
+    if not np.isfinite(_safe_float(z_source)):
+        return LABEL_COLOR_DEFAULT
+    if _within_redshift_delta(z_source, row.get("master_zspec_best"), SPECZ_LABEL_DELTA_MAX):
+        return LABEL_COLOR_SPECZ_MATCH
+    if _within_redshift_delta(z_source, row.get("master_zphot_best"), PHOTOZ_LABEL_DELTA_MAX):
+        return LABEL_COLOR_PHOTOZ_MATCH
+    return LABEL_COLOR_DEFAULT
+
+
+def _status_label_color(status: str) -> str:
+    return STATUS_LABEL_COLORS.get(str(status).upper(), LABEL_COLOR_DEFAULT)
+
+
+def _format_xy_label(prefix: str, x_value: Any, y_value: Any) -> str:
+    return f"{prefix} x={_format_number(x_value, precision=3)} y={_format_number(y_value, precision=3)}"
+
+
+def _image_panel_label(row: pd.Series) -> str:
+    residual = _safe_float(row.get("image_residual_q50"))
+    if not np.isfinite(residual):
+        residual = _safe_float(row.get("image_residual_arcsec"))
+    redshift = _format_z(row.get("z_source"), "z")
+    effective_redshift = _format_z(row.get("effective_z_source"), "zeff")
+    return (
+        f"fam {row.get('family_id')} image {row.get('image_label')}\n"
+        f"{_format_xy_label('obs', row.get('x_obs_arcsec'), row.get('y_obs_arcsec'))}\n"
+        f"{_format_xy_label('model', row.get('x_model_cutout_arcsec'), row.get('y_model_cutout_arcsec'))}\n"
+        f"resid={_format_number(residual, precision=3)}  {redshift}  {effective_redshift}"
+    )
+
+
+def _family_sort_key_value(family_id: Any) -> tuple[int, str]:
+    family_text = str(family_id)
+    family_number = int(family_text) if family_text.isdigit() else 10**9
+    return family_number, family_text
+
+
+def _family_ids_for_panels(image_fit: pd.DataFrame, extra_matches: pd.DataFrame) -> list[str]:
+    family_ids = set(image_fit.get("family_id", pd.Series(dtype=object)).dropna().astype(str))
+    family_ids.update(extra_matches.get("family_id", pd.Series(dtype=object)).dropna().astype(str))
+    return sorted(family_ids, key=_family_sort_key_value)
+
+
+def _image_panel(row: pd.Series, *, panel_status: str, panel_index: int, center_prefix: str) -> dict[str, Any]:
+    result = row.to_dict()
+    result.update(
+        {
+            "panel_status": panel_status,
+            "panel_index": int(panel_index),
+            "ra": _safe_float(row.get(f"{center_prefix}_ra")),
+            "dec": _safe_float(row.get(f"{center_prefix}_dec")),
+            "detail_label": _image_panel_label(row),
+            "detail_label_color": LABEL_COLOR_DEFAULT,
+            "status_label_color": _status_label_color(panel_status),
+        }
+    )
+    return result
+
+
+def _extra_panel(row: pd.Series, *, panel_index: int, mark_status_by_redshift: bool = False) -> dict[str, Any]:
+    redshift_color = _panel_label_color(row)
+    result = row.to_dict()
+    result.update(
+        {
+            "panel_status": STATUS_EXTRA,
+            "panel_index": int(panel_index),
+            "detail_label": _panel_label(row),
+            "detail_label_color": redshift_color,
+            "status_label_color": redshift_color if mark_status_by_redshift else _status_label_color(STATUS_EXTRA),
+        }
+    )
+    return result
+
+
+def _sorted_family_extra_matches(extra_matches: pd.DataFrame, family_id: Any) -> pd.DataFrame:
+    if "family_id" not in extra_matches.columns:
+        return extra_matches.iloc[0:0]
+    family_extra = extra_matches.loc[extra_matches["family_id"].astype(str) == str(family_id)]
+    if family_extra.empty:
+        return family_extra
+    return family_extra.iloc[
+        sorted(range(len(family_extra)), key=lambda index: _sort_key(family_extra.iloc[index]))
+    ].reset_index(drop=True)
+
+
+def build_recovery_cutout_panels(image_fit: pd.DataFrame, extra_matches: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for family_id in _family_ids_for_panels(image_fit, extra_matches):
+        panel_index = 0
+        family_images = image_fit.loc[image_fit["family_id"].astype(str) == str(family_id)].reset_index(drop=True)
+        recovered = family_images.loc[
+            family_images["image_recovery_status"].fillna("").astype(str).str.lower().eq("recovered")
+        ].reset_index(drop=True)
+        missing = family_images.loc[
+            ~family_images["image_recovery_status"].fillna("").astype(str).str.lower().eq("recovered")
+        ].reset_index(drop=True)
+        for _, image_row in recovered.iterrows():
+            rows.append(_image_panel(image_row, panel_status=STATUS_OBSERVED, panel_index=panel_index, center_prefix="observed"))
+            panel_index += 1
+            rows.append(_image_panel(image_row, panel_status=STATUS_RECOVERED, panel_index=panel_index, center_prefix="model"))
+            panel_index += 1
+        for _, image_row in missing.iterrows():
+            rows.append(_image_panel(image_row, panel_status=STATUS_MISSING, panel_index=panel_index, center_prefix="observed"))
+            panel_index += 1
+
+        family_extra = _sorted_family_extra_matches(extra_matches, family_id)
+        for _, extra_row in family_extra.iterrows():
+            rows.append(_extra_panel(extra_row, panel_index=panel_index))
+            panel_index += 1
+    return pd.DataFrame(rows)
+
+
+def build_extra_redshift_cutout_panels(extra_matches: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for family_id in _family_ids_for_panels(pd.DataFrame(), extra_matches):
+        for panel_index, (_, extra_row) in enumerate(_sorted_family_extra_matches(extra_matches, family_id).iterrows()):
+            rows.append(_extra_panel(extra_row, panel_index=panel_index, mark_status_by_redshift=True))
+    return pd.DataFrame(rows)
+
+
 def _draw_extra_marker(
     ax: plt.Axes,
     image: BandImage,
@@ -411,6 +661,151 @@ def _draw_master_marker(
     )
 
 
+def _coord_from_columns(row: pd.Series, ra_column: str, dec_column: str) -> SkyCoord | None:
+    ra = _safe_float(row.get(ra_column))
+    dec = _safe_float(row.get(dec_column))
+    if not np.isfinite(ra) or not np.isfinite(dec):
+        return None
+    return SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
+
+
+def _draw_row_marker(
+    ax: plt.Axes,
+    image: BandImage,
+    row: pd.Series,
+    center_coord: SkyCoord,
+    *,
+    ra_column: str,
+    dec_column: str,
+    cutout_size_arcsec: float,
+    rendered_shape: tuple[int, int],
+    edgecolor: str,
+    linestyle: str = "-",
+    linewidth: float = 0.9,
+    alpha: float = 0.9,
+    zorder: float = 8,
+) -> None:
+    target_coord = _coord_from_columns(row, ra_column, dec_column)
+    if target_coord is None:
+        return
+    _draw_marker(
+        ax,
+        image,
+        center_coord,
+        target_coord,
+        cutout_size_arcsec=cutout_size_arcsec,
+        rendered_shape=rendered_shape,
+        edgecolor=edgecolor,
+        alpha=alpha,
+        linestyle=linestyle,
+        linewidth=linewidth,
+        zorder=zorder,
+    )
+
+
+def _draw_recovery_panel_markers(
+    ax: plt.Axes,
+    image: BandImage,
+    row: pd.Series,
+    center_coord: SkyCoord,
+    *,
+    cutout_size_arcsec: float,
+    rendered_shape: tuple[int, int],
+) -> None:
+    status = str(row.get("panel_status", "")).upper()
+    if status == STATUS_EXTRA:
+        _draw_extra_marker(
+            ax,
+            image,
+            center_coord,
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rendered_shape,
+        )
+        _draw_master_marker(
+            ax,
+            image,
+            row,
+            center_coord,
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rendered_shape,
+        )
+        return
+    if status == STATUS_MISSING:
+        _draw_row_marker(
+            ax,
+            image,
+            row,
+            center_coord,
+            ra_column="observed_ra",
+            dec_column="observed_dec",
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rendered_shape,
+            edgecolor=MISSING_MARKER_COLOR,
+            linewidth=1.0,
+            zorder=9,
+        )
+        return
+    if status == STATUS_OBSERVED:
+        _draw_row_marker(
+            ax,
+            image,
+            row,
+            center_coord,
+            ra_column="observed_ra",
+            dec_column="observed_dec",
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rendered_shape,
+            edgecolor=OBSERVED_MARKER_COLOR,
+            linewidth=1.0,
+            zorder=9,
+        )
+        _draw_row_marker(
+            ax,
+            image,
+            row,
+            center_coord,
+            ra_column="model_ra",
+            dec_column="model_dec",
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rendered_shape,
+            edgecolor=RECOVERED_MARKER_COLOR,
+            linestyle="--",
+            linewidth=0.85,
+            alpha=0.85,
+            zorder=8,
+        )
+        return
+    if status == STATUS_RECOVERED:
+        _draw_row_marker(
+            ax,
+            image,
+            row,
+            center_coord,
+            ra_column="model_ra",
+            dec_column="model_dec",
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rendered_shape,
+            edgecolor=RECOVERED_MARKER_COLOR,
+            linewidth=1.0,
+            zorder=9,
+        )
+        _draw_row_marker(
+            ax,
+            image,
+            row,
+            center_coord,
+            ra_column="observed_ra",
+            dec_column="observed_dec",
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rendered_shape,
+            edgecolor=OBSERVED_MARKER_COLOR,
+            linestyle="--",
+            linewidth=0.85,
+            alpha=0.85,
+            zorder=8,
+        )
+
+
 def _draw_extra_legend(ax: plt.Axes) -> None:
     legend_bbox = {"facecolor": "black", "alpha": 0.38, "edgecolor": "none", "pad": 0.45}
     ax.text(
@@ -457,18 +852,49 @@ def _draw_extra_legend(ax: plt.Axes) -> None:
 
 
 def _sort_key(row: pd.Series) -> tuple[int, str, int, int]:
-    family_text = str(row.get("family_id", ""))
-    family_number = int(family_text) if family_text.isdigit() else 10**9
-    extra_index = int(_safe_float(row.get("extra_image_index"))) if np.isfinite(_safe_float(row.get("extra_image_index"))) else 10**9
-    return family_number, family_text, extra_index, int(row.name)
+    family_number, family_text = _family_sort_key_value(row.get("family_id", ""))
+    panel_index = _safe_float(row.get("panel_index"))
+    extra_index = _safe_float(row.get("extra_image_index"))
+    sequence_index = int(panel_index) if np.isfinite(panel_index) else int(extra_index) if np.isfinite(extra_index) else 10**9
+    return family_number, family_text, sequence_index, int(row.name)
 
 
 def _figure_size(rows: int, cols: int) -> tuple[float, float]:
     return CUTOUT_PANEL_SIZE_INCH * float(cols), CUTOUT_PANEL_SIZE_INCH * float(rows)
 
 
+def _sorted_panel_rows(panels: pd.DataFrame) -> pd.DataFrame:
+    sorted_indices = sorted(range(len(panels)), key=lambda idx: _sort_key(panels.iloc[idx]))
+    return panels.iloc[sorted_indices].reset_index(drop=True)
+
+
+def _family_page_groups(panels: pd.DataFrame, images_per_page: int) -> list[list[pd.DataFrame]]:
+    if images_per_page <= 0:
+        raise ValueError("--images-per-page must be positive.")
+
+    sorted_matches = _sorted_panel_rows(panels)
+    family_groups = [
+        family.reset_index(drop=True)
+        for _, family in sorted_matches.groupby(sorted_matches["family_id"].astype(str), sort=False)
+    ]
+    pages: list[list[pd.DataFrame]] = []
+    current_page: list[pd.DataFrame] = []
+    current_count = 0
+    for family in family_groups:
+        family_count = len(family)
+        if current_page and current_count + family_count > int(images_per_page):
+            pages.append(current_page)
+            current_page = []
+            current_count = 0
+        current_page.append(family)
+        current_count += family_count
+    if current_page:
+        pages.append(current_page)
+    return pages
+
+
 def write_extra_image_cutout_pdf(
-    matches: pd.DataFrame,
+    panels: pd.DataFrame,
     band_images: dict[str, BandImage],
     output: Path,
     *,
@@ -476,72 +902,79 @@ def write_extra_image_cutout_pdf(
     cutout_size_arcsec: float = DEFAULT_CUTOUT_SIZE_ARCSEC,
     images_per_page: int = DEFAULT_IMAGES_PER_PAGE,
 ) -> int:
-    if matches.empty:
-        raise ValueError("No extra images are available for cutout plotting.")
+    if panels.empty:
+        raise ValueError("No recovery image panels are available for cutout plotting.")
     if images_per_page <= 0:
         raise ValueError("--images-per-page must be positive.")
     output = Path(output).with_suffix(".pdf")
     output.parent.mkdir(parents=True, exist_ok=True)
-    sorted_matches = matches.iloc[sorted(range(len(matches)), key=lambda idx: _sort_key(matches.iloc[idx]))].reset_index(drop=True)
-    cols = min(4, int(images_per_page))
-    n_pages = int(math.ceil(len(sorted_matches) / int(images_per_page)))
+    page_groups = _family_page_groups(panels, int(images_per_page))
+    n_pages = len(page_groups)
+    rgb_display = build_rgb_display(band_images, bands=bands)
     with PdfPages(output) as pdf:
-        for page_index in range(n_pages):
-            page = sorted_matches.iloc[page_index * images_per_page : (page_index + 1) * images_per_page].reset_index(drop=True)
-            rows = int(math.ceil(len(page) / cols))
+        for page_families in page_groups:
+            rows = len(page_families)
+            cols = max(len(family) for family in page_families)
             fig, axes = plt.subplots(rows, cols, figsize=_figure_size(rows, cols), squeeze=False)
             _style_cutout_figure(fig)
             fig.patch.set_facecolor(PAGE_FACE_COLOR)
-            for panel_index in range(rows * cols):
-                row_index = panel_index // cols
-                col_index = panel_index % cols
-                ax = axes[row_index, col_index]
-                _style_cutout_axis(ax)
-                ax.set_facecolor(AXIS_FACE_COLOR)
-                if panel_index >= len(page):
-                    ax.set_axis_off()
-                    continue
-                image_row = page.iloc[panel_index]
-                coord = _coord_from_row(image_row)
-                if coord is None:
-                    ax.set_axis_off()
-                    continue
-                cutouts = {
-                    str(band): extract_band_cutout(band_images[str(band)], coord, cutout_size_arcsec=cutout_size_arcsec)
-                    for band in bands
-                }
-                rgb = make_rgb_cutout(cutouts, bands=bands)
-                ax.imshow(rgb, origin="lower", interpolation="nearest")
-                reference_image = band_images[str(bands[-1])]
-                _draw_extra_marker(
-                    ax,
-                    reference_image,
-                    coord,
-                    cutout_size_arcsec=cutout_size_arcsec,
-                    rendered_shape=rgb.shape[:2],
-                )
-                _draw_master_marker(
-                    ax,
-                    reference_image,
-                    image_row,
-                    coord,
-                    cutout_size_arcsec=cutout_size_arcsec,
-                    rendered_shape=rgb.shape[:2],
-                )
-                _draw_extra_legend(ax)
-                ax.text(
-                    0.04,
-                    0.94,
-                    _panel_label(image_row),
-                    transform=ax.transAxes,
-                    va="top",
-                    ha="left",
-                    fontsize=CUTOUT_LABEL_FONT_SIZE,
-                    color="white",
-                    linespacing=0.95,
-                    clip_on=True,
-                    bbox=CUTOUT_TEXT_BBOX,
-                )
+            for row_index, family in enumerate(page_families):
+                for col_index in range(cols):
+                    ax = axes[row_index, col_index]
+                    _style_cutout_axis(ax)
+                    ax.set_facecolor(AXIS_FACE_COLOR)
+                    if col_index >= len(family):
+                        ax.set_axis_off()
+                        continue
+                    image_row = family.iloc[col_index]
+                    coord = _coord_from_row(image_row)
+                    if coord is None:
+                        ax.set_axis_off()
+                        continue
+                    cutouts = {
+                        str(band): extract_band_cutout(band_images[str(band)], coord, cutout_size_arcsec=cutout_size_arcsec)
+                        for band in bands
+                    }
+                    rgb = make_rgb_cutout(cutouts, bands=bands, rgb_display=rgb_display)
+                    ax.imshow(rgb, origin="lower", interpolation="nearest")
+                    reference_image = band_images[str(bands[-1])]
+                    _draw_recovery_panel_markers(
+                        ax,
+                        reference_image,
+                        image_row,
+                        coord,
+                        cutout_size_arcsec=cutout_size_arcsec,
+                        rendered_shape=rgb.shape[:2],
+                    )
+                    if str(image_row.get("panel_status", "")).upper() == STATUS_EXTRA:
+                        _draw_extra_legend(ax)
+                    ax.text(
+                        0.04,
+                        0.96,
+                        str(image_row.get("panel_status", "")).upper(),
+                        transform=ax.transAxes,
+                        va="top",
+                        ha="left",
+                        fontsize=STATUS_LABEL_FONT_SIZE,
+                        fontweight="bold",
+                        color=str(image_row.get("status_label_color", LABEL_COLOR_DEFAULT)),
+                        linespacing=0.95,
+                        clip_on=True,
+                        bbox=STATUS_TEXT_BBOX,
+                    )
+                    ax.text(
+                        0.04,
+                        DETAIL_TEXT_Y,
+                        str(image_row.get("detail_label", "")),
+                        transform=ax.transAxes,
+                        va="top",
+                        ha="left",
+                        fontsize=CUTOUT_LABEL_FONT_SIZE,
+                        color=str(image_row.get("detail_label_color", LABEL_COLOR_DEFAULT)),
+                        linespacing=0.95,
+                        clip_on=True,
+                        bbox=CUTOUT_TEXT_BBOX,
+                    )
             pdf.savefig(fig, facecolor=fig.get_facecolor(), **SAVEFIG_KWARGS)
             plt.close(fig)
     return n_pages
@@ -551,6 +984,7 @@ def run(
     stage_dir: Path,
     *,
     output: Path | None = None,
+    extras_output: Path | None = None,
     matches_output: Path | None = None,
     cluster: str | None = None,
     catalog_root: Path = DEFAULT_HFF_CATALOG_ROOT,
@@ -561,9 +995,12 @@ def run(
     cutout_size_arcsec: float = DEFAULT_CUTOUT_SIZE_ARCSEC,
     images_per_page: int = DEFAULT_IMAGES_PER_PAGE,
     par_path: Path | None = None,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, Path]:
     stage_dir = resolve_stage_dir(stage_dir)
+    image_fit_csv = image_fit_quality_csv_path(stage_dir)
     extra_images_csv = extra_images_csv_path(stage_dir)
+    if not image_fit_csv.exists():
+        raise FileNotFoundError(f"Missing image-fit quality CSV: {image_fit_csv}")
     if not extra_images_csv.exists():
         raise FileNotFoundError(f"Missing extra-images CSV: {extra_images_csv}")
     if len(bands) != 3:
@@ -572,9 +1009,12 @@ def run(
     cluster_key = _canonical_cluster(cluster) if cluster is not None else infer_cluster(stage_dir, reference)
     if cluster_key is None:
         raise ValueError("Could not infer cluster key; pass --cluster.")
+    image_fit = load_image_fit_quality(image_fit_csv, reference)
     extra_images = load_extra_images(extra_images_csv, reference)
     master = load_master_catalog(Path(catalog_root), cluster_key)
     matches = match_extra_images_to_master(extra_images, master, radius_arcsec=match_radius_arcsec)
+    panels = build_recovery_cutout_panels(image_fit, matches)
+    extra_panels = build_extra_redshift_cutout_panels(matches)
 
     matches_path = Path(matches_output) if matches_output is not None else default_matches_output_path(stage_dir)
     matches_path.parent.mkdir(parents=True, exist_ok=True)
@@ -584,26 +1024,39 @@ def run(
     band_images = load_rgb_metadata(band_paths, bands=bands)
     output_path = Path(output) if output is not None else default_output_path(stage_dir)
     write_extra_image_cutout_pdf(
-        matches,
+        panels,
         band_images,
         output_path,
         bands=bands,
         cutout_size_arcsec=cutout_size_arcsec,
         images_per_page=images_per_page,
     )
-    return output_path.with_suffix(".pdf"), matches_path
+    extras_output_path = Path(extras_output) if extras_output is not None else default_extras_output_path(stage_dir)
+    write_extra_image_cutout_pdf(
+        extra_panels,
+        band_images,
+        extras_output_path,
+        bands=bands,
+        cutout_size_arcsec=cutout_size_arcsec,
+        images_per_page=images_per_page,
+    )
+    return output_path.with_suffix(".pdf"), matches_path, extras_output_path.with_suffix(".pdf")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot WCS cutouts for extra model images from a stage/run directory."
+        description="Plot WCS cutouts for observed, recovered, missing, and extra model images from a stage/run directory."
     )
     parser.add_argument(
         "stage_dir",
         type=Path,
-        help="Stage/run directory containing tables/image_recovery_extra_images.csv and artifacts/plot_bundle.h5.",
+        help=(
+            "Stage/run directory containing tables/image_fit_quality.csv, "
+            "tables/image_recovery_extra_images.csv, and artifacts/plot_bundle.h5."
+        ),
     )
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--extras-output", type=Path, default=None)
     parser.add_argument("--matches-output", type=Path, default=None)
     parser.add_argument("--cluster", default=None)
     parser.add_argument("--catalog-root", type=Path, default=DEFAULT_HFF_CATALOG_ROOT)
@@ -620,9 +1073,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        output, matches_output = run(
+        output, matches_output, extras_output = run(
             args.stage_dir,
             output=args.output,
+            extras_output=args.extras_output,
             matches_output=args.matches_output,
             cluster=args.cluster,
             catalog_root=args.catalog_root,
@@ -638,6 +1092,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(f"Wrote {output}")
+    print(f"Wrote {extras_output}")
     print(f"Wrote {matches_output}")
     return 0
 

@@ -101,21 +101,54 @@ REDSHIFT_SERVICES = ("ned", "simbad")
 REDSHIFT_SERVICE_CHOICES = ("all", *REDSHIFT_SERVICES)
 REDSHIFT_FIELDS = ("core", "parallel")
 SIMBAD_REDSHIFT_COLUMNS = ["main_id", "ra", "dec", "otype", "rvz_redshift", "rvz_qual", "rvz_bibcode"]
+HFF_CLUSTER_CHOICES = tuple(spec.key for spec in HFF_FIELD_SPECS) + tuple(spec.target for spec in HFF_FIELD_SPECS)
+HFF_FIELD_BY_CLUSTER_CHOICE = {
+    cluster_choice: spec
+    for spec in HFF_FIELD_SPECS
+    for cluster_choice in (spec.key, spec.target)
+}
 
 
-def build_pagul2024_targets(output_dir: str | Path = DEFAULT_OUTPUT_DIR) -> list[DownloadTarget]:
+def resolve_hff_cluster(cluster: str | None) -> HFFFieldSpec | None:
+    if cluster is None:
+        return None
+    try:
+        return HFF_FIELD_BY_CLUSTER_CHOICE[cluster]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported HFF cluster {cluster!r}. Valid choices: {HFF_CLUSTER_CHOICES}.") from exc
+
+
+def _selected_hff_field_specs(cluster: str | None) -> tuple[HFFFieldSpec, ...]:
+    spec = resolve_hff_cluster(cluster)
+    if spec is None:
+        return HFF_FIELD_SPECS
+    return (spec,)
+
+
+def _selected_mast_clusters(cluster: str | None) -> tuple[str, ...]:
+    spec = resolve_hff_cluster(cluster)
+    if spec is None:
+        return PAGUL2024_CLUSTERS
+    return (spec.target,)
+
+
+def build_pagul2024_targets(
+    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    *,
+    cluster: str | None = None,
+) -> list[DownloadTarget]:
     """Build direct MAST download targets for the BUFFALO Pagul v2.0 catalogs."""
 
     root = Path(output_dir)
     targets: list[DownloadTarget] = []
-    for cluster in PAGUL2024_CLUSTERS:
-        product_url_root = f"{BUFFALO_BASE_URL}/{cluster}/catalogs/pagul-v2.0"
+    for mast_cluster in _selected_mast_clusters(cluster):
+        product_url_root = f"{BUFFALO_BASE_URL}/{mast_cluster}/catalogs/pagul-v2.0"
         for suffix in PAGUL2024_SUFFIXES:
-            filename = f"hlsp_buffalo_hst_ir-weighted_{cluster}_multi_v2.0_{suffix}"
+            filename = f"hlsp_buffalo_hst_ir-weighted_{mast_cluster}_multi_v2.0_{suffix}"
             targets.append(
                 DownloadTarget(
                     catalog="pagul2024",
-                    cluster=cluster,
+                    cluster=mast_cluster,
                     filename=filename,
                     url=f"{product_url_root}/{filename}",
                     destination=root / filename,
@@ -182,13 +215,14 @@ def build_buffalo_image_targets(
     output_dir: str | Path = DEFAULT_BUFFALO_IMAGE_OUTPUT_DIR,
     *,
     image_scale: str = DEFAULT_BUFFALO_IMAGE_SCALE,
+    cluster: str | None = None,
     timeout: float = DEFAULT_TIMEOUT_SEC,
 ) -> list[DownloadTarget]:
     targets: list[DownloadTarget] = []
-    for cluster in PAGUL2024_CLUSTERS:
-        script_url = buffalo_image_script_url(cluster, image_scale)
+    for mast_cluster in _selected_mast_clusters(cluster):
+        script_url = buffalo_image_script_url(mast_cluster, image_scale)
         script_text = fetch_text(script_url, timeout=timeout)
-        targets.extend(parse_buffalo_image_script(script_text, output_dir=output_dir, cluster=cluster))
+        targets.extend(parse_buffalo_image_script(script_text, output_dir=output_dir, cluster=mast_cluster))
     return targets
 
 
@@ -220,11 +254,12 @@ def build_hff_redshift_targets(
     *,
     radius_arcmin: float = DEFAULT_HFF_REDSHIFT_RADIUS_ARCMIN,
     services: str | tuple[str, ...] = "all",
+    cluster: str | None = None,
 ) -> list[RedshiftQueryTarget]:
     root = Path(output_dir)
     selected_services = resolve_redshift_services(services)
     targets: list[RedshiftQueryTarget] = []
-    for spec in HFF_FIELD_SPECS:
+    for spec in _selected_hff_field_specs(cluster):
         for field in REDSHIFT_FIELDS:
             center = _field_center(spec, field)
             for service in selected_services:
@@ -522,6 +557,7 @@ def download_hff_redshifts(
     output_dir: str | Path = DEFAULT_REDSHIFT_OUTPUT_DIR,
     radius_arcmin: float = DEFAULT_HFF_REDSHIFT_RADIUS_ARCMIN,
     service: str = "all",
+    cluster: str | None = None,
     force: bool = False,
     dry_run: bool = False,
     timeout: float = DEFAULT_REDSHIFT_TIMEOUT_SEC,
@@ -529,7 +565,12 @@ def download_hff_redshifts(
 ) -> int:
     console = console or Console()
     selected_services = resolve_redshift_services(service)
-    targets = build_hff_redshift_targets(output_dir, radius_arcmin=radius_arcmin, services=selected_services)
+    targets = build_hff_redshift_targets(
+        output_dir,
+        radius_arcmin=radius_arcmin,
+        services=selected_services,
+        cluster=cluster,
+    )
     if dry_run:
         render_redshift_dry_run(targets, console)
         return 0
@@ -575,12 +616,13 @@ def download_hff_redshifts(
 def download_pagul2024(
     *,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    cluster: str | None = None,
     force: bool = False,
     dry_run: bool = False,
     timeout: float = DEFAULT_TIMEOUT_SEC,
     console: Console | None = None,
 ) -> int:
-    targets = build_pagul2024_targets(output_dir)
+    targets = build_pagul2024_targets(output_dir, cluster=cluster)
     return download_targets(
         targets,
         label="Pagul 2024",
@@ -595,12 +637,13 @@ def download_buffalo_images(
     *,
     output_dir: str | Path = DEFAULT_BUFFALO_IMAGE_OUTPUT_DIR,
     image_scale: str = DEFAULT_BUFFALO_IMAGE_SCALE,
+    cluster: str | None = None,
     force: bool = False,
     dry_run: bool = False,
     timeout: float = DEFAULT_TIMEOUT_SEC,
     console: Console | None = None,
 ) -> int:
-    targets = build_buffalo_image_targets(output_dir, image_scale=image_scale, timeout=timeout)
+    targets = build_buffalo_image_targets(output_dir, image_scale=image_scale, cluster=cluster, timeout=timeout)
     return download_targets(
         targets,
         label=f"BUFFALO {image_scale} science images",
@@ -624,6 +667,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Directory for downloaded catalog files. Defaults depend on --catalog.",
+    )
+    parser.add_argument(
+        "--cluster",
+        choices=HFF_CLUSTER_CHOICES,
+        default=None,
+        help="Limit downloads to one HFF cluster, accepting short keys or MAST target names.",
     )
     parser.add_argument("--force", action="store_true", help="Overwrite files even when the size matches MAST.")
     parser.add_argument("--dry-run", action="store_true", help="Show planned downloads without writing files.")
@@ -659,6 +708,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.catalog == "pagul2024":
         return download_pagul2024(
             output_dir=args.output_dir or DEFAULT_OUTPUT_DIR,
+            cluster=args.cluster,
             force=args.force,
             dry_run=args.dry_run,
             timeout=args.timeout if args.timeout is not None else DEFAULT_TIMEOUT_SEC,
@@ -668,6 +718,7 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output_dir or DEFAULT_REDSHIFT_OUTPUT_DIR,
             radius_arcmin=args.radius_arcmin,
             service=args.service,
+            cluster=args.cluster,
             force=args.force,
             dry_run=args.dry_run,
             timeout=args.timeout if args.timeout is not None else DEFAULT_REDSHIFT_TIMEOUT_SEC,
@@ -676,6 +727,7 @@ def main(argv: list[str] | None = None) -> int:
         return download_buffalo_images(
             output_dir=args.output_dir or DEFAULT_BUFFALO_IMAGE_OUTPUT_DIR,
             image_scale=args.image_scale,
+            cluster=args.cluster,
             force=args.force,
             dry_run=args.dry_run,
             timeout=args.timeout if args.timeout is not None else DEFAULT_TIMEOUT_SEC,

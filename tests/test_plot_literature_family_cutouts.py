@@ -52,22 +52,30 @@ def _write_final_literature_catalog(root: Path, rows: list[str] | None = None) -
     return path
 
 
-def _wcs_header(ra: float = 10.0, dec: float = 0.0) -> fits.Header:
+def _wcs_header(ra: float = 10.0, dec: float = 0.0, crpix: tuple[float, float] = (50.0, 50.0)) -> fits.Header:
     wcs = WCS(naxis=2)
-    wcs.wcs.crpix = [50.0, 50.0]
+    wcs.wcs.crpix = list(crpix)
     wcs.wcs.cdelt = np.array([-1.0 / 3600.0, 1.0 / 3600.0])
     wcs.wcs.crval = [ra, dec]
     wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
     return wcs.to_header()
 
 
-def _write_band_image(root: Path, band: str, *, cluster_token: str = "abell370", ra: float = 10.0, dec: float = 0.0) -> Path:
+def _write_band_image(
+    root: Path,
+    band: str,
+    *,
+    cluster_token: str = "abell370",
+    ra: float = 10.0,
+    dec: float = 0.0,
+    crpix: tuple[float, float] = (50.0, 50.0),
+) -> Path:
     path = root / cluster_token / f"hlsp_buffalo_hst_multi_{cluster_token}_{band.lower()}_v1.0_drz.fits"
     path.parent.mkdir(parents=True, exist_ok=True)
     yy, xx = np.mgrid[:100, :100]
     band_offsets = {"F435W": 5.0, "F606W": 15.0, "F814W": 30.0}
     data = band_offsets.get(band, 0.0) + 0.1 * xx + 0.2 * yy
-    fits.PrimaryHDU(data.astype(np.float32), header=_wcs_header(ra=ra, dec=dec)).writeto(path, overwrite=True)
+    fits.PrimaryHDU(data.astype(np.float32), header=_wcs_header(ra=ra, dec=dec, crpix=crpix)).writeto(path, overwrite=True)
     return path
 
 
@@ -249,6 +257,23 @@ def test_find_rgb_band_paths_falls_back_when_requested_scale_missing(tmp_path: P
     actual = plotter.find_rgb_band_paths(tmp_path, cluster="a370", bands=plotter.DEFAULT_BANDS, image_scale="30mas")
 
     assert actual == expected
+
+
+def test_find_rgb_band_paths_supports_ff_sims_simulation_names(tmp_path: Path) -> None:
+    root = tmp_path / "fits"
+    bands = ("F435W", "F606W", "F814W")
+    expected = {}
+    for band in bands:
+        path = root / "ares" / f"simulation_hst_{band.lower()}.fits"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fits.PrimaryHDU(np.ones((20, 20), dtype=np.float32), header=_wcs_header(ra=0.0, dec=0.0)).writeto(path)
+        expected[band] = path
+
+    actual_from_root = plotter.find_rgb_band_paths(root, cluster="ares", bands=bands, image_scale="auto")
+    actual_from_cluster_dir = plotter.find_rgb_band_paths(root / "ares", cluster="ares", bands=bands, image_scale="auto")
+
+    assert actual_from_root == expected
+    assert actual_from_cluster_dir == expected
 
 
 def test_find_rgb_band_paths_raises_download_command_when_images_missing(tmp_path: Path) -> None:
@@ -461,12 +486,12 @@ def test_write_family_cutout_pdf_renders_synthetic_multipage_rgb(tmp_path: Path)
         families_per_page=1,
     )
 
-    assert n_pages == 2
+    assert n_pages == 3
     assert output.exists()
     assert output.stat().st_size > 0
 
 
-def test_make_rgb_cutout_uses_fixed_clustertag_lupton_stretch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_make_rgb_cutout_delegates_to_shared_natural_renderer(monkeypatch: pytest.MonkeyPatch) -> None:
     yy, xx = np.mgrid[:12, :12]
     cutouts = {
         "F435W": (0.3 * xx + 0.2 * yy + 5.0).astype(float),
@@ -475,22 +500,134 @@ def test_make_rgb_cutout_uses_fixed_clustertag_lupton_stretch(monkeypatch: pytes
     }
     expected_rgb = np.full((12, 12, 3), 0.37, dtype=float)
     calls: list[dict[str, Any]] = []
+    display = object()
 
-    def fake_make_lupton_rgb(red: np.ndarray, green: np.ndarray, blue: np.ndarray, **kwargs: Any) -> np.ndarray:
-        calls.append({"red": red, "green": green, "blue": blue, **kwargs})
+    def fake_make_natural_rgb(cutouts_arg: dict[str, np.ndarray], *, bands: tuple[str, ...], display: object | None) -> np.ndarray:
+        calls.append({"cutouts": cutouts_arg, "bands": bands, "display": display})
         return expected_rgb
 
-    monkeypatch.setattr(plotter, "make_lupton_rgb", fake_make_lupton_rgb)
+    monkeypatch.setattr(plotter, "make_natural_rgb", fake_make_natural_rgb)
 
-    actual = plotter.make_rgb_cutout(cutouts)
-    _g_med, g_std = plotter._channel_stats(cutouts["F606W"])
+    actual = plotter.make_rgb_cutout(cutouts, rgb_display=display)
 
-    assert actual is expected_rgb
+    np.testing.assert_allclose(actual, expected_rgb)
     assert calls
-    assert calls[0]["Q"] == 10
-    assert calls[0]["minimum"] == 0.0
-    assert calls[0]["stretch"] == pytest.approx(g_std * 6.0)
-    assert calls[0]["green"].shape == (12, 12)
+    assert calls[0]["bands"] == plotter.DEFAULT_BANDS
+    assert calls[0]["display"] is display
+    assert calls[0]["cutouts"] is cutouts
+
+
+def test_write_family_cutout_pdf_reuses_shared_rgb_display(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    catalog_path = _write_literature_catalog(
+        tmp_path / "literature",
+        "hlsp_buffalo_hst_multi_abell370_multi_v1.0_sl-gold.dat",
+        rows=[
+            "1.1 10.000000 0.000000 0.1 0.1 0.0 1.0 25.0",
+            "1.2 10.000500 0.000000 0.1 0.1 0.0 1.0 25.0",
+        ],
+    )
+    catalog = plotter.select_literature_catalog(tmp_path / "literature", catalog_contains="sl-gold")
+    paths = {band: _write_band_image(tmp_path / "images", band) for band in plotter.DEFAULT_BANDS}
+    band_images = plotter.load_rgb_metadata(paths)
+    output = tmp_path / "cutouts.pdf"
+    display = object()
+    seen_displays: list[object | None] = []
+
+    monkeypatch.setattr(plotter, "build_rgb_display", lambda band_images_arg, *, bands: display)
+
+    def fake_make_rgb_cutout(
+        cutouts_by_band: dict[str, np.ndarray],
+        bands: tuple[str, ...] = plotter.DEFAULT_BANDS,
+        *,
+        rgb_display: object | None = None,
+    ) -> np.ndarray:
+        seen_displays.append(rgb_display)
+        return np.zeros((8, 8, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(plotter, "make_rgb_cutout", fake_make_rgb_cutout)
+
+    n_pages = plotter.write_family_cutout_pdf(catalog, band_images, output, cutout_size_arcsec=8.0)
+
+    assert catalog_path.exists()
+    assert n_pages == 2
+    assert output.exists()
+    assert seen_displays
+    assert all(seen_display is display for seen_display in seen_displays)
+
+
+def test_write_family_cutout_pdf_detail_grid_ignores_legacy_image_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_literature_catalog(
+        tmp_path / "literature",
+        "hlsp_buffalo_hst_multi_abell370_multi_v1.0_sl-gold.dat",
+        rows=[
+            "1.1 10.000000 0.000000 0.1 0.1 0.0 1.0 25.0",
+            "1.2 10.000500 0.000000 0.1 0.1 0.0 1.0 25.0",
+            "1.3 10.001000 0.000000 0.1 0.1 0.0 1.0 25.0",
+            "1.4 10.001500 0.000000 0.1 0.1 0.0 1.0 25.0",
+        ],
+    )
+    catalog = plotter.select_literature_catalog(tmp_path / "literature", catalog_contains="sl-gold")
+    paths = {band: _write_band_image(tmp_path / "images", band) for band in plotter.DEFAULT_BANDS}
+    band_images = plotter.load_rgb_metadata(paths)
+    detail_labels: list[str] = []
+
+    def fake_detail_panel(
+        ax: object,
+        band_images_arg: dict[str, object],
+        bands: tuple[str, ...],
+        rgb_display: object,
+        image_row: plotter.pd.Series,
+        *,
+        cutout_size_arcsec: float,
+    ) -> None:
+        detail_labels.append(str(image_row.get("literature_id")))
+
+    monkeypatch.setattr(plotter, "_draw_literature_detail_panel", fake_detail_panel)
+
+    n_pages = plotter.write_family_cutout_pdf(
+        catalog,
+        band_images,
+        tmp_path / "cutouts.pdf",
+        cutout_size_arcsec=8.0,
+        max_images_per_family=1,
+    )
+
+    assert n_pages == 2
+    assert detail_labels == ["1.1", "1.2", "1.3", "1.4"]
+
+
+def test_extract_band_cutout_clamps_edge_window_to_real_pixels(tmp_path: Path) -> None:
+    path = _write_band_image(tmp_path / "images", "F814W", crpix=(2.0, 2.0))
+    image = plotter.load_band_metadata("F814W", path)
+    coord = plotter.SkyCoord(ra=10.0 * plotter.u.deg, dec=0.0 * plotter.u.deg, frame="icrs")
+
+    cutout = plotter.extract_band_cutout(image, coord, cutout_size_arcsec=8.0)
+
+    yy, xx = np.mgrid[:8, :8]
+    expected = 30.0 + 0.1 * xx + 0.2 * yy
+    assert cutout.shape == (8, 8)
+    assert np.isfinite(cutout).all()
+    np.testing.assert_allclose(cutout, expected.astype(np.float32), atol=1.0e-6)
+
+
+def test_cutout_marker_uses_clamped_edge_window_origin(tmp_path: Path) -> None:
+    path = _write_band_image(tmp_path / "images", "F814W", crpix=(2.0, 2.0))
+    image = plotter.load_band_metadata("F814W", path)
+    coord = plotter.SkyCoord(ra=10.0 * plotter.u.deg, dec=0.0 * plotter.u.deg, frame="icrs")
+
+    x, y, radius = plotter._cutout_pixel_position(
+        image,
+        coord,
+        coord,
+        cutout_size_arcsec=8.0,
+    )
+
+    assert radius == pytest.approx(0.2)
+    assert x == pytest.approx(1.0, abs=1.0e-3)
+    assert y == pytest.approx(1.0, abs=1.0e-3)
 
 
 def test_cutout_layout_uses_black_tight_page_style() -> None:
@@ -540,6 +677,7 @@ def test_write_family_cutout_pdf_saves_black_tight_page(monkeypatch: pytest.Monk
     assert save_calls[0]["facecolor"] == plotter.matplotlib.colors.to_rgba("black")
     assert save_calls[0]["bbox_inches"] == "tight"
     assert save_calls[0]["pad_inches"] == 0.02
+    assert save_calls[0]["dpi"] == plotter.CUTOUT_FIGURE_DPI
 
 
 def test_run_renders_pdf_with_pagul_match_info_enabled(tmp_path: Path) -> None:
@@ -667,8 +805,8 @@ def test_write_family_cutout_pdf_omits_bottom_left_family_label(monkeypatch: pyt
         families_per_page=1,
     )
 
-    assert not any(str(call["s"]).startswith("Family ") for call in text_calls)
-    assert not any(call["x"] == 0.04 and call["y"] == 0.06 for call in text_calls)
+    assert any(str(call["s"]).startswith("Family ") for call in text_calls)
+    assert not any(str(call["s"]).startswith("Family ") and call["x"] == 0.04 and call["y"] == 0.06 for call in text_calls)
 
 
 def test_parse_args_keeps_a370_niemiec_pagul_defaults() -> None:

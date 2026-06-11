@@ -6,9 +6,9 @@ This repository now has two public fitting workflows: the sequential optimizer/s
 2. Fit the joint large+small model with SVI, initialized from the large-scale SVI solution.
 3. Optionally run NUTS on the joint model with `--fit-method svi+nuts`.
 4. Optionally run an image-plane refinement stage with `--image-plane-mode local-jacobian`.
-5. Optionally run a final image-plane stage using `--image-plane-mode linearized-forward-beta-image-plane` or `--image-plane-mode marginal-image-plane`.
+5. Optionally run a final image-plane stage using `--image-plane-mode linearized-forward-beta-image-plane`, `--image-plane-mode forward-metric-image-plane`, or `--image-plane-mode fold-regularized-forward-beta-image-plane`.
 
-Use `--fit-method svi` for a fast variational result or `--fit-method svi+nuts` for SVI initialization followed by joint posterior sampling. In the optional sequential image-plane workflow, `--fit-method`, `--warmup`, `--samples`, and `--max-tree-depth` may each take one value for all sampled stages, two values mapping to `stage2_joint` and `stage3_image_plane`, or three values when a final stage-4 image-plane mode is enabled. Nested sampling is reserved for the one-shot evidence workflow: use `--fit-mode evidence-ns` with an explicit `--evidence-source-prior-sigma-arcsec`; `--fit-method`, `--warmup`, and `--samples` are ignored in that mode.
+Use `--fit-method svi` for a fast variational result or `--fit-method svi+nuts` for SVI initialization followed by joint posterior sampling. In the optional sequential image-plane workflow, `--fit-method`, `--svi-steps`, `--warmup`, `--samples`, and `--max-tree-depth` may each take one value for all sampled stages, two values mapping to `stage2_joint` and `stage3_image_plane`, or three values when a final stage-4 image-plane mode is enabled. Nested sampling is reserved for the one-shot evidence workflow: use `--fit-mode evidence-ns` with an explicit `--evidence-source-prior-sigma-arcsec`; `--fit-method`, `--svi-steps`, `--warmup`, and `--samples` are ignored in that mode.
 
 ## Run
 
@@ -40,9 +40,10 @@ python -m cluster_solver \
   --output-dir plots/m0416_original \
   --run-name joint_workflow \
   --fit-method svi+nuts svi+nuts svi \
-  --image-plane-mode marginal-image-plane \
+  --image-plane-mode forward-metric-image-plane \
   --image-plane-newton-steps 0 \
   --warmup 1000 1000 0 \
+  --svi-steps 2000 2000 500 \
   --samples 250 250 100 \
   --chains 4 \
   --sampling-engine refreshing_surrogate \
@@ -55,7 +56,7 @@ python -m cluster_solver \
   --plot-caustics
 ```
 
-The same command with scalar `--fit-method svi` skips NUTS in every sampled stage and writes the AutoNormal guide posterior. A mixed command such as `--fit-method svi+nuts svi --warmup 1000 0 --samples 250 100 --max-tree-depth 8 6` runs NUTS in stage 2 and an SVI-only image-plane stage 3; with stage 4 enabled, a third value controls the final stage-4 directory.
+The same command with scalar `--fit-method svi` skips NUTS in every sampled stage and writes the AutoNormal guide posterior. A mixed command such as `--fit-method svi+nuts svi --svi-steps 2000 500 --warmup 1000 0 --samples 250 100 --max-tree-depth 8 6` runs NUTS in stage 2 and an SVI-only image-plane stage 3; with stage 4 enabled, a third value controls the final stage-4 directory.
 
 One-shot evidence nested sampling example:
 
@@ -111,7 +112,8 @@ python -m lenscluster.validation \
   --n-subhalo-families 0 \
   --min-images-per-family 3 \
   --n-subhalos 50 \
-  --source-redshifts 1.5,2.0,3.0 \
+  --primary-source-redshifts 1.5,2.0,3.0 \
+  --subhalo-source-redshifts 1.5,2.0,3.0 \
   --pos-sigma-arcsec 0.15 \
   --sampling-engine refreshing_surrogate \
   --active-scaling-selection adaptive \
@@ -134,8 +136,24 @@ refreshing surrogate rather than removed from the model.
 closed caustics found at each source redshift. These are local caustic-driven
 mock families, not a fit-time likelihood option.
 
-When subhalos are enabled, the mock injects intrinsic log-normal scatter around
-the member-galaxy scaling relations by default:
+When subhalos are enabled, the mock draws a Natarajan-style count-matched
+Schechter cluster-member luminosity function by default. It samples a parent
+population with `dN/dL proportional to L^alpha exp(-L)` using
+`--subhalo-schechter-alpha -0.7`, maps luminosity to the dPIE mass proxy through
+the configured scaling relation, applies a faint member limit
+`--subhalo-mag-faint-limit 24.0`, and randomly selects `--n-subhalos`
+members from candidates brighter than that limit. The default dPIE slopes
+`vdslope=4` and `slope=4` imply constant M/L scaling, so `L*` maps to
+`--subhalo-mass-ref 1e12` and the log-space peak is near `3e11 Msun`.
+The mass controls are:
+
+- `--subhalo-mass-min 1e9`
+- `--subhalo-mass-max 1e13`
+- `--subhalo-mass-ref 1e12`
+- `--subhalo-parent-factor 1000`
+
+The mock also injects intrinsic log-normal scatter around the member-galaxy
+scaling relations by default:
 
 - `--subhalo-sigma-scatter-dex 0.07`
 - `--subhalo-cut-scatter-dex 0.20`
@@ -164,6 +182,7 @@ python -m lenscluster.validation \
   --image-plane-mode linearized-forward-beta-image-plane \
   --image-plane-newton-steps 0 \
   --fit-method svi+nuts svi+nuts svi \
+  --svi-steps 2000 1000 500 \
   --warmup 1000 1000 0 \
   --samples 250 100 500 \
   --max-tree-depth 8 8 6
@@ -226,9 +245,13 @@ Mock-truth recovery PDFs are additionally written at the seed directory level:
 - `surface_density_recovery.pdf`
 - `critical_caustic_recovery.pdf`
 - `magnification_recovery.pdf`
+- `absolute_magnification_recovery.pdf`
 - `image_recovery.pdf`
+- `image_residual_histogram.pdf`
 - `source_recovery.pdf`
-- `subhalo_population.pdf`
+- `subhalo_shmf.pdf`
+- `subhalo_recovery_shmf.pdf`
+- `subhalo_recovery_radial.pdf`
 - `validation_summary.pdf`
 - `corner.pdf`
 - `potfile_corner.pdf` when potfile scaling parameters are present
@@ -346,25 +369,57 @@ local image-plane correction at each observed image even when
 updates before scoring the image-plane displacement. It uses its own
 `image_sigma_int` scatter parameter in image-plane units.
 
-When `--image-plane-mode marginal-image-plane` is selected, the workflow adds
-`stage4_marginal_image_plane`. It uses the Gaussian linearized image-plane
-likelihood with source positions analytically marginalized, centered on the
-previous sampled stage's source centroids with sigma
-`--linearized-beta-prior-sigma-arcsec`. If `--fit-cosmology-flat-wcdm` is
-enabled, this final stage samples cosmology by default; `--fit-cosmology-all-stages`
-still samples cosmology in every executed fitting stage.
+When `--image-plane-mode forward-metric-image-plane` is selected, the workflow
+adds `stage4_forward_metric_image_plane`. It samples the same explicit 2D source
+positions as the linearized forward-beta stage, but leaves the residual in source
+coordinates and scores it with the proposal-current forward image covariance
+`A Sigma_img A^T`, where `A = d beta / d theta` at the observed image. This
+avoids the inverse-Jacobian image displacement while still using image-plane
+positional uncertainties. This mode requires `--image-plane-newton-steps 0` and
+does not support `source-position-parameterization=conditional-whitened`.
 
-The linearized forward-beta stage also includes a smooth observed-image
-presence penalty by default. For each observed image, the local image-plane
-residual is converted to a soft presence probability with
+When `--image-plane-mode fold-regularized-forward-beta-image-plane` is selected,
+the workflow adds `stage4_fold_regularized_image_plane`. It uses the same
+explicit source-position target as `forward-metric-image-plane`, but near a
+critical Jacobian it scores the residual by solving the local signed fold
+equation in the singular-vector frame of `A = d beta / d theta`. The constrained
+component uses the linear image-plane displacement, while the critical component
+uses the minimum real root distance of
+`0.5 kappa_eff theta_crit^2 + s_min theta_crit + r_crit = 0`. `kappa_eff` is
+estimated by finite-differencing the lensing Jacobian along the observed
+critical image-plane direction; with `--sampling-engine refreshing_surrogate`,
+the curvature and near-critical row mask are refreshed with the surrogate cache
+and reused between refreshes. `--fold-curvature-arcsec-inv` remains only as a
+fallback scale for direct helper use. Away from criticality, or when no local
+real root exists, the row falls back to the ordinary forward-metric inlier. It
+requires `--image-plane-newton-steps 0` and does not support
+`source-position-parameterization=conditional-whitened`.
+
+When `--image-plane-mode critical-arc-mixture-image-plane` is selected, the
+stage-4 likelihood uses an observed-anchor LM image-plane correction and a
+point/arc residual mixture whose broad critical-direction branch turns on near
+singular local Jacobians. The critical-arc likelihood always evaluates the full
+exact point/arc mixture; there are no speed-mode approximations or masked
+near-critical row splits.
+
+If `--fit-cosmology-flat-wcdm` is enabled, every executed sequential fitting
+stage samples the flat wCDM cosmology parameters.
+
+The explicit-beta stage-4 image-plane modes also include a smooth
+observed-image presence penalty by default. For each observed image, the local
+image-plane residual is converted to a soft presence probability with
 `--image-presence-match-radius-arcsec` and
 `--image-presence-temperature-arcsec`; each family then receives a smooth
 penalty when the reliability-weighted number of present observed images falls
 below the catalog count. The effective default
 `--image-presence-penalty-weight` is `2.0` for sequential stage 4 and `0.0`
-for evidence or non-image-plane likelihoods; pass `0.0` to disable it. This is
-a differentiable local surrogate for missing observed-image anchors, not an
-exact predicted-image multiplicity count from the full image solver.
+for evidence, non-image-plane likelihoods, and critical-arc mixture likelihoods;
+pass a positive value to enable it. In `critical-arc-mixture-image-plane`, the
+presence probability reuses the critical-arc branch probability and counts an
+image as present when it is close in the noncritical direction, even if displaced
+along the arc. This is a differentiable local surrogate for missing
+observed-image anchors, not an exact predicted-image multiplicity count from the
+full image solver.
 
 Nearby source redshifts are grouped by fractional lensing-efficiency
 `D_ls / D_s` tolerance instead of raw redshift. The default
@@ -399,7 +454,8 @@ For `--run-name joint_workflow`, outputs are written to:
 - `plots/m0416_original/joint_workflow/stage2_joint/`
 - `plots/m0416_original/joint_workflow/stage3_image_plane/` when `--image-plane-mode local-jacobian`, or before stage 4 unless skipped
 - `plots/m0416_original/joint_workflow/stage4_linearized_image_plane/` when `--image-plane-mode linearized-forward-beta-image-plane`
-- `plots/m0416_original/joint_workflow/stage4_marginal_image_plane/` when `--image-plane-mode marginal-image-plane`
+- `plots/m0416_original/joint_workflow/stage4_forward_metric_image_plane/` when `--image-plane-mode forward-metric-image-plane`
+- `plots/m0416_original/joint_workflow/stage4_fold_regularized_image_plane/` when `--image-plane-mode fold-regularized-forward-beta-image-plane`
 - `plots/m0416_original/joint_workflow/sequential_summary.json`
 
 Each stage writes:
@@ -408,7 +464,11 @@ Each stage writes:
 - `tables/run_summary.json`
 - `tables/potential_summary.csv`
 - `tables/family_diagnostics.csv`
-- diagnostic PDFs in the stage directory
+- `tables/subhalo_properties.csv`
+- diagnostic PDFs in the stage directory, including `image_residual_histogram.pdf`;
+  potfile subhalo runs also include `subhalo_mass_function.pdf` and
+  `subhalo_radial_distribution.pdf`;
+  with `--plot-caustics`, this also includes `absolute_magnification.pdf`
 
 `run.xsh` is a thin wrapper around the same command.
 
