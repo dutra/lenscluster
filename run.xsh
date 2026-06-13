@@ -7,9 +7,10 @@ from pathlib import Path
 $JAX_NUM_CPU_DEVICES = "30"
 
 PYTHON = "/home/dutra/.conda/envs/lenstronomy/bin/python"
-output_dir = f"jun11a_nocosmo_scalingrelationslopescatter"
+output_dir = f"jun12a_nocosmo"
 
-HFF_RGB_DISPLAY = {"q": 6.5, "stretch": 0.0165, "minimum": 0.0012, "red_gain": 0.68, "green_gain": 0.68, "blue_gain": 2.75}
+HFF_RGB_BANDS = ["F435W", "F606W", "F814W", "F105W", "F125W", "F140W", "F160W"]
+HFF_RGB_DISPLAY = {"q": 6.4, "stretch": 0.0145, "minimum": -5.5e-4, "red_gain": 0.47, "green_gain": 0.91, "blue_gain": 3.95}
 FF_RGB_DISPLAY = {"q": 8.0, "stretch": 0.1, "minimum": 0.0, "red_gain": 1.0, "green_gain": 1.0, "blue_gain": 1.2}
 
 VALID_CLUSTERS = "A2744, M0416, M1206, AS1063, A307, AS1063_CAMINHA, ARES, HERA"
@@ -118,7 +119,7 @@ image_plane_modes = {
 }
 image_plane_mode = image_plane_modes[mode]
 fit_method = ["svi+nuts", "svi+nuts", "svi+nuts"]
-warmup = [500, 6000, 1000]
+warmup = [500, 2000, 500]
 samples = [250, 500, 250]
 svi_steps = [500, 2000, 2000]
 start_at_stage3 = True
@@ -126,7 +127,10 @@ skip_stage3_image_plane_local_jacobian = False
 quick_diagnostics = False
 image_catalog_family_cutout_image_dir = cluster_config.get("image_catalog_family_cutout_image_dir", "data/BUFFALO_Images")
 image_catalog_family_cutout_image_scale = cluster_config.get("image_catalog_family_cutout_image_scale", "30mas")
-image_catalog_family_cutout_bands = cluster_config.get("image_catalog_family_cutout_bands")
+image_catalog_family_cutout_bands = cluster_config.get(
+    "image_catalog_family_cutout_bands",
+    HFF_RGB_BANDS if image_catalog_family_cutout_image_dir == "data/BUFFALO_Images" else None,
+)
 image_catalog_family_cutout_rgb = cluster_config.get("image_catalog_family_cutout_rgb", {})
 image_catalog_family_cutout_rgb_args = [
     "--image-catalog-family-cutout-rgb-q", image_catalog_family_cutout_rgb["q"],
@@ -147,13 +151,13 @@ kappa_true_args = ["--kappa-true-fits", kappa_true_fits] if kappa_true_fits else
 image_plane_newton_steps = 0
 linearized_beta_prior_sigma_arcsec = 3.0
 source_position_parameterization = "prior-whitened"
-target_accept = 0.6
-max_tree_depth = [8, 8, 9]
+target_accept = 0.7
+max_tree_depth = [8, 8, 8]
 chains = 4
 sampling_engine = "refreshing_surrogate"
 active_scaling_galaxies = [50]
 z_bin_efficiency_tol = 0.01
-pos_sigma_arcsec = 0.5
+pos_sigma_arcsec = 0.25
 anchored_args = [
     "--anchored-image-plane-solve-steps", 0,
     "--anchored-image-plane-trust-radius-arcsec", 0.3,
@@ -229,10 +233,10 @@ scatter_and_stabilizer_args = [
     "--image-presence-match-radius-arcsec", 1.0,
     "--image-presence-temperature-arcsec", 0.5,
     "--image-plane-scatter-prior", "log-uniform",
-    "--image-plane-scatter-floor-arcsec", 0.001,
-    "--image-plane-scatter-upper-arcsec", 1.0,
-    "--scaling-scatter",
-    "--scaling-scatter-fields", "sigma,cut",
+    "--image-plane-scatter-floor-arcsec", 0.1,
+    "--image-plane-scatter-upper-arcsec", 0.5,
+    #"--scaling-scatter",
+    #"--scaling-scatter-fields", "sigma,cut",
     #"--likelihood-stabilizer-max-gain", "50",
     # "--likelihood-stabilizer-max-residual-arcsec", "5",
     # "--likelihood-stabilizer-residual-loss", "student-t",
@@ -246,7 +250,7 @@ real_data_args = [
     "--caustic-source-redshift", 9.0,
     *(kappa_true_args),
     #"--fit-quality-workers", 32,
-    "--fov-limit-radius", 200,
+    #"--fov-limit-radius", 200,
     #"--fit-cosmology-flat-wcdm"
 ]
 

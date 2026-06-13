@@ -71,7 +71,8 @@ def _write_ff_sims_fixture(root: Path) -> Path:
                 "6 -7.0 7.0 25.5 24.5 21.5 21.5 21.5 21.5 21.5",
                 "7 -7.5 7.5 26.0 25.0 22.0 22.0 22.0 22.0 22.0",
                 "8 -8.0 8.0 26.5 25.5 23.0 22.5 22.5 22.5 22.5",
-                "9 -9.0 9.0 27.0 26.0 24.5 23.0 23.0 23.0 23.0",
+                "9 -9.0 9.0 27.0 26.0 23.5 23.0 23.0 23.0 23.0",
+                "60 1.5 1.1 25.0 24.0 22.0 21.0 21.0 21.0 20.6",
                 "10 ************ -4.0 23.0 22.0 20.0 20.0 20.0 20.0 20.0",
             ]
         )
@@ -133,10 +134,10 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     assert {row["cluster_key"] for row in rows} == {"ares", "hera"}
     assert {row["cluster_key"]: row["n_skipped_members"] for row in rows} == {"ares": 0, "hera": 1}
     assert {row["cluster_key"]: row["n_members"] for row in rows} == {"ares": 1, "hera": 4}
-    assert {row["cluster_key"]: row["n_explicit_galaxies"] for row in rows} == {"ares": 5, "hera": 4}
+    assert {row["cluster_key"]: row["n_explicit_galaxies"] for row in rows} == {"ares": 5, "hera": 6}
     assert {row["cluster_key"]: row["explicit_galaxy_ids"] for row in rows} == {
         "ares": "1;2;3;4;5",
-        "hera": "1;2;3;5",
+        "hera": "1;2;3;4;9;60",
     }
     assert {row["cluster_key"]: row["member_selection"] for row in rows} == {
         "ares": "F160W<22.00",
@@ -181,9 +182,11 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     assert any("# Member 1 is excluded from the scaling potfile; modeled explicitly as G1. It also anchors O1." == line for line in hera_members)
     assert any("# Member 2 is excluded from the scaling potfile; modeled explicitly as G2. It also anchors O2." == line for line in hera_members)
     assert any("# Member 3 is excluded from the scaling potfile; modeled explicitly as G3." == line for line in hera_members)
-    assert any("# Member 5 is excluded from the scaling potfile; modeled explicitly as G5." == line for line in hera_members)
-    assert not any("modeled explicitly as G4" in line for line in hera_members)
-    assert not any("modeled explicitly as G6" in line for line in hera_members)
+    assert any("# Member 4 is excluded from the scaling potfile; modeled explicitly as G4." == line for line in hera_members)
+    assert any("# Member 9 is excluded from the scaling potfile; modeled explicitly as G9." == line for line in hera_members)
+    assert any("# Member 60 is excluded from the scaling potfile; modeled explicitly as G60." == line for line in hera_members)
+    assert not any("modeled explicitly as G5" in line for line in hera_members)
+    assert not any(line.endswith("modeled explicitly as G6.") for line in hera_members)
     commented_hera_id2 = next(line for line in hera_members if line.startswith("#          2 "))
     hera_id2_parts = commented_hera_id2.split()
     assert hera_id2_parts[:3] == ["#", "2", "-2.00000000"]
@@ -192,20 +195,21 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     assert float(hera_id2_parts[5]) == pytest.approx(1.0)
     active_hera_member_lines = [line for line in hera_members if not line.startswith("#")]
     assert len(active_hera_member_lines) == 4
-    assert [line.split()[0] for line in active_hera_member_lines] == ["4", "6", "7", "8"]
+    assert [line.split()[0] for line in active_hera_member_lines] == ["5", "6", "7", "8"]
     assert active_hera_member_lines[0].split()[:6] == [
-        "4",
-        "5.00000000",
-        "5.00000000",
+        "5",
+        "6.00000000",
+        "6.00000000",
         "1.00000000",
         "1.00000000",
         "0.0000",
     ]
 
     ares_par = output / "ares" / "ares_lenscluster.par"
-    parsed, potentials_df, images_df, potentials_with_priors = load_best_par(ares_par)
+    parsed, potentials_df, images_df, arcs_df, potentials_with_priors = load_best_par(ares_par)
     assert len(potentials_df) == 8
     assert len(images_df) == 3
+    assert len(arcs_df) == 0
     assert images_df["family_id"].nunique() == 2
     assert len(parsed["potfiles"][0]["catalog_df"]) == 1
     assert {item["id"] for item in potentials_with_priors} == {"O1", "O2", "S1", "G1", "G2", "G3", "G4", "G5"}
@@ -236,19 +240,26 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     hera_o2_block = hera_par_text.split("potentiel O2", maxsplit=1)[1].split("potentiel S1", maxsplit=1)[0]
     assert "\n    x_centre 9.00000000\n    y_centre 1.00000000" in hera_o1_block
     assert "\n    core_radius 8.00000000" in hera_o1_block
-    assert "\n    v_disp 750.00000000" in hera_o1_block
+    assert "\n    angle_pos 30.00000000" in hera_o1_block
+    assert "\n    v_disp 800.00000000" in hera_o1_block
     assert "limit O1\n    x_centre 1 14.00000000 24.00000000 0.10000000\n    y_centre 1 -2.00000000 7.00000000 0.10000000" in hera_o1_block
     assert "\n    x_centre -2.00000000\n    y_centre 3.00000000" in hera_o2_block
     assert "\n    core_radius 5.00000000" in hera_o2_block
-    assert "\n    v_disp 950.00000000" in hera_o2_block
+    assert "\n    angle_pos 24.00000000" in hera_o2_block
+    assert "\n    v_disp 700.00000000" in hera_o2_block
     assert "limit O2\n    x_centre 1 -5.00000000 5.00000000 0.10000000\n    y_centre 1 -4.00000000 4.00000000 0.10000000" in hera_o2_block
     assert "potentiel G3" in hera_par_text
-    assert "potentiel G5" in hera_par_text
-    assert "potentiel G4" not in hera_par_text
-    assert "potentiel G6" not in hera_par_text
+    assert "potentiel G4" in hera_par_text
+    assert "potentiel G9" in hera_par_text
+    assert "potentiel G60" in hera_par_text
+    assert "potentiel G5" not in hera_par_text
+    assert not any(line == "potentiel G6" for line in hera_par_text.splitlines())
+    assert "\n    gamma 0.04000000\n    angle_pos 40.00000000" in hera_par_text
     assert hera_par_text.count("core_radius 1 2.00000000 15.00000000 0.10000000") == 2
     assert "sigma 9 96.70000000 40.00000000 30.00000000 250.00000000" in hera_par_text
     assert "cutkpc 9 33.00000000 25.00000000 3.00000000 250.00000000" in hera_par_text
+    assert "vdslope 1 2.0 6.0 0.1" in hera_par_text
+    assert "slope   1 1.0 6.0 0.1" in hera_par_text
 
 
 def test_validate_outputs_reports_generated_counts(tmp_path: Path) -> None:
@@ -261,11 +272,11 @@ def test_validate_outputs_reports_generated_counts(tmp_path: Path) -> None:
     assert rows == [
         {
             "cluster_key": "hera",
-            "n_potentials": 7,
+            "n_potentials": 9,
             "n_images": 2,
             "n_image_families": 1,
             "n_potfiles": 1,
             "n_members": 4,
-            "n_prior_components": 7,
+            "n_prior_components": 9,
         }
     ]

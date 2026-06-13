@@ -282,17 +282,10 @@ def test_make_multiband_rgb_rejects_missing_source_band() -> None:
         rgb.make_multiband_rgb(cutouts, display=display)
 
 
-def test_literature_cutout_rgb_display_wrapper_forwards_simple_controls(monkeypatch) -> None:
+def test_literature_cutout_rgb_display_wrapper_forwards_simple_controls() -> None:
     plotter = _load_literature_cutout_plotter()
-    calls: list[dict[str, Any]] = []
 
-    def fake_build_rgb_display_from_band_images(*args: Any, **kwargs: Any) -> str:
-        calls.append({"args": args, **kwargs})
-        return "display"
-
-    monkeypatch.setattr(plotter, "build_rgb_display_from_band_images", fake_build_rgb_display_from_band_images)
-
-    result = plotter.build_rgb_display(
+    display = plotter.build_rgb_display(
         {"B": object(), "G": object(), "R": object()},
         bands=("B", "G", "R"),
         q=5.0,
@@ -301,22 +294,113 @@ def test_literature_cutout_rgb_display_wrapper_forwards_simple_controls(monkeypa
         minimum=-0.04,
     )
 
-    assert result == "display"
-    assert calls
-    assert calls[0]["bands"] == ("B", "G", "R")
-    assert calls[0]["q"] == 5.0
-    assert calls[0]["stretch"] == 0.3
-    assert calls[0]["channel_gains"] == {"blue": 1.3, "green": 1.1, "red": 0.6}
-    assert calls[0]["minimum"] == -0.04
+    assert isinstance(display, rgb.CalibratedRGBDisplayConfig)
+    assert display.q == 5.0
+    assert display.stretch == 0.3
+    assert dict(display.channel_gains) == {"blue": 1.3, "green": 1.1, "red": 0.6}
+    assert display.minimum == -0.04
 
 
-def test_literature_cutout_rgb_display_wrapper_uses_generic_defaults() -> None:
+def test_literature_cutout_rgb_display_wrapper_uses_calibrated_defaults() -> None:
     plotter = _load_literature_cutout_plotter()
-    band_images = {band: object() for band in plotter.DEFAULT_BANDS}
+    bands = ("F435W", "F606W", "F814W")
+    band_images = {band: object() for band in bands}
 
-    display = plotter.build_rgb_display(band_images, bands=plotter.DEFAULT_BANDS)
+    display = plotter.build_rgb_display(band_images, bands=bands)
 
-    assert display.q == rgb.DEFAULT_RGB_Q
-    assert display.stretch == rgb.DEFAULT_RGB_STRETCH
+    assert isinstance(display, rgb.CalibratedRGBDisplayConfig)
+    assert display.q == rgb.DEFAULT_CALIBRATED_RGB_Q
+    assert display.stretch == rgb.DEFAULT_CALIBRATED_RGB_STRETCH
     assert display.minimum == rgb.DEFAULT_RGB_MINIMUM
-    assert dict(display.channel_gains) == rgb.DEFAULT_RGB_CHANNEL_GAINS
+    assert dict(display.channel_gains) == rgb.DEFAULT_CALIBRATED_RGB_CHANNEL_GAINS
+    assert dict(display.band_fluxscales) == {band: 1.0 for band in bands}
+    assert dict(display.band_backgrounds) == {band: 0.0 for band in bands}
+
+
+def test_literature_cutout_rgb_display_wrapper_uses_hff_seven_band_defaults() -> None:
+    plotter = _load_literature_cutout_plotter()
+    band_images = {band: object() for band in rgb.DEFAULT_HFF_RGB_BANDS}
+
+    display = plotter.build_rgb_display(band_images, bands=rgb.DEFAULT_HFF_RGB_BANDS)
+
+    assert isinstance(display, rgb.CalibratedRGBDisplayConfig)
+    assert display.q == rgb.DEFAULT_HFF_RGB_Q
+    assert display.stretch == rgb.DEFAULT_HFF_RGB_STRETCH
+    assert display.minimum == rgb.DEFAULT_HFF_RGB_MINIMUM
+    assert dict(display.channel_gains) == rgb.DEFAULT_HFF_RGB_CHANNEL_GAINS
+    assert dict(display.channel_weights) == rgb.DEFAULT_HFF_RGB_CHANNEL_WEIGHTS
+    assert display.warm_highlight_desaturation == rgb.DEFAULT_HFF_RGB_WARM_HIGHLIGHT_DESATURATION
+    assert display.highlight_knee == rgb.DEFAULT_HFF_RGB_HIGHLIGHT_KNEE
+    assert display.highlight_ceiling == rgb.DEFAULT_HFF_RGB_HIGHLIGHT_CEILING
+    assert display.highlight_softness == rgb.DEFAULT_HFF_RGB_HIGHLIGHT_SOFTNESS
+    assert dict(display.band_fluxscales) == {band: 1.0 for band in rgb.DEFAULT_HFF_RGB_BANDS}
+    assert dict(display.band_backgrounds) == {band: 0.0 for band in rgb.DEFAULT_HFF_RGB_BANDS}
+
+
+def test_literature_cutout_rgb_display_uses_band_photometry() -> None:
+    plotter = _load_literature_cutout_plotter()
+
+    class FakeBandImage:
+        def __init__(self, photflam: float, photplam: float, background: float, background_sigma: float) -> None:
+            self.photflam = photflam
+            self.photplam = photplam
+            self.background = background
+            self.background_sigma = background_sigma
+
+    band_images = {
+        "F435W": FakeBandImage(3.1476e-19, 4329.2, 1.4e-4, 5.0e-4),
+        "F606W": FakeBandImage(7.8178e-20, 5922.0, 2.8e-4, 1.0e-3),
+        "F814W": FakeBandImage(7.0478e-20, 8045.0, 2.0e-4, 6.0e-4),
+    }
+
+    display = plotter.build_rgb_display(band_images, bands=("F435W", "F606W", "F814W"))
+
+    assert isinstance(display, rgb.CalibratedRGBDisplayConfig)
+    assert display.band_fluxscales["F814W"] == pytest.approx(1.0)
+    assert display.band_fluxscales["F435W"] == pytest.approx(1.293, rel=1e-2)
+    assert display.band_fluxscales["F606W"] == pytest.approx(0.601, rel=1e-2)
+    assert display.band_backgrounds == {"F435W": 1.4e-4, "F606W": 2.8e-4, "F814W": 2.0e-4}
+    expected_minimum = rgb.CALIBRATED_RGB_MINIMUM_SKY_SIGMA * np.median(
+        [5.0e-4 * display.band_fluxscales["F435W"], 1.0e-3 * display.band_fluxscales["F606W"], 6.0e-4]
+    )
+    assert display.minimum == pytest.approx(expected_minimum)
+
+
+def test_make_calibrated_rgb_saturates_bright_cores_to_white() -> None:
+    shape = (9, 9)
+    bright = np.full(shape, 0.001, dtype=np.float32)
+    bright[4, 4] = 50.0
+    cutouts = {"F435W": bright.copy(), "F606W": bright.copy(), "F814W": bright.copy()}
+    display = rgb.CalibratedRGBDisplayConfig()
+
+    result = rgb.make_natural_rgb(cutouts, bands=("F435W", "F606W", "F814W"), display=display)
+
+    assert result.dtype == np.uint8
+    assert result.shape == (9, 9, 3)
+    assert tuple(result[4, 4]) == (255, 255, 255)
+
+
+def test_make_calibrated_hff_rgb_compresses_bright_cores_below_white() -> None:
+    shape = (9, 9)
+    faint = np.linspace(0.0002, 0.003, shape[0] * shape[1], dtype=np.float32).reshape(shape)
+    bright = faint.copy()
+    bright[4, 4] = 50.0
+    cutouts = {band: bright.copy() for band in rgb.DEFAULT_HFF_RGB_BANDS}
+    display = rgb.CalibratedRGBDisplayConfig(
+        q=rgb.DEFAULT_HFF_RGB_Q,
+        stretch=rgb.DEFAULT_HFF_RGB_STRETCH,
+        channel_gains=dict(rgb.DEFAULT_HFF_RGB_CHANNEL_GAINS),
+        minimum=rgb.DEFAULT_HFF_RGB_MINIMUM,
+        warm_highlight_desaturation=rgb.DEFAULT_HFF_RGB_WARM_HIGHLIGHT_DESATURATION,
+        channel_weights=dict(rgb.DEFAULT_HFF_RGB_CHANNEL_WEIGHTS),
+        highlight_knee=rgb.DEFAULT_HFF_RGB_HIGHLIGHT_KNEE,
+        highlight_ceiling=rgb.DEFAULT_HFF_RGB_HIGHLIGHT_CEILING,
+        highlight_softness=rgb.DEFAULT_HFF_RGB_HIGHLIGHT_SOFTNESS,
+    )
+
+    result = rgb.make_natural_rgb(cutouts, bands=rgb.DEFAULT_HFF_RGB_BANDS, display=display)
+
+    assert result.dtype == np.uint8
+    assert result.shape == (9, 9, 3)
+    assert not np.any(np.all(result == 255, axis=-1))
+    assert int(result[0, 0].max()) > 0

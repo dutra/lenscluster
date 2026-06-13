@@ -1719,14 +1719,14 @@ def _write_plot_fixture(root: Path, spec: builder.ClusterSpec, *, optional: bool
     ).to_csv(pair_path, index=False)
 
 
-def _write_test_wcs_fits(path: Path, *, center_ra: float, center_dec: float, value: float = 1.0) -> None:
+def _write_test_wcs_fits(path: Path, *, center_ra: float, center_dec: float, value: float = 1.0, size: int = 50) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     wcs = WCS(naxis=2)
-    wcs.wcs.crpix = [25.0, 25.0]
+    wcs.wcs.crpix = [float(size) / 2.0, float(size) / 2.0]
     wcs.wcs.cdelt = np.array([-0.0000166667, 0.0000166667])
     wcs.wcs.crval = [center_ra, center_dec]
     wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
-    yy, xx = np.mgrid[0:50, 0:50]
+    yy, xx = np.mgrid[0:size, 0:size]
     data = value + 0.01 * xx + 0.02 * yy
     fits.PrimaryHDU(data.astype(np.float32), header=wcs.to_header()).writeto(path, overwrite=True)
 
@@ -1767,8 +1767,8 @@ def test_image_scale_prefers_matching_background_and_cutout_paths(tmp_path: Path
     for scale in ("60mas", "30mas"):
         scale_dir = image_dir / scale
         scale_dir.mkdir()
-        for band in ("f435w", "f606w", "f814w"):
-            (scale_dir / f"hlsp_buffalo_abell370_{band}_test_drz.fits").write_text("", encoding="utf-8")
+        for band in builder.DEFAULT_FAMILY_CUTOUT_BANDS:
+            (scale_dir / f"hlsp_buffalo_abell370_{band.lower()}_test_drz.fits").write_text("", encoding="utf-8")
 
     background_paths = builder._find_background_band_paths(image_dir, spec, image_scale="30mas")
     cutout_paths = builder._find_family_cutout_band_paths(
@@ -2021,8 +2021,14 @@ def test_cluster_image_overlay_uses_grayscale_and_rgb_fits(tmp_path: Path) -> No
     assert cutouts["status"] == "skipped"
     assert "Missing RGB FITS" in cutouts["reason"]
 
-    _write_test_wcs_fits(image_dir / "hlsp_buffalo_abell370_f435w_test.fits", center_ra=10.0, center_dec=0.0, value=1.0)
-    _write_test_wcs_fits(image_dir / "hlsp_buffalo_abell370_f606w_test.fits", center_ra=10.0, center_dec=0.0, value=2.0)
+    for band_index, band in enumerate(builder.DEFAULT_FAMILY_CUTOUT_BANDS, start=1):
+        _write_test_wcs_fits(
+            image_dir / f"hlsp_buffalo_abell370_{band.lower()}_test.fits",
+            center_ra=10.0,
+            center_dec=0.0,
+            value=float(band_index),
+            size=300,
+        )
 
     builder.run_plots_stage(grayscale_args, builder.Console(record=True), [spec])
     manifest = pd.read_csv(builder.catalog_plot_manifest_path(tmp_path))
@@ -2148,9 +2154,14 @@ def test_family_cutouts_render_all_finite_members(tmp_path: Path) -> None:
     families.to_csv(family_path, index=False)
     pd.DataFrame(members).to_csv(family_member_path, index=False)
     image_dir = tmp_path / "images"
-    _write_test_wcs_fits(image_dir / "hlsp_buffalo_abell370_f435w_test.fits", center_ra=10.0, center_dec=0.0, value=1.0)
-    _write_test_wcs_fits(image_dir / "hlsp_buffalo_abell370_f606w_test.fits", center_ra=10.0, center_dec=0.0, value=2.0)
-    _write_test_wcs_fits(image_dir / "hlsp_buffalo_abell370_f814w_test.fits", center_ra=10.0, center_dec=0.0, value=3.0)
+    for band_index, band in enumerate(builder.DEFAULT_FAMILY_CUTOUT_BANDS, start=1):
+        _write_test_wcs_fits(
+            image_dir / f"hlsp_buffalo_abell370_{band.lower()}_test.fits",
+            center_ra=10.0,
+            center_dec=0.0,
+            value=float(band_index),
+            size=300,
+        )
     args = builder._parse_args(
         [
             "plots",

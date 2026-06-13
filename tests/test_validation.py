@@ -75,8 +75,9 @@ from lenscluster.cluster_solver import (
     _parse_args,
     _validation_metrics_summary,
 )
-from lenscluster.lenstool_parser import _split_image_label, load_best_par
+from lenscluster.lenstool_parser import _load_arc_constraints_catalog, _split_image_label, load_best_par
 from lenscluster.model import (
+    ArcConstraintData,
     BuildState,
     ChainSeed,
     GeometryCache,
@@ -211,7 +212,7 @@ def test_generate_single_bcg_mock_parses_and_has_finite_magnifications(tmp_path:
     config = SingleBCGMockConfig(seed=7, n_primary_families=2, pos_sigma_arcsec=0.0)
 
     paths, images, truth = generate_single_bcg_mock(tmp_path, config)
-    _parsed, _potentials_df, images_df, potentials_with_priors = load_best_par(paths.par_path)
+    _parsed, _potentials_df, images_df, _arcs_df, potentials_with_priors = load_best_par(paths.par_path)
 
     assert paths.par_path.exists()
     assert paths.image_catalog_path.exists()
@@ -903,7 +904,7 @@ fini
         encoding="utf-8",
     )
 
-    parsed, _potentials_df, _images_df, _potentials_with_priors = load_best_par(par_path)
+    parsed, _potentials_df, _images_df, _arcs_df, _potentials_with_priors = load_best_par(par_path)
 
     potfile = parsed["potfiles"][0]
     assert potfile["vdslope"] == [0, 4.0, 0.0]
@@ -940,7 +941,7 @@ fini
         encoding="utf-8",
     )
 
-    parsed, _potentials_df, _images_df, _potentials_with_priors = load_best_par(par_path)
+    parsed, _potentials_df, _images_df, _arcs_df, _potentials_with_priors = load_best_par(par_path)
 
     potfile = parsed["potfiles"][0]
     assert potfile["sigma_nominal"] == pytest.approx(245.0)
@@ -990,7 +991,7 @@ fini
         encoding="utf-8",
     )
 
-    parsed, potentials_df, _images_df, potentials_with_priors = load_best_par(par_path)
+    parsed, potentials_df, _images_df, _arcs_df, potentials_with_priors = load_best_par(par_path)
 
     assert potentials_df.loc[0, "id"] == "1"
     assert potentials_df.loc[0, "x_centre"] == pytest.approx(0.0)
@@ -1080,7 +1081,7 @@ fini
         encoding="utf-8",
     )
 
-    parsed, _potentials_df, _images_df, potentials_with_priors = load_best_par(par_path)
+    parsed, _potentials_df, _images_df, _arcs_df, potentials_with_priors = load_best_par(par_path)
 
     assert "limit" not in parsed
     assert [item["id"] for item in parsed["limits"]] == ["1", "2", "3", "4"]
@@ -1134,14 +1135,14 @@ fini
         encoding="utf-8",
     )
 
-    _parsed, _potentials_df, images_df, _potentials_with_priors = load_best_par(par_path)
+    _parsed, _potentials_df, images_df, _arcs_df, _potentials_with_priors = load_best_par(par_path)
 
     assert images_df["image_label"].astype(str).tolist() == ["1.a", "1.b", "1.c"]
     assert images_df["family_id"].astype(str).tolist() == ["1", "1", "1"]
     assert images_df["image_id"].astype(str).tolist() == ["a", "b", "c"]
 
 
-def test_load_best_par_arcfile_reference3_merges_constraints(tmp_path: Path) -> None:
+def test_load_best_par_arcfile_reference3_loads_independent_arcs(tmp_path: Path) -> None:
     image_catalog_path = tmp_path / "obs_arcs.dat"
     image_catalog_path.write_text(
         "#REFERENCE 3\n"
@@ -1152,7 +1153,7 @@ def test_load_best_par_arcfile_reference3_merges_constraints(tmp_path: Path) -> 
     arc_catalog_path = tmp_path / "arc_constraints.dat"
     arc_catalog_path.write_text(
         "#REFERENCE 3\n"
-        "1.a 0.25 -0.50 0.82 0.09 0.05 0.02 0.7\n",
+        "arc_A 0.25 -0.50 -1 0.82 0.09 0.05 0.02 0.7\n",
         encoding="utf-8",
     )
     par_path = tmp_path / "with_arcs.par"
@@ -1171,10 +1172,12 @@ fini
         encoding="utf-8",
     )
 
-    _parsed, _potentials_df, images_df, _potentials_with_priors = load_best_par(par_path)
+    _parsed, _potentials_df, images_df, arcs_df, _potentials_with_priors = load_best_par(par_path)
 
-    assert images_df["arc_has_constraint"].astype(bool).tolist() == [True, False]
-    first = images_df.iloc[0]
+    assert not any(column.startswith("arc_") for column in images_df.columns)
+    assert arcs_df["arc_id"].astype(str).tolist() == ["arc_A"]
+    first = arcs_df.iloc[0]
+    assert float(first["z_arc"]) == pytest.approx(-1.0)
     x_anchor, y_anchor = cluster_solver._radec_to_offsets_arcsec(
         np.asarray([first["arc_anchor_ra"]], dtype=float),
         np.asarray([first["arc_anchor_dec"]], dtype=float),
@@ -1190,7 +1193,7 @@ fini
     assert float(first["arc_reliability"]) == pytest.approx(0.7)
 
 
-def test_load_best_par_arcfile_rejects_unknown_image_label(tmp_path: Path) -> None:
+def test_load_best_par_arcfile_accepts_arc_ids_unlinked_to_images(tmp_path: Path) -> None:
     image_catalog_path = tmp_path / "obs_arcs.dat"
     image_catalog_path.write_text(
         "#REFERENCE 0\n"
@@ -1201,7 +1204,7 @@ def test_load_best_par_arcfile_rejects_unknown_image_label(tmp_path: Path) -> No
     arc_catalog_path = tmp_path / "arc_constraints.dat"
     arc_catalog_path.write_text(
         "#REFERENCE 0\n"
-        "2.a 10.0000 20.0000 0.82 0.09 0.05 0.02 1.0\n",
+        "independent_arc 10.0000 20.0000 2.0 0.82 0.09 0.05 0.02 1.0\n",
         encoding="utf-8",
     )
     par_path = tmp_path / "unknown_arc.par"
@@ -1220,8 +1223,62 @@ fini
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="unknown image_label"):
-        load_best_par(par_path)
+    _parsed, _potentials_df, images_df, arcs_df, _potentials_with_priors = load_best_par(par_path)
+
+    assert images_df["image_label"].astype(str).tolist() == ["1.a", "1.b"]
+    assert arcs_df["arc_id"].astype(str).tolist() == ["independent_arc"]
+    assert float(arcs_df.iloc[0]["z_arc"]) == pytest.approx(2.0)
+
+
+def test_load_arc_constraints_catalog_accepts_allowed_redshift_values(tmp_path: Path) -> None:
+    arc_catalog_path = tmp_path / "arc_constraints.dat"
+    arc_catalog_path.write_text(
+        "#REFERENCE 0\n"
+        "arc_z 10.0000 20.0000 2.0 0.82 0.09 0.05 0.02 1.0\n"
+        "arc_zero 10.0001 20.0000 0 0.72 0.08 0.05 0.02 1.0\n"
+        "arc_unknown 10.0002 20.0000 -1 0.62 0.07 0.05 0.02 1.0\n",
+        encoding="utf-8",
+    )
+
+    arcs_df = _load_arc_constraints_catalog(arc_catalog_path, None)
+
+    assert arcs_df["arc_id"].astype(str).tolist() == ["arc_z", "arc_zero", "arc_unknown"]
+    np.testing.assert_allclose(arcs_df["z_arc"].to_numpy(dtype=float), [2.0, 0.0, -1.0])
+
+
+@pytest.mark.parametrize(
+    ("row", "match"),
+    [
+        ("arc_A 10.0000 20.0000 0.82 0.09 0.05 0.02", "fewer than 8"),
+        ("arc_A 10.0000 20.0000 -0.5 0.82 0.09 0.05 0.02", "invalid z_arc"),
+        ("arc_A 10.0000 20.0000 2.0 0.82 -0.09 0.05 0.02", "negative curvature"),
+        ("arc_A 10.0000 20.0000 2.0 0.82 0.09 0.00 0.02", "non-positive tangent sigma"),
+        ("arc_A 10.0000 20.0000 2.0 0.82 0.09 0.05 0.00", "non-positive curvature sigma"),
+    ],
+)
+def test_load_arc_constraints_catalog_rejects_invalid_rows(
+    tmp_path: Path,
+    row: str,
+    match: str,
+) -> None:
+    arc_catalog_path = tmp_path / "invalid_arc_constraints.dat"
+    arc_catalog_path.write_text(f"#REFERENCE 0\n{row}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=match):
+        _load_arc_constraints_catalog(arc_catalog_path, None)
+
+
+def test_load_arc_constraints_catalog_rejects_duplicate_arc_ids(tmp_path: Path) -> None:
+    arc_catalog_path = tmp_path / "duplicate_arc_constraints.dat"
+    arc_catalog_path.write_text(
+        "#REFERENCE 0\n"
+        "arc_A 10.0000 20.0000 2.0 0.82 0.09 0.05 0.02\n"
+        "arc_A 10.0001 20.0000 2.0 0.72 0.08 0.05 0.02\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate arc_id"):
+        _load_arc_constraints_catalog(arc_catalog_path, None)
 
 
 def test_cab_tangent_angle_residual_wraps_modulo_pi() -> None:
@@ -1233,6 +1290,179 @@ def test_cab_tangent_angle_residual_wraps_modulo_pi() -> None:
     assert float(residual) == pytest.approx(0.05)
 
 
+@pytest.mark.parametrize(
+    "entries",
+    [
+        (0.0, 0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0, 1.0),
+        (0.0, 0.0, 0.0, 1.0),
+        (0.0, -0.1, -0.1, 0.0),
+        (1.0, -1.0e-6, -1.0e-6, 1.0),
+    ],
+)
+def test_cab_tangent_frame_has_finite_weighted_gradient(entries: tuple[float, float, float, float]) -> None:
+    def objective(values: jnp.ndarray) -> jnp.ndarray:
+        frame = cluster_solver._cab_tangent_frame_from_jacobian_entries(
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+        )
+        axial_signal = jnp.sum(frame.branch_weight * jnp.sin(frame.tangent_angle_rad), axis=-1)
+        return frame.frame_weight * axial_signal
+
+    values = jnp.asarray(entries, dtype=jnp.float64)
+    frame = cluster_solver._cab_tangent_frame_from_jacobian_entries(values[0], values[1], values[2], values[3])
+    gradient = jax.grad(objective)(values)
+
+    assert bool(frame.finite)
+    assert np.all(np.isfinite(np.asarray(frame.tangent_angle_rad)))
+    assert np.all(np.isfinite(np.asarray(frame.branch_weight)))
+    assert np.isfinite(float(frame.frame_weight))
+    assert np.all(np.isfinite(np.asarray(gradient)))
+
+
+def test_cab_tangent_frame_weights_fade_at_ambiguous_limits() -> None:
+    zero_shear = cluster_solver._cab_tangent_frame_from_jacobian_entries(
+        jnp.asarray(1.0, dtype=jnp.float64),
+        jnp.asarray(0.0, dtype=jnp.float64),
+        jnp.asarray(0.0, dtype=jnp.float64),
+        jnp.asarray(1.0, dtype=jnp.float64),
+    )
+    kappa_one_shear = cluster_solver._cab_tangent_frame_from_jacobian_entries(
+        jnp.asarray(0.0, dtype=jnp.float64),
+        jnp.asarray(-0.1, dtype=jnp.float64),
+        jnp.asarray(-0.1, dtype=jnp.float64),
+        jnp.asarray(0.0, dtype=jnp.float64),
+    )
+    axis_ratio_1p1 = cluster_solver._cab_tangent_frame_from_jacobian_entries(
+        jnp.asarray(1.0, dtype=jnp.float64),
+        jnp.asarray(0.0, dtype=jnp.float64),
+        jnp.asarray(0.0, dtype=jnp.float64),
+        jnp.asarray(1.1, dtype=jnp.float64),
+    )
+    clear_frame = cluster_solver._cab_tangent_frame_from_jacobian_entries(
+        jnp.asarray(0.0, dtype=jnp.float64),
+        jnp.asarray(0.0, dtype=jnp.float64),
+        jnp.asarray(0.0, dtype=jnp.float64),
+        jnp.asarray(1.0, dtype=jnp.float64),
+    )
+
+    assert float(zero_shear.frame_weight) == pytest.approx(0.0, abs=1.0e-12)
+    assert float(kappa_one_shear.frame_weight) == pytest.approx(0.0, abs=1.0e-12)
+    np.testing.assert_allclose(np.asarray(kappa_one_shear.branch_weight), [0.5, 0.5], rtol=1.0e-6, atol=1.0e-8)
+    assert float(axis_ratio_1p1.frame_weight) < 0.25
+    assert float(clear_frame.frame_weight) > 0.99
+    assert float(clear_frame.branch_weight[0]) > 0.99
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        (0.0, 0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0, 1.0),
+        (0.0, 0.0, 0.0, 1.0),
+        (0.0, -0.1, -0.1, 0.0),
+    ],
+)
+def test_cab_morphology_loglike_has_finite_jacobian_gradient(
+    entries: tuple[float, float, float, float],
+) -> None:
+    def loglike(values: jnp.ndarray) -> jnp.ndarray:
+        frame = cluster_solver._cab_tangent_frame_from_jacobian_entries(
+            values[0:1],
+            values[1:2],
+            values[2:3],
+            values[3:4],
+        )
+        return cluster_solver._cab_morphology_arc_catalog_loglike(
+            predicted_tangent_angle_rad=frame.tangent_angle_rad,
+            predicted_curvature_arcsec_inv=jnp.zeros_like(frame.tangent_angle_rad),
+            prediction_finite=jnp.repeat(frame.finite[..., jnp.newaxis], 2, axis=-1),
+            observed_tangent_angle_rad=jnp.asarray([0.2], dtype=jnp.float64),
+            observed_curvature_arcsec_inv=jnp.asarray([0.0], dtype=jnp.float64),
+            sigma_tangent_angle_rad=jnp.asarray([0.05], dtype=jnp.float64),
+            sigma_curvature_arcsec_inv=jnp.asarray([0.02], dtype=jnp.float64),
+            reliability=jnp.asarray([1.0], dtype=jnp.float64),
+            active_arcs=jnp.asarray([True]),
+            branch_weight=frame.branch_weight,
+            frame_weight=jnp.repeat(frame.frame_weight[..., jnp.newaxis], 2, axis=-1),
+        )
+
+    values = jnp.asarray(entries, dtype=jnp.float64)
+    gradient = jax.grad(loglike)(values)
+
+    assert np.isfinite(float(loglike(values)))
+    assert np.all(np.isfinite(np.asarray(gradient)))
+
+
+@pytest.mark.parametrize("gamma1", [0.0, 1.0e-6])
+def test_cab_morphology_physical_shear_gradient_is_bounded(gamma1: float) -> None:
+    def loglike_from_gamma2(gamma2: jnp.ndarray) -> jnp.ndarray:
+        p = jnp.asarray(1.0, dtype=jnp.float64)
+        gamma1_value = jnp.asarray(gamma1, dtype=jnp.float64)
+        frame = cluster_solver._cab_tangent_frame_from_jacobian_entries(
+            (p - gamma1_value)[jnp.newaxis],
+            (-gamma2)[jnp.newaxis],
+            (-gamma2)[jnp.newaxis],
+            (p + gamma1_value)[jnp.newaxis],
+        )
+        return cluster_solver._cab_morphology_arc_catalog_loglike(
+            predicted_tangent_angle_rad=frame.tangent_angle_rad,
+            predicted_curvature_arcsec_inv=jnp.zeros_like(frame.tangent_angle_rad),
+            prediction_finite=jnp.repeat(frame.finite[..., jnp.newaxis], 2, axis=-1),
+            observed_tangent_angle_rad=jnp.asarray([0.0], dtype=jnp.float64),
+            observed_curvature_arcsec_inv=jnp.asarray([0.0], dtype=jnp.float64),
+            sigma_tangent_angle_rad=jnp.asarray([0.05], dtype=jnp.float64),
+            sigma_curvature_arcsec_inv=jnp.asarray([0.02], dtype=jnp.float64),
+            reliability=jnp.asarray([1.0], dtype=jnp.float64),
+            active_arcs=jnp.asarray([True]),
+            branch_weight=frame.branch_weight,
+            frame_weight=jnp.repeat(frame.frame_weight[..., jnp.newaxis], 2, axis=-1),
+        )
+
+    derivative = jax.grad(loglike_from_gamma2)(jnp.asarray(0.0, dtype=jnp.float64))
+
+    assert np.isfinite(float(derivative))
+    assert abs(float(derivative)) < 1.0e3
+
+
+def test_cab_morphology_kappa_crossing_gradient_is_physically_gated() -> None:
+    gamma = jnp.asarray(0.3, dtype=jnp.float64)
+    p_values = jnp.asarray(
+        [3.0e-2, 1.0e-2, 3.0e-3, 1.0e-3, 3.0e-4, 0.0, -3.0e-4, -1.0e-3, -3.0e-3, -1.0e-2, -3.0e-2],
+        dtype=jnp.float64,
+    )
+
+    def row_loglike(p: jnp.ndarray) -> jnp.ndarray:
+        frame = cluster_solver._cab_tangent_frame_from_jacobian_entries(
+            p[jnp.newaxis],
+            (-gamma)[jnp.newaxis],
+            (-gamma)[jnp.newaxis],
+            p[jnp.newaxis],
+        )
+        return cluster_solver._cab_morphology_arc_catalog_loglike(
+            predicted_tangent_angle_rad=frame.tangent_angle_rad,
+            predicted_curvature_arcsec_inv=jnp.zeros_like(frame.tangent_angle_rad),
+            prediction_finite=jnp.repeat(frame.finite[..., jnp.newaxis], 2, axis=-1),
+            observed_tangent_angle_rad=jnp.asarray([0.25 * jnp.pi], dtype=jnp.float64),
+            observed_curvature_arcsec_inv=jnp.asarray([0.0], dtype=jnp.float64),
+            sigma_tangent_angle_rad=jnp.asarray([0.1], dtype=jnp.float64),
+            sigma_curvature_arcsec_inv=jnp.asarray([0.02], dtype=jnp.float64),
+            reliability=jnp.asarray([1.0], dtype=jnp.float64),
+            active_arcs=jnp.asarray([True]),
+            branch_weight=frame.branch_weight,
+            frame_weight=jnp.repeat(frame.frame_weight[..., jnp.newaxis], 2, axis=-1),
+        )
+
+    values = jax.vmap(row_loglike)(p_values)
+    gradients = jax.vmap(jax.grad(row_loglike))(p_values)
+
+    assert np.all(np.isfinite(np.asarray(values)))
+    assert np.all(np.isfinite(np.asarray(gradients)))
+    assert float(jnp.max(jnp.abs(gradients))) < 500.0
+
+
 def test_cab_morphology_loglike_rewards_matching_constraints_and_masks_rows() -> None:
     observed_angle = jnp.asarray([0.25, 1.0], dtype=jnp.float64)
     observed_curvature = jnp.asarray([0.08, 0.9], dtype=jnp.float64)
@@ -1240,7 +1470,7 @@ def test_cab_morphology_loglike_rewards_matching_constraints_and_masks_rows() ->
     sigma_curvature = jnp.asarray([0.02, 0.02], dtype=jnp.float64)
     reliability = jnp.asarray([1.0, 1.0], dtype=jnp.float64)
     mask = jnp.asarray([True, False])
-    exact = cluster_solver._cab_morphology_bin_loglike(
+    exact = cluster_solver._cab_morphology_arc_catalog_loglike(
         predicted_tangent_angle_rad=observed_angle,
         predicted_curvature_arcsec_inv=observed_curvature,
         prediction_finite=jnp.asarray([True, True]),
@@ -1249,9 +1479,9 @@ def test_cab_morphology_loglike_rewards_matching_constraints_and_masks_rows() ->
         sigma_tangent_angle_rad=sigma_angle,
         sigma_curvature_arcsec_inv=sigma_curvature,
         reliability=reliability,
-        arc_has_constraint=mask,
+        active_arcs=mask,
     )
-    perturbed = cluster_solver._cab_morphology_bin_loglike(
+    perturbed = cluster_solver._cab_morphology_arc_catalog_loglike(
         predicted_tangent_angle_rad=observed_angle + jnp.asarray([0.10, 10.0], dtype=jnp.float64),
         predicted_curvature_arcsec_inv=observed_curvature + jnp.asarray([0.04, 10.0], dtype=jnp.float64),
         prediction_finite=jnp.asarray([True, True]),
@@ -1260,9 +1490,9 @@ def test_cab_morphology_loglike_rewards_matching_constraints_and_masks_rows() ->
         sigma_tangent_angle_rad=sigma_angle,
         sigma_curvature_arcsec_inv=sigma_curvature,
         reliability=reliability,
-        arc_has_constraint=mask,
+        active_arcs=mask,
     )
-    no_constraints = cluster_solver._cab_morphology_bin_loglike(
+    no_constraints = cluster_solver._cab_morphology_arc_catalog_loglike(
         predicted_tangent_angle_rad=observed_angle + 10.0,
         predicted_curvature_arcsec_inv=observed_curvature + 10.0,
         prediction_finite=jnp.asarray([False, False]),
@@ -1271,23 +1501,176 @@ def test_cab_morphology_loglike_rewards_matching_constraints_and_masks_rows() ->
         sigma_tangent_angle_rad=sigma_angle,
         sigma_curvature_arcsec_inv=sigma_curvature,
         reliability=reliability,
-        arc_has_constraint=jnp.asarray([False, False]),
+        active_arcs=jnp.asarray([False, False]),
     )
 
     assert float(exact) > float(perturbed)
     assert float(no_constraints) == pytest.approx(0.0)
 
 
-def test_cab_likelihood_weight_defaults_to_one_when_arcfile_is_declared() -> None:
-    state_with_arcfile = SimpleNamespace(parsed={"image": {"arcfile": [1, "arcs.dat"]}}, family_data=[], bin_data=[])
-    state_without_arcfile = SimpleNamespace(parsed={"image": {}}, family_data=[], bin_data=[])
+def test_cab_morphology_outlier_branch_limits_bad_constraint_penalty() -> None:
+    common = dict(
+        predicted_tangent_angle_rad=jnp.asarray([np.pi / 2.0], dtype=jnp.float64),
+        predicted_curvature_arcsec_inv=jnp.asarray([10.0], dtype=jnp.float64),
+        prediction_finite=jnp.asarray([True]),
+        observed_tangent_angle_rad=jnp.asarray([0.0], dtype=jnp.float64),
+        observed_curvature_arcsec_inv=jnp.asarray([0.0], dtype=jnp.float64),
+        sigma_tangent_angle_rad=jnp.asarray([0.01], dtype=jnp.float64),
+        sigma_curvature_arcsec_inv=jnp.asarray([0.01], dtype=jnp.float64),
+        reliability=jnp.asarray([1.0], dtype=jnp.float64),
+        active_arcs=jnp.asarray([True]),
+    )
 
-    assert cluster_solver._effective_cab_likelihood_weight(None, state_with_arcfile) == pytest.approx(1.0)
-    assert cluster_solver._effective_cab_likelihood_weight(None, state_without_arcfile) == pytest.approx(0.0)
-    assert cluster_solver._effective_cab_likelihood_weight(0.25, state_with_arcfile) == pytest.approx(0.25)
+    trusted = cluster_solver._cab_morphology_arc_catalog_loglike(**common, frame_weight=jnp.asarray([1.0], dtype=jnp.float64))
+    ambiguous = cluster_solver._cab_morphology_arc_catalog_loglike(**common, frame_weight=jnp.asarray([0.0], dtype=jnp.float64))
+
+    assert np.isfinite(float(trusted))
+    assert np.isfinite(float(ambiguous))
+    assert float(ambiguous) > float(trusted)
+    sigma_curvature_outlier = max(
+        cluster_solver.CAB_OUTLIER_CURVATURE_SIGMA_ARCSEC_INV,
+        3.0 * 0.01,
+    )
+    expected_outlier = (
+        -math.log(math.pi)
+        + 0.5 * math.log(2.0 / (math.pi * sigma_curvature_outlier**2))
+        - 0.5 * (0.0 / sigma_curvature_outlier) ** 2
+    )
+    assert float(ambiguous) == pytest.approx(expected_outlier, abs=1.0e-10)
 
 
-def test_cab_arc_arrays_survive_family_bin_and_traced_conversion(tmp_path: Path) -> None:
+def test_cab_outlier_is_two_dimensional_density() -> None:
+    def outlier_for(observed_curvature: float, sigma_curvature: float) -> float:
+        terms = cluster_solver._cab_morphology_terms(
+            predicted_tangent_angle_rad=jnp.asarray([0.3], dtype=jnp.float64),
+            predicted_curvature_arcsec_inv=jnp.asarray([0.05], dtype=jnp.float64),
+            prediction_finite=jnp.asarray([True]),
+            observed_tangent_angle_rad=jnp.asarray([0.3], dtype=jnp.float64),
+            observed_curvature_arcsec_inv=jnp.asarray([observed_curvature], dtype=jnp.float64),
+            sigma_tangent_angle_rad=jnp.asarray([0.05], dtype=jnp.float64),
+            sigma_curvature_arcsec_inv=jnp.asarray([sigma_curvature], dtype=jnp.float64),
+            reliability=jnp.asarray([0.9], dtype=jnp.float64),
+            active_arcs=jnp.asarray([True]),
+        )
+        return float(terms.outlier_ll[0])
+
+    sigma_curvature_outlier = max(
+        cluster_solver.CAB_OUTLIER_CURVATURE_SIGMA_ARCSEC_INV,
+        3.0 * 0.02,
+    )
+    expected_quad_difference = -0.5 * (0.2**2 - 0.0**2) / sigma_curvature_outlier**2
+    assert outlier_for(0.2, 0.02) - outlier_for(0.0, 0.02) == pytest.approx(
+        expected_quad_difference, abs=1.0e-12
+    )
+
+    broad_sigma_curvature = 0.5
+    expected_broad = (
+        -math.log(math.pi)
+        + 0.5 * math.log(2.0 / (math.pi * (3.0 * broad_sigma_curvature) ** 2))
+        - 0.5 * (0.1 / (3.0 * broad_sigma_curvature)) ** 2
+    )
+    assert outlier_for(0.1, broad_sigma_curvature) == pytest.approx(expected_broad, abs=1.0e-12)
+
+
+def test_cab_inlier_density_normalized_on_axial_halfline_support() -> None:
+    # The inlier density must integrate to 1 over theta in [0, pi) x kappa in [0, inf).
+    predicted_angle = 0.7
+    predicted_curvature = 0.05
+    sigma_tangent = 0.2
+    sigma_curvature = 0.03
+    n_theta, n_kappa = 400, 1000
+    thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False)
+    kappas = np.linspace(0.0, 0.5, n_kappa)  # well past predicted + many sigma
+    dtheta = float(np.pi / n_theta)
+    dkappa = float(kappas[1] - kappas[0])
+    th_grid, ka_grid = np.meshgrid(thetas, kappas, indexing="ij")
+    obs_angle = jnp.asarray(th_grid.ravel(), dtype=jnp.float64)
+    obs_curv = jnp.asarray(ka_grid.ravel(), dtype=jnp.float64)
+    n = int(obs_angle.shape[0])
+    terms = cluster_solver._cab_morphology_terms(
+        predicted_tangent_angle_rad=jnp.full((n,), predicted_angle, dtype=jnp.float64),
+        predicted_curvature_arcsec_inv=jnp.full((n,), predicted_curvature, dtype=jnp.float64),
+        prediction_finite=jnp.ones((n,), dtype=bool),
+        observed_tangent_angle_rad=obs_angle,
+        observed_curvature_arcsec_inv=obs_curv,
+        sigma_tangent_angle_rad=jnp.full((n,), sigma_tangent, dtype=jnp.float64),
+        sigma_curvature_arcsec_inv=jnp.full((n,), sigma_curvature, dtype=jnp.float64),
+        reliability=jnp.ones((n,), dtype=jnp.float64),
+        active_arcs=jnp.ones((n,), dtype=bool),
+        tangent_sigma_floor_rad=1.0e-6,
+        curvature_sigma_floor_arcsec_inv=1.0e-6,
+    )
+    density = np.asarray(jnp.exp(terms.inlier_ll))
+    integral = float(density.sum()) * dtheta * dkappa
+    assert integral == pytest.approx(1.0, abs=0.02)
+
+
+def test_cab_inlier_tangent_matches_gaussian_only_for_small_sigma() -> None:
+    # inlier_ll difference between a residual delta and 0 isolates the tangent term
+    # (curvature is identical and cancels). It must match the Gaussian -0.5 (d/s)^2
+    # for small sigma and deviate for broad sigma near the arctrace cap.
+    def tangent_logdiff(sigma: float, delta: float) -> float:
+        terms = cluster_solver._cab_morphology_terms(
+            predicted_tangent_angle_rad=jnp.asarray([0.3 + delta, 0.3], dtype=jnp.float64),
+            predicted_curvature_arcsec_inv=jnp.asarray([0.05, 0.05], dtype=jnp.float64),
+            prediction_finite=jnp.asarray([True, True]),
+            observed_tangent_angle_rad=jnp.asarray([0.3, 0.3], dtype=jnp.float64),
+            observed_curvature_arcsec_inv=jnp.asarray([0.05, 0.05], dtype=jnp.float64),
+            sigma_tangent_angle_rad=jnp.asarray([sigma, sigma], dtype=jnp.float64),
+            sigma_curvature_arcsec_inv=jnp.asarray([0.02, 0.02], dtype=jnp.float64),
+            reliability=jnp.asarray([1.0, 1.0], dtype=jnp.float64),
+            active_arcs=jnp.asarray([True, True]),
+            tangent_sigma_floor_rad=1.0e-6,
+        )
+        return float(terms.inlier_ll[0] - terms.inlier_ll[1])
+
+    gauss_small = -0.5 * (0.01 / 0.02) ** 2
+    assert tangent_logdiff(0.02, 0.01) == pytest.approx(gauss_small, rel=1.0e-2)
+    gauss_broad = -0.5 * (0.5 / 0.9) ** 2
+    assert abs(tangent_logdiff(0.9, 0.5) - gauss_broad) > 1.0e-3
+
+
+def test_cab_inlier_curvature_gradient_bounded_near_zero() -> None:
+    # The lower-truncation normalizer -log Phi(predicted/sigma) keeps the curvature
+    # gradient finite and bounded by the Mills ratio (predicted >= 0).
+    sigma_c = 0.05
+
+    def inlier_ll(pred_curv: jnp.ndarray) -> jnp.ndarray:
+        terms = cluster_solver._cab_morphology_terms(
+            predicted_tangent_angle_rad=jnp.asarray([0.3], dtype=jnp.float64),
+            predicted_curvature_arcsec_inv=jnp.reshape(pred_curv, (1,)),
+            prediction_finite=jnp.asarray([True]),
+            observed_tangent_angle_rad=jnp.asarray([0.3], dtype=jnp.float64),
+            observed_curvature_arcsec_inv=jnp.asarray([0.0], dtype=jnp.float64),
+            sigma_tangent_angle_rad=jnp.asarray([0.1], dtype=jnp.float64),
+            sigma_curvature_arcsec_inv=jnp.asarray([sigma_c], dtype=jnp.float64),
+            reliability=jnp.asarray([1.0], dtype=jnp.float64),
+            active_arcs=jnp.asarray([True]),
+            curvature_sigma_floor_arcsec_inv=1.0e-6,
+        )
+        return terms.inlier_ll[0]
+
+    grad = jax.grad(inlier_ll)
+    # At predicted == observed == 0 the only gradient is the truncation term:
+    # -phi(0)/Phi(0)/sigma = -0.79788.../sigma.
+    g0 = float(grad(jnp.asarray(0.0, dtype=jnp.float64)))
+    assert g0 == pytest.approx(-0.7978845608 / sigma_c, rel=1.0e-4)
+    for p in (0.0, 0.001, 0.01, 0.05, 0.2):
+        gp = float(grad(jnp.asarray(p, dtype=jnp.float64)))
+        assert np.isfinite(gp)
+        assert abs(gp) <= 0.8 / sigma_c + p / sigma_c**2 + 1.0e-6
+
+
+def test_cab_likelihood_weight_defaults_to_one_when_arc_data_exists() -> None:
+    state_with_arcs = SimpleNamespace(arc_data=SimpleNamespace(n_arcs=1), family_data=[], bin_data=[])
+    state_without_arcs = SimpleNamespace(arc_data=None, family_data=[], bin_data=[])
+
+    assert cluster_solver._effective_cab_likelihood_weight(None, state_with_arcs) == pytest.approx(1.0)
+    assert cluster_solver._effective_cab_likelihood_weight(None, state_without_arcs) == pytest.approx(0.0)
+    assert cluster_solver._effective_cab_likelihood_weight(0.25, state_with_arcs) == pytest.approx(0.25)
+
+
+def test_cab_arcs_survive_parser_prep_and_traced_conversion(tmp_path: Path) -> None:
     image_catalog_path = tmp_path / "obs_arcs.dat"
     image_catalog_path.write_text(
         "#REFERENCE 3\n"
@@ -1298,7 +1681,7 @@ def test_cab_arc_arrays_survive_family_bin_and_traced_conversion(tmp_path: Path)
     arc_catalog_path = tmp_path / "arc_constraints.dat"
     arc_catalog_path.write_text(
         "#REFERENCE 3\n"
-        "1.a 0.25 -0.50 0.82 0.09 0.05 0.02 0.7\n",
+        "arc_A 0.25 -0.50 0 0.82 0.09 0.05 0.02 0.7\n",
         encoding="utf-8",
     )
     par_path = tmp_path / "with_arcs.par"
@@ -1316,8 +1699,9 @@ fini
 """,
         encoding="utf-8",
     )
-    parsed, _potentials_df, images_df, _potentials_with_priors = load_best_par(par_path)
+    parsed, _potentials_df, images_df, arcs_df, _potentials_with_priors = load_best_par(par_path)
     reference = cluster_solver._extract_reference(parsed)
+    arc_data = cluster_solver._prepare_arc_constraint_data(arcs_df, reference)
     families, _elapsed = cluster_solver._prepare_family_data(
         images_df,
         0.2,
@@ -1330,15 +1714,136 @@ fini
     fake = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
     fake.cosmology_effective_z_to_index = {}
 
-    traced = cluster_solver.ClusterJAXEvaluator._prepare_traced_bin_data(fake, bins[0])
+    traced_bin = cluster_solver.ClusterJAXEvaluator._prepare_traced_bin_data(fake, bins[0])
+    traced_arcs = cluster_solver.ClusterJAXEvaluator._prepare_traced_arc_constraint_data(fake, arc_data)
 
-    assert families[0].arc_has_constraint.tolist() == [True, False]
-    np.testing.assert_allclose(families[0].arc_anchor_x, [0.25, 1.0])
-    np.testing.assert_allclose(families[0].arc_anchor_y, [-0.5, 0.0])
-    assert bins[0].arc_has_constraint.tolist() == [True, False]
-    assert traced.arc_constraint_count == 1
-    np.testing.assert_allclose(np.asarray(traced.arc_tangent_angle_rad), [0.82, 0.0])
-    np.testing.assert_allclose(np.asarray(traced.arc_curvature_arcsec_inv), [0.09, 0.0])
+    assert arc_data is not None
+    assert arc_data.arc_ids == ["arc_A"]
+    np.testing.assert_allclose(arc_data.z_arc, [0.0])
+    np.testing.assert_allclose(arc_data.anchor_x, [0.25])
+    np.testing.assert_allclose(arc_data.anchor_y, [-0.5])
+    np.testing.assert_allclose(arc_data.tangent_angle_rad, [0.82])
+    np.testing.assert_allclose(arc_data.curvature_arcsec_inv, [0.09])
+    assert traced_arcs.arc_ids == ("arc_A",)
+    np.testing.assert_allclose(np.asarray(traced_arcs.tangent_angle_rad), [0.82])
+    np.testing.assert_allclose(np.asarray(traced_arcs.curvature_arcsec_inv), [0.09])
+    assert not hasattr(families[0], "arc_has_constraint")
+    assert not hasattr(bins[0], "arc_has_constraint")
+    assert not hasattr(traced_bin, "arc_constraint_count")
+
+
+def test_prepare_family_data_rejects_legacy_cab_image_columns() -> None:
+    images = pd.DataFrame(
+        {
+            "family_id": ["1"],
+            "image_label": ["1.a"],
+            "catalog_z": [2.0],
+            "catalog_source": ["manual"],
+            "ra": [10.0],
+            "dec": [20.0],
+            "arc_has_constraint": [True],
+            "arc_anchor_ra": [10.0],
+            "arc_anchor_dec": [20.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="legacy CAB arc columns"):
+        cluster_solver._prepare_family_data(
+            images,
+            sigma_arcsec=0.5,
+            reference=(3, 10.0, 20.0),
+            z_lens=0.3,
+            cosmo_config={},
+            z_bin_efficiency_tol=0.01,
+        )
+
+
+def test_prepare_arc_constraint_data_rejects_missing_measurements() -> None:
+    arcs = pd.DataFrame(
+        {
+            "arc_id": ["arc_A"],
+            "arc_anchor_ra": [10.0],
+            "arc_anchor_dec": [20.0],
+            "z_arc": [2.0],
+            "arc_tangent_angle_rad": [0.5],
+            "arc_curvature_arcsec_inv": [0.1],
+            "arc_sigma_tangent_angle_rad": [0.05],
+            "arc_reliability": [1.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="missing required columns"):
+        cluster_solver._prepare_arc_constraint_data(arcs, reference=(3, 10.0, 20.0))
+
+
+def test_cab_diagnostic_loglikes_match_arc_catalog_loglike_terms() -> None:
+    arc_data = ArcConstraintData(
+        arc_ids=["arc_A", "arc_B"],
+        z_arc=np.asarray([2.0, -1.0], dtype=float),
+        anchor_x=np.asarray([0.0, 1.0], dtype=float),
+        anchor_y=np.asarray([0.0, 0.0], dtype=float),
+        tangent_angle_rad=np.asarray([0.20, 0.0], dtype=float),
+        curvature_arcsec_inv=np.asarray([0.08, 0.0], dtype=float),
+        sigma_tangent_angle_rad=np.asarray([0.05, 0.05], dtype=float),
+        sigma_curvature_arcsec_inv=np.asarray([0.02, 0.02], dtype=float),
+        reliability=np.asarray([0.8, 1.0], dtype=float),
+    )
+    traced_arcs = cluster_solver.TracedArcConstraintData(
+        arc_ids=("arc_A", "arc_B"),
+        z_arc=jnp.asarray(arc_data.z_arc, dtype=jnp.float64),
+        anchor_x=jnp.asarray(arc_data.anchor_x, dtype=jnp.float64),
+        anchor_y=jnp.asarray(arc_data.anchor_y, dtype=jnp.float64),
+        tangent_angle_rad=jnp.asarray(arc_data.tangent_angle_rad, dtype=jnp.float64),
+        curvature_arcsec_inv=jnp.asarray(arc_data.curvature_arcsec_inv, dtype=jnp.float64),
+        sigma_tangent_angle_rad=jnp.asarray(arc_data.sigma_tangent_angle_rad, dtype=jnp.float64),
+        sigma_curvature_arcsec_inv=jnp.asarray(arc_data.sigma_curvature_arcsec_inv, dtype=jnp.float64),
+        reliability=jnp.asarray(arc_data.reliability, dtype=jnp.float64),
+        n_arcs=2,
+    )
+    prediction = cluster_solver._CabMorphologyPrediction(
+        tangent_angle_rad=jnp.asarray([[0.18, 1.25], [0.0, 1.0]], dtype=jnp.float64),
+        curvature_arcsec_inv=jnp.asarray([[0.10, 0.30], [0.0, 0.0]], dtype=jnp.float64),
+        branch_weight=jnp.asarray([[0.90, 0.10], [0.50, 0.50]], dtype=jnp.float64),
+        frame_weight=jnp.asarray([[0.95, 0.95], [0.0, 0.0]], dtype=jnp.float64),
+        finite=jnp.asarray([[True, True], [True, True]]),
+    )
+
+    class FakeCabEvaluator:
+        cab_likelihood_weight = 0.4
+        cab_tangent_sigma_floor_rad = cluster_solver.DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD
+        cab_curvature_sigma_floor_arcsec_inv = cluster_solver.DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV
+        cab_finite_difference_step_arcsec = cluster_solver.DEFAULT_CAB_FINITE_DIFFERENCE_STEP_ARCSEC
+        state = SimpleNamespace(arc_data=arc_data)
+
+        def _physical_parameter_vector(self, params):
+            return params
+
+        def _build_cab_packed_lens_state_with_validity_from_physical(self, *_args, **_kwargs):
+            return {}, {"is_valid": jnp.asarray(True)}
+
+        def _fit_component_indices(self):
+            return None
+
+        def _prepare_traced_arc_constraint_data(self, _arc_data):
+            return traced_arcs
+
+        def _cab_morphology_predictions_for_anchors(self, *_args, **_kwargs):
+            return prediction
+
+    evaluator = FakeCabEvaluator()
+    details = cluster_solver.ClusterJAXEvaluator._cab_morphology_details_for_arcs(
+        evaluator,
+        np.asarray([0.0], dtype=float),
+    )
+    direct = cluster_solver.ClusterJAXEvaluator._cab_morphology_loglike_for_arcs(
+        evaluator,
+        traced_arcs,
+        {},
+    )
+
+    assert details["cab_finite"].tolist() == [True, True]
+    assert float(np.sum(details["cab_loglike"])) == pytest.approx(float(direct))
+    assert details["arc_id"].astype(str).tolist() == ["arc_A", "arc_B"]
 
 
 def test_load_best_par_rejects_invalid_image_label(tmp_path: Path) -> None:
@@ -1390,7 +1895,7 @@ fini
         encoding="utf-8",
     )
 
-    _parsed, _potentials_df, images_df, _potentials_with_priors = load_best_par(par_path)
+    _parsed, _potentials_df, images_df, _arcs_df, _potentials_with_priors = load_best_par(par_path)
 
     assert images_df["family_id"].astype(str).tolist() == ["2", "2"]
     assert images_df["image_id"].astype(str).tolist() == ["a", "b"]
@@ -1697,6 +2202,107 @@ fini
     assert [family.n_images for family in state.family_data] == [2]
 
 
+def test_build_state_allows_arc_only_constraints_with_model_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    arc_catalog_path = tmp_path / "arc_constraints.cat"
+    arc_catalog_path.write_text(
+        "#REFERENCE 3\n"
+        "arc_A 0.25 -0.50 -1 0.82 0.09 0.05 0.02 1.0\n",
+        encoding="utf-8",
+    )
+    par_path = tmp_path / "arc_only.par"
+    par_path.write_text(
+        """
+runmode
+    reference 3 10.0 20.0
+    end
+
+image
+    arcfile 1 arc_constraints.cat
+    end
+
+cosmology
+    H0 70.0
+    omega 0.3
+    lambda 0.7
+    end
+
+potentiel 1
+    profil 81
+    x_centre 0.0
+    y_centre 0.0
+    ellipticite 0.0
+    angle_pos 0.0
+    core_radius 1.0
+    cut_radius 100.0
+    v_disp 700.0
+    z_lens 0.3
+    end
+
+limit 1
+    v_disp 1 500.0 900.0 10.0
+    end
+fini
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", str(par_path), "--fit-mode", "large-only"])
+    args = _parse_args()
+
+    state = cluster_solver._build_state_from_inputs(args)
+
+    assert state.family_data == []
+    assert state.bin_data == []
+    assert state.arc_data is not None
+    assert state.arc_data.arc_ids == ["arc_A"]
+    assert [spec.sample_name for spec in state.parameter_specs] == ["1_v_disp"]
+
+
+def test_build_state_rejects_arc_only_constraints_without_model_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    arc_catalog_path = tmp_path / "arc_constraints.cat"
+    arc_catalog_path.write_text(
+        "#REFERENCE 3\n"
+        "arc_A 0.25 -0.50 -1 0.82 0.09 0.05 0.02 1.0\n",
+        encoding="utf-8",
+    )
+    par_path = tmp_path / "arc_only_fixed.par"
+    par_path.write_text(
+        """
+runmode
+    reference 3 10.0 20.0
+    end
+
+image
+    arcfile 1 arc_constraints.cat
+    end
+
+potentiel 1
+    profil 81
+    x_centre 0.0
+    y_centre 0.0
+    ellipticite 0.0
+    angle_pos 0.0
+    core_radius 1.0
+    cut_radius 100.0
+    v_disp 700.0
+    z_lens 0.3
+    end
+fini
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", str(par_path), "--fit-mode", "large-only"])
+    args = _parse_args()
+
+    with pytest.raises(ValueError, match="arc-only runs require at least one model parameter"):
+        cluster_solver._build_state_from_inputs(args)
+
+
 def test_build_state_applies_fov_to_images_and_potfile_members(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1791,7 +2397,7 @@ def test_generate_single_bcg_mock_with_subhalos_uses_potfile(tmp_path: Path) -> 
     config = SingleBCGMockConfig(seed=11, n_primary_families=1, n_subhalos=8, pos_sigma_arcsec=0.0)
 
     paths, images, truth = generate_single_bcg_mock(tmp_path, config)
-    parsed, _potentials_df, images_df, potentials_with_priors = load_best_par(paths.par_path)
+    parsed, _potentials_df, images_df, _arcs_df, potentials_with_priors = load_best_par(paths.par_path)
 
     assert (tmp_path / "members.cat").exists()
     assert len(parsed["potfiles"]) == 1
@@ -3524,6 +4130,7 @@ def _minimal_stage4_surrogate_state(*, fit_cosmology_flat_wcdm: bool = False) ->
         packed_lens_spec=packed,
         family_data=[family],
         bin_data=[bin_data],
+        arc_data=None,
         lens_model_list=["DPIE_NIE", "DPIE_NIE"],
         reference=(0, 0.0, 0.0),
         fit_mode="joint",
@@ -3777,7 +4384,7 @@ def _fold_regularized_source_loglike_fake(
             )
             return jnp.full_like(x_obs, 2.0)
 
-        def _cab_morphology_loglike_for_bin(self, *_args, **_kwargs):
+        def _cab_morphology_loglike_for_arcs(self, *_args, **_kwargs):
             return jnp.asarray(0.0, dtype=jnp.float64)
 
     fake = FakeEvaluator()
@@ -4486,7 +5093,7 @@ def test_explicit_beta_surrogate_branch_uses_returned_packed_state() -> None:
         def _maybe_record_invalid_state(self, _validity):
             return None
 
-        def _cab_morphology_loglike_for_bin(self, *_args, **_kwargs):
+        def _cab_morphology_loglike_for_arcs(self, *_args, **_kwargs):
             return jnp.asarray(0.0, dtype=jnp.float64)
 
     fake = FakeEvaluator()
@@ -4573,7 +5180,7 @@ def test_anchored_solved_source_loglike_branch_scores_local_image_residuals() ->
         def _maybe_record_invalid_state(self, _validity):
             return None
 
-        def _cab_morphology_loglike_for_bin(self, *_args, **_kwargs):
+        def _cab_morphology_loglike_for_arcs(self, *_args, **_kwargs):
             return jnp.asarray(0.0, dtype=jnp.float64)
 
     fake = FakeEvaluator()
@@ -4674,7 +5281,7 @@ def test_zero_step_anchored_source_loglike_uses_observed_anchor_lm_step(
         def _maybe_record_invalid_state(self, _validity):
             return None
 
-        def _cab_morphology_loglike_for_bin(self, *_args, **_kwargs):
+        def _cab_morphology_loglike_for_arcs(self, *_args, **_kwargs):
             return jnp.asarray(0.0, dtype=jnp.float64)
 
     fake = FakeEvaluator()
@@ -4718,31 +5325,56 @@ def _critical_arc_loglike_for_test(
     outlier_sigma_arcsec: float = 50.0,
 ) -> float:
     return float(
-        _critical_arc_mixture_image_plane_bin_loglike(
-            residual_x=jnp.asarray([residual_x], dtype=jnp.float64),
-            residual_y=jnp.asarray([residual_y], dtype=jnp.float64),
-            jac_a00=jnp.asarray([jac_a00], dtype=jnp.float64),
-            jac_a01=jnp.asarray([jac_a01], dtype=jnp.float64),
-            jac_a10=jnp.asarray([jac_a10], dtype=jnp.float64),
-            jac_a11=jnp.asarray([jac_a11], dtype=jnp.float64),
-            family_idx=None,
-            n_families=None,
-            sigma_per_image=jnp.asarray([0.05], dtype=jnp.float64),
-            reliability_per_image=jnp.asarray([reliability], dtype=jnp.float64),
-            image_has_constraint=jnp.asarray([True], dtype=bool),
-            image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
-            covariance_floor=1.0e-12,
+        _critical_arc_loglike_jax_for_test(
+            residual_x=residual_x,
+            residual_y=residual_y,
+            jac_a00=jac_a00,
+            jac_a01=jac_a01,
+            jac_a10=jac_a10,
+            jac_a11=jac_a11,
+            reliability=reliability,
             outlier_sigma_arcsec=outlier_sigma_arcsec,
-            image_scatter_floor_arcsec=1.0e-6,
-            image_presence_penalty_weight=0.0,
-            residual_loss="student-t",
-            student_t_nu=4.0,
-            critical_direction_sigma_arcsec=5.0,
-            base_prob=0.10,
-            max_prob=0.80,
-            singular_threshold=0.20,
-            singular_softness=0.05,
         )
+    )
+
+
+def _critical_arc_loglike_jax_for_test(
+    *,
+    residual_x: Any,
+    residual_y: Any,
+    jac_a00: Any = 0.0,
+    jac_a01: Any = 0.0,
+    jac_a10: Any = 0.0,
+    jac_a11: Any = 1.0,
+    reliability: Any = 0.999,
+    outlier_sigma_arcsec: float = 50.0,
+) -> jnp.ndarray:
+    def scalar_array(value: Any) -> jnp.ndarray:
+        return jnp.reshape(jnp.asarray(value, dtype=jnp.float64), (1,))
+
+    return _critical_arc_mixture_image_plane_bin_loglike(
+        residual_x=scalar_array(residual_x),
+        residual_y=scalar_array(residual_y),
+        jac_a00=scalar_array(jac_a00),
+        jac_a01=scalar_array(jac_a01),
+        jac_a10=scalar_array(jac_a10),
+        jac_a11=scalar_array(jac_a11),
+        family_idx=None,
+        n_families=None,
+        sigma_per_image=jnp.asarray([0.05], dtype=jnp.float64),
+        reliability_per_image=scalar_array(reliability),
+        image_has_constraint=jnp.asarray([True], dtype=bool),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        covariance_floor=1.0e-12,
+        outlier_sigma_arcsec=outlier_sigma_arcsec,
+        image_presence_penalty_weight=0.0,
+        residual_loss="student-t",
+        student_t_nu=4.0,
+        critical_direction_sigma_arcsec=5.0,
+        base_prob=0.10,
+        max_prob=0.80,
+        singular_threshold=0.20,
+        singular_softness=0.05,
     )
 
 
@@ -4848,8 +5480,35 @@ def test_critical_arc_projector_quadratics_match_frame_projection() -> None:
     expected_noncritical_direction_quad = jnp.square(residual_x * noncritical_direction_x + residual_y * noncritical_direction_y)
 
     assert bool(np.asarray(jnp.all(finite)))
-    np.testing.assert_allclose(np.asarray(critical_direction_quad), np.asarray(expected_critical_direction_quad), rtol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(noncritical_direction_quad), np.asarray(expected_noncritical_direction_quad), rtol=1.0e-12)
+    np.testing.assert_allclose(
+        np.asarray(critical_direction_quad),
+        np.asarray(expected_critical_direction_quad),
+        rtol=5.0e-6,
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(noncritical_direction_quad),
+        np.asarray(expected_noncritical_direction_quad),
+        rtol=5.0e-6,
+        atol=1.0e-6,
+    )
+
+
+def test_critical_arc_projector_degenerate_normal_matrix_is_isotropic() -> None:
+    (
+        critical_p00,
+        critical_p01,
+        critical_p11,
+    ) = cluster_solver._critical_arc_critical_direction_projector_from_normal_entries(
+        normal00=jnp.asarray([0.0, 2.0], dtype=jnp.float64),
+        normal01=jnp.asarray([0.0, 0.0], dtype=jnp.float64),
+        normal11=jnp.asarray([0.0, 2.0], dtype=jnp.float64),
+        trace=jnp.asarray([0.0, 4.0], dtype=jnp.float64),
+    )
+
+    np.testing.assert_allclose(np.asarray(critical_p00), np.asarray([0.5, 0.5]), rtol=0.0, atol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(critical_p01), np.asarray([0.0, 0.0]), rtol=0.0, atol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(critical_p11), np.asarray([0.5, 0.5]), rtol=0.0, atol=1.0e-12)
 
 
 def test_critical_arc_mixture_is_finite_for_singular_jacobian() -> None:
@@ -4863,6 +5522,246 @@ def test_critical_arc_mixture_is_finite_for_singular_jacobian() -> None:
     )
 
     assert np.isfinite(loglike)
+
+
+def test_critical_arc_mixture_terms_sum_to_bin_loglike_without_presence_penalty() -> None:
+    residual_x = jnp.asarray([0.2, -0.5], dtype=jnp.float64)
+    residual_y = jnp.asarray([0.1, 0.4], dtype=jnp.float64)
+    jac_a00 = jnp.asarray([1.0, 0.4], dtype=jnp.float64)
+    jac_a01 = jnp.asarray([0.0, -0.1], dtype=jnp.float64)
+    jac_a10 = jnp.asarray([0.0, -0.1], dtype=jnp.float64)
+    jac_a11 = jnp.asarray([1.0, 0.8], dtype=jnp.float64)
+    image_has_constraint = jnp.asarray([True, False], dtype=bool)
+    (
+        singular_min,
+        singular_max,
+        critical_p00,
+        critical_p01,
+        critical_p11,
+        finite,
+    ) = _critical_arc_geometry_from_jacobian(
+        jac_a00,
+        jac_a01,
+        jac_a10,
+        jac_a11,
+    )
+
+    terms = cluster_solver._critical_arc_mixture_image_plane_terms(
+        residual_x=residual_x,
+        residual_y=residual_y,
+        sigma_per_image=jnp.asarray([0.05, 0.08], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999, 0.9], dtype=jnp.float64),
+        image_sigma_int=jnp.asarray(0.01, dtype=jnp.float64),
+        covariance_floor=1.0e-12,
+        outlier_sigma_arcsec=50.0,
+        singular_min=singular_min,
+        critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+        residual_loss="student-t",
+        student_t_nu=4.0,
+        critical_direction_sigma_arcsec=5.0,
+        base_prob=0.10,
+        max_prob=0.80,
+        singular_threshold=0.20,
+        singular_softness=0.05,
+    )
+    direct = _critical_arc_mixture_image_plane_bin_loglike(
+        residual_x=residual_x,
+        residual_y=residual_y,
+        jac_a00=jac_a00,
+        jac_a01=jac_a01,
+        jac_a10=jac_a10,
+        jac_a11=jac_a11,
+        family_idx=None,
+        n_families=None,
+        sigma_per_image=jnp.asarray([0.05, 0.08], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999, 0.9], dtype=jnp.float64),
+        image_has_constraint=image_has_constraint,
+        image_sigma_int=jnp.asarray(0.01, dtype=jnp.float64),
+        covariance_floor=1.0e-12,
+        outlier_sigma_arcsec=50.0,
+        image_presence_penalty_weight=0.0,
+        residual_loss="student-t",
+        student_t_nu=4.0,
+        critical_direction_sigma_arcsec=5.0,
+        base_prob=0.10,
+        max_prob=0.80,
+        singular_threshold=0.20,
+        singular_softness=0.05,
+        singular_min_precomputed=singular_min,
+        singular_max_precomputed=singular_max,
+        critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+    )
+    expected = jnp.sum(jnp.where(image_has_constraint, terms.mixture_ll, 0.0))
+
+    assert bool(np.asarray(jnp.all(finite)))
+    assert float(direct) == pytest.approx(float(expected), abs=1.0e-12)
+
+
+def _critical_arc_terms_for_projector_test(
+    projector_entries: tuple[float, float, float],
+    residual_x: float,
+    residual_y: float,
+    critical_direction_sigma_arcsec: float,
+):
+    return cluster_solver._critical_arc_mixture_image_plane_terms(
+        residual_x=jnp.asarray([residual_x], dtype=jnp.float64),
+        residual_y=jnp.asarray([residual_y], dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([0.05], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999], dtype=jnp.float64),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        covariance_floor=1.0e-12,
+        outlier_sigma_arcsec=50.0,
+        singular_min=jnp.asarray([0.05], dtype=jnp.float64),
+        critical_direction_projector_entries=(
+            jnp.asarray([projector_entries[0]], dtype=jnp.float64),
+            jnp.asarray([projector_entries[1]], dtype=jnp.float64),
+            jnp.asarray([projector_entries[2]], dtype=jnp.float64),
+        ),
+        residual_loss="gaussian",
+        critical_direction_sigma_arcsec=critical_direction_sigma_arcsec,
+        base_prob=0.10,
+        max_prob=0.80,
+        singular_threshold=0.20,
+        singular_softness=0.05,
+    )
+
+
+def test_critical_arc_arc_branch_degenerate_limit_is_isotropic() -> None:
+    residual_x, residual_y = 0.7, -0.4
+    sigma_arc = 5.0
+    terms = _critical_arc_terms_for_projector_test((0.5, 0.0, 0.5), residual_x, residual_y, sigma_arc)
+    sigma2 = 0.05**2 + 1.0e-12
+    isotropic_var = sigma2 + 0.5 * sigma_arc**2
+    expected_arc_ll = (
+        -math.log(2.0 * math.pi * isotropic_var)
+        - (residual_x**2 + residual_y**2) / (2.0 * isotropic_var)
+    )
+
+    assert float(terms.arc_ll[0]) == pytest.approx(expected_arc_ll, rel=1.0e-12)
+
+
+@pytest.mark.parametrize("projector_entries", [(1.0, 0.0, 0.0), (0.5, 0.5, 0.5)])
+def test_critical_arc_arc_branch_reduces_to_two_axis_form_for_exact_projector(
+    projector_entries: tuple[float, float, float],
+) -> None:
+    residual_x, residual_y = 0.7, -0.4
+    sigma_arc = 5.0
+    terms = _critical_arc_terms_for_projector_test(projector_entries, residual_x, residual_y, sigma_arc)
+    p00, p01, p11 = projector_entries
+    sigma2 = 0.05**2 + 1.0e-12
+    sigma_parallel2 = sigma2 + sigma_arc**2
+    critical_quad = residual_x**2 * p00 + 2.0 * residual_x * residual_y * p01 + residual_y**2 * p11
+    noncritical_quad = residual_x**2 + residual_y**2 - critical_quad
+    expected_arc_ll = -0.5 * (
+        noncritical_quad / sigma2
+        + critical_quad / sigma_parallel2
+        + 2.0 * math.log(2.0 * math.pi)
+        + math.log(sigma2)
+        + math.log(sigma_parallel2)
+    )
+
+    assert float(terms.arc_ll[0]) == pytest.approx(expected_arc_ll, rel=1.0e-12)
+
+
+def test_critical_arc_arc_branch_is_normalized_density_for_regularized_projector() -> None:
+    residual = np.asarray([0.7, 0.2])
+    sigma_arc = 5.0
+    (
+        singular_min,
+        _singular_max,
+        critical_p00,
+        critical_p01,
+        critical_p11,
+        finite,
+    ) = _critical_arc_geometry_from_jacobian(
+        jnp.asarray([1.1], dtype=jnp.float64),
+        jnp.asarray([0.0], dtype=jnp.float64),
+        jnp.asarray([0.0], dtype=jnp.float64),
+        jnp.asarray([0.3], dtype=jnp.float64),
+    )
+    terms = cluster_solver._critical_arc_mixture_image_plane_terms(
+        residual_x=jnp.asarray([residual[0]], dtype=jnp.float64),
+        residual_y=jnp.asarray([residual[1]], dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([0.05], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999], dtype=jnp.float64),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        covariance_floor=1.0e-12,
+        outlier_sigma_arcsec=50.0,
+        singular_min=singular_min,
+        critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+        residual_loss="gaussian",
+        critical_direction_sigma_arcsec=sigma_arc,
+        base_prob=0.10,
+        max_prob=0.80,
+        singular_threshold=0.20,
+        singular_softness=0.05,
+    )
+    projector = np.asarray(
+        [
+            [float(critical_p00[0]), float(critical_p01[0])],
+            [float(critical_p01[0]), float(critical_p11[0])],
+        ]
+    )
+    sigma2 = 0.05**2 + 1.0e-12
+    covariance = sigma2 * np.eye(2) + sigma_arc**2 * projector
+    expected_arc_ll = -0.5 * (
+        float(residual @ np.linalg.solve(covariance, residual))
+        + 2.0 * math.log(2.0 * math.pi)
+        + float(np.linalg.slogdet(covariance)[1])
+    )
+
+    assert bool(np.asarray(jnp.all(finite)))
+    assert float(terms.arc_ll[0]) == pytest.approx(expected_arc_ll, rel=1.0e-12)
+
+
+@pytest.mark.parametrize(
+    "jacobian_entries",
+    [
+        (0.0, 0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+        (0.0, -0.1, -0.1, 0.0),
+        (1.0, 0.0, 0.0, 1.0),
+    ],
+)
+def test_critical_arc_mixture_has_finite_jacobian_gradient(
+    jacobian_entries: tuple[float, float, float, float],
+) -> None:
+    def loglike_from_jacobian(entries: jnp.ndarray) -> jnp.ndarray:
+        return _critical_arc_loglike_jax_for_test(
+            residual_x=2.0,
+            residual_y=-1.0,
+            jac_a00=entries[0],
+            jac_a01=entries[1],
+            jac_a10=entries[2],
+            jac_a11=entries[3],
+        )
+
+    entries = jnp.asarray(jacobian_entries, dtype=jnp.float64)
+    value = loglike_from_jacobian(entries)
+    gradient = jax.grad(loglike_from_jacobian)(entries)
+
+    assert np.isfinite(float(value))
+    assert np.isfinite(np.asarray(gradient)).all()
+
+
+@pytest.mark.parametrize("gamma1", [0.0, 1.0e-6])
+def test_critical_arc_mixture_physical_shear_gradient_is_bounded(gamma1: float) -> None:
+    def loglike_from_gamma2(gamma2: jnp.ndarray) -> jnp.ndarray:
+        p = jnp.asarray(1.0, dtype=jnp.float64)
+        gamma1_value = jnp.asarray(gamma1, dtype=jnp.float64)
+        return _critical_arc_loglike_jax_for_test(
+            residual_x=2.0,
+            residual_y=-1.0,
+            jac_a00=p - gamma1_value,
+            jac_a01=-gamma2,
+            jac_a10=-gamma2,
+            jac_a11=p + gamma1_value,
+        )
+
+    gradient = jax.grad(loglike_from_gamma2)(jnp.asarray(0.0, dtype=jnp.float64))
+
+    assert np.isfinite(float(gradient))
+    assert abs(float(gradient)) < 1.0e3
 
 
 def test_critical_arc_large_critical_direction_displacement_is_cheaper_than_noncritical() -> None:
@@ -4886,7 +5785,6 @@ def test_critical_arc_image_presence_counts_along_arc_displacement_as_recovered(
         image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
         covariance_floor=1.0e-12,
         outlier_sigma_arcsec=50.0,
-        image_scatter_floor_arcsec=1.0e-6,
         image_presence_match_radius_arcsec=0.5,
         image_presence_temperature_arcsec=0.1,
         image_presence_count_softness=0.05,
@@ -4937,7 +5835,6 @@ def test_critical_arc_student_t_keeps_critical_direction_cheaper_than_noncritica
         image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
         covariance_floor=1.0e-12,
         outlier_sigma_arcsec=50.0,
-        image_scatter_floor_arcsec=1.0e-6,
         image_presence_penalty_weight=0.0,
         residual_loss="student-t",
         student_t_nu=4.0,
@@ -5021,22 +5918,60 @@ def _circle_tangent_arc_jacobian(eps: float = 0.05):
     return jacobian_at
 
 
-def test_critical_arc_aware_support_prioritizes_point_recovery() -> None:
+def test_critical_arc_aware_support_saves_arc_candidate_for_point_recovery() -> None:
+    eps = 0.05
+    critical_direction_delta = 4.0
     details = cluster_solver._arc_aware_image_support_from_local_linearization(
-        beta_residual_x=np.asarray([10.0]),
-        beta_residual_y=np.asarray([10.0]),
-        jac_a00=np.asarray([0.05]),
+        beta_residual_x=np.asarray([-eps * critical_direction_delta]),
+        beta_residual_y=np.asarray([0.0]),
+        jac_a00=np.asarray([eps]),
         jac_a01=np.asarray([0.0]),
         jac_a10=np.asarray([0.0]),
         jac_a11=np.asarray([1.0]),
+        theta_obs_x=np.asarray([0.0]),
+        theta_obs_y=np.asarray([0.0]),
+        jacobian_at=_constant_arc_jacobian(eps),
         point_recovered_mask=np.asarray([True]),
         point_residual_arcsec=np.asarray([0.07]),
+        lm_damping_relative=0.0,
+        lm_damping_absolute=0.0,
     )
 
+    assert details["point_image_residual_arcsec"][0] == pytest.approx(0.07)
+    assert details["arc_candidate_supported"].tolist() == [True]
+    assert details["arc_candidate_image_residual_arcsec"][0] == pytest.approx(0.0, abs=1.0e-6)
+    assert details["preferred_recovery_status"].tolist() == ["point_recovered"]
     assert details["arc_recovery_status"].tolist() == ["point_recovered"]
     assert details["arc_supported_mask"].tolist() == [False]
+    assert details["preferred_image_residual_arcsec"][0] == pytest.approx(0.07)
     assert details["arc_aware_image_residual_arcsec"][0] == pytest.approx(0.07)
     assert details["arc_aware_image_rms_arcsec"] == pytest.approx(0.07)
+
+
+def test_critical_arc_aware_support_keeps_point_on_exact_tie() -> None:
+    eps = 0.05
+    details = cluster_solver._arc_aware_image_support_from_local_linearization(
+        beta_residual_x=np.asarray([-eps]),
+        beta_residual_y=np.asarray([0.0]),
+        jac_a00=np.asarray([eps]),
+        jac_a01=np.asarray([0.0]),
+        jac_a10=np.asarray([0.0]),
+        jac_a11=np.asarray([1.0]),
+        theta_obs_x=np.asarray([0.0]),
+        theta_obs_y=np.asarray([0.0]),
+        jacobian_at=_constant_arc_jacobian(eps),
+        point_recovered_mask=np.asarray([True]),
+        point_residual_arcsec=np.asarray([0.0]),
+        lm_damping_relative=0.0,
+        lm_damping_absolute=0.0,
+    )
+
+    assert details["arc_candidate_supported"].tolist() == [True]
+    assert details["arc_candidate_image_residual_arcsec"][0] == pytest.approx(0.0, abs=1.0e-6)
+    assert details["preferred_recovery_status"].tolist() == ["point_recovered"]
+    assert details["arc_recovery_status"].tolist() == ["point_recovered"]
+    assert details["arc_supported_mask"].tolist() == [False]
+    assert details["arc_aware_image_residual_arcsec"][0] == pytest.approx(0.0, abs=1.0e-6)
 
 
 def test_critical_arc_aware_support_tolerates_large_critical_direction_residual() -> None:
@@ -5068,8 +6003,8 @@ def test_critical_arc_aware_support_tolerates_large_critical_direction_residual(
     assert json.loads(details["arc_support_curve_y_arcsec"][0])
     assert math.hypot(details["arc_critical_direction_x"][0], details["arc_critical_direction_y"][0]) == pytest.approx(1.0)
     assert math.hypot(details["arc_noncritical_direction_x"][0], details["arc_noncritical_direction_y"][0]) == pytest.approx(1.0)
-    assert details["arc_s_min"][0] == pytest.approx(eps)
-    assert details["arc_s_max"][0] == pytest.approx(1.0)
+    assert details["arc_s_min"][0] == pytest.approx(eps, abs=1.0e-5)
+    assert details["arc_s_max"][0] == pytest.approx(1.0, abs=1.0e-5)
     assert details["arc_detA"][0] == pytest.approx(eps)
     assert details["arc_support_finite_mask"].tolist() == [True]
 
@@ -5265,6 +6200,11 @@ def test_critical_arc_aware_recovery_rows_and_counts_propagate() -> None:
         "matched_model_x_arcsec": np.asarray([0.05, np.nan, np.nan], dtype=float),
         "matched_model_y_arcsec": np.asarray([0.0, np.nan, np.nan], dtype=float),
         "recovered_image_mask": np.asarray([True, False, False], dtype=bool),
+        "point_image_residual_arcsec": np.asarray([0.05, np.nan, np.nan], dtype=float),
+        "arc_candidate_supported": np.asarray([True, True, False], dtype=bool),
+        "arc_candidate_image_residual_arcsec": np.asarray([0.03, 0.08, np.nan], dtype=float),
+        "preferred_recovery_status": np.asarray(["point_recovered", "arc_supported", "not_recovered"], dtype=object),
+        "preferred_image_residual_arcsec": np.asarray([0.05, 0.08, np.nan], dtype=float),
         "arc_recovery_status": np.asarray(["point_recovered", "arc_supported", "not_recovered"], dtype=object),
         "arc_aware_image_residual_arcsec": np.asarray([0.05, 0.08, np.nan], dtype=float),
         "arc_noncritical_direction_residual_arcsec": np.asarray([0.02, 0.08, 0.6], dtype=float),
@@ -5277,33 +6217,29 @@ def test_critical_arc_aware_recovery_rows_and_counts_propagate() -> None:
         "arc_s_max": np.asarray([1.0, 1.2, 1.3], dtype=float),
         "arc_detA": np.asarray([0.1, 0.048, 0.052], dtype=float),
         "arc_prior_probability": np.asarray([0.6, 0.75, 0.75], dtype=float),
-        "arc_curve_distance_arcsec": np.asarray([np.nan, 0.08, np.nan], dtype=float),
-        "arc_curve_arclength_arcsec": np.asarray([np.nan, 3.2, np.nan], dtype=float),
-        "arc_curve_finite": np.asarray([False, True, False], dtype=bool),
-        "arc_support_anchor_x_arcsec": np.asarray([np.nan, 1.0, np.nan], dtype=float),
-        "arc_support_anchor_y_arcsec": np.asarray([np.nan, 3.2, np.nan], dtype=float),
-        "arc_support_curve_x_arcsec": np.asarray(["[]", "[1,1,1]", "[]"], dtype=object),
-        "arc_support_curve_y_arcsec": np.asarray(["[]", "[-1,0,1]", "[]"], dtype=object),
+        "arc_curve_distance_arcsec": np.asarray([0.03, 0.08, np.nan], dtype=float),
+        "arc_curve_arclength_arcsec": np.asarray([2.1, 3.2, np.nan], dtype=float),
+        "arc_curve_finite": np.asarray([True, True, False], dtype=bool),
+        "arc_support_anchor_x_arcsec": np.asarray([0.03, 1.0, np.nan], dtype=float),
+        "arc_support_anchor_y_arcsec": np.asarray([0.0, 3.2, np.nan], dtype=float),
+        "arc_support_curve_x_arcsec": np.asarray(["[0,0.03]", "[1,1,1]", "[]"], dtype=object),
+        "arc_support_curve_y_arcsec": np.asarray(["[0,0]", "[-1,0,1]", "[]"], dtype=object),
         "arc_supported_mask": np.asarray([False, True, False], dtype=bool),
         "arc_support_finite_mask": np.asarray([True, True, True], dtype=bool),
-        "cab_has_constraint": np.asarray([False, True, False], dtype=bool),
-        "cab_anchor_x_arcsec": np.asarray([np.nan, 1.1, np.nan], dtype=float),
-        "cab_anchor_y_arcsec": np.asarray([np.nan, 0.2, np.nan], dtype=float),
-        "cab_tangent_angle_obs_rad": np.asarray([np.nan, 0.8, np.nan], dtype=float),
-        "cab_tangent_angle_model_rad": np.asarray([np.nan, 0.85, np.nan], dtype=float),
-        "cab_tangent_residual_rad": np.asarray([np.nan, 0.05, np.nan], dtype=float),
-        "cab_curvature_obs_arcsec_inv": np.asarray([np.nan, 0.09, np.nan], dtype=float),
-        "cab_curvature_model_arcsec_inv": np.asarray([np.nan, 0.11, np.nan], dtype=float),
-        "cab_curvature_residual_arcsec_inv": np.asarray([np.nan, 0.02, np.nan], dtype=float),
-        "cab_loglike": np.asarray([0.0, -1.25, 0.0], dtype=float),
-        "cab_finite": np.asarray([False, True, False], dtype=bool),
         "failed": True,
     }
 
     image_rows, _extra_rows, _count_info = image_diagnostics.family_image_recovery_rows(family, exact_details)
     row_by_label = {row["image_label"]: row for row in image_rows}
 
+    assert row_by_label["1.1"]["image_recovery_status"] == "recovered"
+    assert row_by_label["1.1"]["point_image_residual_arcsec"] == pytest.approx(0.05)
+    assert row_by_label["1.1"]["arc_candidate_supported"] is True
+    assert row_by_label["1.1"]["arc_candidate_image_residual_arcsec"] == pytest.approx(0.03)
+    assert row_by_label["1.1"]["preferred_recovery_status"] == "point_recovered"
+    assert row_by_label["1.1"]["preferred_image_residual_arcsec"] == pytest.approx(0.05)
     assert row_by_label["1.1"]["arc_recovery_status"] == "point_recovered"
+    assert row_by_label["1.1"]["arc_supported"] is False
     assert row_by_label["1.1"]["arc_aware_image_residual_arcsec"] == pytest.approx(0.05)
     assert row_by_label["1.2"]["image_recovery_status"] == "not_recovered"
     assert row_by_label["1.2"]["arc_recovery_status"] == "arc_supported"
@@ -5318,12 +6254,7 @@ def test_critical_arc_aware_recovery_rows_and_counts_propagate() -> None:
     assert row_by_label["1.2"]["arc_curve_finite"] is True
     assert row_by_label["1.2"]["arc_support_curve_x_arcsec"] == "[1,1,1]"
     assert row_by_label["1.2"]["arc_support_curve_y_arcsec"] == "[-1,0,1]"
-    assert row_by_label["1.2"]["cab_has_constraint"] is True
-    assert row_by_label["1.2"]["cab_anchor_x_arcsec"] == pytest.approx(1.1)
-    assert row_by_label["1.2"]["cab_tangent_residual_rad"] == pytest.approx(0.05)
-    assert row_by_label["1.2"]["cab_curvature_residual_arcsec_inv"] == pytest.approx(0.02)
-    assert row_by_label["1.2"]["cab_loglike"] == pytest.approx(-1.25)
-    assert row_by_label["1.2"]["cab_finite"] is True
+    assert not any(key.startswith("cab_") for key in row_by_label["1.2"])
     assert row_by_label["1.3"]["arc_recovery_status"] == "not_recovered"
     assert np.isnan(row_by_label["1.3"]["arc_aware_image_residual_arcsec"])
 
@@ -5331,6 +6262,7 @@ def test_critical_arc_aware_recovery_rows_and_counts_propagate() -> None:
     assert int(table.loc[0, "arc_aware_recovered_image_count"]) == 2
     assert int(table.loc[0, "arc_aware_missing_image_count"]) == 1
     assert int(table.loc[0, "arc_supported_image_count"]) == 1
+    assert int(table.loc[0, "arc_candidate_supported_image_count"]) == 2
     assert table.loc[0, "arc_aware_image_rms_arcsec"] == pytest.approx(math.sqrt((0.05**2 + 0.08**2) / 2.0))
     assert not image_diagnostics.exact_details_hard_failed(
         {
@@ -5460,7 +6392,9 @@ def test_source_mode_exact_recovery_computes_arc_support_from_centroid_after_sol
     assert details["multiplicity_failure_reason"] == "exact_image_prediction_failed"
     assert details["arc_recovery_status"].tolist() == ["arc_supported"]
     assert details["arc_supported_mask"].tolist() == [True]
-    assert details["arc_s_min"][0] == pytest.approx(0.05)
+    # abs tolerance absorbs the documented critical-arc eigengap value softening
+    # (relative lambda_min shift ~ floor^2/(4 gap) with floor = 1e-3 * trace).
+    assert details["arc_s_min"][0] == pytest.approx(0.05, abs=1.0e-5)
     assert details["arc_noncritical_direction_residual_arcsec"][0] == pytest.approx(0.0, abs=1.0e-8)
     assert np.isfinite(details["arc_critical_direction_residual_arcsec"][0])
     assert np.isfinite(details["arc_prior_probability"][0])
@@ -5603,7 +6537,7 @@ def test_critical_arc_source_loglike_branch_uses_anchor_lm_step(
         def _maybe_record_invalid_state(self, _validity):
             return None
 
-        def _cab_morphology_loglike_for_bin(self, *_args, **_kwargs):
+        def _cab_morphology_loglike_for_arcs(self, *_args, **_kwargs):
             return jnp.asarray(0.0, dtype=jnp.float64)
 
     fake = FakeEvaluator()
@@ -5724,7 +6658,7 @@ def test_critical_arc_source_loglike_uses_full_exact_mixture(
         def _maybe_record_invalid_state(self, _validity):
             return None
 
-        def _cab_morphology_loglike_for_bin(self, *_args, **_kwargs):
+        def _cab_morphology_loglike_for_arcs(self, *_args, **_kwargs):
             return jnp.asarray(0.0, dtype=jnp.float64)
 
     fake = FakeEvaluator()
@@ -6667,7 +7601,6 @@ def test_critical_arc_debug_terms_sum_to_bin_loglike_without_presence_penalty() 
         image_sigma_int=image_sigma_int,
         covariance_floor=evaluator.source_plane_covariance_floor,
         outlier_sigma_arcsec=evaluator.source_plane_outlier_sigma_arcsec,
-        image_scatter_floor_arcsec=evaluator.image_plane_scatter_floor_arcsec,
         image_presence_penalty_weight=evaluator.image_presence_penalty_weight,
         image_presence_match_radius_arcsec=evaluator.image_presence_match_radius_arcsec,
         image_presence_temperature_arcsec=evaluator.image_presence_temperature_arcsec,
@@ -12872,6 +13805,7 @@ def test_plot_bundle_round_trips_ns_diagnostics(tmp_path: Path) -> None:
         packed_lens_spec=packed,
         family_data=[],
         bin_data=[],
+        arc_data=None,
         lens_model_list=[],
         reference=(0, 0.0, 0.0),
         fit_mode="joint",
@@ -12914,47 +13848,23 @@ def test_plot_bundle_round_trips_ns_diagnostics(tmp_path: Path) -> None:
     assert "samples" not in arrays["ns_diagnostics"]
 
 
-def test_plot_bundle_round_trips_cab_arc_arrays(tmp_path: Path) -> None:
+def test_plot_bundle_round_trips_independent_cab_arc_data(tmp_path: Path) -> None:
     packed = PackedLensSpec(
         **{
             field_name: np.asarray([], dtype=float)
             for field_name in PackedLensSpec.__dataclass_fields__
         }
     )
-    family = FamilyData(
-        family_id="1",
-        z_source=2.0,
-        effective_z_source=2.0,
-        sigma_arcsec=0.2,
-        image_labels=["1.a", "1.b"],
-        x_obs=np.asarray([0.0, 1.0], dtype=float),
-        y_obs=np.asarray([0.0, 0.0], dtype=float),
-        reliability=np.asarray([1.0, 0.9], dtype=float),
-        arc_anchor_x=np.asarray([0.1, 1.0], dtype=float),
-        arc_anchor_y=np.asarray([0.2, 0.0], dtype=float),
-        arc_tangent_angle_rad=np.asarray([0.7, 0.0], dtype=float),
-        arc_curvature_arcsec_inv=np.asarray([0.08, 0.0], dtype=float),
-        arc_sigma_tangent_angle_rad=np.asarray([0.05, 0.001], dtype=float),
-        arc_sigma_curvature_arcsec_inv=np.asarray([0.02, 0.0001], dtype=float),
-        arc_reliability=np.asarray([0.8, 1.0], dtype=float),
-        arc_has_constraint=np.asarray([True, False], dtype=bool),
-    )
-    bin_item = cluster_solver.BinData(
-        effective_z_source=2.0,
-        family_ids=["1"],
-        family_index_per_image=np.asarray([0, 0], dtype=int),
-        x_obs=family.x_obs,
-        y_obs=family.y_obs,
-        sigma_per_image=np.asarray([0.2, 0.2], dtype=float),
-        reliability_per_image=family.reliability,
-        arc_anchor_x=family.arc_anchor_x,
-        arc_anchor_y=family.arc_anchor_y,
-        arc_tangent_angle_rad=family.arc_tangent_angle_rad,
-        arc_curvature_arcsec_inv=family.arc_curvature_arcsec_inv,
-        arc_sigma_tangent_angle_rad=family.arc_sigma_tangent_angle_rad,
-        arc_sigma_curvature_arcsec_inv=family.arc_sigma_curvature_arcsec_inv,
-        arc_reliability=family.arc_reliability,
-        arc_has_constraint=family.arc_has_constraint,
+    arc_data = ArcConstraintData(
+        arc_ids=["arc_A", "arc_B"],
+        z_arc=np.asarray([2.0, -1.0], dtype=float),
+        anchor_x=np.asarray([0.1, 1.0], dtype=float),
+        anchor_y=np.asarray([0.2, 0.0], dtype=float),
+        tangent_angle_rad=np.asarray([0.7, 0.1], dtype=float),
+        curvature_arcsec_inv=np.asarray([0.08, 0.02], dtype=float),
+        sigma_tangent_angle_rad=np.asarray([0.05, 0.03], dtype=float),
+        sigma_curvature_arcsec_inv=np.asarray([0.02, 0.01], dtype=float),
+        reliability=np.asarray([0.8, 1.0], dtype=float),
     )
     state = BuildState(
         run_name="cab_run",
@@ -12966,8 +13876,9 @@ def test_plot_bundle_round_trips_cab_arc_arrays(tmp_path: Path) -> None:
         parameter_specs=[],
         base_components=[],
         packed_lens_spec=packed,
-        family_data=[family],
-        bin_data=[bin_item],
+        family_data=[],
+        bin_data=[],
+        arc_data=arc_data,
         lens_model_list=[],
         reference=(0, 0.0, 0.0),
         fit_mode="joint",
@@ -12991,14 +13902,14 @@ def test_plot_bundle_round_trips_cab_arc_arrays(tmp_path: Path) -> None:
     cluster_solver._save_plot_bundle_h5(path, state, argparse.Namespace(foo="bar"), np.empty((0,), dtype=float), results)
     loaded_state, _args, _arrays, _init_diag = cluster_solver._rebuild_state_from_h5(path)
 
-    loaded_family = loaded_state.family_data[0]
-    loaded_bin = loaded_state.bin_data[0]
-    np.testing.assert_allclose(loaded_family.arc_anchor_x, [0.1, 1.0])
-    np.testing.assert_allclose(loaded_family.arc_tangent_angle_rad, [0.7, 0.0])
-    assert loaded_family.arc_has_constraint.tolist() == [True, False]
-    np.testing.assert_allclose(loaded_bin.arc_curvature_arcsec_inv, [0.08, 0.0])
-    np.testing.assert_allclose(loaded_bin.arc_reliability, [0.8, 1.0])
-    assert loaded_bin.arc_has_constraint.tolist() == [True, False]
+    assert loaded_state.arc_data is not None
+    assert loaded_state.arc_data.arc_ids == ["arc_A", "arc_B"]
+    np.testing.assert_allclose(loaded_state.arc_data.z_arc, [2.0, -1.0])
+    np.testing.assert_allclose(loaded_state.arc_data.anchor_x, [0.1, 1.0])
+    np.testing.assert_allclose(loaded_state.arc_data.tangent_angle_rad, [0.7, 0.1])
+    np.testing.assert_allclose(loaded_state.arc_data.curvature_arcsec_inv, [0.08, 0.02])
+    assert loaded_state.family_data == []
+    assert loaded_state.bin_data == []
 
 
 def _expected_prefit_output_paths(realization_dir: Path) -> dict[str, Path]:
@@ -14807,18 +15718,17 @@ def test_linearized_image_plane_loglike_scores_zero_residual() -> None:
     assert float(value) > 0.0
 
 
-def test_image_plane_scatter_effective_sigma2_ignores_floor_argument() -> None:
+def test_image_plane_scatter_effective_sigma2_uses_sigma_int_and_covariance_floor() -> None:
     sigma2 = cluster_solver._image_plane_effective_sigma2(
         sigma_per_image=jnp.asarray([0.2], dtype=jnp.float64),
         image_sigma_int=jnp.asarray(0.1, dtype=jnp.float64),
         covariance_floor=0.01,
-        image_scatter_floor_arcsec=0.3,
     )
 
     assert np.asarray(sigma2).tolist() == pytest.approx([0.2**2 + 0.1**2 + 0.01])
 
 
-def test_linearized_image_plane_loglike_image_plane_scatter_floor_is_support_only() -> None:
+def test_linearized_image_plane_loglike_uses_effective_sigma_components() -> None:
     common = dict(
         residual_x=jnp.asarray([0.12, -0.05], dtype=jnp.float64),
         residual_y=jnp.asarray([0.02, 0.09], dtype=jnp.float64),
@@ -14832,18 +15742,18 @@ def test_linearized_image_plane_loglike_image_plane_scatter_floor_is_support_onl
         image_presence_penalty_weight=0.0,
     )
 
-    floor_value = _linearized_image_plane_bin_loglike(
+    zero_scatter_value = _linearized_image_plane_bin_loglike(
         image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
-        image_scatter_floor_arcsec=0.3,
         **common,
     )
-    zero_floor_value = _linearized_image_plane_bin_loglike(
-        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
-        image_scatter_floor_arcsec=0.0,
+    sampled_scatter_value = _linearized_image_plane_bin_loglike(
+        image_sigma_int=jnp.asarray(0.1, dtype=jnp.float64),
         **common,
     )
 
-    assert float(floor_value) == pytest.approx(float(zero_floor_value), abs=1.0e-12)
+    assert np.isfinite(float(zero_scatter_value))
+    assert np.isfinite(float(sampled_scatter_value))
+    assert float(sampled_scatter_value) != pytest.approx(float(zero_scatter_value), abs=1.0e-12)
 
 
 def test_linearized_image_plane_student_t_loss_is_less_punitive_for_large_residual() -> None:

@@ -6,7 +6,6 @@ import gc
 import json
 import math
 import os
-import pickle
 import re
 import sys
 import time
@@ -14,7 +13,7 @@ from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -97,6 +96,7 @@ from .jax_cosmology import (
     w0_from_config as _w0_from_config,
 )
 from .model import (
+    ArcConstraintData,
     BinData,
     BuildState,
     ChainSeed,
@@ -220,6 +220,9 @@ DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS = 0.05
 DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE = 1.0e-3
 DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE = 1.0e-6
 DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC = 20.0
+CRITICAL_ARC_EIGENGAP_RELATIVE_SOFTENING = 1.0e-3
+CRITICAL_ARC_EIGENGAP_VALUE_ABSOLUTE_SOFTENING = 1.0e-18
+CRITICAL_ARC_SINGULAR_VALUE_FLOOR = 1.0e-12
 DEFAULT_FOLD_CURVATURE_ARCSEC_INV = 1.0
 DEFAULT_FOLD_CURVATURE_FINITE_DIFFERENCE_STEP_ARCSEC = 1.0e-3
 DEFAULT_CAB_FINITE_DIFFERENCE_STEP_ARCSEC = 1.0e-3
@@ -227,6 +230,14 @@ DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD = 1.0e-3
 DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV = 1.0e-4
 DEFAULT_CAB_LIKELIHOOD_WEIGHT_WITH_ARCS = 1.0
 DEFAULT_CAB_LIKELIHOOD_WEIGHT_NO_ARCS = 0.0
+CAB_MORPHOLOGY_MODEL_KEY = -1.0
+CAB_FRAME_RELATIVE_SOFTENING = 1.0e-3
+CAB_FRAME_VALUE_ABSOLUTE_SOFTENING = 1.0e-18
+CAB_FRAME_PHYSICAL_AMBIGUITY_FRACTION = 1.0e-1
+# Spread of plausible observed arc curvatures (~1/R for R ~ 5-50 arcsec); sets the
+# curvature dimension of the CAB outlier density so the inlier/outlier handoff does
+# not depend on the absolute unit scale of the per-row curvature sigma.
+CAB_OUTLIER_CURVATURE_SIGMA_ARCSEC_INV = 0.1
 DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC = 0.5
 DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC = 5.0
 DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC = 0.1
@@ -396,15 +407,20 @@ class TracedBinData:
     image_has_constraint: jnp.ndarray
     effective_z_index: int = -1
     constrained_image_indices: jnp.ndarray | None = None
-    arc_anchor_x: jnp.ndarray | None = None
-    arc_anchor_y: jnp.ndarray | None = None
-    arc_tangent_angle_rad: jnp.ndarray | None = None
-    arc_curvature_arcsec_inv: jnp.ndarray | None = None
-    arc_sigma_tangent_angle_rad: jnp.ndarray | None = None
-    arc_sigma_curvature_arcsec_inv: jnp.ndarray | None = None
-    arc_reliability: jnp.ndarray | None = None
-    arc_has_constraint: jnp.ndarray | None = None
-    arc_constraint_count: int = 0
+
+
+@dataclass(frozen=True)
+class TracedArcConstraintData:
+    arc_ids: tuple[str, ...]
+    z_arc: jnp.ndarray
+    anchor_x: jnp.ndarray
+    anchor_y: jnp.ndarray
+    tangent_angle_rad: jnp.ndarray
+    curvature_arcsec_inv: jnp.ndarray
+    sigma_tangent_angle_rad: jnp.ndarray
+    sigma_curvature_arcsec_inv: jnp.ndarray
+    reliability: jnp.ndarray
+    n_arcs: int = 0
 ORIGINAL_DPIE_PROFILE_NAME = "DPIE_NIE"
 UNSUPPORTED_PJAFFE_PROFILE_NAMES = {
     "PJAFFE_COMPACT",
@@ -811,11 +827,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--image-catalog-family-cutout-bands",
-        nargs=3,
+        nargs="+",
         default=None,
-        metavar=("BLUE", "GREEN", "RED"),
+        metavar="BAND",
         help=(
-            "Optional blue/green/red FITS bands for image-catalog family cutout diagnostics. "
+            "Optional three or more FITS bands for image-catalog family cutout diagnostics. "
             "Defaults to the plotting helper's RGB bands."
         ),
     )
@@ -1119,7 +1135,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Weight for optional CAB-informed arc morphology constraints. "
-            "Defaults to 1.0 when image.arcfile supplies constraints and 0.0 otherwise."
+            "Defaults to 1.0 when parsed arc constraints exist and 0.0 otherwise."
         ),
     )
     parser.add_argument(
@@ -3333,41 +3349,125 @@ def _cab_tangent_angle_residual(
     return 0.5 * jnp.arctan2(jnp.sin(2.0 * delta), jnp.cos(2.0 * delta))
 
 
+class _CabTangentFrame(NamedTuple):
+    tangent_angle_rad: jnp.ndarray
+    tangent_x: jnp.ndarray
+    tangent_y: jnp.ndarray
+    lambda_low: jnp.ndarray
+    lambda_high: jnp.ndarray
+    branch_weight: jnp.ndarray
+    frame_weight: jnp.ndarray
+    finite: jnp.ndarray
+
+
+class _CabMorphologyPrediction(NamedTuple):
+    tangent_angle_rad: jnp.ndarray
+    curvature_arcsec_inv: jnp.ndarray
+    branch_weight: jnp.ndarray
+    frame_weight: jnp.ndarray
+    finite: jnp.ndarray
+
+
+class _CabMorphologyTerms(NamedTuple):
+    sigma_tangent: jnp.ndarray
+    sigma_curvature: jnp.ndarray
+    branch_weight: jnp.ndarray
+    frame_weight: jnp.ndarray
+    effective_reliability: jnp.ndarray
+    tangent_residual_by_branch: jnp.ndarray
+    curvature_residual_by_branch: jnp.ndarray
+    tangent_residual: jnp.ndarray
+    curvature_residual: jnp.ndarray
+    branch_inlier_ll: jnp.ndarray
+    inlier_ll: jnp.ndarray
+    outlier_ll: jnp.ndarray
+    row_loglike: jnp.ndarray
+    finite_row: jnp.ndarray
+
+
 def _cab_tangent_frame_from_jacobian_entries(
     jac_a00: jnp.ndarray,
     jac_a01: jnp.ndarray,
     jac_a10: jnp.ndarray,
     jac_a11: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> _CabTangentFrame:
     offdiag = 0.5 * (jac_a01 + jac_a10)
-    matrix = jnp.stack(
-        [
-            jnp.stack([jac_a00, offdiag], axis=-1),
-            jnp.stack([offdiag, jac_a11], axis=-1),
-        ],
-        axis=-2,
+    trace = jac_a00 + jac_a11
+    diff = jac_a00 - jac_a11
+    twice_offdiag = 2.0 * offdiag
+    gap2 = jnp.square(diff) + jnp.square(twice_offdiag)
+    raw_scale = jnp.sqrt(gap2 + jnp.square(jnp.asarray(CAB_FRAME_VALUE_ABSOLUTE_SOFTENING, dtype=jnp.float64)))
+    value_scale = jnp.maximum(jnp.maximum(jnp.abs(trace), raw_scale), 1.0)
+    gap_floor = (
+        jnp.asarray(CAB_FRAME_RELATIVE_SOFTENING, dtype=jnp.float64) * value_scale
+        + jnp.asarray(CAB_FRAME_VALUE_ABSOLUTE_SOFTENING, dtype=jnp.float64)
     )
-    eigvals, eigvecs = jnp.linalg.eigh(matrix)
-    use_first = jnp.abs(eigvals[..., 0]) <= jnp.abs(eigvals[..., 1])
-    tangent_x = jnp.where(use_first, eigvecs[..., 0, 0], eigvecs[..., 0, 1])
-    tangent_y = jnp.where(use_first, eigvecs[..., 1, 0], eigvecs[..., 1, 1])
-    norm = jnp.sqrt(jnp.maximum(jnp.square(tangent_x) + jnp.square(tangent_y), 1.0e-30))
-    tangent_x = tangent_x / norm
-    tangent_y = tangent_y / norm
+    gap = jnp.sqrt(gap2 + jnp.square(gap_floor))
+    lambda_low = 0.5 * (trace - gap)
+    lambda_high = 0.5 * (trace + gap)
+
+    high_x_a = gap + diff
+    high_y_a = twice_offdiag
+    high_x_b = twice_offdiag
+    high_y_b = gap - diff
+    use_a = diff >= 0.0
+    high_x = jnp.where(use_a, high_x_a, high_x_b)
+    high_y = jnp.where(use_a, high_y_a, high_y_b)
+    high_norm = jnp.sqrt(jnp.square(high_x) + jnp.square(high_y))
+    high_x = high_x / high_norm
+    high_y = high_y / high_norm
+    low_x = -high_y
+    low_y = high_x
+
+    tangent_x = jnp.stack([low_x, high_x], axis=-1)
+    tangent_y = jnp.stack([low_y, high_y], axis=-1)
     tangent_angle = jnp.arctan2(tangent_y, tangent_x)
+
+    abs_low = jnp.sqrt(jnp.square(lambda_low) + jnp.square(gap_floor))
+    abs_high = jnp.sqrt(jnp.square(lambda_high) + jnp.square(gap_floor))
+    signed_asym = (abs_high - abs_low) / jnp.maximum(abs_high + abs_low, gap_floor)
+    physical_frac = jnp.asarray(CAB_FRAME_PHYSICAL_AMBIGUITY_FRACTION, dtype=jnp.float64)
+    low_branch_weight = jax.nn.sigmoid(signed_asym / physical_frac)
+    branch_weight = jnp.stack([low_branch_weight, 1.0 - low_branch_weight], axis=-1)
+
+    direction_confidence = gap2 / (gap2 + jnp.square(gap_floor))
+    selection_confidence = jnp.square(signed_asym) / (jnp.square(signed_asym) + jnp.square(physical_frac))
+    frame_weight = jnp.clip(direction_confidence * selection_confidence, 0.0, 1.0)
     finite = (
         jnp.isfinite(jac_a00)
         & jnp.isfinite(jac_a01)
         & jnp.isfinite(jac_a10)
         & jnp.isfinite(jac_a11)
-        & jnp.isfinite(tangent_angle)
-        & jnp.isfinite(tangent_x)
-        & jnp.isfinite(tangent_y)
+        & jnp.all(jnp.isfinite(tangent_angle), axis=-1)
+        & jnp.all(jnp.isfinite(tangent_x), axis=-1)
+        & jnp.all(jnp.isfinite(tangent_y), axis=-1)
+        & jnp.all(jnp.isfinite(branch_weight), axis=-1)
+        & jnp.isfinite(lambda_low)
+        & jnp.isfinite(lambda_high)
+        & jnp.isfinite(frame_weight)
     )
-    return tangent_angle, tangent_x, tangent_y, finite
+    return _CabTangentFrame(
+        tangent_angle_rad=tangent_angle,
+        tangent_x=tangent_x,
+        tangent_y=tangent_y,
+        lambda_low=lambda_low,
+        lambda_high=lambda_high,
+        branch_weight=branch_weight,
+        frame_weight=frame_weight,
+        finite=finite,
+    )
 
 
-def _cab_morphology_bin_loglike(
+def _cab_with_branch_axis(values: jnp.ndarray, *, dtype: Any = jnp.float64) -> jnp.ndarray:
+    arr = jnp.asarray(values, dtype=dtype)
+    if arr.ndim == 0:
+        return arr[jnp.newaxis, jnp.newaxis]
+    if arr.ndim == 1:
+        return arr[..., jnp.newaxis]
+    return arr
+
+
+def _cab_morphology_terms(
     predicted_tangent_angle_rad: jnp.ndarray,
     predicted_curvature_arcsec_inv: jnp.ndarray,
     prediction_finite: jnp.ndarray,
@@ -3376,10 +3476,35 @@ def _cab_morphology_bin_loglike(
     sigma_tangent_angle_rad: jnp.ndarray,
     sigma_curvature_arcsec_inv: jnp.ndarray,
     reliability: jnp.ndarray,
-    arc_has_constraint: jnp.ndarray,
+    active_arcs: jnp.ndarray,
     tangent_sigma_floor_rad: float = DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD,
     curvature_sigma_floor_arcsec_inv: float = DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV,
-) -> jnp.ndarray:
+    branch_weight: jnp.ndarray | None = None,
+    frame_weight: jnp.ndarray | None = None,
+) -> _CabMorphologyTerms:
+    predicted_angle = _cab_with_branch_axis(predicted_tangent_angle_rad)
+    predicted_curvature = _cab_with_branch_axis(predicted_curvature_arcsec_inv)
+    branch_finite = _cab_with_branch_axis(prediction_finite, dtype=bool)
+    n_branch = int(predicted_angle.shape[-1])
+    if branch_weight is None:
+        branch_weights = jnp.ones_like(predicted_angle) / float(n_branch)
+    else:
+        branch_weights = _cab_with_branch_axis(branch_weight)
+    if frame_weight is None:
+        branch_frame_weight = jnp.ones_like(predicted_angle)
+    else:
+        branch_frame_weight = _cab_with_branch_axis(frame_weight)
+    branch_weights = jnp.broadcast_to(branch_weights, predicted_angle.shape)
+    branch_frame_weight = jnp.broadcast_to(branch_frame_weight, predicted_angle.shape)
+    branch_weights = jnp.clip(branch_weights, 0.0, 1.0)
+    branch_weight_sum = jnp.sum(branch_weights, axis=-1, keepdims=True)
+    uniform_branch_weight = jnp.ones_like(branch_weights) / float(n_branch)
+    branch_weights = jnp.where(
+        branch_weight_sum > 0.0,
+        branch_weights / jnp.maximum(branch_weight_sum, 1.0e-300),
+        uniform_branch_weight,
+    )
+    branch_frame_weight = jnp.clip(branch_frame_weight, 0.0, 1.0)
     sigma_tangent = jnp.maximum(
         jnp.asarray(sigma_tangent_angle_rad, dtype=jnp.float64),
         jnp.asarray(float(tangent_sigma_floor_rad), dtype=jnp.float64),
@@ -3389,21 +3514,61 @@ def _cab_morphology_bin_loglike(
         jnp.asarray(float(curvature_sigma_floor_arcsec_inv), dtype=jnp.float64),
     )
     tangent_residual = _cab_tangent_angle_residual(
-        predicted_tangent_angle_rad,
-        observed_tangent_angle_rad,
+        predicted_angle,
+        jnp.asarray(observed_tangent_angle_rad, dtype=jnp.float64)[..., jnp.newaxis],
     )
-    curvature_residual = predicted_curvature_arcsec_inv - observed_curvature_arcsec_inv
-    tangent_quad = jnp.square(tangent_residual / sigma_tangent)
-    curvature_quad = jnp.square(curvature_residual / sigma_curvature)
-    row_loglike = -0.5 * (
-        tangent_quad
-        + curvature_quad
-        + jnp.log(2.0 * jnp.pi * jnp.square(sigma_tangent))
-        + jnp.log(2.0 * jnp.pi * jnp.square(sigma_curvature))
+    curvature_residual = predicted_curvature - jnp.asarray(observed_curvature_arcsec_inv, dtype=jnp.float64)[
+        ..., jnp.newaxis
+    ]
+    # Inlier density lives on the same observation support as the outlier,
+    # [0, pi) x [0, inf): an axial von Mises on the doubled tangent angle and a
+    # normal on curvature lower-truncated at 0. Both reduce to the previous
+    # Gaussians for small sigma / predicted curvature far from 0.
+    sigma_tangent_b = sigma_tangent[..., jnp.newaxis]
+    sigma_curvature_b = sigma_curvature[..., jnp.newaxis]
+    # Axial von Mises: g(theta) = exp(kappa cos 2d) / (pi I0(kappa)), kappa =
+    # 1/(4 sigma^2) so it matches the Gaussian -0.5 (d/sigma)^2 - 0.5 log(2 pi
+    # sigma^2) as sigma -> 0. log I0(kappa) = kappa + log i0e(kappa); fold the
+    # kappa into (cos 2d - 1) so I0 is never formed and there is no large cancellation.
+    kappa_tangent = 1.0 / (4.0 * jnp.square(sigma_tangent_b))
+    tangent_ll = (
+        kappa_tangent * (jnp.cos(2.0 * tangent_residual) - 1.0)
+        - jnp.log(jnp.asarray(jnp.pi, dtype=jnp.float64))
+        - jnp.log(jsp_special.i0e(kappa_tangent))
     )
-    active = jnp.asarray(arc_has_constraint, dtype=bool)
-    row_weight = jnp.clip(jnp.asarray(reliability, dtype=jnp.float64), 0.0, 1.0)
-    bin_loglike = jnp.sum(jnp.where(active, row_weight * row_loglike, 0.0))
+    # Normal lower-truncated to observed curvature >= 0; the truncation mass is
+    # Phi(predicted/sigma) (predicted curvature is a nonnegative magnitude), so the
+    # normalizer -log Phi(predicted/sigma) is model-dependent.
+    curvature_ll = (
+        -0.5 * jnp.square(curvature_residual / sigma_curvature_b)
+        - 0.5 * jnp.log(2.0 * jnp.pi * jnp.square(sigma_curvature_b))
+        - jsp_special.log_ndtr(predicted_curvature / sigma_curvature_b)
+    )
+    branch_inlier_ll = tangent_ll + curvature_ll
+    inlier_ll = jsp_special.logsumexp(jnp.log(jnp.clip(branch_weights, 1.0e-300, 1.0)) + branch_inlier_ll, axis=-1)
+    row_frame_weight = jnp.sum(branch_weights * branch_frame_weight, axis=-1)
+    reliability_value = jnp.clip(jnp.asarray(reliability, dtype=jnp.float64), 0.0, 1.0)
+    effective_reliability = jnp.clip(reliability_value * row_frame_weight, 0.0, 1.0)
+    # Outlier models a bad arc-morphology measurement: uniform over the axial angle
+    # times a half-normal over the observed (non-negative) curvature. It scores the
+    # observation, not the model residual, so it is parameter-independent by design.
+    observed_curvature = jnp.asarray(observed_curvature_arcsec_inv, dtype=jnp.float64)
+    sigma_curvature_outlier = jnp.maximum(
+        jnp.asarray(CAB_OUTLIER_CURVATURE_SIGMA_ARCSEC_INV, dtype=jnp.float64),
+        3.0 * sigma_curvature,
+    )
+    outlier_ll = (
+        -jnp.log(jnp.asarray(jnp.pi, dtype=jnp.float64))
+        + 0.5 * jnp.log(2.0 / (jnp.pi * jnp.square(sigma_curvature_outlier)))
+        - 0.5 * jnp.square(observed_curvature / sigma_curvature_outlier)
+    )
+    row_loglike = jnp.logaddexp(
+        jnp.log(jnp.clip(effective_reliability, 1.0e-300, 1.0)) + inlier_ll,
+        jnp.log(jnp.clip(1.0 - effective_reliability, 1.0e-300, 1.0)) + outlier_ll,
+    )
+    tangent_residual_mean = jnp.sum(branch_weights * tangent_residual, axis=-1)
+    curvature_residual_mean = jnp.sum(branch_weights * curvature_residual, axis=-1)
+    active = jnp.asarray(active_arcs, dtype=bool)
     finite_inputs = (
         jnp.isfinite(observed_tangent_angle_rad)
         & jnp.isfinite(observed_curvature_arcsec_inv)
@@ -3412,13 +3577,82 @@ def _cab_morphology_bin_loglike(
         & (sigma_tangent > 0.0)
         & (sigma_curvature > 0.0)
         & jnp.isfinite(reliability)
+        & jnp.isfinite(effective_reliability)
+        & jnp.isfinite(row_frame_weight)
     )
+    finite_branch = (
+        branch_finite
+        & jnp.isfinite(predicted_angle)
+        & jnp.isfinite(predicted_curvature)
+        & jnp.isfinite(branch_weights)
+        & jnp.isfinite(branch_frame_weight)
+        & jnp.isfinite(branch_inlier_ll)
+    )
+    finite_row = (
+        active
+        & finite_inputs
+        & jnp.all(finite_branch, axis=-1)
+        & jnp.isfinite(inlier_ll)
+        & jnp.isfinite(outlier_ll)
+        & jnp.isfinite(row_loglike)
+        & jnp.isfinite(tangent_residual_mean)
+        & jnp.isfinite(curvature_residual_mean)
+    )
+    return _CabMorphologyTerms(
+        sigma_tangent=sigma_tangent,
+        sigma_curvature=sigma_curvature,
+        branch_weight=branch_weights,
+        frame_weight=branch_frame_weight,
+        effective_reliability=effective_reliability,
+        tangent_residual_by_branch=tangent_residual,
+        curvature_residual_by_branch=curvature_residual,
+        tangent_residual=tangent_residual_mean,
+        curvature_residual=curvature_residual_mean,
+        branch_inlier_ll=branch_inlier_ll,
+        inlier_ll=inlier_ll,
+        outlier_ll=outlier_ll,
+        row_loglike=row_loglike,
+        finite_row=finite_row,
+    )
+
+
+def _cab_morphology_arc_catalog_loglike(
+    predicted_tangent_angle_rad: jnp.ndarray,
+    predicted_curvature_arcsec_inv: jnp.ndarray,
+    prediction_finite: jnp.ndarray,
+    observed_tangent_angle_rad: jnp.ndarray,
+    observed_curvature_arcsec_inv: jnp.ndarray,
+    sigma_tangent_angle_rad: jnp.ndarray,
+    sigma_curvature_arcsec_inv: jnp.ndarray,
+    reliability: jnp.ndarray,
+    active_arcs: jnp.ndarray,
+    tangent_sigma_floor_rad: float = DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD,
+    curvature_sigma_floor_arcsec_inv: float = DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV,
+    branch_weight: jnp.ndarray | None = None,
+    frame_weight: jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    terms = _cab_morphology_terms(
+        predicted_tangent_angle_rad=predicted_tangent_angle_rad,
+        predicted_curvature_arcsec_inv=predicted_curvature_arcsec_inv,
+        prediction_finite=prediction_finite,
+        observed_tangent_angle_rad=observed_tangent_angle_rad,
+        observed_curvature_arcsec_inv=observed_curvature_arcsec_inv,
+        sigma_tangent_angle_rad=sigma_tangent_angle_rad,
+        sigma_curvature_arcsec_inv=sigma_curvature_arcsec_inv,
+        reliability=reliability,
+        active_arcs=active_arcs,
+        tangent_sigma_floor_rad=tangent_sigma_floor_rad,
+        curvature_sigma_floor_arcsec_inv=curvature_sigma_floor_arcsec_inv,
+        branch_weight=branch_weight,
+        frame_weight=frame_weight,
+    )
+    active = jnp.asarray(active_arcs, dtype=bool)
+    arc_loglike = jnp.sum(jnp.where(active, terms.row_loglike, 0.0))
     finite = (
-        jnp.all(jnp.where(active, prediction_finite & finite_inputs, True))
-        & jnp.all(jnp.where(active, jnp.isfinite(row_loglike), True))
-        & jnp.isfinite(bin_loglike)
+        jnp.all(jnp.where(active, terms.finite_row, True))
+        & jnp.isfinite(arc_loglike)
     )
-    return jnp.where(finite, bin_loglike, jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64))
+    return jnp.where(finite, arc_loglike, jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64))
 
 
 def _forward_metric_image_plane_bin_loglike(
@@ -3436,7 +3670,6 @@ def _forward_metric_image_plane_bin_loglike(
     scatter_var_y: jnp.ndarray,
     covariance_floor: float,
     outlier_sigma_arcsec: float,
-    image_scatter_floor_arcsec: float = DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
     max_gain: float = DEFAULT_LIKELIHOOD_STABILIZER_MAX_GAIN,
     max_residual_arcsec: float = DEFAULT_LIKELIHOOD_STABILIZER_MAX_RESIDUAL_ARCSEC,
     residual_loss: str = DEFAULT_LIKELIHOOD_STABILIZER_RESIDUAL_LOSS,
@@ -3449,7 +3682,6 @@ def _forward_metric_image_plane_bin_loglike(
     image_presence_count_softness: float = DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS,
     image_presence_count_margin: float = DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN,
 ) -> jnp.ndarray:
-    del image_scatter_floor_arcsec
     image_sigma2 = jnp.square(sigma_per_image) + jnp.square(image_sigma_int)
     cov_floor = jnp.asarray(covariance_floor, dtype=jnp.float64)
     c00 = image_sigma2 * (jnp.square(jac_a00) + jnp.square(jac_a01)) + scatter_var_x + cov_floor
@@ -3653,7 +3885,6 @@ def _fold_regularized_image_plane_bin_loglike(
     scatter_var_y: jnp.ndarray,
     covariance_floor: float,
     outlier_sigma_arcsec: float,
-    image_scatter_floor_arcsec: float = DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
     fold_curvature_arcsec_inv: float = DEFAULT_FOLD_CURVATURE_ARCSEC_INV,
     fold_kappa_eff: jnp.ndarray | None = None,
     fold_frame: tuple[jnp.ndarray, ...] | None = None,
@@ -3674,7 +3905,6 @@ def _fold_regularized_image_plane_bin_loglike(
         sigma_per_image,
         image_sigma_int,
         covariance_floor,
-        image_scatter_floor_arcsec,
     )
     cov_floor = jnp.asarray(covariance_floor, dtype=jnp.float64)
     dx, dy = _smooth_residual_cap(residual_beta_x, residual_beta_y, max_residual_arcsec)
@@ -4087,10 +4317,23 @@ def _critical_arc_normal_matrix_entries(
     normal11 = jnp.square(jac_a01) + jnp.square(jac_a11)
     trace = jnp.maximum(normal00 + normal11, jnp.asarray(0.0, dtype=jnp.float64))
     diff = normal00 - normal11
-    gap = jnp.sqrt(jnp.maximum(jnp.square(diff) + 4.0 * jnp.square(normal01), 0.0))
+    gap2 = jnp.square(diff) + 4.0 * jnp.square(normal01)
+    value_gap_floor = (
+        jnp.asarray(CRITICAL_ARC_EIGENGAP_RELATIVE_SOFTENING, dtype=jnp.float64) * trace
+        + jnp.asarray(CRITICAL_ARC_EIGENGAP_VALUE_ABSOLUTE_SOFTENING, dtype=jnp.float64)
+    )
+    gap = jnp.sqrt(gap2 + jnp.square(value_gap_floor))
     lambda_min = jnp.maximum(0.5 * (trace - gap), jnp.asarray(0.0, dtype=jnp.float64))
     lambda_max = jnp.maximum(0.5 * (trace + gap), jnp.asarray(0.0, dtype=jnp.float64))
     return normal00, normal01, normal11, trace, gap, lambda_min, lambda_max, diff
+
+
+def _critical_arc_singular_values_from_lambdas(
+    lambda_min: jnp.ndarray,
+    lambda_max: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    singular_floor2 = jnp.square(jnp.asarray(CRITICAL_ARC_SINGULAR_VALUE_FLOOR, dtype=jnp.float64))
+    return jnp.sqrt(lambda_min + singular_floor2), jnp.sqrt(lambda_max + singular_floor2)
 
 
 def _critical_arc_critical_direction_projector_from_normal_entries(
@@ -4098,19 +4341,16 @@ def _critical_arc_critical_direction_projector_from_normal_entries(
     normal01: jnp.ndarray,
     normal11: jnp.ndarray,
     trace: jnp.ndarray,
-    lambda_min: jnp.ndarray,
-    lambda_max: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    gap = lambda_max - lambda_min
-    gap_floor = jnp.asarray(1.0e-24, dtype=jnp.float64) * (1.0 + trace)
-    nondegenerate = gap > gap_floor
-    gap_safe = jnp.where(nondegenerate, gap, jnp.ones_like(gap))
-    critical_p00 = (lambda_max - normal00) / gap_safe
-    critical_p01 = -normal01 / gap_safe
-    critical_p11 = (lambda_max - normal11) / gap_safe
-    critical_p00 = jnp.where(nondegenerate, critical_p00, jnp.zeros_like(critical_p00))
-    critical_p01 = jnp.where(nondegenerate, critical_p01, jnp.zeros_like(critical_p01))
-    critical_p11 = jnp.where(nondegenerate, critical_p11, jnp.ones_like(critical_p11))
+    diff = normal00 - normal11
+    projector_gap_floor = jnp.asarray(CRITICAL_ARC_EIGENGAP_RELATIVE_SOFTENING, dtype=jnp.float64) * jnp.maximum(
+        trace,
+        jnp.asarray(1.0, dtype=jnp.float64),
+    )
+    projector_gap = jnp.sqrt(jnp.square(diff) + 4.0 * jnp.square(normal01) + jnp.square(projector_gap_floor))
+    critical_p00 = 0.5 - 0.5 * diff / projector_gap
+    critical_p01 = -normal01 / projector_gap
+    critical_p11 = 0.5 + 0.5 * diff / projector_gap
     return critical_p00, critical_p01, critical_p11
 
 
@@ -4126,15 +4366,12 @@ def _critical_arc_geometry_from_jacobian(
         jac_a10,
         jac_a11,
     )
-    singular_min = jnp.sqrt(lambda_min)
-    singular_max = jnp.sqrt(lambda_max)
+    singular_min, singular_max = _critical_arc_singular_values_from_lambdas(lambda_min, lambda_max)
     critical_p00, critical_p01, critical_p11 = _critical_arc_critical_direction_projector_from_normal_entries(
         normal00,
         normal01,
         normal11,
         trace,
-        lambda_min,
-        lambda_max,
     )
     finite = (
         jnp.isfinite(normal00)
@@ -4184,15 +4421,12 @@ def _critical_arc_lm_geometry_from_jacobian(
         jac_a10,
         jac_a11,
     )
-    singular_min = jnp.sqrt(lambda_min)
-    singular_max = jnp.sqrt(lambda_max)
+    singular_min, singular_max = _critical_arc_singular_values_from_lambdas(lambda_min, lambda_max)
     critical_p00, critical_p01, critical_p11 = _critical_arc_critical_direction_projector_from_normal_entries(
         normal00,
         normal01,
         normal11,
         trace,
-        lambda_min,
-        lambda_max,
     )
     lam = (
         jnp.asarray(float(lm_damping_absolute), dtype=jnp.float64)
@@ -4282,16 +4516,13 @@ def _critical_arc_jacobian_frame(
     jac_a10: jnp.ndarray,
     jac_a11: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    normal00 = jnp.square(jac_a00) + jnp.square(jac_a10)
-    normal01 = jac_a00 * jac_a01 + jac_a10 * jac_a11
-    normal11 = jnp.square(jac_a01) + jnp.square(jac_a11)
-    trace = jnp.maximum(normal00 + normal11, jnp.asarray(0.0, dtype=jnp.float64))
-    diff = normal00 - normal11
-    gap = jnp.sqrt(jnp.maximum(jnp.square(diff) + 4.0 * jnp.square(normal01), 0.0))
-    lambda_min = jnp.maximum(0.5 * (trace - gap), jnp.asarray(0.0, dtype=jnp.float64))
-    lambda_max = jnp.maximum(0.5 * (trace + gap), jnp.asarray(0.0, dtype=jnp.float64))
-    singular_min = jnp.sqrt(lambda_min)
-    singular_max = jnp.sqrt(lambda_max)
+    normal00, normal01, normal11, _trace, _gap, lambda_min, lambda_max, diff = _critical_arc_normal_matrix_entries(
+        jac_a00,
+        jac_a01,
+        jac_a10,
+        jac_a11,
+    )
+    singular_min, singular_max = _critical_arc_singular_values_from_lambdas(lambda_min, lambda_max)
     angle = 0.5 * jnp.arctan2(2.0 * normal01, diff)
     noncritical_direction_x = jnp.cos(angle)
     noncritical_direction_y = jnp.sin(angle)
@@ -4327,6 +4558,171 @@ def _critical_arc_branch_probability(
     )
     prob = base + (high - base) * transition
     return jnp.clip(prob, 1.0e-6, 1.0 - 1.0e-6)
+
+
+class _CriticalArcMixtureTerms(NamedTuple):
+    sigma2: jnp.ndarray
+    reliability: jnp.ndarray
+    critical_quad: jnp.ndarray
+    noncritical_quad: jnp.ndarray
+    arc_prob: jnp.ndarray
+    point_ll: jnp.ndarray
+    arc_ll: jnp.ndarray
+    outlier_ll: jnp.ndarray
+    inlier_ll: jnp.ndarray
+    mixture_ll: jnp.ndarray
+
+
+class _CriticalArcMixtureResponsibilities(NamedTuple):
+    point_log_weight: jnp.ndarray
+    arc_log_weight: jnp.ndarray
+    inlier_log_weight: jnp.ndarray
+    outlier_log_weight: jnp.ndarray
+    point_inlier_responsibility: jnp.ndarray
+    arc_inlier_responsibility: jnp.ndarray
+    point_mixture_responsibility: jnp.ndarray
+    arc_mixture_responsibility: jnp.ndarray
+    inlier_responsibility: jnp.ndarray
+    outlier_responsibility: jnp.ndarray
+
+
+def _critical_arc_mixture_image_plane_terms(
+    residual_x: jnp.ndarray,
+    residual_y: jnp.ndarray,
+    sigma_per_image: jnp.ndarray,
+    reliability_per_image: jnp.ndarray,
+    image_sigma_int: jnp.ndarray,
+    covariance_floor: float,
+    outlier_sigma_arcsec: float,
+    singular_min: jnp.ndarray,
+    critical_direction_projector_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    *,
+    residual_loss: str = DEFAULT_LIKELIHOOD_STABILIZER_RESIDUAL_LOSS,
+    student_t_nu: float = DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU,
+    critical_direction_sigma_arcsec: float = DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+    base_prob: float = DEFAULT_CRITICAL_ARC_BASE_PROB,
+    max_prob: float = DEFAULT_CRITICAL_ARC_MAX_PROB,
+    singular_threshold: float = DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+    singular_softness: float = DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
+) -> _CriticalArcMixtureTerms:
+    sigma2 = _image_plane_effective_sigma2(
+        sigma_per_image,
+        image_sigma_int,
+        covariance_floor,
+    )
+    reliability = jnp.clip(reliability_per_image, 1.0e-6, 1.0 - 1.0e-6)
+    critical_p00, critical_p01, critical_p11 = critical_direction_projector_entries
+    critical_quad, noncritical_quad = _critical_arc_projected_quadratics(
+        residual_x,
+        residual_y,
+        critical_p00,
+        critical_p01,
+        critical_p11,
+    )
+    point_quad = (jnp.square(residual_x) + jnp.square(residual_y)) / sigma2
+    point_logdet = 2.0 * jnp.log(sigma2)
+    # Covariance-side arc branch: Sigma = sigma2 I + sigma_arc^2 P keeps the branch a
+    # normalized density for the regularized (non-idempotent) projector. It reduces
+    # exactly to the two-axis (sigma2, sigma2 + sigma_arc^2) form when P is an exact
+    # projector and to the broad-isotropic sigma2 + sigma_arc^2/2 at degenerate frames.
+    arc_extra_var = jnp.square(jnp.asarray(float(critical_direction_sigma_arcsec), dtype=jnp.float64))
+    arc_sigma00 = sigma2 + arc_extra_var * critical_p00
+    arc_sigma01 = arc_extra_var * critical_p01
+    arc_sigma11 = sigma2 + arc_extra_var * critical_p11
+    projector_det = jnp.maximum(
+        critical_p00 * critical_p11 - jnp.square(critical_p01),
+        jnp.asarray(0.0, dtype=jnp.float64),
+    )
+    arc_det = (
+        jnp.square(sigma2)
+        + sigma2 * arc_extra_var * (critical_p00 + critical_p11)
+        + jnp.square(arc_extra_var) * projector_det
+    )
+    arc_quad = jnp.maximum(
+        (
+            arc_sigma11 * jnp.square(residual_x)
+            - 2.0 * arc_sigma01 * residual_x * residual_y
+            + arc_sigma00 * jnp.square(residual_y)
+        )
+        / arc_det,
+        jnp.asarray(0.0, dtype=jnp.float64),
+    )
+    arc_logdet = jnp.log(arc_det)
+    arc_prob = _critical_arc_branch_probability(
+        singular_min,
+        base_prob=base_prob,
+        max_prob=max_prob,
+        singular_threshold=singular_threshold,
+        singular_softness=singular_softness,
+    )
+    if str(residual_loss) == LIKELIHOOD_STABILIZER_RESIDUAL_LOSS_STUDENT_T:
+        point_ll = _student_t_2d_loglike_from_quad_logdet(point_quad, point_logdet, student_t_nu)
+        arc_ll = _student_t_2d_loglike_from_quad_logdet(arc_quad, arc_logdet, student_t_nu)
+    else:
+        point_ll = -0.5 * (point_quad + 2.0 * jnp.log(2.0 * jnp.pi) + point_logdet)
+        arc_ll = -0.5 * (arc_quad + 2.0 * jnp.log(2.0 * jnp.pi) + arc_logdet)
+    inlier_ll = jnp.logaddexp(jnp.log1p(-arc_prob) + point_ll, jnp.log(arc_prob) + arc_ll)
+    outlier_sigma2 = jnp.square(jnp.asarray(outlier_sigma_arcsec, dtype=jnp.float64))
+    outlier_ll = -0.5 * (
+        (jnp.square(residual_x) + jnp.square(residual_y)) / outlier_sigma2
+        + 2.0 * jnp.log(2.0 * jnp.pi * outlier_sigma2)
+    )
+    mixture_ll = jnp.logaddexp(jnp.log(reliability) + inlier_ll, jnp.log1p(-reliability) + outlier_ll)
+    return _CriticalArcMixtureTerms(
+        sigma2=sigma2,
+        reliability=reliability,
+        critical_quad=critical_quad,
+        noncritical_quad=noncritical_quad,
+        arc_prob=arc_prob,
+        point_ll=point_ll,
+        arc_ll=arc_ll,
+        outlier_ll=outlier_ll,
+        inlier_ll=inlier_ll,
+        mixture_ll=mixture_ll,
+    )
+
+
+def _critical_arc_mixture_image_plane_responsibilities(
+    terms: _CriticalArcMixtureTerms,
+) -> _CriticalArcMixtureResponsibilities:
+    point_log_weight = (
+        jnp.log(terms.reliability)
+        + jnp.log(jnp.clip(1.0 - terms.arc_prob, 1.0e-300, 1.0))
+        + terms.point_ll
+    )
+    arc_log_weight = (
+        jnp.log(terms.reliability)
+        + jnp.log(jnp.clip(terms.arc_prob, 1.0e-300, 1.0))
+        + terms.arc_ll
+    )
+    inlier_log_weight = jnp.log(terms.reliability) + terms.inlier_ll
+    outlier_log_weight = jnp.log1p(-terms.reliability) + terms.outlier_ll
+    point_inlier_responsibility = jnp.exp(
+        jnp.log(jnp.clip(1.0 - terms.arc_prob, 1.0e-300, 1.0))
+        + terms.point_ll
+        - terms.inlier_ll
+    )
+    arc_inlier_responsibility = jnp.exp(
+        jnp.log(jnp.clip(terms.arc_prob, 1.0e-300, 1.0))
+        + terms.arc_ll
+        - terms.inlier_ll
+    )
+    point_mixture_responsibility = jnp.exp(point_log_weight - terms.mixture_ll)
+    arc_mixture_responsibility = jnp.exp(arc_log_weight - terms.mixture_ll)
+    inlier_responsibility = jnp.exp(inlier_log_weight - terms.mixture_ll)
+    outlier_responsibility = jnp.exp(outlier_log_weight - terms.mixture_ll)
+    return _CriticalArcMixtureResponsibilities(
+        point_log_weight=point_log_weight,
+        arc_log_weight=arc_log_weight,
+        inlier_log_weight=inlier_log_weight,
+        outlier_log_weight=outlier_log_weight,
+        point_inlier_responsibility=point_inlier_responsibility,
+        arc_inlier_responsibility=arc_inlier_responsibility,
+        point_mixture_responsibility=point_mixture_responsibility,
+        arc_mixture_responsibility=arc_mixture_responsibility,
+        inlier_responsibility=inlier_responsibility,
+        outlier_responsibility=outlier_responsibility,
+    )
 
 
 def _json_arcsec_array(values: Any) -> str:
@@ -4563,7 +4959,6 @@ def _critical_arc_mixture_image_plane_bin_loglike(
     image_sigma_int: jnp.ndarray,
     covariance_floor: float,
     outlier_sigma_arcsec: float,
-    image_scatter_floor_arcsec: float = DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
     image_presence_penalty_weight: float = 0.0,
     image_presence_match_radius_arcsec: float = DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC,
     image_presence_temperature_arcsec: float = DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC,
@@ -4580,13 +4975,6 @@ def _critical_arc_mixture_image_plane_bin_loglike(
     singular_max_precomputed: jnp.ndarray | None = None,
     critical_direction_projector_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray] | None = None,
 ) -> jnp.ndarray:
-    sigma2 = _image_plane_effective_sigma2(
-        sigma_per_image,
-        image_sigma_int,
-        covariance_floor,
-        image_scatter_floor_arcsec,
-    )
-    reliability = jnp.clip(reliability_per_image, 1.0e-6, 1.0 - 1.0e-6)
     if (
         singular_min_precomputed is None
         or singular_max_precomputed is None
@@ -4616,40 +5004,25 @@ def _critical_arc_mixture_image_plane_bin_loglike(
             & jnp.isfinite(critical_p01)
             & jnp.isfinite(critical_p11)
         )
-    critical_direction_quad_component, noncritical_direction_quad_component = _critical_arc_projected_quadratics(
-        residual_x,
-        residual_y,
-        critical_p00,
-        critical_p01,
-        critical_p11,
-    )
-    point_quad = (jnp.square(residual_x) + jnp.square(residual_y)) / sigma2
-    point_logdet = 2.0 * jnp.log(sigma2)
-    critical_direction_sigma2 = sigma2 + jnp.square(jnp.asarray(float(critical_direction_sigma_arcsec), dtype=jnp.float64))
-    noncritical_direction_sigma2 = sigma2
-    arc_quad = noncritical_direction_quad_component / noncritical_direction_sigma2 + critical_direction_quad_component / critical_direction_sigma2
-    arc_logdet = jnp.log(noncritical_direction_sigma2) + jnp.log(critical_direction_sigma2)
-    arc_prob = _critical_arc_branch_probability(
-        singular_min,
+    terms = _critical_arc_mixture_image_plane_terms(
+        residual_x=residual_x,
+        residual_y=residual_y,
+        sigma_per_image=sigma_per_image,
+        reliability_per_image=reliability_per_image,
+        image_sigma_int=image_sigma_int,
+        covariance_floor=covariance_floor,
+        outlier_sigma_arcsec=outlier_sigma_arcsec,
+        singular_min=singular_min,
+        critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+        residual_loss=residual_loss,
+        student_t_nu=student_t_nu,
+        critical_direction_sigma_arcsec=critical_direction_sigma_arcsec,
         base_prob=base_prob,
         max_prob=max_prob,
         singular_threshold=singular_threshold,
         singular_softness=singular_softness,
     )
-    if str(residual_loss) == LIKELIHOOD_STABILIZER_RESIDUAL_LOSS_STUDENT_T:
-        point_ll = _student_t_2d_loglike_from_quad_logdet(point_quad, point_logdet, student_t_nu)
-        arc_ll = _student_t_2d_loglike_from_quad_logdet(arc_quad, arc_logdet, student_t_nu)
-    else:
-        point_ll = -0.5 * (point_quad + 2.0 * jnp.log(2.0 * jnp.pi) + point_logdet)
-        arc_ll = -0.5 * (arc_quad + 2.0 * jnp.log(2.0 * jnp.pi) + arc_logdet)
-    inlier_ll = jnp.logaddexp(jnp.log1p(-arc_prob) + point_ll, jnp.log(arc_prob) + arc_ll)
-    outlier_sigma2 = jnp.square(jnp.asarray(outlier_sigma_arcsec, dtype=jnp.float64))
-    outlier_ll = -0.5 * (
-        (jnp.square(residual_x) + jnp.square(residual_y)) / outlier_sigma2
-        + 2.0 * jnp.log(2.0 * jnp.pi * outlier_sigma2)
-    )
-    mixture_ll = jnp.logaddexp(jnp.log(reliability) + inlier_ll, jnp.log1p(-reliability) + outlier_ll)
-    bin_loglike = jnp.sum(jnp.where(image_has_constraint, mixture_ll, 0.0))
+    bin_loglike = jnp.sum(jnp.where(image_has_constraint, terms.mixture_ll, 0.0))
     if (
         float(image_presence_penalty_weight) > 0.0
         and family_idx is not None
@@ -4663,12 +5036,14 @@ def _critical_arc_mixture_image_plane_bin_loglike(
         )
         point_presence_probability = jax.nn.sigmoid((radius2 - point_residual2) / temperature2)
         arc_presence_probability = jax.nn.sigmoid(
-            (radius2 - noncritical_direction_quad_component) / temperature2
+            (radius2 - terms.noncritical_quad) / temperature2
         )
         probability_span = jnp.asarray(float(max_prob) - float(base_prob), dtype=jnp.float64)
         probability_span_safe = jnp.maximum(probability_span, jnp.asarray(1.0e-12, dtype=jnp.float64))
-        normalized_arc_gate = (arc_prob - jnp.asarray(float(base_prob), dtype=jnp.float64)) / probability_span_safe
-        arc_gate = jnp.where(probability_span > 1.0e-12, normalized_arc_gate, arc_prob)
+        normalized_arc_gate = (
+            terms.arc_prob - jnp.asarray(float(base_prob), dtype=jnp.float64)
+        ) / probability_span_safe
+        arc_gate = jnp.where(probability_span > 1.0e-12, normalized_arc_gate, terms.arc_prob)
         arc_gate = jnp.clip(arc_gate, 0.0, 1.0)
         presence_probability = point_presence_probability + arc_gate * (
             arc_presence_probability - point_presence_probability
@@ -4677,7 +5052,7 @@ def _critical_arc_mixture_image_plane_bin_loglike(
             presence_probability=presence_probability,
             family_idx=family_idx,
             n_families=int(n_families),
-            reliability_per_image=reliability,
+            reliability_per_image=terms.reliability,
             image_has_constraint=image_has_constraint,
             penalty_weight=float(image_presence_penalty_weight),
             count_softness=float(image_presence_count_softness),
@@ -4687,7 +5062,7 @@ def _critical_arc_mixture_image_plane_bin_loglike(
         jnp.all(frame_finite)
         & jnp.all(jnp.isfinite(residual_x))
         & jnp.all(jnp.isfinite(residual_y))
-        & jnp.all(jnp.isfinite(sigma2))
+        & jnp.all(jnp.isfinite(terms.sigma2))
         & jnp.all(jnp.isfinite(singular_min))
         & jnp.all(jnp.isfinite(singular_max))
         & jnp.isfinite(bin_loglike)
@@ -4804,60 +5179,26 @@ def _critical_arc_debug_terms_for_state(
             lm_damping_absolute=evaluator.critical_arc_lm_damping_absolute,
         )
         invalid = invalid | (~has_source_positions) | (~jnp.all(residual_finite))
-        sigma2 = _image_plane_effective_sigma2(
-            bin_data.sigma_per_image,
-            image_sigma_int,
-            evaluator.source_plane_covariance_floor,
-            evaluator.image_plane_scatter_floor_arcsec,
-        )
-        reliability = jnp.clip(bin_data.reliability_per_image, 1.0e-6, 1.0 - 1.0e-6)
-        critical_quad, noncritical_quad = _critical_arc_projected_quadratics(
-            residual_x,
-            residual_y,
-            critical_p00,
-            critical_p01,
-            critical_p11,
-        )
-        point_quad = (jnp.square(residual_x) + jnp.square(residual_y)) / sigma2
-        point_logdet = 2.0 * jnp.log(sigma2)
-        critical_direction_sigma2 = sigma2 + jnp.square(
-            jnp.asarray(float(evaluator.critical_arc_critical_direction_sigma_arcsec), dtype=jnp.float64)
-        )
-        arc_quad = noncritical_quad / sigma2 + critical_quad / critical_direction_sigma2
-        arc_logdet = jnp.log(sigma2) + jnp.log(critical_direction_sigma2)
-        arc_prob = _critical_arc_branch_probability(
-            singular_min,
+        terms = _critical_arc_mixture_image_plane_terms(
+            residual_x=residual_x,
+            residual_y=residual_y,
+            sigma_per_image=bin_data.sigma_per_image,
+            reliability_per_image=bin_data.reliability_per_image,
+            image_sigma_int=image_sigma_int,
+            covariance_floor=evaluator.source_plane_covariance_floor,
+            outlier_sigma_arcsec=evaluator.source_plane_outlier_sigma_arcsec,
+            singular_min=singular_min,
+            critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+            residual_loss=evaluator.likelihood_stabilizer_residual_loss,
+            student_t_nu=evaluator.likelihood_stabilizer_student_t_nu,
+            critical_direction_sigma_arcsec=evaluator.critical_arc_critical_direction_sigma_arcsec,
             base_prob=evaluator.critical_arc_base_prob,
             max_prob=evaluator.critical_arc_max_prob,
             singular_threshold=evaluator.critical_arc_singular_threshold,
             singular_softness=evaluator.critical_arc_singular_softness,
         )
-        if str(evaluator.likelihood_stabilizer_residual_loss) == LIKELIHOOD_STABILIZER_RESIDUAL_LOSS_STUDENT_T:
-            point_ll = _student_t_2d_loglike_from_quad_logdet(point_quad, point_logdet, evaluator.likelihood_stabilizer_student_t_nu)
-            arc_ll = _student_t_2d_loglike_from_quad_logdet(arc_quad, arc_logdet, evaluator.likelihood_stabilizer_student_t_nu)
-        else:
-            point_ll = -0.5 * (point_quad + 2.0 * jnp.log(2.0 * jnp.pi) + point_logdet)
-            arc_ll = -0.5 * (arc_quad + 2.0 * jnp.log(2.0 * jnp.pi) + arc_logdet)
-        inlier_ll = jnp.logaddexp(jnp.log1p(-arc_prob) + point_ll, jnp.log(arc_prob) + arc_ll)
-        outlier_sigma2 = jnp.square(jnp.asarray(evaluator.source_plane_outlier_sigma_arcsec, dtype=jnp.float64))
-        outlier_ll = -0.5 * (
-            (jnp.square(residual_x) + jnp.square(residual_y)) / outlier_sigma2
-            + 2.0 * jnp.log(2.0 * jnp.pi * outlier_sigma2)
-        )
-        mixture_ll = jnp.logaddexp(jnp.log(reliability) + inlier_ll, jnp.log1p(-reliability) + outlier_ll)
-        point_log_weight = jnp.log(reliability) + jnp.log(jnp.clip(1.0 - arc_prob, 1.0e-300, 1.0)) + point_ll
-        arc_log_weight = jnp.log(reliability) + jnp.log(jnp.clip(arc_prob, 1.0e-300, 1.0)) + arc_ll
-        inlier_log_weight = jnp.log(reliability) + inlier_ll
-        outlier_log_weight = jnp.log1p(-reliability) + outlier_ll
-        point_inlier_responsibility = jnp.exp(
-            jnp.log(jnp.clip(1.0 - arc_prob, 1.0e-300, 1.0)) + point_ll - inlier_ll
-        )
-        arc_inlier_responsibility = jnp.exp(jnp.log(jnp.clip(arc_prob, 1.0e-300, 1.0)) + arc_ll - inlier_ll)
-        point_mixture_responsibility = jnp.exp(point_log_weight - mixture_ll)
-        arc_mixture_responsibility = jnp.exp(arc_log_weight - mixture_ll)
-        inlier_responsibility = jnp.exp(inlier_log_weight - mixture_ll)
-        outlier_responsibility = jnp.exp(outlier_log_weight - mixture_ll)
-        image_contribution = jnp.where(bin_data.image_has_constraint, mixture_ll, 0.0)
+        responsibilities = _critical_arc_mixture_image_plane_responsibilities(terms)
+        image_contribution = jnp.where(bin_data.image_has_constraint, terms.mixture_ll, 0.0)
         mixture_sum = jnp.sum(image_contribution)
         bin_loglike_without_transport = _critical_arc_mixture_image_plane_bin_loglike(
             residual_x=residual_x,
@@ -4869,12 +5210,11 @@ def _critical_arc_debug_terms_for_state(
             family_idx=bin_data.family_index_per_image,
             n_families=bin_data.n_families,
             sigma_per_image=bin_data.sigma_per_image,
-            reliability_per_image=reliability,
+            reliability_per_image=bin_data.reliability_per_image,
             image_has_constraint=bin_data.image_has_constraint,
             image_sigma_int=image_sigma_int,
             covariance_floor=evaluator.source_plane_covariance_floor,
             outlier_sigma_arcsec=evaluator.source_plane_outlier_sigma_arcsec,
-            image_scatter_floor_arcsec=evaluator.image_plane_scatter_floor_arcsec,
             image_presence_penalty_weight=evaluator.image_presence_penalty_weight,
             image_presence_match_radius_arcsec=evaluator.image_presence_match_radius_arcsec,
             image_presence_temperature_arcsec=evaluator.image_presence_temperature_arcsec,
@@ -4921,7 +5261,7 @@ def _critical_arc_debug_terms_for_state(
                     "residual_x": float(residual_x_np[local_image_index]),
                     "residual_y": float(residual_y_np[local_image_index]),
                     "residual_norm": float(np.hypot(residual_x_np[local_image_index], residual_y_np[local_image_index])),
-                    "sigma_eff": float(np.sqrt(np1(sigma2)[local_image_index])),
+                    "sigma_eff": float(np.sqrt(np1(terms.sigma2)[local_image_index])),
                     "image_sigma_int": float(np.asarray(image_sigma_int, dtype=float)),
                     "image_sigma_int_sampled": bool(getattr(evaluator, "image_sigma_int_sampled", False)),
                     "fixed_image_sigma_int_arcsec": (
@@ -4929,39 +5269,41 @@ def _critical_arc_debug_terms_for_state(
                         if getattr(evaluator, "fixed_image_sigma_int_arcsec", None) is not None
                         else float("nan")
                     ),
-                    "reliability": float(np1(reliability)[local_image_index]),
+                    "reliability": float(np1(terms.reliability)[local_image_index]),
                     "det_a": float(det_a_np[local_image_index]),
                     "singular_min": float(np1(singular_min)[local_image_index]),
                     "singular_max": float(np1(singular_max)[local_image_index]),
-                    "arc_probability": float(np1(arc_prob)[local_image_index]),
-                    "critical_direction_residual": float(np.sqrt(np1(critical_quad)[local_image_index])),
-                    "noncritical_direction_residual": float(np.sqrt(np1(noncritical_quad)[local_image_index])),
-                    "point_loglike": float(np1(point_ll)[local_image_index]),
-                    "arc_loglike": float(np1(arc_ll)[local_image_index]),
-                    "outlier_loglike": float(np1(outlier_ll)[local_image_index]),
-                    "inlier_loglike": float(np1(inlier_ll)[local_image_index]),
-                    "mixture_loglike": float(np1(mixture_ll)[local_image_index]),
-                    "inlier_responsibility": float(np1(inlier_responsibility)[local_image_index]),
-                    "outlier_responsibility": float(np1(outlier_responsibility)[local_image_index]),
-                    "point_inlier_responsibility": float(np1(point_inlier_responsibility)[local_image_index]),
-                    "arc_inlier_responsibility": float(np1(arc_inlier_responsibility)[local_image_index]),
-                    "point_mixture_responsibility": float(np1(point_mixture_responsibility)[local_image_index]),
-                    "arc_mixture_responsibility": float(np1(arc_mixture_responsibility)[local_image_index]),
-                    "inlier_log_weight": float(np1(inlier_log_weight)[local_image_index]),
-                    "outlier_log_weight": float(np1(outlier_log_weight)[local_image_index]),
-                    "point_log_weight": float(np1(point_log_weight)[local_image_index]),
-                    "arc_log_weight": float(np1(arc_log_weight)[local_image_index]),
+                    "arc_probability": float(np1(terms.arc_prob)[local_image_index]),
+                    "critical_direction_residual": float(np.sqrt(np1(terms.critical_quad)[local_image_index])),
+                    "noncritical_direction_residual": float(np.sqrt(np1(terms.noncritical_quad)[local_image_index])),
+                    "point_loglike": float(np1(terms.point_ll)[local_image_index]),
+                    "arc_loglike": float(np1(terms.arc_ll)[local_image_index]),
+                    "outlier_loglike": float(np1(terms.outlier_ll)[local_image_index]),
+                    "inlier_loglike": float(np1(terms.inlier_ll)[local_image_index]),
+                    "mixture_loglike": float(np1(terms.mixture_ll)[local_image_index]),
+                    "inlier_responsibility": float(np1(responsibilities.inlier_responsibility)[local_image_index]),
+                    "outlier_responsibility": float(np1(responsibilities.outlier_responsibility)[local_image_index]),
+                    "point_inlier_responsibility": float(np1(responsibilities.point_inlier_responsibility)[local_image_index]),
+                    "arc_inlier_responsibility": float(np1(responsibilities.arc_inlier_responsibility)[local_image_index]),
+                    "point_mixture_responsibility": float(np1(responsibilities.point_mixture_responsibility)[local_image_index]),
+                    "arc_mixture_responsibility": float(np1(responsibilities.arc_mixture_responsibility)[local_image_index]),
+                    "inlier_log_weight": float(np1(responsibilities.inlier_log_weight)[local_image_index]),
+                    "outlier_log_weight": float(np1(responsibilities.outlier_log_weight)[local_image_index]),
+                    "point_log_weight": float(np1(responsibilities.point_log_weight)[local_image_index]),
+                    "arc_log_weight": float(np1(responsibilities.arc_log_weight)[local_image_index]),
                     "outlier_margin_log_weight_minus_inlier": float(
-                        np1(outlier_log_weight - inlier_log_weight)[local_image_index]
+                        np1(responsibilities.outlier_log_weight - responsibilities.inlier_log_weight)[local_image_index]
                     ),
-                    "arc_margin_log_weight_minus_point": float(np1(arc_log_weight - point_log_weight)[local_image_index]),
+                    "arc_margin_log_weight_minus_point": float(
+                        np1(responsibilities.arc_log_weight - responsibilities.point_log_weight)[local_image_index]
+                    ),
                     "final_image_mixture_contribution": float(np1(image_contribution)[local_image_index]),
-                    "branch_margin_arc_minus_point": float(np1(arc_ll - point_ll)[local_image_index]),
+                    "branch_margin_arc_minus_point": float(np1(terms.arc_ll - terms.point_ll)[local_image_index]),
                     "residual_finite": bool(np1(residual_finite, dtype=bool)[local_image_index]),
                 }
             )
         finite_contrib = np1(image_contribution)
-        outlier_resp_np = np1(outlier_responsibility)
+        outlier_resp_np = np1(responsibilities.outlier_responsibility)
         worst_indices = np.argsort(finite_contrib)[: min(5, finite_contrib.size)] if finite_contrib.size else np.asarray([], dtype=int)
         constrained_indices = np.where(image_has_np)[0]
         finite_outlier_indices = constrained_indices[np.isfinite(outlier_resp_np[constrained_indices])] if constrained_indices.size else np.asarray([], dtype=int)
@@ -5058,6 +5400,8 @@ def _arc_aware_image_support_from_local_linearization(
     )
     if point_residual.shape != shape:
         point_residual = np.full(shape, np.nan, dtype=float)
+    point_valid = point_recovered & np.isfinite(point_residual)
+    point_residual = np.where(point_valid, point_residual, np.nan)
     obs_x = (
         np.asarray(theta_obs_x, dtype=float).reshape(-1)
         if theta_obs_x is not None
@@ -5164,22 +5508,23 @@ def _arc_aware_image_support_from_local_linearization(
                 curve_arclength[index] = float(arclength)
                 curve_x_json[index] = _json_arcsec_array(curve_x)
                 curve_y_json[index] = _json_arcsec_array(curve_y)
-    arc_supported = (
-        (~point_recovered)
-        & finite
+    arc_candidate_supported = (
+        finite
         & curve_finite
         & (arc_prior_np >= critical_probability)
         & (curve_distance <= float(noncritical_support_radius_arcsec))
     )
+    arc_candidate_residual = np.where(arc_candidate_supported, curve_distance, np.nan)
+    arc_supported = (~point_valid) & arc_candidate_supported & np.isfinite(arc_candidate_residual)
     status = np.where(
-        point_recovered,
+        point_valid,
         "point_recovered",
         np.where(arc_supported, "arc_supported", "not_recovered"),
     )
     arc_aware_residual = np.where(
-        point_recovered,
+        point_valid,
         point_residual,
-        np.where(arc_supported, curve_distance, np.nan),
+        np.where(arc_supported, arc_candidate_residual, np.nan),
     )
     supported_or_recovered = np.isfinite(arc_aware_residual)
     arc_aware_rms = (
@@ -5188,6 +5533,11 @@ def _arc_aware_image_support_from_local_linearization(
         else np.nan
     )
     return {
+        "point_image_residual_arcsec": point_residual.astype(float),
+        "arc_candidate_supported": arc_candidate_supported.astype(bool),
+        "arc_candidate_image_residual_arcsec": arc_candidate_residual.astype(float),
+        "preferred_recovery_status": status.astype(object),
+        "preferred_image_residual_arcsec": arc_aware_residual.astype(float),
         "arc_recovery_status": status.astype(object),
         "arc_aware_image_residual_arcsec": arc_aware_residual.astype(float),
         "arc_noncritical_direction_residual_arcsec": noncritical_direction_residual.astype(float),
@@ -5214,6 +5564,7 @@ def _arc_aware_image_support_from_local_linearization(
         "arc_aware_recovered_image_count": int(np.sum(supported_or_recovered)),
         "arc_aware_missing_image_count": int(max(0, len(arc_aware_residual) - int(np.sum(supported_or_recovered)))),
         "arc_supported_image_count": int(np.sum(arc_supported)),
+        "arc_candidate_supported_image_count": int(np.sum(arc_candidate_supported)),
     }
 
 
@@ -5378,9 +5729,7 @@ def _image_plane_effective_sigma2(
     sigma_per_image: jnp.ndarray,
     image_sigma_int: jnp.ndarray,
     covariance_floor: float,
-    image_scatter_floor_arcsec: float = DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
 ) -> jnp.ndarray:
-    del image_scatter_floor_arcsec
     cov_floor = jnp.asarray(covariance_floor, dtype=jnp.float64)
     return jnp.maximum(
         jnp.square(sigma_per_image) + jnp.square(image_sigma_int) + cov_floor,
@@ -5399,7 +5748,6 @@ def _linearized_image_plane_bin_loglike(
     image_sigma_int: jnp.ndarray,
     covariance_floor: float,
     outlier_sigma_arcsec: float,
-    image_scatter_floor_arcsec: float = DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
     image_presence_penalty_weight: float = 0.0,
     image_presence_match_radius_arcsec: float = DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC,
     image_presence_temperature_arcsec: float = DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC,
@@ -5412,7 +5760,6 @@ def _linearized_image_plane_bin_loglike(
         sigma_per_image,
         image_sigma_int,
         covariance_floor,
-        image_scatter_floor_arcsec,
     )
     reliability = jnp.clip(reliability_per_image, 1.0e-6, 1.0 - 1.0e-6)
     quad = (jnp.square(residual_x) + jnp.square(residual_y)) / sigma2
@@ -7697,9 +8044,7 @@ def _effective_cab_likelihood_weight(
 ) -> float:
     if requested_weight is not None:
         return float(requested_weight)
-    parsed_image_block = getattr(state, "parsed", {}).get("image") if isinstance(getattr(state, "parsed", None), dict) else None
-    has_arcfile = isinstance(parsed_image_block, dict) and "arcfile" in parsed_image_block
-    if has_arcfile or _has_arc_constraints_in_state(state):
+    if _has_arc_constraints_in_state(state):
         return DEFAULT_CAB_LIKELIHOOD_WEIGHT_WITH_ARCS
     return DEFAULT_CAB_LIKELIHOOD_WEIGHT_NO_ARCS
 
@@ -9937,29 +10282,82 @@ def _adaptive_active_scaling_count(
     return selected, cumulative_count, knee_count
 
 
-def _optional_family_arc_array(
-    family: FamilyData,
-    field_name: str,
-    default: np.ndarray,
-    *,
-    dtype: type = float,
-) -> np.ndarray:
-    values = getattr(family, field_name, None)
-    if values is None:
-        return np.asarray(default, dtype=dtype)
-    return np.asarray(values, dtype=dtype)
-
-
 def _has_arc_constraints_in_state(state: BuildState) -> bool:
-    for family in getattr(state, "family_data", []) or []:
-        mask = getattr(family, "arc_has_constraint", None)
-        if mask is not None and bool(np.any(np.asarray(mask, dtype=bool))):
-            return True
-    for bin_item in getattr(state, "bin_data", []) or []:
-        mask = getattr(bin_item, "arc_has_constraint", None)
-        if mask is not None and bool(np.any(np.asarray(mask, dtype=bool))):
-            return True
+    arc_data = getattr(state, "arc_data", None)
+    if arc_data is not None and int(getattr(arc_data, "n_arcs", 0)) > 0:
+        return True
     return False
+
+
+def _prepare_arc_constraint_data(
+    arcs_df: pd.DataFrame,
+    reference: tuple[int, float, float],
+) -> ArcConstraintData | None:
+    if arcs_df.empty:
+        return None
+    _, ra0_deg, dec0_deg = reference
+    required_columns = [
+        "arc_id",
+        "arc_anchor_ra",
+        "arc_anchor_dec",
+        "z_arc",
+        "arc_tangent_angle_rad",
+        "arc_curvature_arcsec_inv",
+        "arc_sigma_tangent_angle_rad",
+        "arc_sigma_curvature_arcsec_inv",
+        "arc_reliability",
+    ]
+    missing_columns = [column for column in required_columns if column not in arcs_df.columns]
+    if missing_columns:
+        raise ValueError(f"Arc catalog is missing required columns {missing_columns}.")
+    arc_ids = arcs_df["arc_id"].astype(str).tolist()
+    bad_ids = [arc_id for arc_id in arc_ids if not arc_id or arc_id.strip() != arc_id or any(ch.isspace() for ch in arc_id)]
+    if bad_ids:
+        raise ValueError(f"Arc catalog has invalid arc_id values {bad_ids}; IDs must be non-empty and contain no whitespace.")
+    duplicate_ids = sorted(arcs_df.loc[arcs_df["arc_id"].astype(str).duplicated(keep=False), "arc_id"].astype(str).unique().tolist())
+    if duplicate_ids:
+        raise ValueError(f"Arc catalog has duplicate arc_id values {duplicate_ids}.")
+    numeric_columns = [column for column in required_columns if column != "arc_id"]
+    numeric = {
+        column: pd.to_numeric(arcs_df[column], errors="coerce").to_numpy(dtype=float)
+        for column in numeric_columns
+    }
+    finite_mask = np.ones(len(arcs_df), dtype=bool)
+    for values in numeric.values():
+        finite_mask &= np.isfinite(values)
+    if not bool(np.all(finite_mask)):
+        bad_ids = arcs_df.loc[~finite_mask, "arc_id"].astype(str).tolist()
+        raise ValueError(f"Arc catalog has non-finite numeric values for arc IDs {bad_ids}.")
+    z_arc = numeric["z_arc"]
+    bad_z = ~((z_arc >= 0.0) | (z_arc == -1.0))
+    if bool(np.any(bad_z)):
+        bad_ids = arcs_df.loc[bad_z, "arc_id"].astype(str).tolist()
+        raise ValueError(f"Arc catalog has invalid z_arc values for arc IDs {bad_ids}; use z_arc >= 0 or -1.")
+    sigma_tangent = numeric["arc_sigma_tangent_angle_rad"]
+    sigma_curvature = numeric["arc_sigma_curvature_arcsec_inv"]
+    if bool(np.any(sigma_tangent <= 0.0) or np.any(sigma_curvature <= 0.0)):
+        bad_ids = arcs_df.loc[(sigma_tangent <= 0.0) | (sigma_curvature <= 0.0), "arc_id"].astype(str).tolist()
+        raise ValueError(f"Arc catalog has non-positive sigmas for arc IDs {bad_ids}.")
+    if bool(np.any(numeric["arc_curvature_arcsec_inv"] < 0.0)):
+        bad_ids = arcs_df.loc[numeric["arc_curvature_arcsec_inv"] < 0.0, "arc_id"].astype(str).tolist()
+        raise ValueError(f"Arc catalog has negative curvature magnitudes for arc IDs {bad_ids}.")
+    anchor_x, anchor_y = _radec_to_offsets_arcsec(
+        numeric["arc_anchor_ra"],
+        numeric["arc_anchor_dec"],
+        ra0_deg,
+        dec0_deg,
+    )
+    return ArcConstraintData(
+        arc_ids=arc_ids,
+        z_arc=np.asarray(z_arc, dtype=float),
+        anchor_x=np.asarray(anchor_x, dtype=float),
+        anchor_y=np.asarray(anchor_y, dtype=float),
+        tangent_angle_rad=np.asarray(numeric["arc_tangent_angle_rad"], dtype=float),
+        curvature_arcsec_inv=np.asarray(numeric["arc_curvature_arcsec_inv"], dtype=float),
+        sigma_tangent_angle_rad=np.asarray(sigma_tangent, dtype=float),
+        sigma_curvature_arcsec_inv=np.asarray(sigma_curvature, dtype=float),
+        reliability=np.asarray(np.clip(numeric["arc_reliability"], 0.0, 1.0), dtype=float),
+    )
 
 
 def _prepare_family_data(
@@ -9972,6 +10370,16 @@ def _prepare_family_data(
     z_bin_efficiency_tol: float,
 ) -> tuple[list[FamilyData], float]:
     family_start = time.perf_counter()
+    legacy_arc_columns = [
+        str(column)
+        for column in images_df.columns
+        if str(column) == "arc_has_constraint" or str(column).startswith("arc_")
+    ]
+    if legacy_arc_columns:
+        raise ValueError(
+            "Image catalog contains legacy CAB arc columns "
+            f"{legacy_arc_columns}; declare CAB morphology constraints in image.arcfile instead."
+        )
     _, ra0_deg, dec0_deg = reference
     if "catalog_z" not in images_df.columns:
         raise ValueError("Image catalog is missing required catalog_z column.")
@@ -10016,61 +10424,6 @@ def _prepare_family_data(
             ra0_deg,
             dec0_deg,
         )
-        n_images = int(len(family_df))
-        arc_has_constraint = (
-            family_df.get("arc_has_constraint", pd.Series(False, index=family_df.index))
-            .fillna(False)
-            .astype(bool)
-            .to_numpy(dtype=bool)
-        )
-        arc_anchor_x = np.asarray(x_obs, dtype=float).copy()
-        arc_anchor_y = np.asarray(y_obs, dtype=float).copy()
-        if bool(np.any(arc_has_constraint)):
-            if "arc_anchor_ra" in family_df.columns:
-                arc_ra = pd.to_numeric(family_df["arc_anchor_ra"], errors="coerce").to_numpy(dtype=float)
-            else:
-                arc_ra = np.full(n_images, np.nan, dtype=float)
-            if "arc_anchor_dec" in family_df.columns:
-                arc_dec = pd.to_numeric(family_df["arc_anchor_dec"], errors="coerce").to_numpy(dtype=float)
-            else:
-                arc_dec = np.full(n_images, np.nan, dtype=float)
-            finite_anchor = arc_has_constraint & np.isfinite(arc_ra) & np.isfinite(arc_dec)
-            if not bool(np.all(finite_anchor[arc_has_constraint])):
-                bad_labels = family_df.loc[arc_has_constraint & ~finite_anchor, "image_label"].astype(str).tolist()
-                raise ValueError(f"Arc constraints for family {family_id} have missing anchor coordinates: {bad_labels}.")
-            converted_x, converted_y = _radec_to_offsets_arcsec(arc_ra[finite_anchor], arc_dec[finite_anchor], ra0_deg, dec0_deg)
-            arc_anchor_x[finite_anchor] = np.asarray(converted_x, dtype=float)
-            arc_anchor_y[finite_anchor] = np.asarray(converted_y, dtype=float)
-
-        def arc_numeric_column(column: str, default: float) -> np.ndarray:
-            if column in family_df.columns:
-                values = pd.to_numeric(family_df[column], errors="coerce").to_numpy(dtype=float)
-            else:
-                values = np.full(n_images, default, dtype=float)
-            values = np.where(arc_has_constraint, values, default)
-            return np.asarray(values, dtype=float)
-
-        arc_tangent_angle_rad = arc_numeric_column("arc_tangent_angle_rad", 0.0)
-        arc_curvature_arcsec_inv = arc_numeric_column("arc_curvature_arcsec_inv", 0.0)
-        arc_sigma_tangent_angle_rad = arc_numeric_column(
-            "arc_sigma_tangent_angle_rad",
-            DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD,
-        )
-        arc_sigma_curvature_arcsec_inv = arc_numeric_column(
-            "arc_sigma_curvature_arcsec_inv",
-            DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV,
-        )
-        arc_reliability = arc_numeric_column("arc_reliability", 1.0)
-        if bool(np.any(arc_has_constraint)):
-            sigma_tangent = arc_sigma_tangent_angle_rad[arc_has_constraint]
-            sigma_curvature = arc_sigma_curvature_arcsec_inv[arc_has_constraint]
-            if (sigma_tangent <= 0.0).any() or (sigma_curvature <= 0.0).any():
-                bad_labels = family_df.loc[
-                    arc_has_constraint
-                    & ((arc_sigma_tangent_angle_rad <= 0.0) | (arc_sigma_curvature_arcsec_inv <= 0.0)),
-                    "image_label",
-                ].astype(str).tolist()
-                raise ValueError(f"Arc constraints for family {family_id} have non-positive sigmas: {bad_labels}.")
         families.append(
             FamilyData(
                 family_id=family_id,
@@ -10087,14 +10440,6 @@ def _prepare_family_data(
                     .to_numpy(dtype=float),
                     dtype=float,
                 ),
-                arc_anchor_x=np.asarray(arc_anchor_x, dtype=float),
-                arc_anchor_y=np.asarray(arc_anchor_y, dtype=float),
-                arc_tangent_angle_rad=np.asarray(arc_tangent_angle_rad, dtype=float),
-                arc_curvature_arcsec_inv=np.asarray(arc_curvature_arcsec_inv, dtype=float),
-                arc_sigma_tangent_angle_rad=np.asarray(arc_sigma_tangent_angle_rad, dtype=float),
-                arc_sigma_curvature_arcsec_inv=np.asarray(arc_sigma_curvature_arcsec_inv, dtype=float),
-                arc_reliability=np.asarray(np.clip(arc_reliability, 0.0, 1.0), dtype=float),
-                arc_has_constraint=np.asarray(arc_has_constraint, dtype=bool),
             )
         )
     return families, float(time.perf_counter() - family_start)
@@ -10147,61 +10492,6 @@ def _build_bin_data(families: list[FamilyData]) -> list[BinData]:
             [np.full(family.n_images, family.sigma_arcsec, dtype=float) for family in family_list]
         )
         reliability_per_image = np.concatenate([family.reliability for family in family_list])
-        arc_anchor_x = np.concatenate(
-            [_optional_family_arc_array(family, "arc_anchor_x", family.x_obs) for family in family_list]
-        )
-        arc_anchor_y = np.concatenate(
-            [_optional_family_arc_array(family, "arc_anchor_y", family.y_obs) for family in family_list]
-        )
-        arc_tangent_angle_rad = np.concatenate(
-            [
-                _optional_family_arc_array(family, "arc_tangent_angle_rad", np.zeros(family.n_images, dtype=float))
-                for family in family_list
-            ]
-        )
-        arc_curvature_arcsec_inv = np.concatenate(
-            [
-                _optional_family_arc_array(family, "arc_curvature_arcsec_inv", np.zeros(family.n_images, dtype=float))
-                for family in family_list
-            ]
-        )
-        arc_sigma_tangent_angle_rad = np.concatenate(
-            [
-                _optional_family_arc_array(
-                    family,
-                    "arc_sigma_tangent_angle_rad",
-                    np.full(family.n_images, DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD, dtype=float),
-                )
-                for family in family_list
-            ]
-        )
-        arc_sigma_curvature_arcsec_inv = np.concatenate(
-            [
-                _optional_family_arc_array(
-                    family,
-                    "arc_sigma_curvature_arcsec_inv",
-                    np.full(family.n_images, DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV, dtype=float),
-                )
-                for family in family_list
-            ]
-        )
-        arc_reliability = np.concatenate(
-            [
-                _optional_family_arc_array(family, "arc_reliability", np.ones(family.n_images, dtype=float))
-                for family in family_list
-            ]
-        )
-        arc_has_constraint = np.concatenate(
-            [
-                _optional_family_arc_array(
-                    family,
-                    "arc_has_constraint",
-                    np.zeros(family.n_images, dtype=bool),
-                    dtype=bool,
-                )
-                for family in family_list
-            ]
-        )
         family_index_per_image = np.concatenate(
             [np.full(family.n_images, idx, dtype=int) for idx, family in enumerate(family_list)]
         )
@@ -10214,14 +10504,6 @@ def _build_bin_data(families: list[FamilyData]) -> list[BinData]:
                 y_obs=y_obs,
                 sigma_per_image=sigma_per_image,
                 reliability_per_image=reliability_per_image,
-                arc_anchor_x=np.asarray(arc_anchor_x, dtype=float),
-                arc_anchor_y=np.asarray(arc_anchor_y, dtype=float),
-                arc_tangent_angle_rad=np.asarray(arc_tangent_angle_rad, dtype=float),
-                arc_curvature_arcsec_inv=np.asarray(arc_curvature_arcsec_inv, dtype=float),
-                arc_sigma_tangent_angle_rad=np.asarray(arc_sigma_tangent_angle_rad, dtype=float),
-                arc_sigma_curvature_arcsec_inv=np.asarray(arc_sigma_curvature_arcsec_inv, dtype=float),
-                arc_reliability=np.asarray(np.clip(arc_reliability, 0.0, 1.0), dtype=float),
-                arc_has_constraint=np.asarray(arc_has_constraint, dtype=bool),
             )
         )
     return bin_data
@@ -10538,6 +10820,12 @@ class ClusterJAXEvaluator:
             )
             for effective_z_source in geometry_cache.effective_z_source_values
         }
+        if getattr(state.arc_data, "n_arcs", 0):
+            self.models_by_effective_z[float(CAB_MORPHOLOGY_MODEL_KEY)] = LensModelBulk(
+                unique_lens_model_list=unique_lens_model_list,
+                multi_plane=False,
+                cosmo=self.cosmo,
+            )
         self.kpc_per_arcsec = _kpc_per_arcsec_from_config(state.z_lens, self.cosmo_config)
         self.dpie_sigma0_factors = {
             float(z_source): float(value)
@@ -10566,6 +10854,7 @@ class ClusterJAXEvaluator:
         self.timing_totals["geometry_cache_setup"] += time.perf_counter() - geometry_setup_start
         self.traced_bin_data = tuple(self._prepare_traced_bin_data(bin_item) for bin_item in state.bin_data)
         self.traced_bin_data_by_z = {bin_item.effective_z_source: bin_item for bin_item in self.traced_bin_data}
+        self.traced_arc_data = self._prepare_traced_arc_constraint_data(state.arc_data)
         component_family = np.asarray(self.state.packed_lens_spec.component_family, dtype=np.int32)
         self.scaling_component_indices = np.where(component_family == 1)[0].astype(np.int32)
         self.large_component_indices = np.where(component_family != 1)[0].astype(np.int32)
@@ -10784,19 +11073,6 @@ class ClusterJAXEvaluator:
         image_has_constraint = family_counts[family_idx] > 1
         n_images = int(len(family_idx))
 
-        def traced_array(field_name: str, default: np.ndarray, *, dtype: type = float) -> np.ndarray:
-            values = getattr(bin_data, field_name, None)
-            if values is None:
-                return np.asarray(default, dtype=dtype)
-            arr = np.asarray(values, dtype=dtype)
-            if arr.shape[0] != n_images:
-                raise ValueError(
-                    f"BinData {field_name} length {arr.shape[0]} does not match image count {n_images} "
-                    f"for effective_z_source={bin_data.effective_z_source}."
-                )
-            return arr
-
-        arc_has_constraint = traced_array("arc_has_constraint", np.zeros(n_images, dtype=bool), dtype=bool)
         return TracedBinData(
             effective_z_source=float(bin_data.effective_z_source),
             family_ids=tuple(str(family_id) for family_id in bin_data.family_ids),
@@ -10809,36 +11085,44 @@ class ClusterJAXEvaluator:
             image_has_constraint=jnp.asarray(image_has_constraint, dtype=bool),
             effective_z_index=int(self.cosmology_effective_z_to_index.get(float(bin_data.effective_z_source), -1)),
             constrained_image_indices=jnp.asarray(np.flatnonzero(image_has_constraint), dtype=jnp.int32),
-            arc_anchor_x=jnp.asarray(traced_array("arc_anchor_x", np.asarray(bin_data.x_obs, dtype=float)), dtype=jnp.float64),
-            arc_anchor_y=jnp.asarray(traced_array("arc_anchor_y", np.asarray(bin_data.y_obs, dtype=float)), dtype=jnp.float64),
-            arc_tangent_angle_rad=jnp.asarray(
-                traced_array("arc_tangent_angle_rad", np.zeros(n_images, dtype=float)),
-                dtype=jnp.float64,
-            ),
-            arc_curvature_arcsec_inv=jnp.asarray(
-                traced_array("arc_curvature_arcsec_inv", np.zeros(n_images, dtype=float)),
-                dtype=jnp.float64,
-            ),
-            arc_sigma_tangent_angle_rad=jnp.asarray(
-                traced_array(
-                    "arc_sigma_tangent_angle_rad",
-                    np.full(n_images, DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD, dtype=float),
-                ),
-                dtype=jnp.float64,
-            ),
-            arc_sigma_curvature_arcsec_inv=jnp.asarray(
-                traced_array(
-                    "arc_sigma_curvature_arcsec_inv",
-                    np.full(n_images, DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV, dtype=float),
-                ),
-                dtype=jnp.float64,
-            ),
-            arc_reliability=jnp.asarray(
-                traced_array("arc_reliability", np.ones(n_images, dtype=float)),
-                dtype=jnp.float64,
-            ),
-            arc_has_constraint=jnp.asarray(arc_has_constraint, dtype=bool),
-            arc_constraint_count=int(np.sum(arc_has_constraint)),
+        )
+
+    def _prepare_traced_arc_constraint_data(self, arc_data: ArcConstraintData | None) -> TracedArcConstraintData:
+        if arc_data is None or int(getattr(arc_data, "n_arcs", 0)) <= 0:
+            empty = jnp.asarray([], dtype=jnp.float64)
+            return TracedArcConstraintData(
+                arc_ids=(),
+                z_arc=empty,
+                anchor_x=empty,
+                anchor_y=empty,
+                tangent_angle_rad=empty,
+                curvature_arcsec_inv=empty,
+                sigma_tangent_angle_rad=empty,
+                sigma_curvature_arcsec_inv=empty,
+                reliability=empty,
+                n_arcs=0,
+            )
+        n_arcs = int(arc_data.n_arcs)
+
+        def traced_array(field_name: str) -> np.ndarray:
+            values = np.asarray(getattr(arc_data, field_name), dtype=float)
+            if values.shape[0] != n_arcs:
+                raise ValueError(
+                    f"ArcConstraintData {field_name} length {values.shape[0]} does not match arc count {n_arcs}."
+                )
+            return values
+
+        return TracedArcConstraintData(
+            arc_ids=tuple(str(arc_id) for arc_id in arc_data.arc_ids),
+            z_arc=jnp.asarray(traced_array("z_arc"), dtype=jnp.float64),
+            anchor_x=jnp.asarray(traced_array("anchor_x"), dtype=jnp.float64),
+            anchor_y=jnp.asarray(traced_array("anchor_y"), dtype=jnp.float64),
+            tangent_angle_rad=jnp.asarray(traced_array("tangent_angle_rad"), dtype=jnp.float64),
+            curvature_arcsec_inv=jnp.asarray(traced_array("curvature_arcsec_inv"), dtype=jnp.float64),
+            sigma_tangent_angle_rad=jnp.asarray(traced_array("sigma_tangent_angle_rad"), dtype=jnp.float64),
+            sigma_curvature_arcsec_inv=jnp.asarray(traced_array("sigma_curvature_arcsec_inv"), dtype=jnp.float64),
+            reliability=jnp.asarray(traced_array("reliability"), dtype=jnp.float64),
+            n_arcs=n_arcs,
         )
 
     def _prepare_packed_spec_arrays(self) -> dict[str, jnp.ndarray]:
@@ -11001,7 +11285,6 @@ class ClusterJAXEvaluator:
             bin_data.sigma_per_image,
             image_sigma_int,
             self.source_plane_covariance_floor,
-            getattr(self, "image_plane_scatter_floor_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC),
         )
         reliability = jnp.clip(bin_data.reliability_per_image, 1.0e-6, 1.0)
         weight = reliability / sigma2
@@ -12172,7 +12455,7 @@ class ClusterJAXEvaluator:
         anchor_y: jnp.ndarray,
         packed_state: dict[str, Any],
         component_indices: np.ndarray | None = None,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ) -> _CabMorphologyPrediction:
         base_entries = self._lensing_jacobian_for_components(
             z_source,
             anchor_x,
@@ -12180,19 +12463,23 @@ class ClusterJAXEvaluator:
             packed_state,
             component_indices,
         )
-        base_angle, tangent_x, tangent_y, base_finite = _cab_tangent_frame_from_jacobian_entries(*base_entries)
+        base_frame = _cab_tangent_frame_from_jacobian_entries(*base_entries)
         step = jnp.asarray(self.cab_finite_difference_step_arcsec, dtype=jnp.float64)
         n_anchor = int(anchor_x.shape[0])
         probe_x = jnp.concatenate(
             [
-                anchor_x + step * tangent_x,
-                anchor_x - step * tangent_x,
+                anchor_x + step * base_frame.tangent_x[:, 0],
+                anchor_x - step * base_frame.tangent_x[:, 0],
+                anchor_x + step * base_frame.tangent_x[:, 1],
+                anchor_x - step * base_frame.tangent_x[:, 1],
             ]
         )
         probe_y = jnp.concatenate(
             [
-                anchor_y + step * tangent_y,
-                anchor_y - step * tangent_y,
+                anchor_y + step * base_frame.tangent_y[:, 0],
+                anchor_y - step * base_frame.tangent_y[:, 0],
+                anchor_y + step * base_frame.tangent_y[:, 1],
+                anchor_y - step * base_frame.tangent_y[:, 1],
             ]
         )
         probe_entries = self._lensing_jacobian_for_components(
@@ -12202,53 +12489,97 @@ class ClusterJAXEvaluator:
             packed_state,
             component_indices,
         )
-        plus_entries = tuple(entry[:n_anchor] for entry in probe_entries)
-        minus_entries = tuple(entry[n_anchor:] for entry in probe_entries)
-        plus_angle, _plus_tangent_x, _plus_tangent_y, plus_finite = _cab_tangent_frame_from_jacobian_entries(*plus_entries)
-        minus_angle, _minus_tangent_x, _minus_tangent_y, minus_finite = _cab_tangent_frame_from_jacobian_entries(*minus_entries)
-        curvature = jnp.abs(_cab_tangent_angle_residual(plus_angle, minus_angle) / (2.0 * step))
-        finite = (
-            base_finite
-            & plus_finite
-            & minus_finite
-            & jnp.isfinite(curvature)
-            & jnp.isfinite(base_angle)
-            & jnp.isfinite(anchor_x)
-            & jnp.isfinite(anchor_y)
+        probe_frame = _cab_tangent_frame_from_jacobian_entries(*probe_entries)
+        plus_low_angle = probe_frame.tangent_angle_rad[:n_anchor, 0]
+        minus_low_angle = probe_frame.tangent_angle_rad[n_anchor : 2 * n_anchor, 0]
+        plus_high_angle = probe_frame.tangent_angle_rad[2 * n_anchor : 3 * n_anchor, 1]
+        minus_high_angle = probe_frame.tangent_angle_rad[3 * n_anchor :, 1]
+        curvature_low = jnp.abs(_cab_tangent_angle_residual(plus_low_angle, minus_low_angle) / (2.0 * step))
+        curvature_high = jnp.abs(_cab_tangent_angle_residual(plus_high_angle, minus_high_angle) / (2.0 * step))
+        curvature = jnp.stack([curvature_low, curvature_high], axis=-1)
+        plus_low_finite = probe_frame.finite[:n_anchor]
+        minus_low_finite = probe_frame.finite[n_anchor : 2 * n_anchor]
+        plus_high_finite = probe_frame.finite[2 * n_anchor : 3 * n_anchor]
+        minus_high_finite = probe_frame.finite[3 * n_anchor :]
+        branch_finite = jnp.stack(
+            [
+                base_frame.finite & plus_low_finite & minus_low_finite,
+                base_frame.finite & plus_high_finite & minus_high_finite,
+            ],
+            axis=-1,
         )
-        return base_angle, curvature, finite
+        branch_frame_weight = jnp.stack(
+            [
+                base_frame.frame_weight
+                * probe_frame.frame_weight[:n_anchor]
+                * probe_frame.frame_weight[n_anchor : 2 * n_anchor],
+                base_frame.frame_weight
+                * probe_frame.frame_weight[2 * n_anchor : 3 * n_anchor]
+                * probe_frame.frame_weight[3 * n_anchor :],
+            ],
+            axis=-1,
+        )
+        finite = (
+            branch_finite
+            & jnp.isfinite(curvature)
+            & jnp.isfinite(base_frame.tangent_angle_rad)
+            & jnp.isfinite(anchor_x)[..., jnp.newaxis]
+            & jnp.isfinite(anchor_y)[..., jnp.newaxis]
+        )
+        return _CabMorphologyPrediction(
+            tangent_angle_rad=base_frame.tangent_angle_rad,
+            curvature_arcsec_inv=curvature,
+            branch_weight=base_frame.branch_weight,
+            frame_weight=branch_frame_weight,
+            finite=finite,
+        )
 
-    def _cab_morphology_loglike_for_bin(
+    def _build_cab_packed_lens_state_with_validity_from_physical(
         self,
-        bin_data: TracedBinData,
+        physical_params: jnp.ndarray,
+        *,
+        stop_gradient: bool,
+    ) -> tuple[dict[str, Any], dict[str, jnp.ndarray]]:
+        return self._build_packed_lens_state_with_validity_from_physical(
+            physical_params,
+            float(CAB_MORPHOLOGY_MODEL_KEY),
+            stop_gradient=stop_gradient,
+            kpc_per_arcsec=self._kpc_per_arcsec_for_physical(physical_params),
+            dpie_sigma0_factor=jnp.asarray(1.0, dtype=jnp.float64),
+        )
+
+    def _cab_morphology_loglike_for_arcs(
+        self,
+        arc_data: TracedArcConstraintData,
         packed_state: dict[str, Any],
         component_indices: np.ndarray | None = None,
     ) -> jnp.ndarray:
-        if float(self.cab_likelihood_weight) <= 0.0 or int(getattr(bin_data, "arc_constraint_count", 0)) <= 0:
+        if float(self.cab_likelihood_weight) <= 0.0 or int(getattr(arc_data, "n_arcs", 0)) <= 0:
             return jnp.asarray(0.0, dtype=jnp.float64)
-        if bin_data.arc_anchor_x is None or bin_data.arc_anchor_y is None or bin_data.arc_has_constraint is None:
-            return jnp.asarray(0.0, dtype=jnp.float64)
-        predicted_angle, predicted_curvature, prediction_finite = self._cab_morphology_predictions_for_anchors(
-            bin_data.effective_z_source,
-            bin_data.arc_anchor_x,
-            bin_data.arc_anchor_y,
+        active = jnp.ones((int(arc_data.n_arcs),), dtype=bool)
+        prediction = self._cab_morphology_predictions_for_anchors(
+            float(CAB_MORPHOLOGY_MODEL_KEY),
+            arc_data.anchor_x,
+            arc_data.anchor_y,
             packed_state,
             component_indices,
         )
-        bin_loglike = _cab_morphology_bin_loglike(
-            predicted_tangent_angle_rad=predicted_angle,
-            predicted_curvature_arcsec_inv=predicted_curvature,
-            prediction_finite=prediction_finite,
-            observed_tangent_angle_rad=bin_data.arc_tangent_angle_rad,
-            observed_curvature_arcsec_inv=bin_data.arc_curvature_arcsec_inv,
-            sigma_tangent_angle_rad=bin_data.arc_sigma_tangent_angle_rad,
-            sigma_curvature_arcsec_inv=bin_data.arc_sigma_curvature_arcsec_inv,
-            reliability=bin_data.arc_reliability,
-            arc_has_constraint=bin_data.arc_has_constraint,
+        arc_loglike = _cab_morphology_arc_catalog_loglike(
+            predicted_tangent_angle_rad=prediction.tangent_angle_rad,
+            predicted_curvature_arcsec_inv=prediction.curvature_arcsec_inv,
+            prediction_finite=prediction.finite,
+            observed_tangent_angle_rad=arc_data.tangent_angle_rad,
+            observed_curvature_arcsec_inv=arc_data.curvature_arcsec_inv,
+            sigma_tangent_angle_rad=arc_data.sigma_tangent_angle_rad,
+            sigma_curvature_arcsec_inv=arc_data.sigma_curvature_arcsec_inv,
+            reliability=arc_data.reliability,
+            active_arcs=active,
             tangent_sigma_floor_rad=self.cab_tangent_sigma_floor_rad,
             curvature_sigma_floor_arcsec_inv=self.cab_curvature_sigma_floor_arcsec_inv,
+            branch_weight=prediction.branch_weight,
+            frame_weight=prediction.frame_weight,
         )
-        return jnp.asarray(float(self.cab_likelihood_weight), dtype=jnp.float64) * bin_loglike
+        return jnp.asarray(float(self.cab_likelihood_weight), dtype=jnp.float64) * arc_loglike
 
     def _fold_signed_curvature_from_observed_jacobian(
         self,
@@ -13168,7 +13499,6 @@ class ClusterJAXEvaluator:
                     image_sigma_int=image_sigma_int,
                     covariance_floor=self.source_plane_covariance_floor,
                     outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                    image_scatter_floor_arcsec=self.image_plane_scatter_floor_arcsec,
                     image_presence_penalty_weight=self.image_presence_penalty_weight,
                     image_presence_match_radius_arcsec=self.image_presence_match_radius_arcsec,
                     image_presence_temperature_arcsec=self.image_presence_temperature_arcsec,
@@ -13234,7 +13564,6 @@ class ClusterJAXEvaluator:
                     image_sigma_int=image_sigma_int,
                     covariance_floor=self.source_plane_covariance_floor,
                     outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                    image_scatter_floor_arcsec=self.image_plane_scatter_floor_arcsec,
                     image_presence_penalty_weight=self.image_presence_penalty_weight,
                     image_presence_match_radius_arcsec=self.image_presence_match_radius_arcsec,
                     image_presence_temperature_arcsec=self.image_presence_temperature_arcsec,
@@ -13303,7 +13632,6 @@ class ClusterJAXEvaluator:
                     image_sigma_int=image_sigma_int,
                     covariance_floor=self.source_plane_covariance_floor,
                     outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                    image_scatter_floor_arcsec=self.image_plane_scatter_floor_arcsec,
                     image_presence_penalty_weight=self.image_presence_penalty_weight,
                     image_presence_match_radius_arcsec=self.image_presence_match_radius_arcsec,
                     image_presence_temperature_arcsec=self.image_presence_temperature_arcsec,
@@ -13399,7 +13727,6 @@ class ClusterJAXEvaluator:
                             scatter_var_y=take_rows(scatter_var_y, fold_near_indices),
                             covariance_floor=self.source_plane_covariance_floor,
                             outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                            image_scatter_floor_arcsec=self.image_plane_scatter_floor_arcsec,
                             fold_curvature_arcsec_inv=self.fold_curvature_arcsec_inv,
                             fold_kappa_eff=take_rows(fold_kappa_eff, fold_near_indices),
                             max_gain=self.likelihood_stabilizer_max_gain,
@@ -13426,7 +13753,6 @@ class ClusterJAXEvaluator:
                             scatter_var_y=take_rows(scatter_var_y, fold_far_indices),
                             covariance_floor=self.source_plane_covariance_floor,
                             outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                            image_scatter_floor_arcsec=self.image_plane_scatter_floor_arcsec,
                             max_gain=self.likelihood_stabilizer_max_gain,
                             max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
                             residual_loss=self.likelihood_stabilizer_residual_loss,
@@ -13471,7 +13797,6 @@ class ClusterJAXEvaluator:
                         scatter_var_y=scatter_var_y,
                         covariance_floor=self.source_plane_covariance_floor,
                         outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                        image_scatter_floor_arcsec=self.image_plane_scatter_floor_arcsec,
                         fold_curvature_arcsec_inv=self.fold_curvature_arcsec_inv,
                         fold_kappa_eff=fold_kappa_eff,
                         fold_frame=fold_frame,
@@ -13539,7 +13864,6 @@ class ClusterJAXEvaluator:
                     scatter_var_y=scatter_var_y,
                     covariance_floor=self.source_plane_covariance_floor,
                     outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                    image_scatter_floor_arcsec=self.image_plane_scatter_floor_arcsec,
                     max_gain=self.likelihood_stabilizer_max_gain,
                     max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
                     residual_loss=self.likelihood_stabilizer_residual_loss,
@@ -13595,14 +13919,24 @@ class ClusterJAXEvaluator:
                     residual_loss=self.likelihood_stabilizer_residual_loss,
                     student_t_nu=self.likelihood_stabilizer_student_t_nu,
                 )
-            if _sample_likelihood_uses_explicit_beta(self.sample_likelihood_mode):
-                bin_loglike = bin_loglike + self._cab_morphology_loglike_for_bin(
-                    bin_data,
-                    packed_state,
-                    fit_component_indices,
-                )
             total_loglike = jnp.where(invalid, total_loglike, total_loglike + bin_loglike)
             invalid_seen = jnp.logical_or(invalid_seen, invalid)
+        arc_data = getattr(self, "traced_arc_data", None)
+        cab_likelihood_weight = float(getattr(self, "cab_likelihood_weight", 0.0))
+        if arc_data is not None and int(getattr(arc_data, "n_arcs", 0)) > 0 and cab_likelihood_weight > 0.0:
+            cab_packed_state, cab_validity = self._build_cab_packed_lens_state_with_validity_from_physical(
+                physical_params,
+                stop_gradient=True,
+            )
+            self._maybe_record_invalid_state(cab_validity)
+            cab_invalid = ~cab_validity["is_valid"]
+            cab_loglike = self._cab_morphology_loglike_for_arcs(
+                arc_data,
+                cab_packed_state,
+                fit_component_indices,
+            )
+            total_loglike = jnp.where(cab_invalid, total_loglike, total_loglike + cab_loglike)
+            invalid_seen = jnp.logical_or(invalid_seen, cab_invalid)
         return jnp.where(
             invalid_seen,
             jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64),
@@ -13929,14 +14263,22 @@ class ClusterJAXEvaluator:
                     + np.square(matched_y - np.asarray(family.y_obs, dtype=float))
                 )
                 point_residual = np.where(point_recovered, point_residual, np.nan)
+        point_valid = point_recovered & np.isfinite(point_residual)
+        point_residual = np.where(point_valid, point_residual, np.nan)
         supported_or_recovered = np.isfinite(point_residual)
         arc_aware_rms = (
             float(np.sqrt(np.mean(np.square(point_residual[supported_or_recovered]))))
             if np.any(supported_or_recovered)
             else np.nan
         )
+        status = np.where(point_valid, "point_recovered", "not_recovered").astype(object)
         return {
-            "arc_recovery_status": np.where(point_recovered, "point_recovered", "not_recovered").astype(object),
+            "point_image_residual_arcsec": point_residual,
+            "arc_candidate_supported": np.zeros(n_images, dtype=bool),
+            "arc_candidate_image_residual_arcsec": np.full(n_images, np.nan, dtype=float),
+            "preferred_recovery_status": status,
+            "preferred_image_residual_arcsec": point_residual,
+            "arc_recovery_status": status,
             "arc_aware_image_residual_arcsec": point_residual,
             "arc_noncritical_direction_residual_arcsec": np.full(n_images, np.nan, dtype=float),
             "arc_critical_direction_residual_arcsec": np.full(n_images, np.nan, dtype=float),
@@ -13962,128 +14304,99 @@ class ClusterJAXEvaluator:
             "arc_aware_recovered_image_count": int(np.sum(supported_or_recovered)),
             "arc_aware_missing_image_count": int(max(0, n_images - int(np.sum(supported_or_recovered)))),
             "arc_supported_image_count": 0,
+            "arc_candidate_supported_image_count": 0,
         }
 
-    def _empty_cab_morphology_details(self, family: FamilyData) -> dict[str, Any]:
-        n_images = int(getattr(family, "n_images", 0))
-        return {
-            "cab_has_constraint": np.zeros(n_images, dtype=bool),
-            "cab_anchor_x_arcsec": np.full(n_images, np.nan, dtype=float),
-            "cab_anchor_y_arcsec": np.full(n_images, np.nan, dtype=float),
-            "cab_tangent_angle_obs_rad": np.full(n_images, np.nan, dtype=float),
-            "cab_tangent_angle_model_rad": np.full(n_images, np.nan, dtype=float),
-            "cab_tangent_residual_rad": np.full(n_images, np.nan, dtype=float),
-            "cab_curvature_obs_arcsec_inv": np.full(n_images, np.nan, dtype=float),
-            "cab_curvature_model_arcsec_inv": np.full(n_images, np.nan, dtype=float),
-            "cab_curvature_residual_arcsec_inv": np.full(n_images, np.nan, dtype=float),
-            "cab_loglike": np.zeros(n_images, dtype=float),
-            "cab_finite": np.zeros(n_images, dtype=bool),
-        }
-
-    def _cab_morphology_details_for_family(self, params: np.ndarray, family: FamilyData) -> dict[str, Any]:
-        n_images = int(getattr(family, "n_images", 0))
-        details = self._empty_cab_morphology_details(family)
-        if n_images <= 0:
-            return details
-        mask = np.asarray(
-            _optional_family_arc_array(family, "arc_has_constraint", np.zeros(n_images, dtype=bool), dtype=bool),
-            dtype=bool,
+    def _cab_morphology_details_for_arcs(self, params: np.ndarray) -> pd.DataFrame:
+        arc_data = getattr(self.state, "arc_data", None)
+        if arc_data is None or int(getattr(arc_data, "n_arcs", 0)) <= 0:
+            return pd.DataFrame(
+                columns=[
+                    "arc_id",
+                    "z_arc",
+                    "cab_anchor_x_arcsec",
+                    "cab_anchor_y_arcsec",
+                    "cab_tangent_angle_obs_rad",
+                    "cab_tangent_angle_model_rad",
+                    "cab_tangent_residual_rad",
+                    "cab_curvature_obs_arcsec_inv",
+                    "cab_curvature_model_arcsec_inv",
+                    "cab_curvature_residual_arcsec_inv",
+                    "cab_loglike",
+                    "cab_finite",
+                ]
+            )
+        n_arcs = int(arc_data.n_arcs)
+        base = pd.DataFrame(
+            {
+                "arc_id": [str(value) for value in arc_data.arc_ids],
+                "z_arc": np.asarray(arc_data.z_arc, dtype=float),
+                "cab_anchor_x_arcsec": np.asarray(arc_data.anchor_x, dtype=float),
+                "cab_anchor_y_arcsec": np.asarray(arc_data.anchor_y, dtype=float),
+                "cab_tangent_angle_obs_rad": np.asarray(arc_data.tangent_angle_rad, dtype=float),
+                "cab_tangent_angle_model_rad": np.full(n_arcs, np.nan, dtype=float),
+                "cab_tangent_residual_rad": np.full(n_arcs, np.nan, dtype=float),
+                "cab_curvature_obs_arcsec_inv": np.asarray(arc_data.curvature_arcsec_inv, dtype=float),
+                "cab_curvature_model_arcsec_inv": np.full(n_arcs, np.nan, dtype=float),
+                "cab_curvature_residual_arcsec_inv": np.full(n_arcs, np.nan, dtype=float),
+                "cab_loglike": np.zeros(n_arcs, dtype=float),
+                "cab_finite": np.zeros(n_arcs, dtype=bool),
+            }
         )
-        details["cab_has_constraint"] = mask
-        details["cab_anchor_x_arcsec"] = _optional_family_arc_array(family, "arc_anchor_x", family.x_obs)
-        details["cab_anchor_y_arcsec"] = _optional_family_arc_array(family, "arc_anchor_y", family.y_obs)
-        details["cab_tangent_angle_obs_rad"] = _optional_family_arc_array(
-            family,
-            "arc_tangent_angle_rad",
-            np.full(n_images, np.nan, dtype=float),
-        )
-        details["cab_curvature_obs_arcsec_inv"] = _optional_family_arc_array(
-            family,
-            "arc_curvature_arcsec_inv",
-            np.full(n_images, np.nan, dtype=float),
-        )
-        if not bool(np.any(mask)):
-            return details
-
-        effective_z = float(getattr(family, "effective_z_source", family.z_source))
-        models_by_effective_z = getattr(self, "models_by_effective_z", None)
-        if (
-            isinstance(models_by_effective_z, dict)
-            and effective_z not in models_by_effective_z
-            and float(family.z_source) in models_by_effective_z
-        ):
-            effective_z = float(family.z_source)
+        if float(self.cab_likelihood_weight) <= 0.0:
+            return base
         try:
             params_jax = jnp.asarray(params, dtype=jnp.float64)
-            packed_state = self._build_packed_lens_state(params_jax, effective_z)
-            angle_model, curvature_model, finite = self._cab_morphology_predictions_for_anchors(
-                effective_z,
-                jnp.asarray(details["cab_anchor_x_arcsec"], dtype=jnp.float64),
-                jnp.asarray(details["cab_anchor_y_arcsec"], dtype=jnp.float64),
+            physical_params = self._physical_parameter_vector(params_jax)
+            packed_state, validity = self._build_cab_packed_lens_state_with_validity_from_physical(
+                physical_params,
+                stop_gradient=False,
+            )
+            if not bool(np.asarray(validity["is_valid"], dtype=bool)):
+                return base
+            traced = self._prepare_traced_arc_constraint_data(arc_data)
+            prediction = self._cab_morphology_predictions_for_anchors(
+                float(CAB_MORPHOLOGY_MODEL_KEY),
+                traced.anchor_x,
+                traced.anchor_y,
                 packed_state,
                 self._fit_component_indices(),
             )
-            angle_np = np.asarray(angle_model, dtype=float)
-            curvature_np = np.asarray(curvature_model, dtype=float)
-            finite_np = np.asarray(finite, dtype=bool)
+            active = jnp.ones((n_arcs,), dtype=bool)
+            terms = _cab_morphology_terms(
+                predicted_tangent_angle_rad=prediction.tangent_angle_rad,
+                predicted_curvature_arcsec_inv=prediction.curvature_arcsec_inv,
+                prediction_finite=prediction.finite,
+                observed_tangent_angle_rad=traced.tangent_angle_rad,
+                observed_curvature_arcsec_inv=traced.curvature_arcsec_inv,
+                sigma_tangent_angle_rad=traced.sigma_tangent_angle_rad,
+                sigma_curvature_arcsec_inv=traced.sigma_curvature_arcsec_inv,
+                reliability=traced.reliability,
+                active_arcs=active,
+                tangent_sigma_floor_rad=self.cab_tangent_sigma_floor_rad,
+                curvature_sigma_floor_arcsec_inv=self.cab_curvature_sigma_floor_arcsec_inv,
+                branch_weight=prediction.branch_weight,
+                frame_weight=prediction.frame_weight,
+            )
+            angle_by_branch = np.asarray(prediction.tangent_angle_rad, dtype=float)
+            curvature_by_branch = np.asarray(prediction.curvature_arcsec_inv, dtype=float)
+            branch_score = np.asarray(terms.branch_weight * terms.frame_weight, dtype=float)
+            dominant_branch = np.argmax(branch_score, axis=1)
+            row_index = np.arange(n_arcs)
+            finite = np.asarray(terms.finite_row, dtype=bool)
+            base["cab_tangent_angle_model_rad"] = np.where(finite, angle_by_branch[row_index, dominant_branch], np.nan)
+            base["cab_curvature_model_arcsec_inv"] = np.where(finite, curvature_by_branch[row_index, dominant_branch], np.nan)
+            base["cab_tangent_residual_rad"] = np.where(finite, np.asarray(terms.tangent_residual, dtype=float), np.nan)
+            base["cab_curvature_residual_arcsec_inv"] = np.where(finite, np.asarray(terms.curvature_residual, dtype=float), np.nan)
+            base["cab_loglike"] = np.where(
+                finite,
+                float(self.cab_likelihood_weight) * np.asarray(terms.row_loglike, dtype=float),
+                0.0,
+            )
+            base["cab_finite"] = finite
         except Exception:
-            return details
-
-        details["cab_tangent_angle_model_rad"] = np.where(mask, angle_np, np.nan)
-        details["cab_curvature_model_arcsec_inv"] = np.where(mask, curvature_np, np.nan)
-        obs_angle = np.asarray(details["cab_tangent_angle_obs_rad"], dtype=float)
-        obs_curvature = np.asarray(details["cab_curvature_obs_arcsec_inv"], dtype=float)
-        tangent_residual = np.asarray(
-            _cab_tangent_angle_residual(
-                jnp.asarray(angle_np, dtype=jnp.float64),
-                jnp.asarray(obs_angle, dtype=jnp.float64),
-            ),
-            dtype=float,
-        )
-        curvature_residual = curvature_np - obs_curvature
-        details["cab_tangent_residual_rad"] = np.where(mask, tangent_residual, np.nan)
-        details["cab_curvature_residual_arcsec_inv"] = np.where(mask, curvature_residual, np.nan)
-        sigma_tangent = np.maximum(
-            _optional_family_arc_array(
-                family,
-                "arc_sigma_tangent_angle_rad",
-                np.full(n_images, DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD, dtype=float),
-            ),
-            float(self.cab_tangent_sigma_floor_rad),
-        )
-        sigma_curvature = np.maximum(
-            _optional_family_arc_array(
-                family,
-                "arc_sigma_curvature_arcsec_inv",
-                np.full(n_images, DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV, dtype=float),
-            ),
-            float(self.cab_curvature_sigma_floor_arcsec_inv),
-        )
-        reliability = np.clip(
-            _optional_family_arc_array(family, "arc_reliability", np.ones(n_images, dtype=float)),
-            0.0,
-            1.0,
-        )
-        row_loglike = -0.5 * (
-            np.square(tangent_residual / sigma_tangent)
-            + np.square(curvature_residual / sigma_curvature)
-            + np.log(2.0 * np.pi * np.square(sigma_tangent))
-            + np.log(2.0 * np.pi * np.square(sigma_curvature))
-        )
-        finite_row = (
-            mask
-            & finite_np
-            & np.isfinite(row_loglike)
-            & np.isfinite(tangent_residual)
-            & np.isfinite(curvature_residual)
-        )
-        details["cab_loglike"] = np.where(
-            finite_row,
-            float(self.cab_likelihood_weight) * reliability * row_loglike,
-            0.0,
-        )
-        details["cab_finite"] = finite_row
-        return details
+            return base
+        return base
 
     def _arc_aware_image_support_details(
         self,
@@ -14187,11 +14500,6 @@ class ClusterJAXEvaluator:
             "failed": True,
         }
         base_details.update(self._empty_arc_aware_image_support_details(family))
-        base_details.update(self._empty_cab_morphology_details(family))
-        try:
-            base_details.update(self._cab_morphology_details_for_family(params, family))
-        except Exception:
-            pass
         packed_state = self._build_packed_lens_state(jnp.asarray(params, dtype=jnp.float64), family.z_source)
         try:
             beta_x, beta_y = self._exact_source_ray_shooting(family, packed_state)
@@ -14485,13 +14793,6 @@ def _read_h5_json(group: h5py.Group, name: str, default: Any = None) -> Any:
     return _from_jsonable(json.loads(raw))
 
 
-def _artifact_array_value(item: dict[str, Any], key: str, default: Any, *, dtype: type = float) -> np.ndarray:
-    value = item.get(key, None)
-    if value is None:
-        value = default
-    return np.asarray(value, dtype=dtype)
-
-
 def _slim_potfiles_for_artifact(potfiles: list[dict[str, Any]]) -> list[dict[str, Any]]:
     slim: list[dict[str, Any]] = []
     for potfile in potfiles:
@@ -14599,14 +14900,6 @@ def _save_plot_bundle_h5(
                         "x_obs": family.x_obs,
                         "y_obs": family.y_obs,
                         "reliability": family.reliability,
-                        "arc_anchor_x": family.arc_anchor_x,
-                        "arc_anchor_y": family.arc_anchor_y,
-                        "arc_tangent_angle_rad": family.arc_tangent_angle_rad,
-                        "arc_curvature_arcsec_inv": family.arc_curvature_arcsec_inv,
-                        "arc_sigma_tangent_angle_rad": family.arc_sigma_tangent_angle_rad,
-                        "arc_sigma_curvature_arcsec_inv": family.arc_sigma_curvature_arcsec_inv,
-                        "arc_reliability": family.arc_reliability,
-                        "arc_has_constraint": family.arc_has_constraint,
                     }
                     for family in state.family_data
                 ],
@@ -14619,17 +14912,24 @@ def _save_plot_bundle_h5(
                         "y_obs": bin_item.y_obs,
                         "sigma_per_image": bin_item.sigma_per_image,
                         "reliability_per_image": bin_item.reliability_per_image,
-                        "arc_anchor_x": bin_item.arc_anchor_x,
-                        "arc_anchor_y": bin_item.arc_anchor_y,
-                        "arc_tangent_angle_rad": bin_item.arc_tangent_angle_rad,
-                        "arc_curvature_arcsec_inv": bin_item.arc_curvature_arcsec_inv,
-                        "arc_sigma_tangent_angle_rad": bin_item.arc_sigma_tangent_angle_rad,
-                        "arc_sigma_curvature_arcsec_inv": bin_item.arc_sigma_curvature_arcsec_inv,
-                        "arc_reliability": bin_item.arc_reliability,
-                        "arc_has_constraint": bin_item.arc_has_constraint,
                     }
                     for bin_item in state.bin_data
                 ],
+                "arc_data": (
+                    {
+                        "arc_ids": state.arc_data.arc_ids,
+                        "z_arc": state.arc_data.z_arc,
+                        "anchor_x": state.arc_data.anchor_x,
+                        "anchor_y": state.arc_data.anchor_y,
+                        "tangent_angle_rad": state.arc_data.tangent_angle_rad,
+                        "curvature_arcsec_inv": state.arc_data.curvature_arcsec_inv,
+                        "sigma_tangent_angle_rad": state.arc_data.sigma_tangent_angle_rad,
+                        "sigma_curvature_arcsec_inv": state.arc_data.sigma_curvature_arcsec_inv,
+                        "reliability": state.arc_data.reliability,
+                    }
+                    if state.arc_data is not None
+                    else None
+                ),
             },
         )
         packed_group = state_group.create_group("packed_lens_spec")
@@ -14682,43 +14982,6 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
                         item.get("reliability", np.ones(len(item["image_labels"]), dtype=float)),
                         dtype=float,
                     ),
-                    arc_anchor_x=_artifact_array_value(item, "arc_anchor_x", item["x_obs"]),
-                    arc_anchor_y=_artifact_array_value(item, "arc_anchor_y", item["y_obs"]),
-                    arc_tangent_angle_rad=_artifact_array_value(
-                        item,
-                        "arc_tangent_angle_rad",
-                        np.zeros(len(item["image_labels"]), dtype=float),
-                    ),
-                    arc_curvature_arcsec_inv=_artifact_array_value(
-                        item,
-                        "arc_curvature_arcsec_inv",
-                        np.zeros(len(item["image_labels"]), dtype=float),
-                    ),
-                    arc_sigma_tangent_angle_rad=_artifact_array_value(
-                        item,
-                        "arc_sigma_tangent_angle_rad",
-                        np.full(len(item["image_labels"]), DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD, dtype=float),
-                    ),
-                    arc_sigma_curvature_arcsec_inv=_artifact_array_value(
-                        item,
-                        "arc_sigma_curvature_arcsec_inv",
-                        np.full(
-                            len(item["image_labels"]),
-                            DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV,
-                            dtype=float,
-                        ),
-                    ),
-                    arc_reliability=_artifact_array_value(
-                        item,
-                        "arc_reliability",
-                        np.ones(len(item["image_labels"]), dtype=float),
-                    ),
-                    arc_has_constraint=_artifact_array_value(
-                        item,
-                        "arc_has_constraint",
-                        np.zeros(len(item["image_labels"]), dtype=bool),
-                        dtype=bool,
-                    ),
                 )
                 for item in meta.get("family_data", [])
             ],
@@ -14734,42 +14997,24 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
                         item.get("reliability_per_image", np.ones(len(item["x_obs"]), dtype=float)),
                         dtype=float,
                     ),
-                    arc_anchor_x=_artifact_array_value(item, "arc_anchor_x", item["x_obs"]),
-                    arc_anchor_y=_artifact_array_value(item, "arc_anchor_y", item["y_obs"]),
-                    arc_tangent_angle_rad=_artifact_array_value(
-                        item,
-                        "arc_tangent_angle_rad",
-                        np.zeros(len(item["x_obs"]), dtype=float),
-                    ),
-                    arc_curvature_arcsec_inv=_artifact_array_value(
-                        item,
-                        "arc_curvature_arcsec_inv",
-                        np.zeros(len(item["x_obs"]), dtype=float),
-                    ),
-                    arc_sigma_tangent_angle_rad=_artifact_array_value(
-                        item,
-                        "arc_sigma_tangent_angle_rad",
-                        np.full(len(item["x_obs"]), DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD, dtype=float),
-                    ),
-                    arc_sigma_curvature_arcsec_inv=_artifact_array_value(
-                        item,
-                        "arc_sigma_curvature_arcsec_inv",
-                        np.full(len(item["x_obs"]), DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV, dtype=float),
-                    ),
-                    arc_reliability=_artifact_array_value(
-                        item,
-                        "arc_reliability",
-                        np.ones(len(item["x_obs"]), dtype=float),
-                    ),
-                    arc_has_constraint=_artifact_array_value(
-                        item,
-                        "arc_has_constraint",
-                        np.zeros(len(item["x_obs"]), dtype=bool),
-                        dtype=bool,
-                    ),
                 )
                 for item in meta.get("bin_data", [])
             ],
+            arc_data=(
+                ArcConstraintData(
+                    arc_ids=[str(value) for value in meta["arc_data"]["arc_ids"]],
+                    z_arc=np.asarray(meta["arc_data"]["z_arc"], dtype=float),
+                    anchor_x=np.asarray(meta["arc_data"]["anchor_x"], dtype=float),
+                    anchor_y=np.asarray(meta["arc_data"]["anchor_y"], dtype=float),
+                    tangent_angle_rad=np.asarray(meta["arc_data"]["tangent_angle_rad"], dtype=float),
+                    curvature_arcsec_inv=np.asarray(meta["arc_data"]["curvature_arcsec_inv"], dtype=float),
+                    sigma_tangent_angle_rad=np.asarray(meta["arc_data"]["sigma_tangent_angle_rad"], dtype=float),
+                    sigma_curvature_arcsec_inv=np.asarray(meta["arc_data"]["sigma_curvature_arcsec_inv"], dtype=float),
+                    reliability=np.asarray(meta["arc_data"]["reliability"], dtype=float),
+                )
+                if isinstance(meta.get("arc_data"), dict)
+                else None
+            ),
             lens_model_list=lens_model_list,
             reference=tuple(meta.get("reference", [0, 0.0, 0.0])),
             fit_mode=str(meta["fit_mode"]),
@@ -14805,88 +15050,11 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
     return state, cli_args, arrays, init_diagnostics
 
 
-class _LegacyArtifactUnpickler(pickle.Unpickler):
-    def find_class(self, module: str, name: str) -> Any:  # pragma: no cover - compatibility shim
-        if module == "__main__" and name in globals():
-            return globals()[name]
-        return super().find_class(module, name)
-
-
-def _ensure_inactive_cab_arrays_on_state(state: BuildState) -> None:
-    for family in getattr(state, "family_data", []) or []:
-        n_images = int(getattr(family, "n_images", len(getattr(family, "x_obs", []))))
-        defaults = {
-            "arc_anchor_x": np.asarray(getattr(family, "x_obs", np.zeros(n_images)), dtype=float),
-            "arc_anchor_y": np.asarray(getattr(family, "y_obs", np.zeros(n_images)), dtype=float),
-            "arc_tangent_angle_rad": np.zeros(n_images, dtype=float),
-            "arc_curvature_arcsec_inv": np.zeros(n_images, dtype=float),
-            "arc_sigma_tangent_angle_rad": np.full(n_images, DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD, dtype=float),
-            "arc_sigma_curvature_arcsec_inv": np.full(
-                n_images,
-                DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV,
-                dtype=float,
-            ),
-            "arc_reliability": np.ones(n_images, dtype=float),
-            "arc_has_constraint": np.zeros(n_images, dtype=bool),
-        }
-        for field_name, default in defaults.items():
-            if getattr(family, field_name, None) is None:
-                setattr(family, field_name, default)
-    for bin_item in getattr(state, "bin_data", []) or []:
-        n_images = int(len(getattr(bin_item, "x_obs", [])))
-        defaults = {
-            "arc_anchor_x": np.asarray(getattr(bin_item, "x_obs", np.zeros(n_images)), dtype=float),
-            "arc_anchor_y": np.asarray(getattr(bin_item, "y_obs", np.zeros(n_images)), dtype=float),
-            "arc_tangent_angle_rad": np.zeros(n_images, dtype=float),
-            "arc_curvature_arcsec_inv": np.zeros(n_images, dtype=float),
-            "arc_sigma_tangent_angle_rad": np.full(n_images, DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD, dtype=float),
-            "arc_sigma_curvature_arcsec_inv": np.full(
-                n_images,
-                DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV,
-                dtype=float,
-            ),
-            "arc_reliability": np.ones(n_images, dtype=float),
-            "arc_has_constraint": np.zeros(n_images, dtype=bool),
-        }
-        for field_name, default in defaults.items():
-            if getattr(bin_item, field_name, None) is None:
-                setattr(bin_item, field_name, default)
-
-
-def _load_legacy_artifacts(artifacts_dir: Path) -> tuple[BuildState, dict[str, Any], dict[str, np.ndarray], dict[str, Any]]:
-    with (artifacts_dir / "build_state.pkl").open("rb") as handle:
-        state = _LegacyArtifactUnpickler(handle).load()
-    if not hasattr(state, "scaling_component_records"):
-        state.scaling_component_records = []
-    _validate_supported_lens_model_list([str(name) for name in getattr(state, "lens_model_list", [])], str(artifacts_dir))
-    if not hasattr(state, "geometry_cache"):
-        state.geometry_cache = None
-    if not hasattr(state, "fit_cosmology_flat_wcdm"):
-        state.fit_cosmology_flat_wcdm = False
-    if not hasattr(state, "previous_stage_best_values"):
-        state.previous_stage_best_values = None
-    if not hasattr(state, "source_position_parameterization"):
-        raise ValueError(
-            "Legacy artifacts are missing explicit source_position_parameterization metadata; "
-            "rerun the solver to regenerate artifacts."
-        )
-    _ensure_inactive_cab_arrays_on_state(state)
-    cli_args = json.loads((artifacts_dir / "cli_args.json").read_text())
-    arrays = {key: np.asarray(value) for key, value in np.load(artifacts_dir / "posterior_arrays.npz").items()}
-    init_diagnostics_path = artifacts_dir / "init_diagnostics.json"
-    if init_diagnostics_path.exists():
-        init_diagnostics = json.loads(init_diagnostics_path.read_text())
-    else:
-        init_diagnostics = {}
-    return state, cli_args, arrays, init_diagnostics
-
-
 def _load_artifacts(artifacts_dir: Path) -> tuple[BuildState, dict[str, Any], dict[str, np.ndarray], dict[str, Any]]:
     h5_path = artifacts_dir / "plot_bundle.h5"
-    if h5_path.exists():
-        state, cli_args, arrays, init_diagnostics = _rebuild_state_from_h5(h5_path)
-    else:
-        state, cli_args, arrays, init_diagnostics = _load_legacy_artifacts(artifacts_dir)
+    if not h5_path.exists():
+        raise FileNotFoundError(f"Missing current-format artifact bundle: {h5_path}")
+    state, cli_args, arrays, init_diagnostics = _rebuild_state_from_h5(h5_path)
     if state.geometry_cache is None:
         cosmo_config = dict(state.cosmo_config) if state.cosmo_config else _build_cosmology(state.parsed)
         state.cosmo_config = dict(cosmo_config)
@@ -14896,7 +15064,6 @@ def _load_artifacts(artifacts_dir: Path) -> tuple[BuildState, dict[str, Any], di
             state.family_data,
             state.bin_data,
         )
-    _ensure_inactive_cab_arrays_on_state(state)
     return state, cli_args, arrays, init_diagnostics
 
 
@@ -15476,10 +15643,12 @@ def _build_state_from_inputs(
     fit_mode = fit_mode_override or args.fit_mode
     model_fit_mode = FIT_MODE_JOINT if fit_mode == FIT_MODE_EVIDENCE_NS else fit_mode
     fit_cosmology_flat_wcdm = bool(getattr(args, "fit_cosmology_flat_wcdm", False))
-    parsed, _potentials_df, images_df, potentials_with_priors = load_best_par(args.par_path)
-    if images_df.empty:
-        raise ValueError("No multiple-image constraints found in the parsed image catalog.")
+    parsed, _potentials_df, images_df, arcs_df, potentials_with_priors = load_best_par(args.par_path)
+    if images_df.empty and arcs_df.empty:
+        raise ValueError("No multiple-image or CAB arc constraints found in the parsed catalogs.")
     reference = _extract_reference(parsed)
+    if reference is None:
+        raise ValueError("runmode.reference is required to convert image and CAB arc coordinates into solver offsets.")
     cosmo_config = _cosmology_config_override_from_args(args) or _build_cosmology(parsed)
     z_lens_values = [float(pot.get("z_lens", 0.0)) for pot in potentials_with_priors if pot.get("z_lens") is not None]
     z_lens = float(z_lens_values[0]) if z_lens_values else 0.0
@@ -15494,23 +15663,26 @@ def _build_state_from_inputs(
     fov_limit = _fov_limit_from_args(args)
     if fov_limit is not None:
         fov_description = _format_fov_limit(fov_limit)
-        images_df, image_fov_summary = _filter_images_by_fov(images_df, reference, fov_limit)
+        image_fov_summary: dict[str, Any] = {}
+        if not images_df.empty:
+            images_df, image_fov_summary = _filter_images_by_fov(images_df, reference, fov_limit)
         potfiles, potfile_fov_summary = _filter_potfiles_by_fov(potfiles, reference, fov_limit)
-        _log(
-            args,
-            (
-                f"[input] fov_limit={fov_description} "
-                f"images_kept={image_fov_summary.get('kept', 0)}/{image_fov_summary.get('total', 0)} "
-                f"image_rows_dropped={image_fov_summary.get('dropped', 0)} "
-                f"affected_families={len(image_fov_summary.get('affected_family_ids', []))} "
-                f"removed_families={len(image_fov_summary.get('removed_family_ids', []))} "
-                f"removed_ids={','.join(image_fov_summary.get('removed_family_ids', []))}"
-            ),
-        )
+        if image_fov_summary:
+            _log(
+                args,
+                (
+                    f"[input] fov_limit={fov_description} "
+                    f"images_kept={image_fov_summary.get('kept', 0)}/{image_fov_summary.get('total', 0)} "
+                    f"image_rows_dropped={image_fov_summary.get('dropped', 0)} "
+                    f"affected_families={len(image_fov_summary.get('affected_family_ids', []))} "
+                    f"removed_families={len(image_fov_summary.get('removed_family_ids', []))} "
+                    f"removed_ids={','.join(image_fov_summary.get('removed_family_ids', []))}"
+                ),
+            )
         if potfile_fov_summary:
             _log(args, f"[input] fov_limit={fov_description} potfile_catalog_rows={json.dumps(potfile_fov_summary, sort_keys=True)}")
-        if images_df.empty:
-            raise ValueError("No multiple-image constraints remain after applying FOV limits.")
+        if images_df.empty and arcs_df.empty:
+            raise ValueError("No multiple-image or CAB arc constraints remain after applying FOV limits.")
     large_parameter_specs, large_component_param_assignments, large_lens_model_list = _build_parameter_specs(potentials_with_priors)
     if model_fit_mode == "small-only" and large_parameter_specs:
         if stage1_prior_summary is None:
@@ -15558,50 +15730,58 @@ def _build_state_from_inputs(
         lens_model_list.extend(scaling_lens_model_list)
         base_components.extend(scaling_components)
     packed_lens_spec = _build_packed_lens_spec(base_components, component_param_assignments, scaling_component_assignments)
-    fit_images_df, n_nonpositive_images_skipped, n_nonpositive_families_skipped, nonpositive_family_ids = (
-        _filter_non_positive_redshift_families(images_df)
-    )
-    if fit_images_df.empty:
-        raise ValueError(
-            "No positive-redshift image families remain after dropping non-positive-redshift families. "
-            "At least one family must have finite catalog_z > 0."
+    family_data: list[FamilyData] = []
+    family_redshift_binning_sec = 0.0
+    if not images_df.empty:
+        fit_images_df, n_nonpositive_images_skipped, n_nonpositive_families_skipped, nonpositive_family_ids = (
+            _filter_non_positive_redshift_families(images_df)
         )
-    if n_nonpositive_images_skipped > 0:
-        _log(
-            args,
-            (
-                f"[input] dropped non-positive-redshift families before fitting: "
-                f"families={n_nonpositive_families_skipped} images={n_nonpositive_images_skipped} "
-                f"ids={','.join(nonpositive_family_ids)}"
-            ),
-        )
+        if fit_images_df.empty:
+            if arcs_df.empty:
+                raise ValueError(
+                    "No positive-redshift image families remain after dropping non-positive-redshift families. "
+                    "At least one family must have finite catalog_z > 0."
+                )
+        else:
+            if n_nonpositive_images_skipped > 0:
+                _log(
+                    args,
+                    (
+                        f"[input] dropped non-positive-redshift families before fitting: "
+                        f"families={n_nonpositive_families_skipped} images={n_nonpositive_images_skipped} "
+                        f"ids={','.join(nonpositive_family_ids)}"
+                    ),
+                )
 
-    fit_images_df, n_singleton_images_skipped, n_singleton_families_skipped = _filter_singleton_families(fit_images_df)
-    if fit_images_df.empty:
-        raise ValueError(
-            "No multi-image families remain after dropping singleton pseudo-families. "
-            "At least one family must contain two or more images."
-        )
-    if n_singleton_images_skipped > 0:
-        _log(
-            args,
-            (
-                f"[input] dropped singleton pseudo-families before fitting: "
-                f"families={n_singleton_families_skipped} images={n_singleton_images_skipped}"
-            ),
-        )
-    family_data, family_redshift_binning_sec = _prepare_family_data(
-        fit_images_df,
-        sigma_arcsec,
-        reference,
-        z_lens=z_lens,
-        cosmo_config=cosmo_config,
-        z_bin_efficiency_tol=float(args.z_bin_efficiency_tol),
-    )
+            fit_images_df, n_singleton_images_skipped, n_singleton_families_skipped = _filter_singleton_families(fit_images_df)
+            if fit_images_df.empty:
+                if arcs_df.empty:
+                    raise ValueError(
+                        "No multi-image families remain after dropping singleton pseudo-families. "
+                        "At least one family must contain two or more images."
+                    )
+            else:
+                if n_singleton_images_skipped > 0:
+                    _log(
+                        args,
+                        (
+                            f"[input] dropped singleton pseudo-families before fitting: "
+                            f"families={n_singleton_families_skipped} images={n_singleton_images_skipped}"
+                        ),
+                    )
+                family_data, family_redshift_binning_sec = _prepare_family_data(
+                    fit_images_df,
+                    sigma_arcsec,
+                    reference,
+                    z_lens=z_lens,
+                    cosmo_config=cosmo_config,
+                    z_bin_efficiency_tol=float(args.z_bin_efficiency_tol),
+                )
     bin_data = _build_bin_data(family_data)
+    arc_data = _prepare_arc_constraint_data(arcs_df, reference)
     sample_likelihood_mode = str(getattr(args, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))
     source_position_parameterization = SOURCE_POSITION_PARAMETERIZATION_DIRECT
-    if _sample_likelihood_uses_explicit_beta(sample_likelihood_mode):
+    if family_data and _sample_likelihood_uses_explicit_beta(sample_likelihood_mode):
         source_position_parameterization = str(
             getattr(
                 args,
@@ -15652,7 +15832,7 @@ def _build_state_from_inputs(
                     ),
                 )
             )
-    else:
+    elif family_data:
         parameter_specs.append(_build_source_scatter_parameter_spec(start_index=len(parameter_specs)))
     if fit_cosmology_flat_wcdm:
         parameter_specs.extend(_build_cosmology_parameter_specs(len(parameter_specs), cosmo_config))
@@ -15723,6 +15903,8 @@ def _build_state_from_inputs(
             coupled_physical_init_values,
         )
     svi_init_values = _apply_cosmology_init_overrides(args, parameter_specs, svi_init_values)
+    if not family_data and arc_data is not None and int(getattr(arc_data, "n_arcs", 0)) > 0 and not parameter_specs:
+        raise ValueError("CAB arc-only runs require at least one model parameter to constrain.")
     geometry_cache = _build_geometry_cache(
         cosmo_config,
         z_lens,
@@ -15742,6 +15924,7 @@ def _build_state_from_inputs(
         packed_lens_spec=packed_lens_spec,
         family_data=family_data,
         bin_data=bin_data,
+        arc_data=arc_data,
         lens_model_list=lens_model_list,
         reference=reference,
         fit_mode=fit_mode,

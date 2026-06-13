@@ -121,14 +121,6 @@ class FamilyData:
     x_obs: np.ndarray
     y_obs: np.ndarray
     reliability: np.ndarray
-    arc_anchor_x: np.ndarray | None = None
-    arc_anchor_y: np.ndarray | None = None
-    arc_tangent_angle_rad: np.ndarray | None = None
-    arc_curvature_arcsec_inv: np.ndarray | None = None
-    arc_sigma_tangent_angle_rad: np.ndarray | None = None
-    arc_sigma_curvature_arcsec_inv: np.ndarray | None = None
-    arc_reliability: np.ndarray | None = None
-    arc_has_constraint: np.ndarray | None = None
 
     @property
     def n_images(self) -> int:
@@ -162,14 +154,23 @@ class BinData:
     y_obs: np.ndarray
     sigma_per_image: np.ndarray
     reliability_per_image: np.ndarray
-    arc_anchor_x: np.ndarray | None = None
-    arc_anchor_y: np.ndarray | None = None
-    arc_tangent_angle_rad: np.ndarray | None = None
-    arc_curvature_arcsec_inv: np.ndarray | None = None
-    arc_sigma_tangent_angle_rad: np.ndarray | None = None
-    arc_sigma_curvature_arcsec_inv: np.ndarray | None = None
-    arc_reliability: np.ndarray | None = None
-    arc_has_constraint: np.ndarray | None = None
+
+
+@dataclass
+class ArcConstraintData:
+    arc_ids: list[str]
+    z_arc: np.ndarray
+    anchor_x: np.ndarray
+    anchor_y: np.ndarray
+    tangent_angle_rad: np.ndarray
+    curvature_arcsec_inv: np.ndarray
+    sigma_tangent_angle_rad: np.ndarray
+    sigma_curvature_arcsec_inv: np.ndarray
+    reliability: np.ndarray
+
+    @property
+    def n_arcs(self) -> int:
+        return len(self.arc_ids)
 
 
 @dataclass(frozen=True)
@@ -263,6 +264,7 @@ class BuildState:
     packed_lens_spec: PackedLensSpec
     family_data: list[FamilyData]
     bin_data: list[BinData]
+    arc_data: ArcConstraintData | None
     lens_model_list: list[str]
     reference: tuple[int, float, float]
     fit_mode: str

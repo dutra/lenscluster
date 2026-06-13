@@ -936,7 +936,7 @@ def write_extra_image_cutout_pdf(
                         for band in bands
                     }
                     rgb = make_rgb_cutout(cutouts, bands=bands, rgb_display=rgb_display)
-                    ax.imshow(rgb, origin="lower", interpolation="nearest")
+                    ax.imshow(rgb, origin="lower", interpolation="none")
                     reference_image = band_images[str(bands[-1])]
                     _draw_recovery_panel_markers(
                         ax,
@@ -1003,8 +1003,8 @@ def run(
         raise FileNotFoundError(f"Missing image-fit quality CSV: {image_fit_csv}")
     if not extra_images_csv.exists():
         raise FileNotFoundError(f"Missing extra-images CSV: {extra_images_csv}")
-    if len(bands) != 3:
-        raise ValueError("--bands must provide exactly three bands in blue green red order.")
+    if len(bands) < 3:
+        raise ValueError("--bands must provide at least three bands.")
     reference = load_reference_frame(stage_dir, par_path=par_path)
     cluster_key = _canonical_cluster(cluster) if cluster is not None else infer_cluster(stage_dir, reference)
     if cluster_key is None:
@@ -1062,7 +1062,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--catalog-root", type=Path, default=DEFAULT_HFF_CATALOG_ROOT)
     parser.add_argument("--image-dir", type=Path, default=DEFAULT_IMAGE_DIR)
     parser.add_argument("--image-scale", choices=IMAGE_SCALE_CHOICES, default=DEFAULT_IMAGE_SCALE)
-    parser.add_argument("--bands", nargs=3, default=list(DEFAULT_BANDS), metavar=("BLUE", "GREEN", "RED"))
+    parser.add_argument("--bands", nargs="+", default=list(DEFAULT_BANDS), metavar="BAND")
     parser.add_argument("--match-radius-arcsec", type=float, default=DEFAULT_MATCH_RADIUS_ARCSEC)
     parser.add_argument("--cutout-size-arcsec", type=float, default=DEFAULT_CUTOUT_SIZE_ARCSEC)
     parser.add_argument("--images-per-page", type=int, default=DEFAULT_IMAGES_PER_PAGE)

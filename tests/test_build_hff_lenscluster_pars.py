@@ -131,9 +131,10 @@ def test_render_outputs_blank_catalogs_and_loadable_par(tmp_path: Path) -> None:
 
     assert obs_path.read_text(encoding="utf-8") == "#REFERENCE 3\n"
     assert potfile_path.read_text(encoding="utf-8") == "#REFERENCE 3\n"
-    parsed, potentials_df, images_df, potentials_with_priors = load_best_par(par_path)
+    parsed, potentials_df, images_df, arcs_df, potentials_with_priors = load_best_par(par_path)
     assert len(potentials_df) == 2
     assert len(images_df) == 0
+    assert len(arcs_df) == 0
     assert len(parsed["potfiles"]) == 1
     assert len(parsed["potfiles"][0]["catalog_df"]) == 0
     assert {item["id"] for item in potentials_with_priors} == {"O1", "S1"}

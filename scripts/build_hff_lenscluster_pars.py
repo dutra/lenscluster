@@ -374,7 +374,7 @@ def validate_outputs(
         par_path = root / cluster_key / f"{cluster_key}_lenscluster.par"
         if not par_path.exists():
             raise FileNotFoundError(f"Generated par file is missing for cluster '{cluster_key}': {par_path}")
-        parsed, potentials_df, images_df, potentials_with_priors = load_best_par(par_path)
+        parsed, potentials_df, images_df, _arcs_df, potentials_with_priors = load_best_par(par_path)
         rows.append(
             {
                 "cluster_key": cluster_key,

@@ -53,10 +53,15 @@ class FFSimConfig:
     cut_radius_ref_upper_kpc: float = 250.0
     smooth_anchor_ids: tuple[str, str] = ("1", "2")
     smooth_v_disps: tuple[float, ...] = (950.0, 750.0)
+    smooth_angle_positions: tuple[float, ...] | None = None
     smooth_center_prior_boxes: tuple[CenterPriorBox, ...] | None = None
     smooth_core_radius_priors: tuple[CoreRadiusPrior, ...] | None = None
+    shear_gamma: float = 0.05
+    shear_angle_pos: float = 0.0
     explicit_galaxy_count: int = 2
     explicit_galaxy_ids: tuple[str, ...] | None = None
+    explicit_galaxy_sigma_upper_factors: tuple[tuple[str, float], ...] = ()
+    free_potfile_slopes: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,7 @@ CONFIGS = {
         cut_radius_ref_upper_kpc=700.0,
         smooth_anchor_ids=("1", "3"),
         explicit_galaxy_count=5,
+        explicit_galaxy_sigma_upper_factors=(("5", 2.5),),
     ),
     "hera": FFSimConfig(
         key="hera",
@@ -129,10 +135,15 @@ CONFIGS = {
         cut_radius_ref_lower_kpc=3.0,
         cut_radius_ref_upper_kpc=250.0,
         smooth_anchor_ids=("1", "2"),
-        smooth_v_disps=(750.0, 950.0),
+        smooth_v_disps=(800.0, 700.0),
+        smooth_angle_positions=(30.0, 24.0),
         smooth_center_prior_boxes=((14.0, 24.0, -2.0, 7.0), (-5.0, 5.0, -4.0, 4.0)),
         smooth_core_radius_priors=((8.0, 2.0, 15.0), (5.0, 2.0, 15.0)),
-        explicit_galaxy_ids=("1", "2", "3", "5"),
+        shear_gamma=0.04,
+        shear_angle_pos=40.0,
+        explicit_galaxy_ids=("1", "2", "3", "4", "9", "60"),
+        explicit_galaxy_sigma_upper_factors=(("9", 2.5), ("60", 2.5)),
+        free_potfile_slopes=True,
     ),
 }
 
@@ -458,6 +469,7 @@ def _cluster_potential_block(
     anchor: MemberRow,
     config: FFSimConfig,
     v_disp: float,
+    angle_pos: float,
     *,
     center_prior_box: CenterPriorBox | None = None,
     core_radius_prior: CoreRadiusPrior | None = None,
@@ -469,7 +481,7 @@ def _cluster_potential_block(
     x_centre {_format_float(anchor.x_arcsec)}
     y_centre {_format_float(anchor.y_arcsec)}
     ellipticite 0.30000000
-    angle_pos 0.00000000
+    angle_pos {_format_float(angle_pos)}
     core_radius {_format_float(core_radius)}
     cut_radius_kpc {_format_float(CLUSTER_CUT_RADIUS_KPC)}
     v_disp {_format_float(v_disp)}
@@ -485,6 +497,11 @@ limit {component_id}
     end"""
 
 
+def _explicit_galaxy_sigma_upper_factor(row: MemberRow, config: FFSimConfig) -> float:
+    factors = {object_id: float(factor) for object_id, factor in config.explicit_galaxy_sigma_upper_factors}
+    return factors.get(row.object_id, 1.5)
+
+
 def _galaxy_potential_block(component_id: str, row: MemberRow, config: FFSimConfig) -> str:
     sigma = _scaled_sigma(row, config)
     cut_radius = _scaled_cut_radius_kpc(row, config)
@@ -495,7 +512,7 @@ def _galaxy_potential_block(component_id: str, row: MemberRow, config: FFSimConf
     cut_lower = max(GALAXY_CORE_RADIUS_KPC + 0.01, 0.25 * cut_radius)
     cut_upper = max(cut_lower * 1.01, 2.0 * cut_radius)
     sigma_lower = max(10.0, 0.5 * sigma)
-    sigma_upper_factor = 2.5 if component_id == "G5" else 1.5
+    sigma_upper_factor = _explicit_galaxy_sigma_upper_factor(row, config)
     sigma_upper = max(sigma_lower * 1.01, sigma_upper_factor * sigma)
     return f"""potentiel {component_id}
     profil 81
@@ -520,14 +537,24 @@ limit {component_id}
 def _shear_potential_block(config: FFSimConfig) -> str:
     return f"""potentiel S1
     profil 14
-    gamma 0.05000000
-    angle_pos 0.00000000
+    gamma {_format_float(config.shear_gamma)}
+    angle_pos {_format_float(config.shear_angle_pos)}
     z_lens {_format_float(config.z_lens)}
     end
 limit S1
     gamma 1 0.00000000 0.30000000 0.00500000
     angle_pos 1 -180.00000000 180.00000000 0.50000000
     end"""
+
+
+def _potfile_slope_block(config: FFSimConfig) -> str:
+    if config.free_potfile_slopes:
+        return """    # vdslope 0 4.00000000 0
+    # slope 0 4.00000000 0
+    vdslope 1 2.0 6.0 0.1
+    slope   1 1.0 6.0 0.1"""
+    return """    vdslope 0 4.00000000 0
+    slope 0 4.00000000 0"""
 
 
 def _write_par(
@@ -543,6 +570,9 @@ def _write_par(
     v_disps = config.smooth_v_disps
     if len(v_disps) != len(anchors):
         raise ValueError(f"{config.key} has {len(anchors)} smooth halos but {len(v_disps)} smooth-halo velocity dispersions.")
+    angle_positions = config.smooth_angle_positions or (0.0,) * len(anchors)
+    if len(angle_positions) != len(anchors):
+        raise ValueError(f"{config.key} has {len(anchors)} smooth halos but {len(angle_positions)} smooth-halo position angles.")
     center_prior_boxes = config.smooth_center_prior_boxes or (None,) * len(anchors)
     if len(center_prior_boxes) != len(anchors):
         raise ValueError(f"{config.key} has {len(anchors)} smooth halos but {len(center_prior_boxes)} center prior boxes.")
@@ -575,9 +605,9 @@ image
     sigposArcsec 0.50000000
     end
 # O1 is the first smooth dPIE clump, anchored on clgal_cat.txt member {anchors[0].object_id}.
-{_cluster_potential_block("O1", anchors[0], config, v_disps[0], center_prior_box=center_prior_boxes[0], core_radius_prior=core_radius_priors[0])}
+{_cluster_potential_block("O1", anchors[0], config, v_disps[0], angle_positions[0], center_prior_box=center_prior_boxes[0], core_radius_prior=core_radius_priors[0])}
 # O2 is the second smooth dPIE clump, anchored on clgal_cat.txt member {anchors[1].object_id}.
-{_cluster_potential_block("O2", anchors[1], config, v_disps[1], center_prior_box=center_prior_boxes[1], core_radius_prior=core_radius_priors[1])}
+{_cluster_potential_block("O2", anchors[1], config, v_disps[1], angle_positions[1], center_prior_box=center_prior_boxes[1], core_radius_prior=core_radius_priors[1])}
 # S1 is a weak external shear term that absorbs cluster-scale quadrupole structure.
 {_shear_potential_block(config)}
 # Bright galaxies are explicit dPIE components and are commented out of the potfile.
@@ -590,8 +620,7 @@ potfile
     z_lens {_format_float(config.z_lens)}
     sigma 9 {_format_float(config.sigma_ref)} {_format_float(config.sigma_ref_uncertainty)} {_format_float(config.sigma_ref_lower)} {_format_float(config.sigma_ref_upper)}
     cutkpc 9 {_format_float(config.cut_radius_ref_kpc)} {_format_float(config.cut_radius_ref_uncertainty_kpc)} {_format_float(config.cut_radius_ref_lower_kpc)} {_format_float(config.cut_radius_ref_upper_kpc)}
-    vdslope 0 4.00000000 0
-    slope 0 4.00000000 0
+{_potfile_slope_block(config)}
     end
 cosmologie
     H0 70.00000000
@@ -735,7 +764,7 @@ def validate_outputs(output_dir: str | Path = DEFAULT_OUTPUT_DIR, clusters: list
         par_path = output / cluster_key / f"{cluster_key}_lenscluster.par"
         if not par_path.is_file():
             raise FileNotFoundError(f"Generated par file is missing for {cluster_key}: {par_path}")
-        parsed, potentials_df, images_df, potentials_with_priors = load_best_par(par_path)
+        parsed, potentials_df, images_df, _arcs_df, potentials_with_priors = load_best_par(par_path)
         rows.append(
             {
                 "cluster_key": cluster_key,

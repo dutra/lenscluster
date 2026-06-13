@@ -401,26 +401,13 @@ def _empty_images_df() -> pd.DataFrame:
     )
 
 
-ARC_CONSTRAINT_COLUMNS = [
-    "arc_has_constraint",
-    "arc_anchor_ra",
-    "arc_anchor_dec",
-    "arc_tangent_angle_rad",
-    "arc_curvature_arcsec_inv",
-    "arc_sigma_tangent_angle_rad",
-    "arc_sigma_curvature_arcsec_inv",
-    "arc_reliability",
-    "arc_catalog_reference",
-    "arc_catalog_source",
-]
-
-
 def _empty_arc_constraints_df() -> pd.DataFrame:
     return pd.DataFrame(
         columns=[
-            "image_label",
+            "arc_id",
             "arc_anchor_ra",
             "arc_anchor_dec",
+            "z_arc",
             "arc_tangent_angle_rad",
             "arc_curvature_arcsec_inv",
             "arc_sigma_tangent_angle_rad",
@@ -430,18 +417,6 @@ def _empty_arc_constraints_df() -> pd.DataFrame:
             "arc_catalog_source",
         ]
     )
-
-
-def _images_df_with_empty_arc_columns(images_df: pd.DataFrame) -> pd.DataFrame:
-    result = images_df.copy()
-    if "arc_has_constraint" not in result.columns:
-        result["arc_has_constraint"] = False
-    for column in ARC_CONSTRAINT_COLUMNS:
-        if column == "arc_has_constraint":
-            result[column] = result[column].fillna(False).astype(bool)
-        elif column not in result.columns:
-            result[column] = np.nan
-    return result
 
 
 def _split_image_label(image_label: str) -> tuple[str, str]:
@@ -530,12 +505,87 @@ def _load_multiple_images_catalog(
     return result
 
 
+# Canonical arc-catalog columns and the header names arctrace (or a hand-written
+# catalog) may use for each. Coordinates are stored generically as coord_1/coord_2
+# and interpreted per the #REFERENCE header (0 = absolute RA/Dec, 3 = offsets).
+_ARC_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "arc_id": ("arc_id", "image_label"),
+    "coord_1": ("ra_deg", "coord_1", "x_anchor"),
+    "coord_2": ("dec_deg", "coord_2", "y_anchor"),
+    "z_arc": ("z_arc",),
+    "arc_tangent_angle_rad": ("tangent_angle_rad", "arc_tangent_angle_rad"),
+    "arc_curvature_arcsec_inv": ("curvature_arcsec_inv", "arc_curvature_arcsec_inv"),
+    "arc_sigma_tangent_angle_rad": ("sigma_tangent_angle_rad", "arc_sigma_tangent_angle_rad", "sigma_tangent"),
+    "arc_sigma_curvature_arcsec_inv": ("sigma_curvature_arcsec_inv", "arc_sigma_curvature_arcsec_inv", "sigma_curvature"),
+    "arc_reliability": ("reliability", "arc_reliability"),
+}
+_ARC_REQUIRED_CANONICAL: tuple[str, ...] = (
+    "arc_id",
+    "coord_1",
+    "coord_2",
+    "z_arc",
+    "arc_tangent_angle_rad",
+    "arc_curvature_arcsec_inv",
+    "arc_sigma_tangent_angle_rad",
+    "arc_sigma_curvature_arcsec_inv",
+)
+# Token that identifies a `# ...` comment as a column-name header rather than prose.
+_ARC_COLUMN_HEADER_MARKER = "tangent_angle_rad"
+
+
+def _parse_arc_column_header(line: str) -> list[str] | None:
+    """Return the column names from a ``# ...`` arc-catalog header, else None.
+
+    Recognized only when the comment names the arc columns (it contains the
+    ``tangent_angle_rad`` token), so ordinary prose comments are ignored.
+    """
+    stripped = line.strip()
+    if not stripped.startswith("#"):
+        return None
+    tokens = stripped[1:].split()
+    if _ARC_COLUMN_HEADER_MARKER not in tokens:
+        return None
+    return tokens
+
+
+def _arc_header_index_map(header_names: list[str], path: Path) -> dict[str, int]:
+    """Map canonical arc columns to positions in a named header.
+
+    Raises a precise error for the legacy pre-``z_arc`` arctrace layout, which the
+    positional loader would otherwise silently mis-shift by one column.
+    """
+    position = {name: index for index, name in enumerate(header_names)}
+    if "z_arc" not in position:
+        raise ValueError(
+            f"Arc catalog '{path}' has a legacy header without a z_arc column "
+            "(pre-z_arc arctrace format); every column from the 4th on would be "
+            "misread. Regenerate it with the current arctrace, or insert a z_arc "
+            "column (use -1 for unknown redshift)."
+        )
+    index_map: dict[str, int] = {}
+    for canonical in _ARC_REQUIRED_CANONICAL:
+        match = next((alias for alias in _ARC_COLUMN_ALIASES[canonical] if alias in position), None)
+        if match is None:
+            raise ValueError(
+                f"Arc catalog '{path}' header is missing a column for {canonical} "
+                f"(any of {_ARC_COLUMN_ALIASES[canonical]})."
+            )
+        index_map[canonical] = position[match]
+    reliability_match = next(
+        (alias for alias in _ARC_COLUMN_ALIASES["arc_reliability"] if alias in position), None
+    )
+    if reliability_match is not None:
+        index_map["arc_reliability"] = position[reliability_match]
+    return index_map
+
+
 def _load_arc_constraints_catalog(
     filepath: str | Path,
     par_reference: tuple[int, float, float] | None,
 ) -> pd.DataFrame:
     path = Path(filepath)
     header_reference: int | None = None
+    header_names: list[str] | None = None
     rows: list[list[str]] = []
 
     with path.open(encoding="utf-8") as handle:
@@ -550,6 +600,9 @@ def _load_arc_constraints_catalog(
                 header_reference = int(parts[1])
                 continue
             if line.startswith("#"):
+                column_header = _parse_arc_column_header(line)
+                if column_header is not None:
+                    header_names = column_header
                 continue
             rows.append(line.split())
 
@@ -559,38 +612,67 @@ def _load_arc_constraints_catalog(
     if not rows:
         return _empty_arc_constraints_df()
 
-    if min(len(row) for row in rows) < 7:
-        raise ValueError(
-            f"Arc catalog '{path}' has rows with fewer than 7 required columns: "
-            "image_label x_anchor y_anchor tangent_angle_rad curvature_arcsec_inv "
-            "sigma_tangent_angle_rad sigma_curvature_arcsec_inv [reliability]."
+    canonical_columns = [
+        "arc_id",
+        "coord_1",
+        "coord_2",
+        "z_arc",
+        "arc_tangent_angle_rad",
+        "arc_curvature_arcsec_inv",
+        "arc_sigma_tangent_angle_rad",
+        "arc_sigma_curvature_arcsec_inv",
+        "arc_reliability",
+    ]
+    if header_names is not None:
+        # A named column header (the one arctrace writes) is authoritative: map data
+        # columns by name, not by position. This also rejects the legacy pre-z_arc
+        # arctrace layout, which the positional path below would silently mis-shift.
+        index_map = _arc_header_index_map(header_names, path)
+        n_header = len(header_names)
+        if any(len(row) != n_header for row in rows):
+            raise ValueError(
+                f"Arc catalog '{path}' has data rows whose column count does not match "
+                f"its {n_header}-column header."
+            )
+        df = pd.DataFrame(
+            [
+                [
+                    row[index_map["arc_id"]],
+                    row[index_map["coord_1"]],
+                    row[index_map["coord_2"]],
+                    row[index_map["z_arc"]],
+                    row[index_map["arc_tangent_angle_rad"]],
+                    row[index_map["arc_curvature_arcsec_inv"]],
+                    row[index_map["arc_sigma_tangent_angle_rad"]],
+                    row[index_map["arc_sigma_curvature_arcsec_inv"]],
+                    row[index_map["arc_reliability"]] if "arc_reliability" in index_map else "1.0",
+                ]
+                for row in rows
+            ],
+            columns=canonical_columns,
         )
-    if max(len(row) for row in rows) > 8:
-        raise ValueError(f"Arc catalog '{path}' has rows with more than 8 columns.")
-
-    padded_rows = [row + ["1.0"] * (8 - len(row)) for row in rows]
-    df = pd.DataFrame(
-        padded_rows,
-        columns=[
-            "image_label",
-            "coord_1",
-            "coord_2",
-            "arc_tangent_angle_rad",
-            "arc_curvature_arcsec_inv",
-            "arc_sigma_tangent_angle_rad",
-            "arc_sigma_curvature_arcsec_inv",
-            "arc_reliability",
-        ],
-    )
-    df["image_label"] = df["image_label"].astype(str)
-    for image_label in df["image_label"]:
-        try:
-            _split_image_label(image_label)
-        except ValueError as exc:
-            raise ValueError(f"{exc} in arc catalog {path}.") from exc
+    else:
+        # Headerless catalog: positional parsing. The only supported 8-column layout
+        # is "arc_id coord_1 coord_2 z_arc tangent curvature sigma_tangent
+        # sigma_curvature"; a 9th column adds reliability.
+        if min(len(row) for row in rows) < 8:
+            raise ValueError(
+                f"Arc catalog '{path}' has rows with fewer than 8 required columns: "
+                "arc_id x_anchor y_anchor z_arc tangent_angle_rad curvature_arcsec_inv "
+                "sigma_tangent_angle_rad sigma_curvature_arcsec_inv [reliability]."
+            )
+        if max(len(row) for row in rows) > 9:
+            raise ValueError(f"Arc catalog '{path}' has rows with more than 9 columns.")
+        padded_rows = [row + ["1.0"] * (9 - len(row)) for row in rows]
+        df = pd.DataFrame(padded_rows, columns=canonical_columns)
+    df["arc_id"] = df["arc_id"].astype(str)
+    bad_arc_ids = [arc_id for arc_id in df["arc_id"].tolist() if not arc_id or arc_id.strip() != arc_id or any(ch.isspace() for ch in arc_id)]
+    if bad_arc_ids:
+        raise ValueError(f"Arc catalog '{path}' has invalid arc_id values {bad_arc_ids}; IDs must be non-empty and contain no whitespace.")
     for column in [
         "coord_1",
         "coord_2",
+        "z_arc",
         "arc_tangent_angle_rad",
         "arc_curvature_arcsec_inv",
         "arc_sigma_tangent_angle_rad",
@@ -602,6 +684,7 @@ def _load_arc_constraints_catalog(
     numeric_columns = [
         "coord_1",
         "coord_2",
+        "z_arc",
         "arc_tangent_angle_rad",
         "arc_curvature_arcsec_inv",
         "arc_sigma_tangent_angle_rad",
@@ -610,20 +693,25 @@ def _load_arc_constraints_catalog(
     ]
     finite_mask = np.isfinite(df[numeric_columns].to_numpy(dtype=float)).all(axis=1)
     if not bool(np.all(finite_mask)):
-        bad_labels = df.loc[~finite_mask, "image_label"].astype(str).tolist()
-        raise ValueError(f"Arc catalog '{path}' has non-finite numeric values for labels {bad_labels}.")
+        bad_ids = df.loc[~finite_mask, "arc_id"].astype(str).tolist()
+        raise ValueError(f"Arc catalog '{path}' has non-finite numeric values for arc IDs {bad_ids}.")
+    z_arc_values = df["z_arc"].to_numpy(dtype=float)
+    bad_z_mask = ~((z_arc_values >= 0.0) | np.isclose(z_arc_values, -1.0, rtol=0.0, atol=0.0))
+    if bool(np.any(bad_z_mask)):
+        bad_ids = df.loc[bad_z_mask, "arc_id"].astype(str).tolist()
+        raise ValueError(f"Arc catalog '{path}' has invalid z_arc values for arc IDs {bad_ids}; use z_arc >= 0 or -1.")
     if (df["arc_sigma_tangent_angle_rad"].to_numpy(dtype=float) <= 0.0).any():
-        bad_labels = df.loc[df["arc_sigma_tangent_angle_rad"].to_numpy(dtype=float) <= 0.0, "image_label"].astype(str).tolist()
-        raise ValueError(f"Arc catalog '{path}' has non-positive tangent sigma for labels {bad_labels}.")
+        bad_ids = df.loc[df["arc_sigma_tangent_angle_rad"].to_numpy(dtype=float) <= 0.0, "arc_id"].astype(str).tolist()
+        raise ValueError(f"Arc catalog '{path}' has non-positive tangent sigma for arc IDs {bad_ids}.")
     if (df["arc_sigma_curvature_arcsec_inv"].to_numpy(dtype=float) <= 0.0).any():
-        bad_labels = df.loc[
+        bad_ids = df.loc[
             df["arc_sigma_curvature_arcsec_inv"].to_numpy(dtype=float) <= 0.0,
-            "image_label",
+            "arc_id",
         ].astype(str).tolist()
-        raise ValueError(f"Arc catalog '{path}' has non-positive curvature sigma for labels {bad_labels}.")
+        raise ValueError(f"Arc catalog '{path}' has non-positive curvature sigma for arc IDs {bad_ids}.")
     if (df["arc_curvature_arcsec_inv"].to_numpy(dtype=float) < 0.0).any():
-        bad_labels = df.loc[df["arc_curvature_arcsec_inv"].to_numpy(dtype=float) < 0.0, "image_label"].astype(str).tolist()
-        raise ValueError(f"Arc catalog '{path}' has negative curvature magnitudes for labels {bad_labels}.")
+        bad_ids = df.loc[df["arc_curvature_arcsec_inv"].to_numpy(dtype=float) < 0.0, "arc_id"].astype(str).tolist()
+        raise ValueError(f"Arc catalog '{path}' has negative curvature magnitudes for arc IDs {bad_ids}.")
 
     if header_reference == 0:
         df["arc_anchor_ra"] = df["coord_1"]
@@ -644,10 +732,10 @@ def _load_arc_constraints_catalog(
     else:
         raise ValueError(f"Unsupported #REFERENCE value {header_reference} in '{path}'.")
 
-    duplicate_mask = df["image_label"].duplicated(keep=False)
+    duplicate_mask = df["arc_id"].duplicated(keep=False)
     if bool(duplicate_mask.any()):
-        labels = sorted(df.loc[duplicate_mask, "image_label"].astype(str).unique().tolist())
-        raise ValueError(f"Arc catalog '{path}' has duplicate constraints for image labels {labels}.")
+        arc_ids = sorted(df.loc[duplicate_mask, "arc_id"].astype(str).unique().tolist())
+        raise ValueError(f"Arc catalog '{path}' has duplicate arc_id values {arc_ids}.")
 
     df["arc_reliability"] = df["arc_reliability"].clip(0.0, 1.0)
     df["arc_catalog_reference"] = header_reference
@@ -717,43 +805,21 @@ def _extract_arc_catalog_paths(parsed: dict[str, Any], base_dir: Path) -> list[P
     return discovered_paths
 
 
-def _merge_arc_constraints(
-    images_df: pd.DataFrame,
+def _combine_arc_constraints(
     arc_frames: list[pd.DataFrame],
     *,
     source_label: str | Path | list[Path],
 ) -> pd.DataFrame:
-    if images_df.empty:
-        if any(not frame.empty for frame in arc_frames):
-            raise ValueError(f"Arc constraints were provided in {source_label}, but no multiple-image catalog rows exist.")
-        return _images_df_with_empty_arc_columns(images_df)
     if not arc_frames:
-        return _images_df_with_empty_arc_columns(images_df)
-
+        return _empty_arc_constraints_df()
     arcs_df = pd.concat(arc_frames, axis=0, ignore_index=True)
     if arcs_df.empty:
-        return _images_df_with_empty_arc_columns(images_df)
-    duplicate_mask = arcs_df["image_label"].duplicated(keep=False)
+        return _empty_arc_constraints_df()
+    duplicate_mask = arcs_df["arc_id"].duplicated(keep=False)
     if bool(duplicate_mask.any()):
-        labels = sorted(arcs_df.loc[duplicate_mask, "image_label"].astype(str).unique().tolist())
-        raise ValueError(f"Duplicate arc constraints across arc catalogs for image labels {labels}.")
-
-    known_labels = set(images_df["image_label"].astype(str).tolist())
-    arc_labels = set(arcs_df["image_label"].astype(str).tolist())
-    unknown_labels = sorted(arc_labels - known_labels)
-    if unknown_labels:
-        raise ValueError(
-            f"Arc catalog {source_label} references unknown image_label values {unknown_labels}; "
-            "each arc row must match an existing multiple-image catalog row."
-        )
-
-    result = images_df.merge(arcs_df, how="left", on="image_label", validate="one_to_one")
-    result["arc_has_constraint"] = result["arc_tangent_angle_rad"].notna()
-    for column in ARC_CONSTRAINT_COLUMNS:
-        if column not in result.columns:
-            result[column] = np.nan if column != "arc_has_constraint" else False
-    result["arc_has_constraint"] = result["arc_has_constraint"].fillna(False).astype(bool)
-    return result
+        arc_ids = sorted(arcs_df.loc[duplicate_mask, "arc_id"].astype(str).unique().tolist())
+        raise ValueError(f"Duplicate arc_id values across arc catalogs {source_label}: {arc_ids}.")
+    return arcs_df.loc[:, _empty_arc_constraints_df().columns].reset_index(drop=True)
 
 
 def _resolve_potfile_catalog_path(filein_value: Any, base_dir: Path) -> Path | None:
@@ -875,11 +941,15 @@ def _build_potentials_with_priors(parsed: dict[str, Any]) -> list[dict[str, Any]
     if not isinstance(potentials, list):
         return []
 
-    limits = parsed.get("limits", [])
-    if isinstance(limits, dict):
-        limits = [limits]
-    elif not isinstance(limits, list):
-        limits = []
+    limits: list[Any] = []
+    single_limit = parsed.get("limit")
+    if isinstance(single_limit, dict):
+        limits.append(single_limit)
+    repeated_limits = parsed.get("limits", [])
+    if isinstance(repeated_limits, dict):
+        limits.append(repeated_limits)
+    elif isinstance(repeated_limits, list):
+        limits.extend(repeated_limits)
 
     limit_lookup: dict[str, dict[str, Any]] = {}
     for limit_block in limits:
@@ -1017,7 +1087,14 @@ def load_best_par(
     filepath: str | Path,
     dat_files: list[str | Path] | None = None,
     cosmo: Any = None,
-) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame, list[dict[str, Any]]]:
+    """Parse a Lenstool-style par file.
+
+    Returns ``(parsed, potentials_df, images_df, arcs_df, potentials_with_priors)``.
+    ``images_df`` contains family-image position/redshift constraints only;
+    ``arcs_df`` contains independent CAB morphology constraints from
+    ``image.arcfile`` rows.
+    """
     path = Path(filepath)
     with path.open(encoding="utf-8") as handle:
         lines = handle.readlines()
@@ -1094,10 +1171,10 @@ def load_best_par(
         images_df = _empty_images_df()
     arc_catalog_paths = _extract_arc_catalog_paths(parsed, path.parent)
     arc_frames = [_load_arc_constraints_catalog(arc_catalog_path, par_reference) for arc_catalog_path in arc_catalog_paths]
-    images_df = _merge_arc_constraints(images_df, arc_frames, source_label=arc_catalog_paths)
+    arcs_df = _combine_arc_constraints(arc_frames, source_label=arc_catalog_paths)
 
     potentials_df = _enrich_potentials_with_images(potentials_df, images_df)
 
     potentials_with_priors = _build_potentials_with_priors(parsed)
 
-    return parsed, potentials_df, images_df, potentials_with_priors
+    return parsed, potentials_df, images_df, arcs_df, potentials_with_priors

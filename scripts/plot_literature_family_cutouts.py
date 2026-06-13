@@ -40,12 +40,29 @@ from analyze_literature_family_diagnostics import (  # noqa: E402
 )
 from compare_hff_to_literature import LiteratureCatalog, discover_literature_catalogs  # noqa: E402
 from lenscluster.rgb import (  # noqa: E402
+    CALIBRATED_RGB_MINIMUM_SKY_SIGMA,
+    DEFAULT_CALIBRATED_RGB_CHANNEL_GAINS,
+    DEFAULT_CALIBRATED_RGB_Q,
+    DEFAULT_CALIBRATED_RGB_STRETCH,
+    DEFAULT_CALIBRATED_RGB_WARM_HIGHLIGHT_DESATURATION,
+    DEFAULT_HFF_RGB_BANDS,
+    DEFAULT_HFF_RGB_CHANNEL_GAINS,
+    DEFAULT_HFF_RGB_CHANNEL_WEIGHTS,
+    DEFAULT_HFF_RGB_HIGHLIGHT_CEILING,
+    DEFAULT_HFF_RGB_HIGHLIGHT_KNEE,
+    DEFAULT_HFF_RGB_HIGHLIGHT_SOFTNESS,
+    DEFAULT_HFF_RGB_MINIMUM,
+    DEFAULT_HFF_RGB_Q,
+    DEFAULT_HFF_RGB_REFERENCE_BAND,
+    DEFAULT_HFF_RGB_STRETCH,
+    DEFAULT_HFF_RGB_WARM_HIGHLIGHT_DESATURATION,
     DEFAULT_RGB_CHANNEL_GAINS,
     DEFAULT_RGB_MINIMUM,
     DEFAULT_RGB_Q,
     DEFAULT_RGB_STRETCH,
+    CalibratedRGBDisplayConfig,
     RGBDisplayConfig,
-    build_rgb_display_from_band_images,
+    compute_fnu_band_fluxscales,
     make_natural_rgb,
     trim_to_common_shape,
 )
@@ -61,7 +78,7 @@ DEFAULT_SOURCE_SLUG = "niemiec_buffalo"
 DEFAULT_CATALOG_CONTAINS = "sl-final"
 PRESET_SINGLE = "single"
 PRESET_BERGAMINI = "bergamini"
-DEFAULT_BANDS = ("F435W", "F606W", "F814W")
+DEFAULT_BANDS = DEFAULT_HFF_RGB_BANDS
 DEFAULT_IMAGE_SCALE = "auto"
 IMAGE_SCALE_CHOICES = ("auto", "30mas", "60mas")
 DEFAULT_CUTOUT_SIZE_ARCSEC = 10.0
@@ -147,6 +164,10 @@ class BandImage:
     shape: tuple[int, int]
     wcs: WCS
     pixel_scale_arcsec: float
+    photflam: float | None = None
+    photplam: float | None = None
+    background: float = 0.0
+    background_sigma: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -277,8 +298,49 @@ def find_rgb_band_paths(
     return result
 
 
+def _header_photometry_keyword(headers: Sequence[fits.Header], keyword: str) -> float | None:
+    for header in headers:
+        value = header.get(keyword)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number) and number > 0.0:
+            return number
+    return None
+
+
+def _measure_global_background(data: Any, *, max_samples: int = 400_000) -> tuple[float, float]:
+    """Sigma-clipped median sky level and robust sigma from a strided subsample.
+
+    Exactly-zero pixels are excluded because drizzled mosaics pad the region
+    outside the observed footprint with zeros.
+    """
+
+    ny, nx = data.shape
+    stride = max(1, int(math.sqrt(max(1, (ny * nx) / float(max_samples)))))
+    sample = np.asarray(data[::stride, ::stride], dtype=np.float32)
+    values = sample[np.isfinite(sample) & (sample != 0.0)]
+    if values.size == 0:
+        return 0.0, 0.0
+    sigma = 0.0
+    for _ in range(5):
+        median = float(np.median(values))
+        sigma = 1.4826 * float(np.median(np.abs(values - median)))
+        if sigma <= 0.0:
+            break
+        kept = values[np.abs(values - median) < 3.0 * sigma]
+        if kept.size == values.size or kept.size == 0:
+            break
+        values = kept
+    return float(np.median(values)), float(sigma)
+
+
 def load_band_metadata(band: str, path: Path) -> BandImage:
     with fits.open(path, memmap=True) as hdul:
+        primary_header = hdul[0].header
         for hdu_index, hdu in enumerate(hdul):
             if hdu.data is None:
                 continue
@@ -293,6 +355,8 @@ def load_band_metadata(band: str, path: Path) -> BandImage:
             if not np.isfinite(pixel_scale) or pixel_scale <= 0.0:
                 continue
             ny, nx = hdu.data.shape
+            headers = (hdu.header, primary_header)
+            background, background_sigma = _measure_global_background(hdu.data)
             return BandImage(
                 band=str(band),
                 path=Path(path),
@@ -300,6 +364,10 @@ def load_band_metadata(band: str, path: Path) -> BandImage:
                 shape=(int(ny), int(nx)),
                 wcs=celestial,
                 pixel_scale_arcsec=pixel_scale,
+                photflam=_header_photometry_keyword(headers, "PHOTFLAM"),
+                photplam=_header_photometry_keyword(headers, "PHOTPLAM"),
+                background=background,
+                background_sigma=background_sigma,
             )
     raise ValueError(f"No 2D celestial WCS image found in {path}")
 
@@ -381,23 +449,80 @@ def _trim_to_common_shape(arrays: Iterable[np.ndarray]) -> list[np.ndarray]:
     return trim_to_common_shape([np.asarray(array) for array in arrays])
 
 
+def _default_calibrated_minimum(
+    band_images: Mapping[str, BandImage],
+    band_keys: Sequence[str],
+    fluxscales: Mapping[str, float],
+) -> float:
+    sigmas = []
+    for band in band_keys:
+        sigma = float(getattr(band_images.get(band), "background_sigma", 0.0) or 0.0)
+        if sigma > 0.0:
+            sigmas.append(sigma * float(fluxscales.get(band, 1.0)))
+    if not sigmas:
+        return DEFAULT_RGB_MINIMUM
+    return CALIBRATED_RGB_MINIMUM_SKY_SIGMA * float(np.median(sigmas))
+
+
+def _hff_channel_weights_for_bands(band_keys: Sequence[str]) -> dict[str, dict[str, float]]:
+    available = {str(band) for band in band_keys}
+    channel_weights: dict[str, dict[str, float]] = {}
+    for role, weights in DEFAULT_HFF_RGB_CHANNEL_WEIGHTS.items():
+        selected = {band: float(weight) for band, weight in weights.items() if band in available}
+        if selected:
+            channel_weights[role] = selected
+    return channel_weights
+
+
+def _use_hff_multiband_display(band_keys: Sequence[str]) -> bool:
+    if len(tuple(band_keys)) <= 3:
+        return False
+    weights = _hff_channel_weights_for_bands(band_keys)
+    return all(weights.get(role) for role in ("blue", "green", "red"))
+
+
 def build_rgb_display(
     band_images: Mapping[str, BandImage],
     *,
     bands: Sequence[str] = DEFAULT_BANDS,
-    q: float = DEFAULT_RGB_Q,
-    stretch: float = DEFAULT_RGB_STRETCH,
-    channel_gains: Mapping[str, float] = DEFAULT_RGB_CHANNEL_GAINS,
-    minimum: float = DEFAULT_RGB_MINIMUM,
+    q: float | None = None,
+    stretch: float | None = None,
+    channel_gains: Mapping[str, float] | None = None,
+    minimum: float | None = None,
 ) -> RGBDisplayConfig:
-    return build_rgb_display_from_band_images(
-        band_images,
-        bands=bands,
-        q=q,
-        stretch=stretch,
-        channel_gains=channel_gains,
-        minimum=minimum,
+    band_keys = [str(band) for band in bands]
+    use_hff_multiband = _use_hff_multiband_display(band_keys)
+    reference_band = DEFAULT_HFF_RGB_REFERENCE_BAND if DEFAULT_HFF_RGB_REFERENCE_BAND in band_keys else band_keys[-1]
+    fluxscales = compute_fnu_band_fluxscales(
+        {band: getattr(band_images.get(band), "photflam", None) for band in band_keys},
+        {band: getattr(band_images.get(band), "photplam", None) for band in band_keys},
+        reference_band=reference_band,
     )
+    backgrounds = {band: float(getattr(band_images.get(band), "background", 0.0) or 0.0) for band in band_keys}
+    if minimum is None:
+        minimum = DEFAULT_HFF_RGB_MINIMUM if use_hff_multiband else _default_calibrated_minimum(band_images, band_keys, fluxscales)
+    display = CalibratedRGBDisplayConfig(
+        q=(DEFAULT_HFF_RGB_Q if use_hff_multiband else DEFAULT_CALIBRATED_RGB_Q) if q is None else float(q),
+        stretch=(DEFAULT_HFF_RGB_STRETCH if use_hff_multiband else DEFAULT_CALIBRATED_RGB_STRETCH) if stretch is None else float(stretch),
+        channel_gains=dict(
+            (DEFAULT_HFF_RGB_CHANNEL_GAINS if use_hff_multiband else DEFAULT_CALIBRATED_RGB_CHANNEL_GAINS)
+            if channel_gains is None
+            else channel_gains
+        ),
+        minimum=float(minimum),
+        band_backgrounds=backgrounds,
+        band_fluxscales=fluxscales,
+        warm_highlight_desaturation=(
+            DEFAULT_HFF_RGB_WARM_HIGHLIGHT_DESATURATION
+            if use_hff_multiband
+            else DEFAULT_CALIBRATED_RGB_WARM_HIGHLIGHT_DESATURATION
+        ),
+        channel_weights=_hff_channel_weights_for_bands(band_keys) if use_hff_multiband else {},
+        highlight_knee=DEFAULT_HFF_RGB_HIGHLIGHT_KNEE if use_hff_multiband else 1.0,
+        highlight_ceiling=DEFAULT_HFF_RGB_HIGHLIGHT_CEILING if use_hff_multiband else 1.0,
+        highlight_softness=DEFAULT_HFF_RGB_HIGHLIGHT_SOFTNESS if use_hff_multiband else 0.44,
+    )
+    return display
 
 
 def make_rgb_cutout(
@@ -427,7 +552,7 @@ def _draw_rgb_cutout(
     ax.imshow(
         rgb,
         origin="lower",
-        interpolation="bilinear",
+        interpolation="none",
         extent=(-0.5, width - 0.5, -0.5, height - 0.5),
     )
     ax.set_xlim(-0.5, width - 0.5)
@@ -1480,8 +1605,8 @@ def run(
     hff_catalog_root: Path = DEFAULT_HFF_CATALOG_ROOT,
     include_hff_diagnostics: bool = True,
 ) -> Path:
-    if len(bands) != 3:
-        raise ValueError("--bands must provide exactly three bands in blue green red order.")
+    if len(bands) < 3:
+        raise ValueError("--bands must provide at least three bands.")
     catalog = select_literature_catalog(
         Path(literature_root),
         cluster=cluster,
@@ -1528,8 +1653,8 @@ def run_bergamini(
     hff_catalog_root: Path = DEFAULT_HFF_CATALOG_ROOT,
     include_hff_diagnostics: bool = True,
 ) -> list[Path]:
-    if len(bands) != 3:
-        raise ValueError("--bands must provide exactly three bands in blue green red order.")
+    if len(bands) < 3:
+        raise ValueError("--bands must provide at least three bands.")
     if output is not None and Path(output).suffix:
         raise ValueError("--output must be a directory when --preset bergamini is used.")
 
@@ -1578,7 +1703,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pagul-match-radius-arcsec", type=float, default=DEFAULT_PAGUL_MATCH_RADIUS_ARCSEC)
     parser.add_argument("--no-pagul-match-info", action="store_true", help="Render cutouts without Pagul2024 match labels.")
     parser.add_argument("--no-hff-diagnostics", action="store_true", help="Render cutouts without HFF family selection diagnostics.")
-    parser.add_argument("--bands", nargs=3, default=list(DEFAULT_BANDS), metavar=("BLUE", "GREEN", "RED"))
+    parser.add_argument("--bands", nargs="+", default=list(DEFAULT_BANDS), metavar="BAND")
     return parser.parse_args(argv)
 
 

@@ -402,6 +402,16 @@ singular local Jacobians. The critical-arc likelihood always evaluates the full
 exact point/arc mixture; there are no speed-mode approximations or masked
 near-critical row splits.
 
+Optional CAB arc-morphology constraints are supplied by `image.arcfile` as an
+independent arc catalog, not as image annotations. Rows have the form
+`arc_id coord_1 coord_2 z_arc tangent_angle_rad curvature_arcsec_inv
+sigma_tangent_angle_rad sigma_curvature_arcsec_inv [reliability]`; `arc_id`
+must be unique, and `z_arc` is retained only for provenance diagnostics
+(`z_arc >= 0` or `-1`). CAB uses the arc anchor, tangent, and curvature only,
+so it never links an arc to an image family. CAB rows use a smoothed local
+tangent frame, so constraints automatically fade to an axial-uniform outlier
+branch when the local stretch direction or branch choice is ill-defined.
+
 If `--fit-cosmology-flat-wcdm` is enabled, every executed sequential fitting
 stage samples the flat wCDM cosmology parameters.
 

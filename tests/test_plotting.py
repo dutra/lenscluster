@@ -2075,6 +2075,43 @@ def test_run_summary_arc_aware_chi_square_counts_arc_supported_rows() -> None:
     assert summary["arc_aware_chi_square_red1_total_sigma_arcsec"] == pytest.approx(math.sqrt(5.25 / 2.0))
 
 
+def test_run_summary_arc_aware_keeps_point_recovered_rows_point_first() -> None:
+    state = SimpleNamespace(parameter_specs=[], family_data=[])
+    image_df = pd.DataFrame(
+        {
+            "x_obs_arcsec": [0.0, 0.0, 0.0],
+            "y_obs_arcsec": [0.0, 0.0, 0.0],
+            "x_model_arcsec": [1.0, 0.0, np.nan],
+            "y_model_arcsec": [0.0, 2.0, np.nan],
+            "sigma_arcsec": [1.0, 1.0, 1.0],
+            "image_sigma_eff_arcsec": [1.0, 1.0, 1.0],
+            "image_recovery_status": ["recovered", "recovered", "not_recovered"],
+            "preferred_recovery_status": ["point_recovered", "point_recovered", "not_recovered"],
+            "arc_recovery_status": ["point_recovered", "point_recovered", "not_recovered"],
+            "arc_supported": [False, False, False],
+            "point_image_residual_arcsec": [1.0, 2.0, np.nan],
+            "arc_candidate_supported": [True, False, False],
+            "arc_candidate_image_residual_arcsec": [0.2, np.nan, np.nan],
+            "preferred_image_residual_arcsec": [1.0, 2.0, np.nan],
+            "arc_aware_image_residual_arcsec": [1.0, 2.0, np.nan],
+            "exact_image_prediction_failed": [False, False, True],
+        }
+    )
+
+    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+
+    assert summary["headline_chi_square"] == pytest.approx(5.0)
+    assert summary["headline_point_image_count"] == 2
+    assert summary["headline_missing_image_count"] == 1
+    assert summary["arc_aware_chi_square"] == pytest.approx(5.0)
+    assert summary["arc_aware_point_image_count"] == 2
+    assert summary["arc_aware_arc_supported_image_count"] == 0
+    assert summary["arc_aware_missing_image_count"] == 1
+    assert summary["arc_aware_n_data"] == 4
+    assert summary["arc_aware_valid_image_count"] == 2
+    assert summary["arc_aware_image_rms_arcsec"] == pytest.approx(math.sqrt((1.0**2 + 2.0**2) / 2.0))
+
+
 def test_run_summary_chi_square_requires_image_sigma_eff_arcsec() -> None:
     state = SimpleNamespace(
         parameter_specs=[ParameterSpec("p", "p", "mock", 81, "x", "uniform", -1.0, 1.0, 0.1)],
@@ -2518,9 +2555,9 @@ def test_parse_args_image_catalog_rgb_display_controls(monkeypatch: Any) -> None
             "--image-catalog-family-cutout-rgb-red-gain",
             "0.68",
             "--image-catalog-family-cutout-rgb-green-gain",
-            "0.69",
+            "0.75",
             "--image-catalog-family-cutout-rgb-blue-gain",
-            "2.75",
+            "3.5",
         ],
     )
     args = cluster_solver._parse_args()
@@ -2528,8 +2565,8 @@ def test_parse_args_image_catalog_rgb_display_controls(monkeypatch: Any) -> None
     assert args.image_catalog_family_cutout_rgb_stretch == pytest.approx(0.0165)
     assert args.image_catalog_family_cutout_rgb_minimum == pytest.approx(-0.001)
     assert args.image_catalog_family_cutout_rgb_red_gain == pytest.approx(0.68)
-    assert args.image_catalog_family_cutout_rgb_green_gain == pytest.approx(0.69)
-    assert args.image_catalog_family_cutout_rgb_blue_gain == pytest.approx(2.75)
+    assert args.image_catalog_family_cutout_rgb_green_gain == pytest.approx(0.75)
+    assert args.image_catalog_family_cutout_rgb_blue_gain == pytest.approx(3.5)
 
     monkeypatch.setattr(sys, "argv", ["cluster_solver", "--image-catalog-family-cutout-rgb-q", "0"])
     with pytest.raises(SystemExit):
@@ -3212,23 +3249,26 @@ def test_image_recovery_uses_status_colors_and_small_points(monkeypatch: Any, tm
     monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
     image_df = pd.DataFrame(
         {
-            "family_id": ["1", "1", "2"],
-            "image_label": ["1.1", "1.2", "2.1"],
-            "image_recovery_status": ["recovered", "not_recovered", "recovered"],
-            "x_obs_arcsec": [0.0, 2.0, 5.0],
-            "y_obs_arcsec": [0.0, 1.0, -1.0],
-            "x_model_arcsec": [0.1, 2.2, 4.8],
-            "y_model_arcsec": [0.2, 1.1, -1.1],
-            "x_model_q16": [0.0, 2.1, 4.7],
-            "x_model_q50": [0.1, 2.2, 4.8],
-            "x_model_q84": [0.2, 2.3, 4.9],
-            "y_model_q16": [0.1, 1.0, -1.2],
-            "y_model_q50": [0.2, 1.1, -1.1],
-            "y_model_q84": [0.3, 1.2, -1.0],
-            "image_residual_arcsec": [0.2, 0.3, 0.4],
-            "image_residual_q16": [0.1, 0.2, 0.3],
-            "image_residual_q50": [0.2, 0.3, 0.4],
-            "image_residual_q84": [0.3, 0.4, 0.5],
+            "family_id": ["1", "1", "2", "2"],
+            "image_label": ["1.1", "1.2", "2.1", "2.2"],
+            "image_recovery_status": ["recovered", "not_recovered", "not_recovered", "recovered"],
+            "arc_recovery_status": ["point_recovered", "arc_supported", "not_recovered", "point_recovered"],
+            "arc_supported": [False, True, False, False],
+            "x_obs_arcsec": [0.0, 2.0, 5.0, 7.0],
+            "y_obs_arcsec": [0.0, 1.0, -1.0, -2.0],
+            "x_model_arcsec": [0.1, 2.2, 4.8, 6.9],
+            "y_model_arcsec": [0.2, 1.1, -1.1, -2.2],
+            "x_model_q16": [0.0, 2.1, 4.7, 6.8],
+            "x_model_q50": [0.1, 2.2, 4.8, 6.9],
+            "x_model_q84": [0.2, 2.3, 4.9, 7.0],
+            "y_model_q16": [0.1, 1.0, -1.2, -2.3],
+            "y_model_q50": [0.2, 1.1, -1.1, -2.2],
+            "y_model_q84": [0.3, 1.2, -1.0, -2.1],
+            "image_residual_arcsec": [0.2, 0.3, 0.4, 0.25],
+            "image_residual_q16": [0.1, 0.2, 0.3, 0.15],
+            "image_residual_q50": [0.2, 0.3, 0.4, 0.25],
+            "image_residual_q84": [0.3, 0.4, 0.5, 0.35],
+            "arc_aware_image_residual_arcsec": [0.2, 0.18, np.nan, 0.25],
         }
     )
     extra_df = pd.DataFrame(
@@ -3245,18 +3285,24 @@ def test_image_recovery_uses_status_colors_and_small_points(monkeypatch: Any, tm
 
     assert (tmp_path / "image_recovery.pdf").exists()
     assert image_axis.scatters[0][2]["marker"] == "x"
-    assert image_axis.scatters[0][2]["color"] == "tab:green"
+    assert image_axis.scatters[0][2]["color"] == plotting._image_catalog_status_color("POINT_RECOVERED")
     assert image_axis.scatters[0][2]["s"] < 30
-    assert image_axis.scatters[0][2]["label"] == "recovered"
+    assert image_axis.scatters[0][2]["label"] == "point recovered"
     assert image_axis.scatters[1][2]["marker"] == "x"
-    assert image_axis.scatters[1][2]["color"] == "tab:red"
-    assert image_axis.scatters[1][2]["label"] == "not recovered"
-    assert image_axis.scatters[2][2]["marker"] == "o"
-    assert image_axis.scatters[2][2]["color"] == "tab:blue"
-    assert image_axis.scatters[2][2]["s"] < 20
-    assert image_axis.scatters[2][2]["label"] == "extra"
+    assert image_axis.scatters[1][2]["color"] == plotting._image_catalog_status_color("ARC_RECOVERED")
+    assert image_axis.scatters[1][2]["label"] == "arc recovered"
+    assert image_axis.scatters[2][2]["marker"] == "x"
+    assert image_axis.scatters[2][2]["color"] == plotting._image_catalog_status_color("MISSED")
+    assert image_axis.scatters[2][2]["label"] == "not recovered"
+    assert image_axis.scatters[3][2]["marker"] == "o"
+    assert image_axis.scatters[3][2]["color"] == "tab:blue"
+    assert image_axis.scatters[3][2]["s"] < 20
+    assert image_axis.scatters[3][2]["label"] == "extra"
     assert image_axis.errorbars[0][2]["fmt"] == "o"
-    np.testing.assert_allclose(image_axis.errorbars[0][2]["color"], plotting._color_with_alpha("tab:green", 0.75))
+    np.testing.assert_allclose(
+        image_axis.errorbars[0][2]["color"],
+        plotting._color_with_alpha(plotting._image_catalog_status_color("POINT_RECOVERED"), 0.75),
+    )
     assert image_axis.errorbars[0][2]["ecolor"][3] < image_axis.errorbars[0][2]["color"][3]
     assert image_axis.errorbars[0][2]["markersize"] < 4
     assert len(image_axis.plots) == 2
@@ -3314,12 +3360,17 @@ def test_plot_image_residual_histogram_prefers_q50_and_writes_pdf(
 ) -> None:
     image_df = pd.DataFrame(
         {
+            "image_recovery_status": ["recovered", "not_recovered", "not_recovered", "recovered"],
+            "arc_recovery_status": ["point_recovered", "arc_supported", "not_recovered", "point_recovered"],
+            "arc_supported": [False, True, False, False],
             "image_residual_arcsec": [9.0, 9.0, 0.30, 9.0],
             "image_residual_q50": [0.04, np.nan, 0.08, np.inf],
+            "arc_aware_image_residual_arcsec": [0.04, 0.20, np.nan, 9.0],
+            "arc_aware_image_residual_q50": [0.04, 0.18, np.nan, np.inf],
         }
     )
     path = tmp_path / "image_residual_histogram.pdf"
-    captured: dict[str, Any] = {"vertical_lines": [], "texts": []}
+    captured: dict[str, Any] = {"histograms": [], "vertical_lines": [], "texts": []}
     original_subplots = plotting.plt.subplots
 
     def spy_subplots(*args: Any, **kwargs: Any) -> Any:
@@ -3329,7 +3380,12 @@ def test_plot_image_residual_histogram_prefers_q50_and_writes_pdf(
         original_text = ax.text
 
         def spy_hist(values: Any, *hist_args: Any, **hist_kwargs: Any) -> Any:
-            captured["residual"] = np.asarray(values, dtype=float).copy()
+            captured["histograms"].append(
+                {
+                    "values": np.asarray(values, dtype=float).copy(),
+                    "kwargs": dict(hist_kwargs),
+                }
+            )
             return original_hist(values, *hist_args, **hist_kwargs)
 
         def spy_axvline(x: float = 0, *line_args: Any, **line_kwargs: Any) -> Any:
@@ -3352,12 +3408,16 @@ def test_plot_image_residual_histogram_prefers_q50_and_writes_pdf(
 
     assert path.exists()
     assert path.stat().st_size > 0
-    expected_residual = np.asarray([0.04, 9.0, 0.08, 9.0])
-    expected_rms = float(np.sqrt(np.mean(np.square(expected_residual))))
-    np.testing.assert_allclose(captured["residual"], expected_residual)
-    rms_line = next(x for x, label in captured["vertical_lines"] if label == "total RMS")
-    assert rms_line == pytest.approx(expected_rms)
-    assert any("Total RMS" in text and "N = 4" in text for text in captured["texts"])
+    assert len(captured["histograms"]) == 3
+    np.testing.assert_allclose(captured["histograms"][0]["values"], np.asarray([0.04, 9.0]))
+    np.testing.assert_allclose(captured["histograms"][1]["values"], np.asarray([0.18]))
+    np.testing.assert_allclose(captured["histograms"][2]["values"], np.asarray([0.04, 9.0, 0.18]))
+    assert captured["histograms"][1]["kwargs"]["color"] == plotting._image_catalog_status_color("ARC_RECOVERED")
+    assert captured["histograms"][2]["kwargs"]["histtype"] == "step"
+    assert captured["histograms"][2]["kwargs"]["linestyle"] != "-"
+    expected_best_rms = float(np.sqrt(np.mean(np.square(np.asarray([0.04, 9.0, 0.18])))))
+    assert captured["vertical_lines"][-1][0] == pytest.approx(expected_best_rms)
+    assert any("RMS by recovery mode" in text and "missed by both: 1" in text for text in captured["texts"])
 
 
 def test_plot_image_residual_histogram_writes_placeholder_without_finite_values(tmp_path: Path) -> None:

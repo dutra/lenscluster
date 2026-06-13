@@ -689,6 +689,7 @@ def _arc_aware_family_diagnostics_from_image_rows(image_df: pd.DataFrame | None)
         "arc_aware_recovered_image_count",
         "arc_aware_missing_image_count",
         "arc_supported_image_count",
+        "arc_candidate_supported_image_count",
     ]
     if image_df is None or image_df.empty or "family_id" not in image_df:
         return pd.DataFrame(columns=columns)
@@ -710,6 +711,10 @@ def _arc_aware_family_diagnostics_from_image_rows(image_df: pd.DataFrame | None)
             supported_count = int(np.sum(group_df["arc_recovery_status"].astype(str).to_numpy() == "arc_supported"))
         else:
             supported_count = 0
+        if "arc_candidate_supported" in group_df:
+            candidate_supported_count = int(np.sum(group_df["arc_candidate_supported"].astype(bool).to_numpy()))
+        else:
+            candidate_supported_count = supported_count
         rows.append(
             {
                 "family_id": str(family_id),
@@ -717,6 +722,7 @@ def _arc_aware_family_diagnostics_from_image_rows(image_df: pd.DataFrame | None)
                 "arc_aware_recovered_image_count": recovered_count,
                 "arc_aware_missing_image_count": missing_count,
                 "arc_supported_image_count": supported_count,
+                "arc_candidate_supported_image_count": candidate_supported_count,
             }
         )
     return pd.DataFrame(rows, columns=columns)
@@ -856,9 +862,13 @@ def _fit_quality_chi_square_summary(
         arc_supported = df["arc_supported"].astype(bool).to_numpy()
     else:
         arc_supported = arc_recovery_status == "arc_supported"
-    has_recovery_status = "image_recovery_status" in df.columns or "arc_recovery_status" in df.columns
-    point_recovered = (recovery_status == "recovered") | (arc_recovery_status == "point_recovered")
-    if not has_recovery_status:
+    has_image_recovery_status = "image_recovery_status" in df.columns
+    has_recovery_status = has_image_recovery_status or "arc_recovery_status" in df.columns
+    if has_image_recovery_status:
+        point_recovered = recovery_status == "recovered"
+    elif "arc_recovery_status" in df.columns:
+        point_recovered = arc_recovery_status == "point_recovered"
+    else:
         point_recovered = ~failed
     x_model = pd.to_numeric(df["x_model_arcsec"], errors="coerce").to_numpy(dtype=float)
     y_model = pd.to_numeric(df["y_model_arcsec"], errors="coerce").to_numpy(dtype=float)
@@ -2246,7 +2256,7 @@ def _state_potfiles_with_catalogs(state: BuildState) -> list[dict[str, Any]]:
     if not par_path:
         return potfiles
     try:
-        parsed, _potentials_df, _images_df, _potentials_with_priors = load_best_par(par_path)
+        parsed, _potentials_df, _images_df, _arcs_df, _potentials_with_priors = load_best_par(par_path)
     except Exception as exc:
         _log(None, f"[plot:corner] best.par potfile catalog fallback unavailable from {par_path}: {exc}")
         return potfiles
@@ -2340,7 +2350,7 @@ def _load_best_par_marker_values(path: str | Path | None, state: BuildState) -> 
         _log(None, f"[plot:corner] best.par marker skipped; missing file: {best_par_path}")
         return None
     try:
-        _parsed, potentials_df, _images_df, _potentials_with_priors = load_best_par(best_par_path)
+        _parsed, potentials_df, _images_df, _arcs_df, _potentials_with_priors = load_best_par(best_par_path)
     except Exception as exc:
         _log(None, f"[plot:corner] best.par marker skipped; failed to read {best_par_path}: {exc}")
         return None
@@ -3603,12 +3613,14 @@ def _covered_by_inflated_interval(
     return bool((float(observed) >= lo - float(sigma_eff)) and (float(observed) <= hi + float(sigma_eff)))
 
 
-def _fit_quality_value(df: pd.DataFrame, column: str, fallback_column: str | None = None) -> np.ndarray:
+def _fit_quality_value(df: pd.DataFrame, column: str, *fallback_columns: str) -> np.ndarray:
     if column in df.columns:
         values = pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
     else:
         values = np.full(len(df), np.nan, dtype=float)
-    if fallback_column is not None and fallback_column in df.columns:
+    for fallback_column in fallback_columns:
+        if fallback_column not in df.columns:
+            continue
         fallback = pd.to_numeric(df[fallback_column], errors="coerce").to_numpy(dtype=float)
         values = np.where(np.isfinite(values), values, fallback)
     return values
@@ -4373,6 +4385,19 @@ def _fit_quality_tables(
     return pd.DataFrame(image_rows), pd.DataFrame(magnification_rows), pd.DataFrame(best_prediction.get("extra_image_rows", []))
 
 
+def _cab_arc_diagnostics_table(evaluator: Any, best_fit: np.ndarray) -> pd.DataFrame:
+    if not hasattr(evaluator, "_cab_morphology_details_for_arcs"):
+        return pd.DataFrame()
+    try:
+        best_fit_latent = _reported_physical_to_latent_vector(evaluator, np.asarray(best_fit, dtype=float))
+        table = evaluator._cab_morphology_details_for_arcs(best_fit_latent)
+    except Exception:
+        return pd.DataFrame()
+    if isinstance(table, pd.DataFrame):
+        return table
+    return pd.DataFrame(table)
+
+
 def _plot_image_recovery_fit_quality(
     image_df: pd.DataFrame,
     path: Path,
@@ -4391,38 +4416,28 @@ def _plot_image_recovery_fit_quality(
     x_model = np.where(np.isfinite(x_model), x_model, x_best)
     y_model = np.where(np.isfinite(y_model), y_model, y_best)
 
-    if "image_recovery_status" in image_df.columns:
-        status = image_df["image_recovery_status"].fillna("unknown").astype(str).to_numpy()
-    elif "exact_image_prediction_failed" in image_df.columns:
-        failed = image_df["exact_image_prediction_failed"].astype(bool).to_numpy()
-        status = np.where(failed, "not_recovered", "recovered")
-    else:
-        status = np.where(np.isfinite(x_model) & np.isfinite(y_model), "recovered", "not_recovered")
-    recovered = status == "recovered"
-    not_recovered = ~recovered
+    status = _image_catalog_effective_recovery_statuses(image_df)
+    point_recovered = status == "POINT_RECOVERED"
+    arc_recovered = status == "ARC_RECOVERED"
+    missed = status == "MISSED"
     finite_model = np.isfinite(x_model) & np.isfinite(y_model)
-    finite_recovered_model = recovered & finite_model
+    finite_recovered_model = point_recovered & finite_model
 
-    if recovered.any():
-        ax.scatter(
-            x_obs[recovered],
-            y_obs[recovered],
-            marker="x",
-            color="tab:green",
-            s=18,
-            linewidths=0.9,
-            label="recovered",
-        )
-    if not_recovered.any():
-        ax.scatter(
-            x_obs[not_recovered],
-            y_obs[not_recovered],
-            marker="x",
-            color="tab:red",
-            s=18,
-            linewidths=0.9,
-            label="not recovered",
-        )
+    for status_name, mask, label in (
+        ("POINT_RECOVERED", point_recovered, "point recovered"),
+        ("ARC_RECOVERED", arc_recovered, "arc recovered"),
+        ("MISSED", missed, "not recovered"),
+    ):
+        if mask.any():
+            ax.scatter(
+                x_obs[mask],
+                y_obs[mask],
+                marker="x",
+                color=_image_catalog_status_color(status_name),
+                s=18,
+                linewidths=0.9,
+                label=label,
+            )
     if finite_recovered_model.any():
         x16 = _fit_quality_value(image_df, "x_model_q16")
         x84 = _fit_quality_value(image_df, "x_model_q84")
@@ -4442,8 +4457,8 @@ def _plot_image_recovery_fit_quality(
             xerr=xerr,
             yerr=yerr,
             fmt="o",
-            color=_color_with_alpha("tab:green", 0.75),
-            ecolor=_color_with_alpha("tab:green", 0.35),
+            color=_color_with_alpha(_image_catalog_status_color("POINT_RECOVERED"), 0.75),
+            ecolor=_color_with_alpha(_image_catalog_status_color("POINT_RECOVERED"), 0.35),
             markersize=3,
             elinewidth=0.8,
             capsize=1.5,
@@ -4463,7 +4478,7 @@ def _plot_image_recovery_fit_quality(
                 linewidths=0.0,
                 label="extra",
             )
-    for row, x_fit, y_fit, is_recovered in zip(image_df.itertuples(index=False), x_model, y_model, recovered):
+    for row, x_fit, y_fit, is_recovered in zip(image_df.itertuples(index=False), x_model, y_model, point_recovered):
         if is_recovered and np.isfinite(x_fit) and np.isfinite(y_fit):
             ax.plot([row.x_obs_arcsec, x_fit], [row.y_obs_arcsec, y_fit], color="0.6", lw=0.7)
     ax.invert_xaxis()
@@ -4527,33 +4542,77 @@ def _plot_image_count_recovery(image_count_df: pd.DataFrame, path: Path) -> None
         return
     observed = pd.to_numeric(image_count_df["observed_image_count"], errors="coerce").to_numpy(dtype=float)
     recovered = pd.to_numeric(image_count_df["recovered_image_count"], errors="coerce").to_numpy(dtype=float)
+    arc_aware_recovered = (
+        pd.to_numeric(image_count_df["arc_aware_recovered_image_count"], errors="coerce").to_numpy(dtype=float)
+        if "arc_aware_recovered_image_count" in image_count_df.columns
+        else np.full(len(image_count_df), np.nan, dtype=float)
+    )
     produced = pd.to_numeric(image_count_df["produced_image_count"], errors="coerce").to_numpy(dtype=float)
-    if not (np.isfinite(recovered).any() or np.isfinite(produced).any()):
+    if not (np.isfinite(recovered).any() or np.isfinite(arc_aware_recovered).any() or np.isfinite(produced).any()):
         return
     labels = image_count_df["family_id"].astype(str).to_numpy()
     y_index = np.arange(len(image_count_df))
-    height = 0.24
+    height = 0.18 if np.isfinite(arc_aware_recovered).any() else 0.24
     fig, ax = plt.subplots(figsize=(9.5, max(4.2, 0.32 * len(image_count_df))))
     finite_observed = np.isfinite(observed)
     finite_recovered = np.isfinite(recovered)
+    finite_arc_aware_recovered = np.isfinite(arc_aware_recovered)
     finite_produced = np.isfinite(produced)
+    offsets = {
+        "observed": -1.5 * height if finite_arc_aware_recovered.any() else -height,
+        "recovered": -0.5 * height if finite_arc_aware_recovered.any() else 0.0,
+        "arc_aware": 0.5 * height,
+        "produced": 1.5 * height if finite_arc_aware_recovered.any() else height,
+    }
     if finite_observed.any():
-        ax.barh(y_index[finite_observed] - height, observed[finite_observed], height=height, color="0.65", label="observed")
+        ax.barh(
+            y_index[finite_observed] + offsets["observed"],
+            observed[finite_observed],
+            height=height,
+            color="0.65",
+            label="observed",
+        )
     if finite_recovered.any():
-        ax.barh(y_index[finite_recovered], recovered[finite_recovered], height=height, color="tab:green", label="recovered")
+        ax.barh(
+            y_index[finite_recovered] + offsets["recovered"],
+            recovered[finite_recovered],
+            height=height,
+            color=_image_catalog_status_color("POINT_RECOVERED"),
+            label="point recovered",
+        )
+    if finite_arc_aware_recovered.any():
+        ax.barh(
+            y_index[finite_arc_aware_recovered] + offsets["arc_aware"],
+            arc_aware_recovered[finite_arc_aware_recovered],
+            height=height,
+            color=_image_catalog_status_color("ARC_RECOVERED"),
+            label="point + arc recovered",
+        )
     if finite_produced.any():
-        ax.barh(y_index[finite_produced] + height, produced[finite_produced], height=height, color="tab:blue", label="produced")
+        ax.barh(
+            y_index[finite_produced] + offsets["produced"],
+            produced[finite_produced],
+            height=height,
+            color=_image_catalog_status_color("MODEL"),
+            label="produced",
+        )
     total_observed = int(np.nansum(observed))
     total_recovered = int(np.nansum(recovered)) if finite_recovered.any() else 0
+    total_arc_aware_recovered = int(np.nansum(arc_aware_recovered)) if finite_arc_aware_recovered.any() else None
     total_produced = int(np.nansum(produced)) if finite_produced.any() else 0
     ax.set_yticks(y_index)
     ax.set_yticklabels(labels)
     ax.invert_yaxis()
     ax.set_xlabel("image count")
     ax.set_ylabel("family")
-    ax.set_title(
-        f"Image Count Recovery: observed={total_observed} recovered={total_recovered} produced={total_produced}"
-    )
+    if total_arc_aware_recovered is None:
+        title_counts = f"observed={total_observed} point={total_recovered} produced={total_produced}"
+    else:
+        title_counts = (
+            f"observed={total_observed} point={total_recovered} "
+            f"point+arc={total_arc_aware_recovered} produced={total_produced}"
+        )
+    ax.set_title(f"Image Count Recovery: {title_counts}")
     ax.legend(loc="best", fontsize=8)
     ax.grid(axis="x", alpha=0.25)
     fig.tight_layout()
@@ -4647,9 +4706,25 @@ def _write_placeholder_plot(path: Path, title: str, message: str) -> None:
 
 
 def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
-    residual = _fit_quality_value(image_df, "image_residual_q50", "image_residual_arcsec")
-    residual = residual[np.isfinite(residual)]
-    if residual.size == 0:
+    strict_residual = _fit_quality_value(image_df, "image_residual_q50", "image_residual_arcsec")
+    arc_residual = _fit_quality_value(
+        image_df,
+        "arc_aware_image_residual_q50",
+        "arc_aware_image_residual_arcsec",
+        "arc_curve_distance_arcsec",
+    )
+    if any(column in image_df.columns for column in ("image_recovery_status", "arc_recovery_status", "exact_image_prediction_failed")):
+        status = _image_catalog_effective_recovery_statuses(image_df)
+    else:
+        status = np.where(np.isfinite(strict_residual), "POINT_RECOVERED", "MISSED")
+
+    point_mask = status == "POINT_RECOVERED"
+    arc_mask = status == "ARC_RECOVERED"
+    point_residual = strict_residual[point_mask & np.isfinite(strict_residual)]
+    arc_recovered_residual = arc_residual[arc_mask & np.isfinite(arc_residual)]
+    best_residual = np.concatenate([point_residual, arc_recovered_residual])
+    finite_for_bins = np.concatenate([point_residual, arc_recovered_residual])
+    if finite_for_bins.size == 0:
         _write_placeholder_plot(
             path,
             "Image residual histogram",
@@ -4657,27 +4732,68 @@ def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
         )
         return
 
-    fig, ax = plt.subplots(figsize=(6.2, 4.2))
-    bin_count = 30
-    total_rms = float(np.sqrt(np.mean(np.square(residual))))
-    ax.hist(residual, bins=bin_count, color="tab:blue", alpha=0.75)
-    ax.axvline(
-        float(np.nanmedian(residual)),
-        color="black",
-        linestyle="--",
-        linewidth=1.2,
-        label="median",
-    )
-    ax.axvline(
-        total_rms,
-        color="tab:red",
-        linestyle="-.",
-        linewidth=1.2,
-        label="total RMS",
-    )
-    rms_annotation = (
-        f"Total RMS = $\\sqrt{{\\mathrm{{mean}}(r^2)}}$ = {total_rms:.3g} arcsec\n"
-        f"N = {residual.size}"
+    fig, ax = plt.subplots(figsize=(7.4, 4.9))
+    bin_count = min(48, max(14, int(np.sqrt(max(1, finite_for_bins.size)) * 2.4)))
+    max_residual = float(np.nanmax(finite_for_bins))
+    bins = np.linspace(0.0, max(max_residual * 1.04, 1.0e-6), bin_count + 1)
+    point_color = "#64748b"
+    arc_color = _image_catalog_status_color("ARC_RECOVERED")
+    best_color = "#2e7d32"
+
+    def rms(values: np.ndarray) -> float:
+        return float(np.sqrt(np.mean(np.square(values)))) if values.size else np.nan
+
+    point_rms = rms(point_residual)
+    arc_rms = rms(arc_recovered_residual)
+    best_rms = rms(best_residual)
+
+    if point_residual.size:
+        ax.hist(
+            point_residual,
+            bins=bins,
+            color=point_color,
+            alpha=0.52,
+            edgecolor="#334155",
+            linewidth=0.85,
+            label=f"point recovered  N={point_residual.size}  RMS={point_rms:.3g}\"",
+            zorder=2,
+        )
+        ax.axvline(point_rms, color=point_color, linestyle="-", linewidth=1.35, alpha=0.9)
+    if arc_recovered_residual.size:
+        ax.hist(
+            arc_recovered_residual,
+            bins=bins,
+            color=arc_color,
+            alpha=0.58,
+            edgecolor="#b7791f",
+            linewidth=0.9,
+            label=f"arc recovered  N={arc_recovered_residual.size}  RMS={arc_rms:.3g}\"",
+            zorder=4,
+        )
+        ax.axvline(arc_rms, color="#b7791f", linestyle="-", linewidth=1.45, alpha=0.95)
+    if best_residual.size:
+        ax.hist(
+            best_residual,
+            bins=bins,
+            histtype="step",
+            color=best_color,
+            linestyle=(0, (5, 2)),
+            linewidth=2.2,
+            label=f"best point+arc  N={best_residual.size}  RMS={best_rms:.3g}\"",
+            zorder=5,
+        )
+        ax.axvline(best_rms, color=best_color, linestyle=(0, (5, 2)), linewidth=1.8, alpha=0.95)
+    missed_count = int(np.sum(status == "MISSED"))
+    rms_annotation = "\n".join(
+        [
+            "RMS by recovery mode",
+            f"point: {point_rms:.3g}\"  (N={point_residual.size})" if point_residual.size else "point: na  (N=0)",
+            f"arc: {arc_rms:.3g}\"  (N={arc_recovered_residual.size})"
+            if arc_recovered_residual.size
+            else "arc: na  (N=0)",
+            f"best: {best_rms:.3g}\"  (N={best_residual.size})",
+            f"missed by both: {missed_count}",
+        ]
     )
     ax.text(
         0.98,
@@ -4691,12 +4807,17 @@ def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
             "boxstyle": "round,pad=0.3",
             "facecolor": "white",
             "edgecolor": "0.6",
-            "alpha": 0.9,
+            "alpha": 0.88,
         },
     )
     ax.set_xlabel("image residual [arcsec]")
     ax.set_ylabel("N images")
-    ax.legend(loc="best", fontsize=8)
+    ax.set_title("Image Residuals: Point, Arc, and Best Recovery")
+    ax.grid(axis="y", alpha=0.22, linewidth=0.8)
+    ax.grid(axis="x", alpha=0.10, linewidth=0.7)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=1, fontsize=8.5, frameon=False)
     fig.tight_layout()
     fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -4723,17 +4844,11 @@ def _critical_arc_support_available(image_df: pd.DataFrame | None) -> bool:
 
 
 def _critical_arc_status_counts(image_df: pd.DataFrame) -> dict[str, int]:
-    if "arc_recovery_status" in image_df.columns:
-        status = image_df["arc_recovery_status"].fillna("not_recovered").astype(str).to_numpy()
-    elif "arc_supported" in image_df.columns:
-        supported = image_df["arc_supported"].astype(bool).to_numpy()
-        status = np.where(supported, "arc_supported", "not_recovered")
-    else:
-        status = np.full(len(image_df), "not_recovered", dtype=object)
+    status = _image_catalog_effective_recovery_statuses(image_df)
     return {
-        "point_recovered": int(np.sum(status == "point_recovered")),
-        "arc_supported": int(np.sum(status == "arc_supported")),
-        "not_recovered": int(np.sum(status == "not_recovered")),
+        "point_recovered": int(np.sum(status == "POINT_RECOVERED")),
+        "arc_supported": int(np.sum(status == "ARC_RECOVERED")),
+        "not_recovered": int(np.sum(status == "MISSED")),
     }
 
 
@@ -4855,15 +4970,11 @@ def _plot_critical_arc_support_phase_space(
             "No finite critical-arc phase-space diagnostics are available.",
         )
         return
-    status = (
-        image_df["arc_recovery_status"].fillna("not_recovered").astype(str).to_numpy()
-        if "arc_recovery_status" in image_df.columns
-        else np.full(len(image_df), "not_recovered", dtype=object)
-    )
+    status = _image_catalog_effective_recovery_statuses(image_df)
     colors = {
-        "point_recovered": "tab:blue",
-        "arc_supported": "tab:green",
-        "not_recovered": "tab:red",
+        "POINT_RECOVERED": _image_catalog_status_color("POINT_RECOVERED"),
+        "ARC_RECOVERED": _image_catalog_status_color("ARC_RECOVERED"),
+        "MISSED": _image_catalog_status_color("MISSED"),
     }
     finite_critical_direction = np.where(np.isfinite(critical_direction), critical_direction, 0.0)
     critical_direction_scale = np.log10(np.maximum(finite_critical_direction, 1.0e-6))
@@ -4884,7 +4995,7 @@ def _plot_critical_arc_support_phase_space(
                 alpha=0.72,
                 edgecolors="white",
                 linewidths=0.35,
-                label=status_name.replace("_", " "),
+                label=_image_catalog_status_display_text(status_name),
             )
     other_mask = finite & ~np.isin(status, list(colors))
     if other_mask.any():
@@ -4942,9 +5053,9 @@ def _plot_critical_arc_recovery_by_family(image_count_df: pd.DataFrame, path: Pa
     fig, ax = plt.subplots(figsize=(9.5, max(4.5, 0.36 * len(df))))
     series = [
         ("observed", "observed_image_count", "0.65", -1.5 * height),
-        ("strict recovered", "recovered_image_count", "tab:blue", -0.5 * height),
-        ("arc-aware recovered", "arc_aware_recovered_image_count", "tab:green", 0.5 * height),
-        ("arc supported", "arc_supported_image_count", "tab:olive", 1.5 * height),
+        ("point recovered", "recovered_image_count", _image_catalog_status_color("POINT_RECOVERED"), -0.5 * height),
+        ("point + arc recovered", "arc_aware_recovered_image_count", _image_catalog_status_color("ARC_RECOVERED"), 0.5 * height),
+        ("arc recovered only", "arc_supported_image_count", "#ffb300", 1.5 * height),
     ]
     for label, column, color, offset in series:
         values = df[column].to_numpy(dtype=float)
@@ -6309,74 +6420,6 @@ def _draw_cutout_direction_frame(
             )
 
 
-def _draw_image_catalog_cab_morphology(
-    ax: plt.Axes,
-    image: Any,
-    center_coord: SkyCoord,
-    row: pd.Series,
-    reference: tuple[int, float, float],
-    *,
-    cutout_size_arcsec: float,
-    rendered_shape: tuple[int, int],
-    alpha: float = 0.85,
-    zorder: float = 12,
-) -> None:
-    if not bool(row.get("cab_has_constraint", False)):
-        return
-    try:
-        x0 = float(row.get("cab_anchor_x_arcsec", np.nan))
-        y0 = float(row.get("cab_anchor_y_arcsec", np.nan))
-        angle = float(row.get("cab_tangent_angle_model_rad", np.nan))
-        curvature = float(row.get("cab_curvature_model_arcsec_inv", np.nan))
-    except (TypeError, ValueError):
-        return
-    if not np.all(np.isfinite([x0, y0, angle])):
-        return
-    tangent_x = math.cos(angle)
-    tangent_y = math.sin(angle)
-    half_length = min(1.8, max(0.45, 0.14 * float(cutout_size_arcsec)))
-    start_coord = _arcsec_to_skycoord(x0 - half_length * tangent_x, y0 - half_length * tangent_y, reference)
-    end_coord = _arcsec_to_skycoord(x0 + half_length * tangent_x, y0 + half_length * tangent_y, reference)
-    if start_coord is not None and end_coord is not None:
-        _draw_cutout_segment(
-            ax,
-            image,
-            center_coord,
-            start_coord,
-            end_coord,
-            cutout_size_arcsec=cutout_size_arcsec,
-            rendered_shape=rendered_shape,
-            color="#ffe04d",
-            linewidth=1.25,
-            alpha=alpha,
-            zorder=zorder,
-        )
-    if not np.isfinite(curvature) or curvature <= 0.0:
-        return
-    radius_arcsec = 1.0 / curvature
-    if radius_arcsec > 2.0 * float(cutout_size_arcsec):
-        return
-    normal_x = -tangent_y
-    normal_y = tangent_x
-    circle_center = _arcsec_to_skycoord(x0 + radius_arcsec * normal_x, y0 + radius_arcsec * normal_y, reference)
-    if circle_center is None:
-        return
-    _draw_cutout_circle(
-        ax,
-        image,
-        center_coord,
-        circle_center,
-        cutout_size_arcsec=cutout_size_arcsec,
-        rendered_shape=rendered_shape,
-        color="#ffe04d",
-        radius_arcsec=radius_arcsec,
-        linestyle="--",
-        linewidth=0.85,
-        alpha=0.55 * alpha,
-        zorder=zorder - 0.5,
-    )
-
-
 def _format_cutout_float(value: Any, precision: int = 2) -> str:
     try:
         numeric = float(value)
@@ -6388,12 +6431,21 @@ def _format_cutout_float(value: Any, precision: int = 2) -> str:
 
 
 def _format_image_catalog_diagnostic_label(row: pd.Series) -> str:
-    status = str(row.get("arc_recovery_status", row.get("image_recovery_status", ""))).replace("_", " ")
+    status = _image_catalog_compact_status_text(row, _image_catalog_observed_panel_status(row))
+    point_recovered = _image_catalog_point_recovered(row)
+    arc_recovered = _image_catalog_arc_recovered(row)
+    point_status = "recovered" if point_recovered else ("arc recovered" if arc_recovered else "missed")
+    arc_status = "recovered" if arc_recovered else ("supported" if _image_catalog_arc_candidate_supported(row) else "not supported")
     lines = [
         f"{row.get('image_label', '')} z={_format_cutout_float(row.get('z_source', row.get('catalog_z')), 3)}",
         (
-            f"r={_format_cutout_float(row.get('image_residual_arcsec'))} "
-            f"arc={_format_cutout_float(row.get('arc_aware_image_residual_arcsec'))}"
+            f"point={point_status} "
+            f"r_point={_format_cutout_float(row.get('point_image_residual_arcsec', row.get('image_residual_arcsec')))} "
+        ),
+        (
+            f"arc={arc_status} "
+            f"r_arc={_format_cutout_float(row.get('arc_candidate_image_residual_arcsec', row.get('arc_curve_distance_arcsec')))}"
+            f" p_arc={_format_cutout_float(row.get('arc_prior_probability'))}"
         ),
         (
             f"N={_format_cutout_float(row.get('arc_noncritical_direction_residual_arcsec'))} "
@@ -6409,15 +6461,43 @@ def _format_image_catalog_diagnostic_label(row: pd.Series) -> str:
             f"det={_format_cutout_float(row.get('arc_detA'))}"
         ),
     ]
-    if bool(row.get("cab_has_constraint", False)):
-        lines.append(
-            (
-                f"CAB dphi={_format_cutout_float(row.get('cab_tangent_residual_rad'))} "
-                f"dk={_format_cutout_float(row.get('cab_curvature_residual_arcsec_inv'))}"
-            )
-        )
-    lines.append(f"p_arc={_format_cutout_float(row.get('arc_prior_probability'))} {status}")
+    lines.append(status)
     return "\n".join(lines)
+
+
+def _image_catalog_normalized_family_key(value: Any) -> str:
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return ""
+    try:
+        numeric = float(text)
+    except (TypeError, ValueError):
+        numeric = np.nan
+    if np.isfinite(numeric) and float(numeric).is_integer():
+        return str(int(numeric))
+    if re.fullmatch(r"[+-]?\d+", text):
+        return str(int(text))
+    return text.lower()
+
+
+def _image_catalog_normalized_label_key(value: Any) -> str:
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return ""
+    family_text, separator, image_suffix = text.partition(".")
+    if separator:
+        return f"{_image_catalog_normalized_family_key(family_text)}.{image_suffix.strip().lower()}"
+    return text.lower()
 
 
 def _image_catalog_cutout_rows(state: BuildState, image_df: pd.DataFrame) -> pd.DataFrame:
@@ -6444,16 +6524,33 @@ def _image_catalog_cutout_rows(state: BuildState, image_df: pd.DataFrame) -> pd.
     if base.empty or image_df is None or image_df.empty:
         return base
     diagnostics = image_df.copy()
-    for column in ("family_id", "image_label"):
-        if column in diagnostics.columns:
-            diagnostics[column] = diagnostics[column].astype(str)
+    base["__family_key"] = base["family_id"].map(_image_catalog_normalized_family_key)
+    base["__label_key"] = base["image_label"].map(_image_catalog_normalized_label_key)
+    if "family_id" in diagnostics.columns:
+        diagnostics["__family_key"] = diagnostics["family_id"].map(_image_catalog_normalized_family_key)
+    else:
+        diagnostics["__family_key"] = diagnostics.get("image_label", pd.Series("", index=diagnostics.index)).map(
+            lambda value: _image_catalog_normalized_label_key(value).split(".", 1)[0]
+        )
+    if "image_label" in diagnostics.columns:
+        diagnostics["__label_key"] = diagnostics["image_label"].map(_image_catalog_normalized_label_key)
+    else:
+        diagnostics["__label_key"] = ""
+    diagnostics = diagnostics.drop_duplicates(["__family_key", "__label_key"], keep="first")
+    diagnostic_payload = diagnostics.drop(
+        columns=[
+            column
+            for column in ("family_id", "image_label", "x_obs_arcsec", "y_obs_arcsec")
+            if column in diagnostics.columns
+        ]
+    )
     merged = base.merge(
-        diagnostics.drop(columns=[column for column in ("x_obs_arcsec", "y_obs_arcsec") if column in diagnostics.columns]),
-        on=["family_id", "image_label"],
+        diagnostic_payload,
+        on=["__family_key", "__label_key"],
         how="left",
         suffixes=("", "_diagnostic"),
     )
-    return merged
+    return merged.drop(columns=["__family_key", "__label_key"])
 
 
 def _image_catalog_extra_cutout_rows(state: BuildState, extra_image_df: pd.DataFrame | None) -> pd.DataFrame:
@@ -6475,10 +6572,16 @@ def _image_catalog_extra_cutout_rows(state: BuildState, extra_image_df: pd.DataF
     if extra_image_df is None or extra_image_df.empty:
         return pd.DataFrame(columns=columns)
     family_by_id = {str(family.family_id): family for family in getattr(state, "family_data", [])}
+    family_by_normalized_id = {
+        _image_catalog_normalized_family_key(family_id): family
+        for family_id, family in family_by_id.items()
+    }
     rows: list[dict[str, Any]] = []
     for _, row in extra_image_df.iterrows():
         family_id = str(row.get("family_id", ""))
-        family = family_by_id.get(family_id)
+        family = family_by_id.get(family_id) or family_by_normalized_id.get(_image_catalog_normalized_family_key(family_id))
+        if family is not None:
+            family_id = str(family.family_id)
         try:
             x_model = float(row.get("x_model_arcsec"))
             y_model = float(row.get("y_model_arcsec"))
@@ -6525,11 +6628,11 @@ def _image_catalog_extra_cutout_rows(state: BuildState, extra_image_df: pd.DataF
 
 def _image_catalog_status_color(status: str) -> str:
     normalized = str(status).strip().upper()
-    if normalized in {"POINT_RECOVERED", "OBSERVED"}:
+    if normalized in {"POINT_RECOVERED", "POINT_SUPPORTED", "OBSERVED"}:
         return "#4da3ff"
-    if normalized == "ARC_RECOVERED":
+    if normalized in {"ARC_RECOVERED", "ARC_SUPPORTED"}:
         return "#ffd54f"
-    if normalized == "MISSED":
+    if normalized in {"MISSED", "NOT_RECOVERED"}:
         return "#ff4d5e"
     if normalized == "EXTRA":
         return "tab:purple"
@@ -6544,9 +6647,12 @@ def _image_catalog_status_display_text(status: str) -> str:
     normalized = str(status).strip().upper()
     labels = {
         "POINT_RECOVERED": "point recovered",
+        "POINT_SUPPORTED": "point recovered",
         "OBSERVED": "point recovered",
         "ARC_RECOVERED": "arc recovered",
+        "ARC_SUPPORTED": "arc recovered",
         "MISSED": "not recovered",
+        "NOT_RECOVERED": "not recovered",
         "EXTRA": "extra",
     }
     return labels.get(normalized, str(status).strip().replace("_", " ").lower())
@@ -6593,22 +6699,45 @@ def _image_catalog_point_recovered(row: pd.Series) -> bool:
     return _image_catalog_has_finite_model_position(row)
 
 
+def _image_catalog_preferred_point_recovered(row: pd.Series) -> bool:
+    return _image_catalog_point_recovered(row)
+
+
 def _image_catalog_arc_recovered(row: pd.Series) -> bool:
     if _image_catalog_point_recovered(row):
+        return False
+    arc_statuses = {
+        str(row.get(column, "")).strip().lower()
+        for column in ("preferred_recovery_status", "arc_recovery_status")
+    }
+    if arc_statuses & {"arc_supported", "arc_recovered"}:
         return True
-    arc_status = str(row.get("arc_recovery_status", "")).strip().lower()
-    if arc_status in {"point_recovered", "arc_supported", "arc_recovered"}:
+    if _image_catalog_truthy(row.get("arc_supported", False)):
         return True
     try:
         arc_residual = float(row.get("arc_aware_image_residual_arcsec", np.nan))
     except (TypeError, ValueError):
         arc_residual = np.nan
-    if np.isfinite(arc_residual):
+    return bool(np.isfinite(arc_residual))
+
+
+def _image_catalog_arc_candidate_supported(row: pd.Series) -> bool:
+    if _image_catalog_truthy(row.get("arc_candidate_supported", False)):
         return True
-    return _image_catalog_truthy(row.get("arc_supported", False))
+    try:
+        candidate_residual = float(row.get("arc_candidate_image_residual_arcsec", np.nan))
+    except (TypeError, ValueError):
+        candidate_residual = np.nan
+    if np.isfinite(candidate_residual):
+        return True
+    arc_statuses = {
+        str(row.get(column, "")).strip().lower()
+        for column in ("preferred_recovery_status", "arc_recovery_status")
+    }
+    return _image_catalog_truthy(row.get("arc_supported", False)) or bool(arc_statuses & {"arc_supported", "arc_recovered"})
 
 
-def _image_catalog_observed_panel_status(row: pd.Series) -> str:
+def _image_catalog_effective_recovery_status(row: pd.Series) -> str:
     if _image_catalog_point_recovered(row):
         return "POINT_RECOVERED"
     if _image_catalog_arc_recovered(row):
@@ -6616,11 +6745,18 @@ def _image_catalog_observed_panel_status(row: pd.Series) -> str:
     return "MISSED"
 
 
+def _image_catalog_effective_recovery_statuses(data: pd.DataFrame) -> np.ndarray:
+    if data is None or data.empty:
+        return np.asarray([], dtype=object)
+    return np.asarray([_image_catalog_effective_recovery_status(row) for _, row in data.iterrows()], dtype=object)
+
+
+def _image_catalog_observed_panel_status(row: pd.Series) -> str:
+    return _image_catalog_effective_recovery_status(row)
+
+
 def _image_catalog_draw_arc_anchor_overlays(row: pd.Series) -> bool:
-    panel_status = str(row.get("panel_status", "")).strip().upper()
-    if panel_status and panel_status not in {"NAN", "NONE", "NULL"}:
-        return panel_status == "ARC_RECOVERED"
-    return _image_catalog_observed_panel_status(row) == "ARC_RECOVERED"
+    return _image_catalog_arc_candidate_supported(row)
 
 
 def _image_catalog_display_model_arcsec(row: pd.Series) -> tuple[float, float] | None:
@@ -6665,6 +6801,8 @@ IMAGE_CATALOG_OVERVIEW_LABEL_FONT_SIZE = 8.6
 IMAGE_CATALOG_DETAIL_LABEL_FONT_SIZE = 8.0
 IMAGE_CATALOG_STATUS_LABEL_FONT_SIZE = 8.0
 IMAGE_CATALOG_LEGEND_FONT_SIZE = 8.0
+IMAGE_CATALOG_TANGENTIAL_CRITICAL_COLOR = "#ffd54f"
+IMAGE_CATALOG_RADIAL_CRITICAL_COLOR = "#ff4da6"
 
 
 def _image_catalog_geometry_from_points(
@@ -6714,9 +6852,15 @@ def _image_catalog_overview_geometry(
     default_cutout_size_arcsec: float,
 ) -> tuple[float, float, float]:
     arc_anchor_observed = _image_catalog_arc_anchor_overlay_rows(observed)
+    point_model_observed = observed.loc[
+        [
+            _image_catalog_point_recovered(row) or not _image_catalog_draw_arc_anchor_overlays(row)
+            for _, row in observed.iterrows()
+        ]
+    ] if not observed.empty else observed
     points = _finite_image_catalog_points(
         _image_catalog_xy_points(observed, "x_obs_arcsec", "y_obs_arcsec"),
-        _image_catalog_xy_points(observed, "x_model_arcsec", "y_model_arcsec"),
+        _image_catalog_xy_points(point_model_observed, "x_model_arcsec", "y_model_arcsec"),
         _image_catalog_xy_points(arc_anchor_observed, "arc_support_anchor_x_arcsec", "arc_support_anchor_y_arcsec"),
         _image_catalog_arc_support_curve_points(arc_anchor_observed),
         _image_catalog_xy_points(extras, "x_model_arcsec", "y_model_arcsec"),
@@ -6894,7 +7038,10 @@ def _draw_image_catalog_critical_lines(
         )
     except Exception:
         return
-    colors = {"tangential": "#ffd54f", "radial": "#ff4da6"}
+    colors = {
+        "tangential": IMAGE_CATALOG_TANGENTIAL_CRITICAL_COLOR,
+        "radial": IMAGE_CATALOG_RADIAL_CRITICAL_COLOR,
+    }
     linestyles = {"tangential": "-", "radial": "--"}
     for contour in contours:
         crit_x = np.asarray(contour.get("critical_x", []), dtype=float)
@@ -6946,6 +7093,12 @@ IMAGE_CATALOG_PANEL_TEXT_BBOX = {"facecolor": "black", "alpha": 0.38, "edgecolor
 
 
 def _image_catalog_compact_status_text(row: pd.Series, fallback: str) -> str:
+    if _image_catalog_point_recovered(row):
+        if _image_catalog_arc_candidate_supported(row):
+            return "point recovered (arc supported)"
+        return "point recovered"
+    if _image_catalog_arc_recovered(row):
+        return "arc recovered"
     value = row.get("arc_recovery_status", fallback)
     text = str(value).strip()
     if not text or text.lower() in {"nan", "none", "null"}:
@@ -6978,12 +7131,13 @@ def _format_image_catalog_overview_label(block: dict[str, Any]) -> str:
     extras = block["extras"]
     point_recovered = sum(1 for _, row in observed.iterrows() if _image_catalog_point_recovered(row))
     arc_recovered = sum(1 for _, row in observed.iterrows() if _image_catalog_arc_recovered(row))
+    arc_supported = sum(1 for _, row in observed.iterrows() if _image_catalog_arc_candidate_supported(row))
     return "\n".join(
         [
             f"Family {block['family_id']}  z={_format_cutout_float(block.get('z_source'), 3)}",
             (
                 f"Nobs={len(observed)}  Npoint_recovered={point_recovered}  "
-                f"Narc_recovered={arc_recovered}  Nextra={len(extras)}"
+                f"Narc_recovered={arc_recovered}  Narc_supported={arc_supported}  Nextra={len(extras)}"
             ),
         ]
     )
@@ -6994,20 +7148,39 @@ def _format_image_catalog_compact_detail_label(row: pd.Series) -> str:
     lines = [
         f"{row.get('image_label', '')}  {_image_catalog_compact_status_text(row, panel_status)}",
     ]
-    metrics: list[str] = []
-    for label, column in (
-        ("r", "image_residual_arcsec"),
-        ("r_arc", "arc_aware_image_residual_arcsec"),
-        ("d_curve", "arc_curve_distance_arcsec"),
-    ):
-        try:
-            value = float(row.get(column, np.nan))
-        except (TypeError, ValueError):
-            value = np.nan
-        if np.isfinite(value):
-            metrics.append(f"{label}={_format_cutout_float(value)}")
-    if metrics:
-        lines.append("  ".join(metrics))
+    point_recovered = _image_catalog_point_recovered(row)
+    arc_recovered = _image_catalog_arc_recovered(row)
+    point_status = "recovered" if point_recovered else ("arc recovered" if arc_recovered else "missed")
+    arc_status = "recovered" if arc_recovered else ("supported" if _image_catalog_arc_candidate_supported(row) else "not supported")
+
+    def first_finite(*columns: str) -> float:
+        value = np.nan
+        for column in columns:
+            try:
+                candidate = float(row.get(column, np.nan))
+            except (TypeError, ValueError):
+                candidate = np.nan
+            if np.isfinite(candidate):
+                value = candidate
+                break
+        return value
+
+    point_residual = first_finite("point_image_residual_arcsec", "image_residual_arcsec")
+    arc_residual = first_finite("arc_candidate_image_residual_arcsec", "arc_curve_distance_arcsec")
+    lines.append(f"point={point_status}  r_point={_format_cutout_float(point_residual)}")
+    lines.append(
+        f"arc={arc_status}  r_arc={_format_cutout_float(arc_residual)}  "
+        f"p_arc={_format_cutout_float(row.get('arc_prior_probability'))}"
+    )
+    lines.append(
+        f"d_curve={_format_cutout_float(row.get('arc_curve_distance_arcsec'))}  "
+        f"N={_format_cutout_float(row.get('arc_noncritical_direction_residual_arcsec'))}  "
+        f"T={_format_cutout_float(row.get('arc_critical_direction_residual_arcsec'))}"
+    )
+    lines.append(
+        f"s={_format_cutout_float(row.get('arc_s_min'))}/{_format_cutout_float(row.get('arc_s_max'))}  "
+        f"detA={_format_cutout_float(row.get('arc_detA'))}"
+    )
     return "\n".join(lines)
 
 
@@ -7028,8 +7201,8 @@ def _draw_image_catalog_panel_text(ax: plt.Axes, label: str, *, fontsize: float 
     )
 
 
-def _image_catalog_legend_handles() -> list[Line2D]:
-    return [
+def _image_catalog_legend_handles(*, include_critical_lines: bool = False) -> list[Line2D]:
+    handles = [
         Line2D(
             [0],
             [0],
@@ -7113,11 +7286,33 @@ def _image_catalog_legend_handles() -> list[Line2D]:
             label="linearized arc anchor",
         ),
     ]
+    if include_critical_lines:
+        handles.extend(
+            [
+                Line2D(
+                    [0],
+                    [0],
+                    color=IMAGE_CATALOG_TANGENTIAL_CRITICAL_COLOR,
+                    linestyle="-",
+                    linewidth=1.05,
+                    label="tangential critical line",
+                ),
+                Line2D(
+                    [0],
+                    [0],
+                    color=IMAGE_CATALOG_RADIAL_CRITICAL_COLOR,
+                    linestyle="--",
+                    linewidth=1.05,
+                    label="radial critical line",
+                ),
+            ]
+        )
+    return handles
 
 
-def _add_image_catalog_axis_legend(ax: plt.Axes) -> None:
+def _add_image_catalog_axis_legend(ax: plt.Axes, *, include_critical_lines: bool = False) -> None:
     legend = ax.legend(
-        handles=_image_catalog_legend_handles(),
+        handles=_image_catalog_legend_handles(include_critical_lines=include_critical_lines),
         loc="lower right",
         ncol=1,
         fontsize=IMAGE_CATALOG_LEGEND_FONT_SIZE,
@@ -7167,7 +7362,7 @@ def _image_catalog_draw_rgb_cutout(
     ax.imshow(
         rgb,
         origin="lower",
-        interpolation="bilinear",
+        interpolation="none",
         extent=(-0.5, width - 0.5, -0.5, height - 0.5),
     )
     _lock_cutout_axis_to_image(ax, rgb.shape)
@@ -7393,7 +7588,7 @@ def _draw_image_catalog_overview_panel(
     display_image: Any,
     block: dict[str, Any],
     reference: tuple[int, float, float],
-    _model_pair: tuple[Any, list[dict[str, float]]] | None,
+    model_pair: tuple[Any, list[dict[str, float]]] | None,
 ) -> None:
     center_coord = _arcsec_to_skycoord(
         block["overview_center_x_arcsec"],
@@ -7413,6 +7608,20 @@ def _draw_image_catalog_overview_panel(
         center_coord,
         cutout_size_arcsec=cutout_size_arcsec,
     )
+    if model_pair is not None:
+        model, kwargs_lens = model_pair
+        _draw_image_catalog_critical_lines(
+            ax,
+            display_image,
+            center_coord,
+            block["overview_center_x_arcsec"],
+            block["overview_center_y_arcsec"],
+            reference,
+            model,
+            kwargs_lens,
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rgb.shape[:2],
+        )
     for _, image_row in block["observed"].iterrows():
         target_coord = _arcsec_to_skycoord(image_row.get("x_obs_arcsec"), image_row.get("y_obs_arcsec"), reference)
         if target_coord is None:
@@ -7451,7 +7660,8 @@ def _draw_image_catalog_overview_panel(
                 cutout_size_arcsec=cutout_size_arcsec,
                 rendered_shape=rgb.shape[:2],
             )
-            continue
+            if not _image_catalog_point_recovered(image_row):
+                continue
         model_coord = _image_catalog_display_model_coord(image_row, reference)
         if model_coord is None:
             continue
@@ -7489,7 +7699,7 @@ def _draw_image_catalog_overview_panel(
             rendered_shape=rgb.shape[:2],
         )
     _draw_image_catalog_panel_text(ax, _format_image_catalog_overview_label(block), fontsize=IMAGE_CATALOG_OVERVIEW_LABEL_FONT_SIZE)
-    _add_image_catalog_axis_legend(ax)
+    _add_image_catalog_axis_legend(ax, include_critical_lines=model_pair is not None)
 
 
 def _draw_image_catalog_detail_panel(
@@ -7501,9 +7711,9 @@ def _draw_image_catalog_detail_panel(
     display_image: Any,
     row: pd.Series,
     reference: tuple[int, float, float],
-    _model_pair: tuple[Any, list[dict[str, float]]] | None,
+    model_pair: tuple[Any, list[dict[str, float]]] | None,
 ) -> None:
-    center_coord, _center_x, _center_y = _image_catalog_panel_center(row, reference)
+    center_coord, center_x, center_y = _image_catalog_panel_center(row, reference)
     if center_coord is None:
         ax.set_axis_off()
         return
@@ -7517,6 +7727,20 @@ def _draw_image_catalog_detail_panel(
         center_coord,
         cutout_size_arcsec=cutout_size_arcsec,
     )
+    if model_pair is not None:
+        model, kwargs_lens = model_pair
+        _draw_image_catalog_critical_lines(
+            ax,
+            display_image,
+            center_coord,
+            center_x,
+            center_y,
+            reference,
+            model,
+            kwargs_lens,
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rgb.shape[:2],
+        )
     panel_kind = str(row.get("panel_kind", "observed"))
     panel_status = str(row.get("panel_status", "OBSERVED"))
     if panel_kind == "extra":
@@ -7567,7 +7791,7 @@ def _draw_image_catalog_detail_panel(
                 cutout_size_arcsec=cutout_size_arcsec,
                 rendered_shape=rgb.shape[:2],
             )
-        else:
+        if (not draw_arc_anchor_overlays) or _image_catalog_point_recovered(row):
             model_coord = _image_catalog_display_model_coord(row, reference)
             if model_coord is not None:
                 _draw_image_catalog_model_marker(
@@ -7596,6 +7820,39 @@ def _draw_image_catalog_detail_panel(
     _draw_image_catalog_panel_text(ax, label, fontsize=IMAGE_CATALOG_DETAIL_LABEL_FONT_SIZE)
 
 
+def _image_catalog_critical_line_model_pair(
+    evaluator: ClusterJAXEvaluator,
+    best_fit_latent: np.ndarray,
+    block: dict[str, Any],
+    cache: dict[float, tuple[Any, list[dict[str, float]]]],
+) -> tuple[Any, list[dict[str, float]]] | None:
+    family_id = str(block.get("family_id", ""))
+    try:
+        z_source = float(block.get("z_source", np.nan))
+    except (TypeError, ValueError):
+        z_source = np.nan
+    if not np.isfinite(z_source):
+        _log(None, f"[plot:image_catalog_family_cutouts] skipped critical lines family={family_id}: invalid z_source")
+        return None
+    if z_source in cache:
+        return cache[z_source]
+    try:
+        exact_models_by_z = getattr(evaluator, "exact_models_by_z", {})
+        model = exact_models_by_z.get(z_source) if exact_models_by_z is not None else None
+        if model is None:
+            model, _ = evaluator._get_exact_model_solver(z_source)
+        packed_state = evaluator._build_packed_lens_state(jnp.asarray(best_fit_latent, dtype=jnp.float64), z_source)
+        kwargs_lens = evaluator._packed_to_kwargs_lens(packed_state)
+    except Exception as exc:
+        _log(
+            None,
+            f"[plot:image_catalog_family_cutouts] skipped critical lines family={family_id} z={z_source:g}: {exc}",
+        )
+        return None
+    cache[z_source] = (model, kwargs_lens)
+    return cache[z_source]
+
+
 def _plot_image_catalog_family_cutouts(
     run_dir: Path,
     state: BuildState,
@@ -7610,8 +7867,8 @@ def _plot_image_catalog_family_cutouts(
     image_scale = str(getattr(args, "image_catalog_family_cutout_image_scale", "60mas"))
     requested_bands = getattr(args, "image_catalog_family_cutout_bands", None)
     bands = tuple(requested_bands) if requested_bands is not None else tuple(getattr(helpers, "DEFAULT_BANDS", ("F435W", "F606W", "F814W")))
-    if len(bands) != 3:
-        raise ValueError("--image-catalog-family-cutout-bands must contain exactly three bands.")
+    if len(bands) < 3:
+        raise ValueError("--image-catalog-family-cutout-bands must contain at least three bands.")
     cutout_size_arcsec = float(getattr(helpers, "DEFAULT_CUTOUT_SIZE_ARCSEC", 10.0))
     cluster = _infer_image_catalog_cutout_cluster(state)
     band_paths = helpers.find_rgb_band_paths(image_dir, cluster=cluster, bands=bands, image_scale=image_scale)
@@ -7625,7 +7882,7 @@ def _plot_image_catalog_family_cutouts(
         value = getattr(args, arg_name, None)
         if value is not None:
             rgb_kwargs[kwarg_name] = float(value)
-    channel_gains = dict(getattr(helpers, "DEFAULT_RGB_CHANNEL_GAINS", {"red": 1.0, "green": 1.0, "blue": 1.2}))
+    channel_gains = dict(getattr(helpers, "DEFAULT_CALIBRATED_RGB_CHANNEL_GAINS", {"red": 1.0, "green": 1.0, "blue": 1.2}))
     channel_gain_supplied = False
     for arg_name, role in (
         ("image_catalog_family_cutout_rgb_red_gain", "red"),
@@ -7639,7 +7896,8 @@ def _plot_image_catalog_family_cutouts(
     if channel_gain_supplied:
         rgb_kwargs["channel_gains"] = channel_gains
     rgb_display = helpers.build_rgb_display(band_images, bands=bands, **rgb_kwargs)
-    display_image = band_images[str(bands[-1])]
+    reference_band = str(getattr(helpers, "DEFAULT_HFF_RGB_REFERENCE_BAND", bands[-1]))
+    display_image = band_images[reference_band] if reference_band in band_images else band_images[str(bands[-1])]
     catalog_df = _image_catalog_cutout_rows(state, image_df)
     extra_df = _image_catalog_extra_cutout_rows(state, extra_image_df)
     if catalog_df.empty and extra_df.empty:
@@ -7660,6 +7918,12 @@ def _plot_image_catalog_family_cutouts(
         detail_cols=detail_cols,
         default_cutout_size_arcsec=cutout_size_arcsec,
     )
+    try:
+        best_fit_latent = _reported_physical_to_latent_vector(evaluator, np.asarray(best_fit, dtype=float))
+    except Exception as exc:
+        _log(None, f"[plot:image_catalog_family_cutouts] skipped critical lines: best-fit conversion failed: {exc}")
+        best_fit_latent = None
+    critical_model_pairs_by_z: dict[float, tuple[Any, list[dict[str, float]]]] = {}
     with PdfPages(output) as pdf:
         cluster_units = detail_cols
         fig = plt.figure(
@@ -7684,6 +7948,16 @@ def _plot_image_catalog_family_cutouts(
         plt.close(fig)
 
         for block in blocks:
+            model_pair = (
+                _image_catalog_critical_line_model_pair(
+                    evaluator,
+                    best_fit_latent,
+                    block,
+                    critical_model_pairs_by_z,
+                )
+                if best_fit_latent is not None
+                else None
+            )
             n_rows = max(1, int(block.get("layout_rowspan", block.get("overview_rowspan", 1))))
             n_cols = detail_cols
             fig = plt.figure(
@@ -7704,7 +7978,7 @@ def _plot_image_catalog_family_cutouts(
                 display_image,
                 block,
                 state.reference,
-                None,
+                model_pair,
             )
             for panel_index, panel in enumerate(block["detail_panels"]):
                 detail_row = overview_units + panel_index // detail_cols
@@ -7720,7 +7994,7 @@ def _plot_image_catalog_family_cutouts(
                     display_image,
                     pd.Series(panel),
                     state.reference,
-                    None,
+                    model_pair,
                 )
             pdf.savefig(fig, facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.02, dpi=getattr(helpers, "CUTOUT_FIGURE_DPI", 300))
             plt.close(fig)
@@ -7753,6 +8027,11 @@ def _generate_plots_and_tables(
         args,
         "plots.fit_quality_tables",
         lambda: _fit_quality_tables(state, evaluator, best_fit, results, args),
+    )
+    cab_arc_diagnostics_df = _run_logged_phase(
+        args,
+        "plots.cab_arc_diagnostics_table",
+        lambda: _cab_arc_diagnostics_table(evaluator, best_fit),
     )
     image_count_recovery_df = _run_logged_phase(
         args,
@@ -7867,6 +8146,12 @@ def _generate_plots_and_tables(
         "plots.write_image_recovery_extra_images_csv",
         lambda: image_recovery_extra_df.to_csv(tables_dir / "image_recovery_extra_images.csv", index=False),
     )
+    if not cab_arc_diagnostics_df.empty or len(cab_arc_diagnostics_df.columns) > 0:
+        _run_logged_phase(
+            args,
+            "plots.write_cab_arc_diagnostics_csv",
+            lambda: cab_arc_diagnostics_df.to_csv(tables_dir / "cab_arc_diagnostics.csv", index=False),
+        )
     _run_logged_phase(
         args,
         "plots.write_model_magnification_csv",

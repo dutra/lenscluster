@@ -143,8 +143,8 @@ def run(
     max_images_per_family: int = DEFAULT_MAX_IMAGES_PER_FAMILY,
     par_path: Path | None = None,
 ) -> Path:
-    if len(bands) != 3:
-        raise ValueError("--bands must provide exactly three bands in blue green red order.")
+    if len(bands) < 3:
+        raise ValueError("--bands must provide at least three bands.")
     cluster_key = canonical_cluster(cluster)
     catalog = load_image_catalog(cluster_key, Path(image_catalog_path), par_path=par_path)
     band_paths = find_rgb_band_paths(Path(image_dir), cluster=cluster_key, bands=bands, image_scale=image_scale)
@@ -169,7 +169,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--image-dir", type=Path, default=DEFAULT_IMAGE_DIR)
     parser.add_argument("--image-scale", choices=IMAGE_SCALE_CHOICES, default=DEFAULT_IMAGE_SCALE)
-    parser.add_argument("--bands", nargs=3, default=list(DEFAULT_BANDS), metavar=("BLUE", "GREEN", "RED"))
+    parser.add_argument("--bands", nargs="+", default=list(DEFAULT_BANDS), metavar="BAND")
     parser.add_argument("--cutout-size-arcsec", type=float, default=DEFAULT_CUTOUT_SIZE_ARCSEC)
     parser.add_argument("--families-per-page", type=int, default=DEFAULT_FAMILIES_PER_PAGE)
     parser.add_argument("--max-images-per-family", type=int, default=DEFAULT_MAX_IMAGES_PER_FAMILY)

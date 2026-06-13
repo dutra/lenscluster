@@ -13,6 +13,7 @@ dependencies = [
     "jax-cosmo>=0.1.0",
     "jax>=0.4",
     "matplotlib>=3.7",
+    "photutils>=2.0",
     "PyYAML>=6",
     "rich>=13",
     "scikit-image>=0.22",

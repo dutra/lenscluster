@@ -46,7 +46,25 @@ for import_path in (REPO_ROOT / "src",):
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
 
-from lenscluster.rgb import RGBDisplayConfig, build_rgb_display_from_band_images, make_natural_rgb  # noqa: E402
+from lenscluster.rgb import (  # noqa: E402
+    CALIBRATED_RGB_MINIMUM_SKY_SIGMA,
+    DEFAULT_HFF_RGB_BANDS,
+    DEFAULT_HFF_RGB_CHANNEL_GAINS,
+    DEFAULT_HFF_RGB_CHANNEL_WEIGHTS,
+    DEFAULT_HFF_RGB_HIGHLIGHT_CEILING,
+    DEFAULT_HFF_RGB_HIGHLIGHT_KNEE,
+    DEFAULT_HFF_RGB_HIGHLIGHT_SOFTNESS,
+    DEFAULT_HFF_RGB_MINIMUM,
+    DEFAULT_HFF_RGB_Q,
+    DEFAULT_HFF_RGB_REFERENCE_BAND,
+    DEFAULT_HFF_RGB_STRETCH,
+    DEFAULT_HFF_RGB_WARM_HIGHLIGHT_DESATURATION,
+    CalibratedRGBDisplayConfig,
+    RGBDisplayConfig,
+    build_rgb_display_from_band_images,
+    compute_fnu_band_fluxscales,
+    make_natural_rgb,
+)
 
 
 PAGUL2024_SOURCE = "pagul2024"
@@ -126,7 +144,7 @@ PLOT_IMAGE_MAX_PIXELS = 2500
 DEFAULT_FAMILY_CUTOUT_SIZE_ARCSEC = 5.0
 DEFAULT_FAMILY_CUTOUT_CIRCLE_RADIUS_ARCSEC = 0.6
 DEFAULT_FAMILY_CUTOUT_FAMILIES_PER_PAGE = 6
-DEFAULT_FAMILY_CUTOUT_BANDS = PLOT_RGB_BANDS
+DEFAULT_FAMILY_CUTOUT_BANDS = DEFAULT_HFF_RGB_BANDS
 INVALID_SENTINELS = {-999.0, -99.0, 99.0, -1.0, 1.0e9}
 ZSPEC_CONFLICT_TOL = 0.005
 ZSPEC_EXCELLENT_TOL = 0.005
@@ -235,6 +253,10 @@ class PlotBandImage:
     shape: tuple[int, int]
     wcs: WCS
     pixel_scale_arcsec: float
+    photflam: float | None = None
+    photplam: float | None = None
+    background: float = 0.0
+    background_sigma: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -5539,6 +5561,106 @@ def _missing_cutout_rgb_message(image_dir: Path, spec: ClusterSpec, missing_band
     )
 
 
+def _header_photometry_keyword(headers: Sequence[fits.Header], keyword: str) -> float | None:
+    for header in headers:
+        value = header.get(keyword)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number) and number > 0.0:
+            return number
+    return None
+
+
+def _measure_cutout_image_background(data: Any, *, max_samples: int = 400_000) -> tuple[float, float]:
+    ny, nx = data.shape
+    stride = max(1, int(math.sqrt(max(1, (ny * nx) / float(max_samples)))))
+    sample = np.asarray(data[::stride, ::stride], dtype=np.float32)
+    values = sample[np.isfinite(sample) & (sample != 0.0)]
+    if values.size == 0:
+        return 0.0, 0.0
+    sigma = 0.0
+    for _ in range(5):
+        median = float(np.median(values))
+        sigma = 1.4826 * float(np.median(np.abs(values - median)))
+        if sigma <= 0.0:
+            break
+        kept = values[np.abs(values - median) < 3.0 * sigma]
+        if kept.size == values.size or kept.size == 0:
+            break
+        values = kept
+    return float(np.median(values)), float(sigma)
+
+
+def _default_family_cutout_minimum(
+    band_images: dict[str, PlotBandImage],
+    bands: Sequence[str],
+    fluxscales: dict[str, float],
+) -> float:
+    sigmas = []
+    for band in bands:
+        band_key = str(band)
+        sigma = float(getattr(band_images.get(band_key), "background_sigma", 0.0) or 0.0)
+        if sigma > 0.0:
+            sigmas.append(sigma * float(fluxscales.get(band_key, 1.0)))
+    if not sigmas:
+        return 0.0
+    return CALIBRATED_RGB_MINIMUM_SKY_SIGMA * float(np.median(sigmas))
+
+
+def _hff_family_cutout_channel_weights(bands: Sequence[str]) -> dict[str, dict[str, float]]:
+    available = {str(band) for band in bands}
+    weights: dict[str, dict[str, float]] = {}
+    for role, role_weights in DEFAULT_HFF_RGB_CHANNEL_WEIGHTS.items():
+        selected = {band: float(weight) for band, weight in role_weights.items() if band in available}
+        if selected:
+            weights[role] = selected
+    return weights
+
+
+def _build_family_cutout_rgb_display(
+    band_images: dict[str, PlotBandImage],
+    bands: Sequence[str],
+) -> RGBDisplayConfig:
+    band_keys = tuple(str(band) for band in bands)
+    channel_weights = _hff_family_cutout_channel_weights(band_keys)
+    reference_band = DEFAULT_HFF_RGB_REFERENCE_BAND if DEFAULT_HFF_RGB_REFERENCE_BAND in band_keys else band_keys[-1]
+    fluxscales = compute_fnu_band_fluxscales(
+        {band: getattr(band_images.get(band), "photflam", None) for band in band_keys},
+        {band: getattr(band_images.get(band), "photplam", None) for band in band_keys},
+        reference_band=reference_band,
+    )
+    backgrounds = {band: float(getattr(band_images.get(band), "background", 0.0) or 0.0) for band in band_keys}
+    if len(band_keys) > 3 and all(channel_weights.get(role) for role in ("blue", "green", "red")):
+        return CalibratedRGBDisplayConfig(
+            q=DEFAULT_HFF_RGB_Q,
+            stretch=DEFAULT_HFF_RGB_STRETCH,
+            channel_gains=dict(DEFAULT_HFF_RGB_CHANNEL_GAINS),
+            minimum=DEFAULT_HFF_RGB_MINIMUM,
+            band_backgrounds=backgrounds,
+            band_fluxscales=fluxscales,
+            warm_highlight_desaturation=DEFAULT_HFF_RGB_WARM_HIGHLIGHT_DESATURATION,
+            channel_weights=channel_weights,
+            highlight_knee=DEFAULT_HFF_RGB_HIGHLIGHT_KNEE,
+            highlight_ceiling=DEFAULT_HFF_RGB_HIGHLIGHT_CEILING,
+            highlight_softness=DEFAULT_HFF_RGB_HIGHLIGHT_SOFTNESS,
+        )
+    display = CalibratedRGBDisplayConfig(
+        q=6.5,
+        stretch=0.0165,
+        channel_gains={"red": 0.68, "green": 0.75, "blue": 3.5},
+        minimum=_default_family_cutout_minimum(band_images, band_keys, fluxscales),
+        band_backgrounds=backgrounds,
+        band_fluxscales=fluxscales,
+    )
+    if len(band_keys) == 3:
+        return display
+    raise ValueError("--family-cutout-bands must either provide exactly three bands or the HFF multiband RGB set.")
+
+
 def _find_family_cutout_band_paths(
     image_dir: Path,
     spec: ClusterSpec,
@@ -5546,8 +5668,8 @@ def _find_family_cutout_band_paths(
     *,
     image_scale: str = DEFAULT_IMAGE_SCALE,
 ) -> dict[str, Path]:
-    if len(tuple(bands)) != 3:
-        raise ValueError("--family-cutout-bands must provide exactly three bands in blue green red order.")
+    if len(tuple(bands)) < 3:
+        raise ValueError("--family-cutout-bands must provide at least three bands.")
     if image_scale not in IMAGE_SCALE_CHOICES:
         raise ValueError(f"Unsupported image scale {image_scale!r}. Valid choices: {IMAGE_SCALE_CHOICES}.")
     root = Path(image_dir)
@@ -5584,6 +5706,7 @@ def _find_family_cutout_band_paths(
 
 def _load_family_cutout_band_image(band: str, path: Path) -> PlotBandImage:
     with fits.open(path, memmap=True) as hdul:
+        primary_header = hdul[0].header
         for hdu_index, hdu in enumerate(hdul):
             if hdu.data is None:
                 continue
@@ -5601,6 +5724,8 @@ def _load_family_cutout_band_image(band: str, path: Path) -> PlotBandImage:
             if not np.isfinite(pixel_scale) or pixel_scale <= 0.0:
                 continue
             ny, nx = data.shape
+            headers = (hdu.header, primary_header)
+            background, background_sigma = _measure_cutout_image_background(data)
             return PlotBandImage(
                 band=str(band),
                 path=Path(path),
@@ -5608,6 +5733,10 @@ def _load_family_cutout_band_image(band: str, path: Path) -> PlotBandImage:
                 shape=(int(ny), int(nx)),
                 wcs=celestial,
                 pixel_scale_arcsec=pixel_scale,
+                photflam=_header_photometry_keyword(headers, "PHOTFLAM"),
+                photplam=_header_photometry_keyword(headers, "PHOTPLAM"),
+                background=background,
+                background_sigma=background_sigma,
             )
     raise ValueError(f"No 2D celestial WCS image found in {path}")
 
@@ -6419,8 +6548,8 @@ def _plot_candidate_family_cutouts(
     image_scale: str,
     families_per_page: int,
 ) -> tuple[list[Path], dict[str, Any]]:
-    if len(tuple(bands)) != 3:
-        raise ValueError("--family-cutout-bands must provide exactly three bands in blue green red order.")
+    if len(tuple(bands)) < 3:
+        raise ValueError("--family-cutout-bands must provide at least three bands.")
     if families_per_page <= 0:
         raise ValueError("family_cutout_families_per_page must be positive.")
     if circle_radius_arcsec < 0.0:
@@ -6436,7 +6565,7 @@ def _plot_candidate_family_cutouts(
     member_crms = _family_cutout_member_crms(selected_members, pairs)
     n_pages = int(math.ceil(len(family_ids) / int(families_per_page)))
     rendered_images = 0
-    rgb_display = build_rgb_display_from_band_images(band_images, bands)
+    rgb_display = _build_family_cutout_rgb_display(band_images, bands)
 
     with PdfPages(output) as pdf:
         for page_index in range(n_pages):
@@ -6889,9 +7018,9 @@ def _add_plot_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--family-cutout-families-per-page", type=int, default=DEFAULT_FAMILY_CUTOUT_FAMILIES_PER_PAGE)
     parser.add_argument(
         "--family-cutout-bands",
-        nargs=3,
+        nargs="+",
         default=list(DEFAULT_FAMILY_CUTOUT_BANDS),
-        metavar=("BLUE", "GREEN", "RED"),
+        metavar="BAND",
     )
 
 

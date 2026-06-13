@@ -87,6 +87,7 @@ def image_count_recovery_table(state: Any, image_df: pd.DataFrame) -> pd.DataFra
         "arc_aware_recovered_image_count",
         "arc_aware_missing_image_count",
         "arc_supported_image_count",
+        "arc_candidate_supported_image_count",
         "arc_aware_image_rms_arcsec",
     ]
     rows: list[dict[str, Any]] = []
@@ -121,6 +122,10 @@ def image_count_recovery_table(state: Any, image_df: pd.DataFrame) -> pd.DataFra
                 arc_supported_count = int(np.sum(group_df["arc_recovery_status"].astype(str).to_numpy() == "arc_supported"))
             else:
                 arc_supported_count = np.nan
+            if "arc_candidate_supported" in group_df:
+                arc_candidate_supported_count = int(np.sum(group_df["arc_candidate_supported"].astype(bool).to_numpy()))
+            else:
+                arc_candidate_supported_count = arc_supported_count
             rows.append(
                 {
                     "family_id": str(family_id),
@@ -136,6 +141,7 @@ def image_count_recovery_table(state: Any, image_df: pd.DataFrame) -> pd.DataFra
                     "arc_aware_recovered_image_count": arc_aware_recovered,
                     "arc_aware_missing_image_count": arc_aware_missing,
                     "arc_supported_image_count": arc_supported_count,
+                    "arc_candidate_supported_image_count": arc_candidate_supported_count,
                     "arc_aware_image_rms_arcsec": arc_aware_rms,
                 }
             )
@@ -241,6 +247,11 @@ def family_image_recovery_rows(
     image_recovery_status = np.full(n_images, str(unavailable_status), dtype=object)
     arc_recovery_status: np.ndarray | None = None
     arc_aware_residual = np.full(n_images, np.nan, dtype=float)
+    point_image_residual = np.full(n_images, np.nan, dtype=float)
+    arc_candidate_supported = np.zeros(n_images, dtype=bool)
+    arc_candidate_residual = np.full(n_images, np.nan, dtype=float)
+    preferred_recovery_status: np.ndarray | None = None
+    preferred_image_residual = np.full(n_images, np.nan, dtype=float)
     arc_noncritical_direction_residual = np.full(n_images, np.nan, dtype=float)
     arc_critical_direction_residual = np.full(n_images, np.nan, dtype=float)
     arc_critical_direction_x = np.full(n_images, np.nan, dtype=float)
@@ -260,17 +271,6 @@ def family_image_recovery_rows(
     arc_support_curve_y = np.full(n_images, "[]", dtype=object)
     arc_supported = np.zeros(n_images, dtype=bool)
     arc_support_finite = np.zeros(n_images, dtype=bool)
-    cab_has_constraint = np.zeros(n_images, dtype=bool)
-    cab_anchor_x = np.full(n_images, np.nan, dtype=float)
-    cab_anchor_y = np.full(n_images, np.nan, dtype=float)
-    cab_tangent_obs = np.full(n_images, np.nan, dtype=float)
-    cab_tangent_model = np.full(n_images, np.nan, dtype=float)
-    cab_tangent_residual = np.full(n_images, np.nan, dtype=float)
-    cab_curvature_obs = np.full(n_images, np.nan, dtype=float)
-    cab_curvature_model = np.full(n_images, np.nan, dtype=float)
-    cab_curvature_residual = np.full(n_images, np.nan, dtype=float)
-    cab_loglike = np.zeros(n_images, dtype=float)
-    cab_finite = np.zeros(n_images, dtype=bool)
 
     if isinstance(exact_details, dict):
         count_info = image_count_info_from_exact_details(family, exact_details)
@@ -300,6 +300,21 @@ def family_image_recovery_rows(
         arc_array = diagnostic_detail_array(exact_details, "arc_aware_image_residual_arcsec", n_images, float)
         if arc_array is not None:
             arc_aware_residual = arc_array
+        arc_array = diagnostic_detail_array(exact_details, "point_image_residual_arcsec", n_images, float)
+        if arc_array is not None:
+            point_image_residual = arc_array
+        arc_bool = diagnostic_detail_array(exact_details, "arc_candidate_supported", n_images, bool)
+        if arc_bool is not None:
+            arc_candidate_supported = arc_bool
+        arc_array = diagnostic_detail_array(exact_details, "arc_candidate_image_residual_arcsec", n_images, float)
+        if arc_array is not None:
+            arc_candidate_residual = arc_array
+        arc_status_values = diagnostic_detail_array(exact_details, "preferred_recovery_status", n_images, object)
+        if arc_status_values is not None:
+            preferred_recovery_status = arc_status_values.astype(object)
+        arc_array = diagnostic_detail_array(exact_details, "preferred_image_residual_arcsec", n_images, float)
+        if arc_array is not None:
+            preferred_image_residual = arc_array
         arc_array = diagnostic_detail_array(exact_details, "arc_noncritical_direction_residual_arcsec", n_images, float)
         if arc_array is not None:
             arc_noncritical_direction_residual = arc_array
@@ -361,47 +376,17 @@ def family_image_recovery_rows(
             arc_bool = diagnostic_detail_array(exact_details, "arc_support_finite", n_images, bool)
         if arc_bool is not None:
             arc_support_finite = arc_bool
-        cab_bool = diagnostic_detail_array(exact_details, "cab_has_constraint", n_images, bool)
-        if cab_bool is not None:
-            cab_has_constraint = cab_bool
-        cab_array = diagnostic_detail_array(exact_details, "cab_anchor_x_arcsec", n_images, float)
-        if cab_array is not None:
-            cab_anchor_x = cab_array
-        cab_array = diagnostic_detail_array(exact_details, "cab_anchor_y_arcsec", n_images, float)
-        if cab_array is not None:
-            cab_anchor_y = cab_array
-        cab_array = diagnostic_detail_array(exact_details, "cab_tangent_angle_obs_rad", n_images, float)
-        if cab_array is not None:
-            cab_tangent_obs = cab_array
-        cab_array = diagnostic_detail_array(exact_details, "cab_tangent_angle_model_rad", n_images, float)
-        if cab_array is not None:
-            cab_tangent_model = cab_array
-        cab_array = diagnostic_detail_array(exact_details, "cab_tangent_residual_rad", n_images, float)
-        if cab_array is not None:
-            cab_tangent_residual = cab_array
-        cab_array = diagnostic_detail_array(exact_details, "cab_curvature_obs_arcsec_inv", n_images, float)
-        if cab_array is not None:
-            cab_curvature_obs = cab_array
-        cab_array = diagnostic_detail_array(exact_details, "cab_curvature_model_arcsec_inv", n_images, float)
-        if cab_array is not None:
-            cab_curvature_model = cab_array
-        cab_array = diagnostic_detail_array(exact_details, "cab_curvature_residual_arcsec_inv", n_images, float)
-        if cab_array is not None:
-            cab_curvature_residual = cab_array
-        cab_array = diagnostic_detail_array(exact_details, "cab_loglike", n_images, float)
-        if cab_array is not None:
-            cab_loglike = cab_array
-        cab_bool = diagnostic_detail_array(exact_details, "cab_finite", n_images, bool)
-        if cab_bool is not None:
-            cab_finite = cab_bool
     else:
         count_info = unavailable_image_count_info(family, unavailable_reason)
     if arc_recovery_status is None:
         arc_recovery_status = np.where(image_recovery_status == "recovered", "point_recovered", "not_recovered").astype(object)
+    if preferred_recovery_status is None:
+        preferred_recovery_status = np.asarray(arc_recovery_status, dtype=object)
+    preferred_image_residual = np.where(np.isfinite(preferred_image_residual), preferred_image_residual, arc_aware_residual)
 
     model_count_fields = model_count_fields_from_count_info(count_info)
     rows: list[dict[str, Any]] = []
-    for (
+    for index, (
         label,
         x_obs,
         y_obs,
@@ -430,18 +415,8 @@ def family_image_recovery_rows(
         support_curve_y,
         is_arc_supported,
         is_arc_support_finite,
-        has_cab_constraint,
-        cab_x,
-        cab_y,
-        cab_tan_obs,
-        cab_tan_model,
-        cab_tan_residual,
-        cab_curv_obs,
-        cab_curv_model,
-        cab_curv_residual,
-        cab_ll,
-        is_cab_finite,
-    ) in zip(
+    ) in enumerate(
+        zip(
         getattr(family, "image_labels", []),
         getattr(family, "x_obs", []),
         getattr(family, "y_obs", []),
@@ -470,26 +445,31 @@ def family_image_recovery_rows(
         arc_support_curve_y,
         arc_supported,
         arc_support_finite,
-        cab_has_constraint,
-        cab_anchor_x,
-        cab_anchor_y,
-        cab_tangent_obs,
-        cab_tangent_model,
-        cab_tangent_residual,
-        cab_curvature_obs,
-        cab_curvature_model,
-        cab_curvature_residual,
-        cab_loglike,
-        cab_finite,
+        )
     ):
         residual = (
             math.hypot(float(x_model) - float(x_obs), float(y_model) - float(y_obs))
             if np.isfinite(float(x_model) + float(y_model))
             else np.nan
         )
+        point_residual_value = float(point_image_residual[index]) if index < len(point_image_residual) else np.nan
+        if not np.isfinite(point_residual_value) and str(status) == "recovered":
+            point_residual_value = float(residual)
         arc_residual_value = float(arc_residual)
         if not np.isfinite(arc_residual_value) and str(arc_status) == "point_recovered":
             arc_residual_value = float(residual)
+        preferred_status_value = (
+            str(preferred_recovery_status[index]) if index < len(preferred_recovery_status) else str(arc_status)
+        )
+        preferred_residual_value = float(preferred_image_residual[index]) if index < len(preferred_image_residual) else np.nan
+        if not np.isfinite(preferred_residual_value):
+            preferred_residual_value = arc_residual_value
+        arc_candidate_residual_value = (
+            float(arc_candidate_residual[index]) if index < len(arc_candidate_residual) else np.nan
+        )
+        arc_candidate_supported_value = (
+            bool(arc_candidate_supported[index]) if index < len(arc_candidate_supported) else bool(is_arc_supported)
+        )
         rows.append(
             {
                 "family_id": str(family.family_id),
@@ -509,6 +489,11 @@ def family_image_recovery_rows(
                 "y_model_arcsec": float(y_model),
                 "image_residual_arcsec": float(residual),
                 "exact_image_prediction_failed": bool(failed),
+                "point_image_residual_arcsec": point_residual_value,
+                "arc_candidate_supported": arc_candidate_supported_value,
+                "arc_candidate_image_residual_arcsec": arc_candidate_residual_value,
+                "preferred_recovery_status": preferred_status_value,
+                "preferred_image_residual_arcsec": preferred_residual_value,
                 "arc_recovery_status": str(arc_status),
                 "arc_aware_image_residual_arcsec": arc_residual_value,
                 "arc_noncritical_direction_residual_arcsec": float(noncritical_direction_residual),
@@ -530,17 +515,6 @@ def family_image_recovery_rows(
                 "arc_support_curve_y_arcsec": str(support_curve_y),
                 "arc_supported": bool(is_arc_supported),
                 "arc_support_finite": bool(is_arc_support_finite),
-                "cab_has_constraint": bool(has_cab_constraint),
-                "cab_anchor_x_arcsec": float(cab_x),
-                "cab_anchor_y_arcsec": float(cab_y),
-                "cab_tangent_angle_obs_rad": float(cab_tan_obs),
-                "cab_tangent_angle_model_rad": float(cab_tan_model),
-                "cab_tangent_residual_rad": float(cab_tan_residual),
-                "cab_curvature_obs_arcsec_inv": float(cab_curv_obs),
-                "cab_curvature_model_arcsec_inv": float(cab_curv_model),
-                "cab_curvature_residual_arcsec_inv": float(cab_curv_residual),
-                "cab_loglike": float(cab_ll),
-                "cab_finite": bool(is_cab_finite),
             }
         )
     return rows, extra_image_rows(family, exact_details, model_count_fields), count_info

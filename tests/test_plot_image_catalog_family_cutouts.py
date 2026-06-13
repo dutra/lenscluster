@@ -228,6 +228,41 @@ def test_image_catalog_family_cutout_blocks_span_and_include_all_panels() -> Non
     assert block["detail_panels"][11]["x_center_arcsec"] == pytest.approx(20.0)
 
 
+def test_image_catalog_cutout_rows_merge_zero_padded_family_diagnostics() -> None:
+    family = SimpleNamespace(
+        family_id="0121",
+        z_source=2.3,
+        effective_z_source=2.0,
+        image_labels=["0121.a", "0121.b"],
+        x_obs=np.asarray([0.0, 1.0], dtype=float),
+        y_obs=np.asarray([0.0, 1.0], dtype=float),
+    )
+    state = SimpleNamespace(reference=(3, 10.0, 0.0), family_data=[family])
+    image_df = pd.DataFrame(
+        {
+            "family_id": [121, 121],
+            "image_label": ["121.a", "0121.b"],
+            "x_model_arcsec": [0.1, np.nan],
+            "y_model_arcsec": [0.1, np.nan],
+            "image_recovery_status": ["recovered", "not_recovered"],
+            "arc_recovery_status": ["point_recovered", "arc_supported"],
+            "arc_supported": [False, True],
+            "arc_aware_image_residual_arcsec": [0.12, 0.18],
+        }
+    )
+
+    catalog_df = solver_plotting._image_catalog_cutout_rows(state, image_df)
+
+    assert catalog_df["family_id"].tolist() == ["0121", "0121"]
+    assert catalog_df["image_label"].tolist() == ["0121.a", "0121.b"]
+    assert catalog_df["image_recovery_status"].tolist() == ["recovered", "not_recovered"]
+    assert catalog_df["arc_recovery_status"].tolist() == ["point_recovered", "arc_supported"]
+    assert [
+        solver_plotting._image_catalog_observed_panel_status(row)
+        for _, row in catalog_df.iterrows()
+    ] == ["POINT_RECOVERED", "ARC_RECOVERED"]
+
+
 def test_image_catalog_family_cutout_compact_labels_and_legend_handles() -> None:
     observed = pd.DataFrame(
         {
@@ -250,7 +285,7 @@ def test_image_catalog_family_cutout_compact_labels_and_legend_handles() -> None
 
     assert overview_label == (
         "Family 4  z=2.35\n"
-        "Nobs=3  Npoint_recovered=1  Narc_recovered=2  Nextra=1"
+        "Nobs=3  Npoint_recovered=1  Narc_recovered=1  Narc_supported=1  Nextra=1"
     )
     assert [solver_plotting._image_catalog_observed_panel_status(row) for _, row in observed.iterrows()] == [
         "POINT_RECOVERED",
@@ -259,8 +294,11 @@ def test_image_catalog_family_cutout_compact_labels_and_legend_handles() -> None
     ]
     assert solver_plotting._image_catalog_status_color("POINT_RECOVERED") == "#4da3ff"
     assert solver_plotting._image_catalog_status_color("ARC_RECOVERED") == "#ffd54f"
+    assert solver_plotting._image_catalog_status_color("arc_supported") == "#ffd54f"
     assert solver_plotting._image_catalog_status_color("MISSED") == "#ff4d5e"
+    assert solver_plotting._image_catalog_status_color("not_recovered") == "#ff4d5e"
     assert solver_plotting._image_catalog_status_color("EXTRA") == "tab:purple"
+    assert solver_plotting._image_catalog_status_display_text("arc_supported") == "arc recovered"
     assert solver_plotting._image_catalog_display_model_arcsec(observed.iloc[0]) == pytest.approx((0.1, 0.0))
     assert solver_plotting._image_catalog_display_model_arcsec(observed.iloc[1]) is None
     assert solver_plotting._image_catalog_display_model_arcsec(observed.iloc[2]) is None
@@ -270,14 +308,57 @@ def test_image_catalog_family_cutout_compact_labels_and_legend_handles() -> None
             {
                 "image_label": "4.1",
                 "panel_status": "POINT_RECOVERED",
-                "arc_recovery_status": "arc_supported",
+                "image_recovery_status": "recovered",
+                "arc_recovery_status": "point_recovered",
+                "arc_candidate_supported": True,
+                "point_image_residual_arcsec": 0.054,
+                "arc_candidate_image_residual_arcsec": 0.0456,
                 "image_residual_arcsec": 0.054,
-                "arc_aware_image_residual_arcsec": 0.123,
+                "arc_aware_image_residual_arcsec": 0.054,
                 "arc_curve_distance_arcsec": 0.0456,
+                "arc_prior_probability": 0.75,
+                "arc_noncritical_direction_residual_arcsec": 0.02,
+                "arc_critical_direction_residual_arcsec": 4.0,
+                "arc_s_min": 0.04,
+                "arc_s_max": 1.1,
+                "arc_detA": 0.044,
             }
         )
     )
-    assert detail_label == "4.1  arc supported\nr=0.054  r_arc=0.12  d_curve=0.046"
+    assert detail_label == (
+        "4.1  point recovered (arc supported)\n"
+        "point=recovered  r_point=0.054\n"
+        "arc=supported  r_arc=0.046  p_arc=0.75\n"
+        "d_curve=0.046  N=0.02  T=4\n"
+        "s=0.04/1.1  detA=0.044"
+    )
+    arc_detail_label = solver_plotting._format_image_catalog_compact_detail_label(
+        pd.Series(
+            {
+                "image_label": "4.2",
+                "panel_status": "ARC_RECOVERED",
+                "image_recovery_status": "not_recovered",
+                "preferred_recovery_status": "arc_supported",
+                "arc_recovery_status": "arc_supported",
+                "arc_supported": True,
+                "image_residual_arcsec": np.nan,
+                "arc_curve_distance_arcsec": 0.041,
+                "arc_prior_probability": 0.8,
+                "arc_noncritical_direction_residual_arcsec": 0.02,
+                "arc_critical_direction_residual_arcsec": 3.0,
+                "arc_s_min": 0.01,
+                "arc_s_max": 0.9,
+                "arc_detA": 0.05,
+            }
+        )
+    )
+    assert arc_detail_label == (
+        "4.2  arc recovered\n"
+        "point=arc recovered  r_point=na\n"
+        "arc=recovered  r_arc=0.041  p_arc=0.8\n"
+        "d_curve=0.041  N=0.02  T=3\n"
+        "s=0.01/0.9  detA=0.05"
+    )
 
     extra_label = solver_plotting._format_image_catalog_extra_label(
         pd.Series(
@@ -291,7 +372,7 @@ def test_image_catalog_family_cutout_compact_labels_and_legend_handles() -> None
     )
     assert extra_label == "4.extra2  extra\nmodel x=1.23 y=-5.68"
 
-    handles = solver_plotting._image_catalog_legend_handles()
+    handles = solver_plotting._image_catalog_legend_handles(include_critical_lines=True)
     assert [handle.get_label() for handle in handles] == [
         "point recovered image",
         "arc recovered image",
@@ -302,12 +383,18 @@ def test_image_catalog_family_cutout_compact_labels_and_legend_handles() -> None
         "observed-to-model residual",
         "tangential arc displacement",
         "linearized arc anchor",
+        "tangential critical line",
+        "radial critical line",
     ]
     handle_by_label = {handle.get_label(): handle for handle in handles}
     assert handle_by_label["arc-support curve"].get_color() == solver_plotting._image_catalog_status_color("ARC_RECOVERED")
     assert handle_by_label["arc-support curve"].get_linestyle() == "--"
     assert handle_by_label["tangential arc displacement"].get_color() == solver_plotting._image_catalog_status_color("ARC_RECOVERED")
     assert handle_by_label["tangential arc displacement"].get_linestyle() == "-"
+    assert handle_by_label["tangential critical line"].get_color() == solver_plotting.IMAGE_CATALOG_TANGENTIAL_CRITICAL_COLOR
+    assert handle_by_label["tangential critical line"].get_linestyle() == "-"
+    assert handle_by_label["radial critical line"].get_color() == solver_plotting.IMAGE_CATALOG_RADIAL_CRITICAL_COLOR
+    assert handle_by_label["radial critical line"].get_linestyle() == "--"
 
 
 def test_image_catalog_arc_support_geometry_uses_closest_curve_point() -> None:
@@ -362,9 +449,12 @@ def test_image_catalog_arc_anchor_overlays_skip_point_recovered_rows(
 ) -> None:
     row = _arc_anchor_overlay_row(
         image_recovery_status="recovered",
+        preferred_recovery_status="point_recovered",
         arc_recovery_status="point_recovered",
         x_model_arcsec=1.6,
         y_model_arcsec=1.0,
+        point_image_residual_arcsec=0.1,
+        preferred_image_residual_arcsec=0.1,
         arc_supported=False,
     )
 
@@ -396,13 +486,21 @@ def test_image_catalog_arc_anchor_overlays_skip_point_recovered_rows(
     )
 
 
-def test_image_catalog_arc_anchor_overlays_draw_for_finite_arc_residual_fallback(
+def test_image_catalog_arc_anchor_overlays_draw_for_point_recovered_arc_supported_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     row = _arc_anchor_overlay_row(
-        arc_recovery_status="not_recovered",
+        image_recovery_status="recovered",
+        preferred_recovery_status="point_recovered",
+        arc_recovery_status="point_recovered",
+        x_model_arcsec=1.6,
+        y_model_arcsec=1.0,
+        point_image_residual_arcsec=0.1,
+        arc_candidate_supported=True,
+        arc_candidate_image_residual_arcsec=0.08,
+        preferred_image_residual_arcsec=0.1,
         arc_supported=False,
-        arc_aware_image_residual_arcsec=0.08,
+        arc_aware_image_residual_arcsec=0.1,
     )
     polyline_calls: list[dict[str, object]] = []
     segment_calls: list[dict[str, object]] = []
@@ -426,7 +524,7 @@ def test_image_catalog_arc_anchor_overlays_draw_for_finite_arc_residual_fallback
 
     center = SkyCoord(ra=10.0 * u.deg, dec=0.0 * u.deg, frame="icrs")
 
-    assert solver_plotting._image_catalog_observed_panel_status(row) == "ARC_RECOVERED"
+    assert solver_plotting._image_catalog_observed_panel_status(row) == "POINT_RECOVERED"
     assert solver_plotting._image_catalog_draw_arc_anchor_overlays(row)
     assert solver_plotting._draw_image_catalog_arc_support_curve(
         object(),
@@ -476,15 +574,19 @@ def test_image_catalog_overview_geometry_gates_arc_anchor_bounds() -> None:
 
     arc_row = _arc_anchor_overlay_row(
         image_recovery_status="not_recovered",
-        arc_recovery_status="not_recovered",
+        preferred_recovery_status="arc_supported",
+        arc_recovery_status="arc_supported",
         x_obs_arcsec=0.0,
         y_obs_arcsec=0.0,
         x_model_arcsec=np.nan,
         y_model_arcsec=np.nan,
+        arc_candidate_supported=True,
+        arc_candidate_image_residual_arcsec=0.08,
+        preferred_image_residual_arcsec=0.08,
         arc_aware_image_residual_arcsec=0.08,
         arc_support_anchor_x_arcsec=100.0,
         arc_support_anchor_y_arcsec=0.0,
-        arc_supported=False,
+        arc_supported=True,
     )
     arc_center_x, arc_center_y, arc_size = solver_plotting._image_catalog_overview_geometry(
         pd.DataFrame([arc_row.to_dict()]),
@@ -653,28 +755,58 @@ def test_stage_image_catalog_family_cutouts_include_solver_diagnostics(
         }
     )
     z_calls: list[float] = []
+    packed_z_calls: list[float] = []
+    packed_state_calls: list[dict[str, float]] = []
+    conversion_calls: list[np.ndarray] = []
+    fake_model = object()
 
     class FakeEvaluator:
         def __init__(self) -> None:
             self.state = state
+            self.exact_models_by_z: dict[float, object] = {}
 
         def reported_physical_to_latent_parameter_vector(self, theta):
-            return np.asarray(theta, dtype=float)
+            theta_array = np.asarray(theta, dtype=float)
+            conversion_calls.append(theta_array.copy())
+            return theta_array + 1.0
 
         def _get_exact_model_solver(self, z_source):
             z_calls.append(float(z_source))
-            return object(), None
+            return fake_model, None
 
-        def _build_packed_lens_state(self, _theta, _z_source):
-            return {}
+        def _build_packed_lens_state(self, theta, z_source):
+            theta_array = np.asarray(theta, dtype=float)
+            packed_z_calls.append(float(z_source))
+            return {"z_source": float(z_source), "theta0": float(theta_array[0])}
 
-        def _packed_to_kwargs_lens(self, _packed_state):
-            return []
+        def _packed_to_kwargs_lens(self, packed_state):
+            payload = dict(packed_state)
+            packed_state_calls.append(payload)
+            return [payload]
 
-    def fail_if_critical_curves_are_requested(*_args, **_kwargs):
-        raise AssertionError("image-catalog cutouts should not draw critical-curve overlays")
+    critical_calls: list[dict[str, object]] = []
 
-    monkeypatch.setattr(solver_plotting, "_critical_curve_caustics", fail_if_critical_curves_are_requested)
+    def recording_critical_curve_caustics(
+        model: object,
+        kwargs_lens: list[dict[str, float]],
+        x_axis: np.ndarray,
+        y_axis: np.ndarray,
+        *,
+        include_tangential: bool,
+        include_radial: bool,
+    ) -> list[dict[str, np.ndarray]]:
+        critical_calls.append(
+            {
+                "model": model,
+                "kwargs_lens": [dict(item) for item in kwargs_lens],
+                "center": (float(0.5 * (x_axis[0] + x_axis[-1])), float(0.5 * (y_axis[0] + y_axis[-1]))),
+                "include_tangential": include_tangential,
+                "include_radial": include_radial,
+            }
+        )
+        return []
+
+    monkeypatch.setattr(solver_plotting, "_critical_curve_caustics", recording_critical_curve_caustics)
     helpers = solver_plotting._load_image_catalog_cutout_helpers()
     original_build_rgb_display = helpers.build_rgb_display
     build_rgb_calls: list[dict[str, object]] = []
@@ -685,11 +817,12 @@ def test_stage_image_catalog_family_cutouts_include_solver_diagnostics(
 
     monkeypatch.setattr(helpers, "build_rgb_display", recording_build_rgb_display)
 
+    evaluator = FakeEvaluator()
     solver_plotting._plot_image_catalog_family_cutouts(
         run_dir,
         state,
-        FakeEvaluator(),
-        np.asarray([], dtype=float),
+        evaluator,
+        np.asarray([4.0], dtype=float),
         image_df,
         extra_image_df,
         SimpleNamespace(
@@ -699,17 +832,28 @@ def test_stage_image_catalog_family_cutouts_include_solver_diagnostics(
             image_catalog_family_cutout_rgb_stretch=0.0165,
             image_catalog_family_cutout_rgb_minimum=0.0012,
             image_catalog_family_cutout_rgb_red_gain=0.68,
-            image_catalog_family_cutout_rgb_green_gain=0.69,
-            image_catalog_family_cutout_rgb_blue_gain=2.75,
+            image_catalog_family_cutout_rgb_green_gain=0.75,
+            image_catalog_family_cutout_rgb_blue_gain=3.5,
         ),
     )
 
     output = run_dir / "image_catalog_family_cutouts.pdf"
     assert output.exists()
     assert output.stat().st_size > 0
-    assert z_calls == []
+    assert [call.tolist() for call in conversion_calls] == [[4.0]]
+    assert z_calls == [2.3]
+    assert packed_z_calls == [2.3]
+    assert packed_state_calls == [{"z_source": 2.3, "theta0": 5.0}]
+    assert len(critical_calls) == 4
+    assert all(call["model"] is fake_model for call in critical_calls)
+    assert all(call["kwargs_lens"] == [{"z_source": 2.3, "theta0": 5.0}] for call in critical_calls)
+    assert all(call["include_tangential"] is True for call in critical_calls)
+    assert all(call["include_radial"] is True for call in critical_calls)
+    centers = [call["center"] for call in critical_calls]
+    for expected_center in ((0.0, 0.25), (0.0, 0.0), (1.0, 0.0), (-1.0, 0.5)):
+        assert any(np.allclose(center, expected_center) for center in centers)
     assert build_rgb_calls
     assert build_rgb_calls[0]["q"] == 6.5
     assert build_rgb_calls[0]["stretch"] == 0.0165
     assert build_rgb_calls[0]["minimum"] == 0.0012
-    assert build_rgb_calls[0]["channel_gains"] == {"red": 0.68, "green": 0.69, "blue": 2.75}
+    assert build_rgb_calls[0]["channel_gains"] == {"red": 0.68, "green": 0.75, "blue": 3.5}
