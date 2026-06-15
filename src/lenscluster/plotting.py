@@ -18,12 +18,13 @@ from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.wcs import WCS
 from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.colors import TwoSlopeNorm, to_rgba
+from matplotlib.colors import LogNorm, Normalize, TwoSlopeNorm, to_rgba
 from matplotlib.lines import Line2D
 from matplotlib.patches import Circle
 import numpy as np
 import pandas as pd
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
+from scipy.ndimage import map_coordinates
 from scipy.stats import norm
 from skimage.measure import find_contours
 
@@ -80,8 +81,27 @@ SMC_CORNER_MAX_PARAMS = 8
 CAUSTIC_OVERLAY_FOV_ARCSEC = 200.0
 CAUSTIC_PLOT_GRID_SCALE_ARCSEC = 0.2
 ABSOLUTE_MAGNIFICATION_PLOT_CAP = 25.0
+ABSOLUTE_MAGNIFICATION_RECOVERY_AXIS_MAX = 29.0
+MAP_RECOVERY_HISTOGRAM_BINS = 80
+MAP_RECOVERY_STAT_BINS = 16
+RECOVERY_ONE_SIGMA_PERCENTILES = (16.0, 84.0)
+RECOVERY_TWO_SIGMA_PERCENTILES = (2.5, 97.5)
+MODEL_GRID_CHUNK_PIXELS = 1024 * 1024
+KAPPA_RECOVERY_LIMITS = (0.0, 5.0)
+RECOVERY_IMAGE_POINT_COLUMNS = [
+    "family_id",
+    "image_label",
+    "x_obs_arcsec",
+    "y_obs_arcsec",
+    "true_value",
+    "model_value",
+]
 CRITICAL_ARC_CURVE_SUPPORT_RADIUS_ARCSEC = 0.5
+CRITICAL_ARC_BASE_PROB = 0.10
+CRITICAL_ARC_MAX_PROB = 0.80
 CRITICAL_ARC_SINGULAR_THRESHOLD = 0.20
+CRITICAL_ARC_SINGULAR_SOFTNESS = 0.05
+CRITICAL_ARC_LOG_S_MIN_FLOOR = 1.0e-12
 SUBHALO_TOTAL_MASS_RADIUS_FACTOR = 1.0e6
 SUBHALO_PROPERTIES_COLUMNS = [
     "component_index",
@@ -116,6 +136,20 @@ def _first_int_value(value: Any, default: int) -> int:
             return int(default)
         return int(value[0])
     return int(value)
+
+
+def _resolve_arc_aware_noncritical_support_radius_arcsec(
+    value: Any,
+    match_tolerance_arcsec: Any = 1.5,
+) -> float:
+    if value is None:
+        value = match_tolerance_arcsec
+    if value is None:
+        value = 1.5
+    radius = float(value)
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError("arc_aware_noncritical_support_radius_arcsec must be finite and positive.")
+    return radius
 
 
 def plot_path(root: Path, name: str) -> Path:
@@ -1445,12 +1479,13 @@ def _run_summary(
         "quick_diagnostics": bool(getattr(args, "quick_diagnostics", False)),
         "image_plane_newton_steps": int(getattr(args, "image_plane_newton_steps", 0)),
         "image_plane_scatter_floor_arcsec": float(getattr(args, "image_plane_scatter_floor_arcsec", 0.0)),
-        "arc_aware_noncritical_support_radius_arcsec": float(
+        "arc_aware_noncritical_support_radius_arcsec": _resolve_arc_aware_noncritical_support_radius_arcsec(
+            getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
             getattr(
                 args,
-                "arc_aware_noncritical_support_radius_arcsec",
-                getattr(evaluator, "arc_aware_noncritical_support_radius_arcsec", 0.5),
-            )
+                "match_tolerance_arcsec",
+                getattr(evaluator, "arc_aware_noncritical_support_radius_arcsec", getattr(evaluator, "match_tolerance_arcsec", 1.5)),
+            ),
         ),
         "arc_aware_max_arclength_arcsec": float(
             getattr(
@@ -3688,7 +3723,6 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
         DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC,
         DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC,
         DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC,
-        DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
         DEFAULT_CRITICAL_ARC_BASE_PROB,
         DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE,
         DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE,
@@ -3705,11 +3739,25 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
         SAMPLE_LIKELIHOOD_SOURCE,
     )
 
+    match_tolerance_arcsec = float(
+        getattr(args, "match_tolerance_arcsec", getattr(evaluator, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE))
+    )
+    arc_aware_noncritical_support_radius_arcsec = _resolve_arc_aware_noncritical_support_radius_arcsec(
+        getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
+        getattr(
+            args,
+            "match_tolerance_arcsec",
+            getattr(
+                evaluator,
+                "arc_aware_noncritical_support_radius_arcsec",
+                getattr(evaluator, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE),
+            ),
+        ),
+    )
+
     return ClusterJAXEvaluator(
         state=evaluator.state,
-        match_tolerance_arcsec=float(
-            getattr(args, "match_tolerance_arcsec", getattr(evaluator, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE))
-        ),
+        match_tolerance_arcsec=match_tolerance_arcsec,
         sampling_engine=str(getattr(args, "sampling_engine", getattr(evaluator, "sampling_engine", "full"))),
         active_scaling_galaxies=getattr(args, "active_scaling_galaxies", None),
         active_scaling_selection=str(
@@ -3817,17 +3865,7 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
                 getattr(evaluator, "critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC),
             )
         ),
-        arc_aware_noncritical_support_radius_arcsec=float(
-            getattr(
-                args,
-                "arc_aware_noncritical_support_radius_arcsec",
-                getattr(
-                    evaluator,
-                    "arc_aware_noncritical_support_radius_arcsec",
-                    DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
-                ),
-            )
-        ),
+        arc_aware_noncritical_support_radius_arcsec=arc_aware_noncritical_support_radius_arcsec,
         arc_aware_max_arclength_arcsec=float(
             getattr(
                 args,
@@ -4857,12 +4895,47 @@ def _histogram_bins(values: np.ndarray) -> int:
     return min(40, max(8, int(np.sqrt(max(count, 1)) * 2)))
 
 
+def _mark_panel_unavailable(ax: Any, message: str = "No finite values") -> None:
+    ax.text(
+        0.5,
+        0.5,
+        message,
+        transform=ax.transAxes,
+        ha="center",
+        va="center",
+        fontsize=8.5,
+        color="0.4",
+    )
+
+
+def _log10_s_min_values(s_min: Any) -> np.ndarray:
+    values = np.asarray(s_min, dtype=float)
+    return np.log10(np.maximum(values, CRITICAL_ARC_LOG_S_MIN_FLOOR))
+
+
+def _critical_arc_probability_curve(
+    s_min: np.ndarray,
+    *,
+    base_prob: float,
+    max_prob: float,
+    singular_threshold: float,
+    singular_softness: float,
+) -> np.ndarray:
+    softness = max(float(singular_softness), 1.0e-12)
+    argument = np.clip((float(singular_threshold) - np.asarray(s_min, dtype=float)) / softness, -700.0, 700.0)
+    transition = 1.0 / (1.0 + np.exp(-argument))
+    return np.clip(float(base_prob) + (float(max_prob) - float(base_prob)) * transition, 1.0e-6, 1.0 - 1.0e-6)
+
+
 def _plot_critical_arc_support_histogram(
     image_df: pd.DataFrame,
     path: Path,
     *,
     curve_support_radius_arcsec: float = CRITICAL_ARC_CURVE_SUPPORT_RADIUS_ARCSEC,
+    critical_arc_base_prob: float = CRITICAL_ARC_BASE_PROB,
+    critical_arc_max_prob: float = CRITICAL_ARC_MAX_PROB,
     singular_threshold: float = CRITICAL_ARC_SINGULAR_THRESHOLD,
+    singular_softness: float = CRITICAL_ARC_SINGULAR_SOFTNESS,
 ) -> None:
     if not _critical_arc_support_available(image_df):
         _write_placeholder_plot(
@@ -4876,26 +4949,48 @@ def _plot_critical_arc_support_histogram(
     arc_residual = _finite_plot_values(
         _fit_quality_value(image_df, "arc_aware_image_residual_q50", "arc_aware_image_residual_arcsec")
     )
-    curve_distance = _finite_plot_values(
-        _fit_quality_value(image_df, "arc_curve_distance_arcsec", "arc_noncritical_direction_residual_arcsec")
-    )
+    curve_distance_raw = _fit_quality_value(image_df, "arc_curve_distance_arcsec", "arc_noncritical_direction_residual_arcsec")
     critical_direction_residual = _finite_plot_values(_fit_quality_value(image_df, "arc_critical_direction_residual_arcsec"))
-    s_min = _finite_plot_values(_fit_quality_value(image_df, "arc_s_min"))
-    arc_prior = _finite_plot_values(_fit_quality_value(image_df, "arc_prior_probability"))
+    s_min_raw = _fit_quality_value(image_df, "arc_s_min")
+    arc_prior_raw = _fit_quality_value(image_df, "arc_prior_probability")
+    curve_distance = _finite_plot_values(curve_distance_raw)
+    s_min = _finite_plot_values(s_min_raw)
+    arc_prior = _finite_plot_values(arc_prior_raw)
+    finite_s_min = np.isfinite(s_min_raw)
+    log_s_min_raw = np.full_like(s_min_raw, np.nan, dtype=float)
+    log_s_min_raw[finite_s_min] = _log10_s_min_values(s_min_raw[finite_s_min])
+    log_s_min = _finite_plot_values(log_s_min_raw)
     counts = _critical_arc_status_counts(image_df)
     strict_rms = float(np.sqrt(np.mean(np.square(strict_residual)))) if strict_residual.size else np.nan
     arc_rms = float(np.sqrt(np.mean(np.square(arc_residual)))) if arc_residual.size else np.nan
+    status = _image_catalog_effective_recovery_statuses(image_df)
+    status_colors = {
+        "POINT_RECOVERED": _image_catalog_status_color("POINT_RECOVERED"),
+        "ARC_RECOVERED": _image_catalog_status_color("ARC_RECOVERED"),
+        "MISSED": _image_catalog_status_color("MISSED"),
+    }
 
-    fig, axes = plt.subplots(2, 2, figsize=(11.5, 8.0))
-    residual_ax, noncritical_ax, critical_direction_ax, singular_ax = axes.ravel()
+    threshold = float(singular_threshold)
+    softness = float(singular_softness)
+    threshold_log = np.log10(threshold) if np.isfinite(threshold) and threshold > 0.0 else np.nan
+    transition_low = threshold - softness
+    transition_high = threshold + softness
+    transition_log_low = np.log10(transition_low) if np.isfinite(transition_low) and transition_low > 0.0 else np.nan
+    transition_log_high = np.log10(transition_high) if np.isfinite(transition_high) and transition_high > 0.0 else np.nan
+
+    fig, axes = plt.subplots(2, 3, figsize=(16.0, 8.4))
+    residual_ax, noncritical_ax, critical_direction_ax, singular_ax, probability_ax, tuning_ax = axes.ravel()
     if strict_residual.size:
         residual_ax.hist(strict_residual, bins=_histogram_bins(strict_residual), color="tab:blue", alpha=0.52, label="strict")
     if arc_residual.size:
         residual_ax.hist(arc_residual, bins=_histogram_bins(arc_residual), color="tab:olive", alpha=0.48, label="arc-aware")
+    if not strict_residual.size and not arc_residual.size:
+        _mark_panel_unavailable(residual_ax)
     residual_ax.set_xlabel("image residual [arcsec]")
     residual_ax.set_ylabel("N images")
     residual_ax.set_title("Strict vs Arc-Aware Residual")
-    residual_ax.legend(loc="best", fontsize=8)
+    if strict_residual.size or arc_residual.size:
+        residual_ax.legend(loc="best", fontsize=8)
     residual_ax.text(
         0.98,
         0.95,
@@ -4913,6 +5008,8 @@ def _plot_critical_arc_support_histogram(
 
     if curve_distance.size:
         noncritical_ax.hist(curve_distance, bins=_histogram_bins(curve_distance), color="tab:green", alpha=0.75)
+    else:
+        _mark_panel_unavailable(noncritical_ax)
     noncritical_ax.axvline(float(curve_support_radius_arcsec), color="black", linestyle="--", linewidth=1.1, label="curve support radius")
     noncritical_ax.set_xlabel("support-curve distance [arcsec]")
     noncritical_ax.set_ylabel("N images")
@@ -4922,21 +5019,103 @@ def _plot_critical_arc_support_histogram(
     if critical_direction_residual.size:
         critical_direction_log = np.log10(np.maximum(critical_direction_residual, 1.0e-6))
         critical_direction_ax.hist(critical_direction_log, bins=_histogram_bins(critical_direction_log), color="tab:purple", alpha=0.72)
+    else:
+        _mark_panel_unavailable(critical_direction_ax)
     critical_direction_ax.set_xlabel("log10 critical-direction residual [arcsec]")
     critical_direction_ax.set_ylabel("N images")
     critical_direction_ax.set_title("Critical-Direction Residual")
 
-    if s_min.size:
-        singular_ax.hist(s_min, bins=_histogram_bins(s_min), color="tab:orange", alpha=0.72)
-        singular_ax.axvline(float(singular_threshold), color="black", linestyle="--", linewidth=1.1, label="singular threshold")
-        singular_ax.set_xlabel("smallest singular value")
+    if log_s_min.size:
+        singular_ax.hist(log_s_min, bins=_histogram_bins(log_s_min), color="tab:orange", alpha=0.72)
+        if np.isfinite(transition_log_low) and np.isfinite(transition_log_high) and transition_log_high > transition_log_low:
+            singular_ax.axvspan(transition_log_low, transition_log_high, color="tab:orange", alpha=0.12, label="threshold +/- softness")
+        if np.isfinite(threshold_log):
+            singular_ax.axvline(threshold_log, color="black", linestyle="--", linewidth=1.1, label="singular threshold")
+        singular_ax.set_xlabel("log10 smallest singular value")
     elif arc_prior.size:
         singular_ax.hist(arc_prior, bins=_histogram_bins(arc_prior), color="tab:orange", alpha=0.72)
         singular_ax.set_xlabel("arc prior probability")
+    else:
+        _mark_panel_unavailable(singular_ax)
     singular_ax.set_ylabel("N images")
     singular_ax.set_title("Local Criticality")
-    if s_min.size:
+    if log_s_min.size and np.isfinite(threshold_log):
         singular_ax.legend(loc="best", fontsize=8)
+
+    finite_probability = finite_s_min & np.isfinite(arc_prior_raw)
+    if finite_probability.any():
+        for status_name, color in status_colors.items():
+            mask = finite_probability & (status == status_name)
+            if mask.any():
+                probability_ax.scatter(
+                    log_s_min_raw[mask],
+                    arc_prior_raw[mask],
+                    s=28.0,
+                    color=color,
+                    alpha=0.78,
+                    edgecolors="white",
+                    linewidths=0.35,
+                    label=_image_catalog_status_display_text(status_name),
+                )
+        other_mask = finite_probability & ~np.isin(status, list(status_colors))
+        if other_mask.any():
+            probability_ax.scatter(log_s_min_raw[other_mask], arc_prior_raw[other_mask], s=28.0, color="0.4", alpha=0.65, label="other")
+        finite_log_s = log_s_min_raw[finite_probability]
+        curve_log_min = float(np.nanmin(finite_log_s))
+        curve_log_max = float(np.nanmax(finite_log_s))
+        if np.isfinite(threshold_log):
+            curve_log_min = min(curve_log_min, threshold_log - 1.0)
+            curve_log_max = max(curve_log_max, threshold_log + 1.0)
+        if curve_log_max <= curve_log_min:
+            curve_log_max = curve_log_min + 1.0
+        curve_log_s = np.linspace(curve_log_min, curve_log_max, 256)
+        curve_s = np.power(10.0, curve_log_s)
+        probability_ax.plot(
+            curve_log_s,
+            _critical_arc_probability_curve(
+                curve_s,
+                base_prob=critical_arc_base_prob,
+                max_prob=critical_arc_max_prob,
+                singular_threshold=threshold,
+                singular_softness=softness,
+            ),
+            color="black",
+            linewidth=1.2,
+            label="configured sigmoid",
+        )
+        if np.isfinite(threshold_log):
+            probability_ax.axvline(threshold_log, color="black", linestyle="--", linewidth=1.0)
+        probability_ax.legend(loc="best", fontsize=7.5)
+    else:
+        _mark_panel_unavailable(probability_ax)
+    probability_ax.set_xlabel("log10 smallest singular value")
+    probability_ax.set_ylabel("arc prior probability")
+    probability_ax.set_title("Arc Prior Gate")
+
+    finite_tuning = finite_s_min & np.isfinite(curve_distance_raw) & np.isfinite(arc_prior_raw)
+    if finite_tuning.any():
+        tuning_scatter = tuning_ax.scatter(
+            log_s_min_raw[finite_tuning],
+            curve_distance_raw[finite_tuning],
+            c=arc_prior_raw[finite_tuning],
+            cmap="viridis",
+            vmin=0.0,
+            vmax=1.0,
+            s=32.0,
+            alpha=0.78,
+            edgecolors="white",
+            linewidths=0.35,
+        )
+        fig.colorbar(tuning_scatter, ax=tuning_ax, label="arc prior probability")
+        if np.isfinite(threshold_log):
+            tuning_ax.axvline(threshold_log, color="black", linestyle="--", linewidth=1.0, label="singular threshold")
+        tuning_ax.axhline(float(curve_support_radius_arcsec), color="0.25", linestyle=":", linewidth=1.2, label="curve support radius")
+        tuning_ax.legend(loc="best", fontsize=7.5)
+    else:
+        _mark_panel_unavailable(tuning_ax)
+    tuning_ax.set_xlabel("log10 smallest singular value")
+    tuning_ax.set_ylabel("support-curve distance [arcsec]")
+    tuning_ax.set_title("Gate vs Support Distance")
 
     fig.tight_layout()
     fig.savefig(path, dpi=180, bbox_inches="tight")
@@ -5542,6 +5721,40 @@ def _load_kappa_true_fits(path: str | Path) -> tuple[np.ndarray, WCS]:
     raise ValueError(f"No 2D celestial WCS image found in {fits_path}")
 
 
+def _validate_matching_truth_wcs(
+    reference_wcs: WCS,
+    candidate_wcs: WCS,
+    image_shape: tuple[int, int],
+    *,
+    label: str,
+) -> None:
+    height, width = image_shape
+    x_probe = np.asarray([0.0, float(width - 1), 0.0, float(width - 1), 0.5 * float(width - 1)], dtype=float)
+    y_probe = np.asarray([0.0, 0.0, float(height - 1), float(height - 1), 0.5 * float(height - 1)], dtype=float)
+    ref_ra, ref_dec = reference_wcs.pixel_to_world_values(x_probe, y_probe)
+    candidate_ra, candidate_dec = candidate_wcs.pixel_to_world_values(x_probe, y_probe)
+    if not (
+        np.allclose(ref_ra, candidate_ra, rtol=0.0, atol=1.0e-8, equal_nan=True)
+        and np.allclose(ref_dec, candidate_dec, rtol=0.0, atol=1.0e-8, equal_nan=True)
+    ):
+        raise ValueError(f"{label} truth FITS WCS does not match the kappa truth FITS WCS.")
+
+
+def _signed_magnification_from_kappa_gamma(kappa: np.ndarray, gamma_x: np.ndarray, gamma_y: np.ndarray) -> np.ndarray:
+    kappa = np.asarray(kappa, dtype=float)
+    gamma_x = np.asarray(gamma_x, dtype=float)
+    gamma_y = np.asarray(gamma_y, dtype=float)
+    denominator = (1.0 - kappa) ** 2 - gamma_x**2 - gamma_y**2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return 1.0 / denominator
+
+
+def _capped_absolute_magnification(values: np.ndarray, cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP) -> np.ndarray:
+    if float(cap) <= 0.0:
+        raise ValueError("cap must be positive.")
+    return np.minimum(np.abs(np.asarray(values, dtype=float)), float(cap))
+
+
 def _radec_to_solver_arcsec_offsets(
     ra_deg: Any,
     dec_deg: Any,
@@ -5564,29 +5777,90 @@ def _radec_to_solver_arcsec_offsets(
     return x_arcsec, y_arcsec
 
 
-def _kappa_model_grid_for_true_fits(
+def _solver_arcsec_offsets_to_radec(
+    x_arcsec: Any,
+    y_arcsec: Any,
+    reference: tuple[int, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        _reference_type, ra0_deg, dec0_deg = reference
+        ra0 = float(ra0_deg)
+        dec0 = float(dec0_deg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("State reference must contain reference type, RA, and Dec.") from exc
+    cos_dec0 = math.cos(math.radians(dec0))
+    if cos_dec0 == 0.0:
+        raise ValueError("Reference declination is too close to a pole for offset conversion.")
+    x_values = np.asarray(x_arcsec, dtype=float)
+    y_values = np.asarray(y_arcsec, dtype=float)
+    ra_values = (ra0 - x_values / (3600.0 * cos_dec0)) % 360.0
+    dec_values = dec0 + y_values / 3600.0
+    return ra_values, dec_values
+
+
+def _sample_wcs_image_at_solver_arcsec(
+    image: np.ndarray,
+    image_wcs: WCS,
+    x_arcsec: np.ndarray,
+    y_arcsec: np.ndarray,
+    reference: tuple[int, float, float],
+) -> np.ndarray:
+    x_values = np.asarray(x_arcsec, dtype=float).reshape(-1)
+    y_values = np.asarray(y_arcsec, dtype=float).reshape(-1)
+    sampled = np.full(x_values.shape, np.nan, dtype=float)
+    finite_xy = np.isfinite(x_values) & np.isfinite(y_values)
+    if not np.any(finite_xy):
+        return sampled
+    ra_deg, dec_deg = _solver_arcsec_offsets_to_radec(x_values[finite_xy], y_values[finite_xy], reference)
+    x_pixels, y_pixels = image_wcs.world_to_pixel_values(ra_deg, dec_deg)
+    height, width = np.asarray(image).shape
+    edge_tolerance = 1.0e-6
+    finite_pixels = (
+        np.isfinite(x_pixels)
+        & np.isfinite(y_pixels)
+        & (x_pixels >= -edge_tolerance)
+        & (x_pixels <= float(width - 1) + edge_tolerance)
+        & (y_pixels >= -edge_tolerance)
+        & (y_pixels <= float(height - 1) + edge_tolerance)
+    )
+    if not np.any(finite_pixels):
+        return sampled
+    finite_indices = np.flatnonzero(finite_xy)[finite_pixels]
+    sample_x = np.clip(x_pixels[finite_pixels], 0.0, float(width - 1))
+    sample_y = np.clip(y_pixels[finite_pixels], 0.0, float(height - 1))
+    sampled[finite_indices] = map_coordinates(
+        np.asarray(image, dtype=float),
+        [sample_y, sample_x],
+        order=1,
+        mode="constant",
+        cval=np.nan,
+    )
+    return sampled
+
+
+def _lens_model_quantity_on_arcsec_grid(
     evaluator: ClusterJAXEvaluator,
     best_fit: np.ndarray,
-    kappa_true_shape: tuple[int, int],
-    kappa_wcs: WCS,
+    x_arcsec: np.ndarray,
+    y_arcsec: np.ndarray,
     caustic_source_redshift: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    height, width = kappa_true_shape
-    y_pixels, x_pixels = np.indices((height, width), dtype=float)
-    ra_deg, dec_deg = kappa_wcs.pixel_to_world_values(x_pixels, y_pixels)
-    x_arcsec, y_arcsec = _radec_to_solver_arcsec_offsets(ra_deg, dec_deg, evaluator.state.reference)
+    quantity: str,
+) -> np.ndarray:
     z_source = float(caustic_source_redshift)
     best_fit_latent = _reported_physical_to_latent_vector(evaluator, np.asarray(best_fit, dtype=float))
     exact_models_by_z = getattr(evaluator, "exact_models_by_z", {})
     model = exact_models_by_z.get(z_source) if exact_models_by_z is not None else None
     if model is None:
         model, _ = evaluator._get_exact_model_solver(z_source)
+    if not hasattr(model, quantity):
+        raise ValueError(f"Lens model does not provide quantity {quantity!r}.")
+    model_quantity = getattr(model, quantity)
     packed_state = evaluator._build_packed_lens_state(jnp.asarray(best_fit_latent, dtype=jnp.float64), z_source)
     kwargs_lens = evaluator._packed_to_kwargs_lens(packed_state)
     flat_x = x_arcsec.reshape(-1)
     flat_y = y_arcsec.reshape(-1)
-    flat_kappa = np.full(flat_x.shape, np.nan, dtype=float)
-    chunk_size = 250_000
+    flat_values = np.full(flat_x.shape, np.nan, dtype=float)
+    chunk_size = MODEL_GRID_CHUNK_PIXELS
     for start in range(0, flat_x.size, chunk_size):
         stop = min(start + chunk_size, flat_x.size)
         finite = np.isfinite(flat_x[start:stop]) & np.isfinite(flat_y[start:stop])
@@ -5594,15 +5868,557 @@ def _kappa_model_grid_for_true_fits(
             continue
         chunk_values = np.full(stop - start, np.nan, dtype=float)
         chunk_values[finite] = np.asarray(
-            model.kappa(
+            model_quantity(
                 flat_x[start:stop][finite],
                 flat_y[start:stop][finite],
                 kwargs_lens,
             ),
             dtype=float,
+        ).reshape(-1)
+        flat_values[start:stop] = chunk_values
+    return flat_values.reshape(x_arcsec.shape)
+
+
+def _empty_recovery_image_points() -> pd.DataFrame:
+    return pd.DataFrame(columns=RECOVERY_IMAGE_POINT_COLUMNS)
+
+
+def _observed_image_recovery_points(
+    image_df: pd.DataFrame | None,
+    evaluator: ClusterJAXEvaluator,
+    best_fit: np.ndarray,
+    truth_grid: np.ndarray,
+    truth_wcs: WCS,
+    caustic_source_redshift: float,
+    model_quantity: str,
+    *,
+    model_transform: Callable[[np.ndarray], np.ndarray] | None = None,
+) -> pd.DataFrame:
+    if image_df is None or image_df.empty or "x_obs_arcsec" not in image_df or "y_obs_arcsec" not in image_df:
+        return _empty_recovery_image_points()
+    x_obs = pd.to_numeric(image_df["x_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
+    y_obs = pd.to_numeric(image_df["y_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
+    finite_xy = np.isfinite(x_obs) & np.isfinite(y_obs)
+    true_values = np.full(x_obs.shape, np.nan, dtype=float)
+    model_values = np.full(x_obs.shape, np.nan, dtype=float)
+    if np.any(finite_xy):
+        true_values[finite_xy] = _sample_wcs_image_at_solver_arcsec(
+            truth_grid,
+            truth_wcs,
+            x_obs[finite_xy],
+            y_obs[finite_xy],
+            evaluator.state.reference,
         )
-        flat_kappa[start:stop] = chunk_values
-    return flat_kappa.reshape(kappa_true_shape), x_arcsec, y_arcsec
+        model_sample = _lens_model_quantity_on_arcsec_grid(
+            evaluator,
+            best_fit,
+            x_obs[finite_xy],
+            y_obs[finite_xy],
+            caustic_source_redshift,
+            model_quantity,
+        )
+        model_values[finite_xy] = np.asarray(model_sample, dtype=float).reshape(-1)
+    if model_transform is not None:
+        model_values = np.asarray(model_transform(model_values), dtype=float)
+    points = _empty_recovery_image_points()
+    for column in ("family_id", "image_label"):
+        if column in image_df:
+            points[column] = image_df[column].astype(str).to_numpy()
+    points["x_obs_arcsec"] = x_obs
+    points["y_obs_arcsec"] = y_obs
+    points["true_value"] = true_values
+    points["model_value"] = model_values
+    return points
+
+
+def _model_quantity_grid_for_wcs_pixels(
+    evaluator: ClusterJAXEvaluator,
+    best_fit: np.ndarray,
+    image_wcs: WCS,
+    x_pixels: np.ndarray,
+    y_pixels: np.ndarray,
+    caustic_source_redshift: float,
+    quantity: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ra_deg, dec_deg = image_wcs.pixel_to_world_values(x_pixels, y_pixels)
+    x_arcsec, y_arcsec = _radec_to_solver_arcsec_offsets(ra_deg, dec_deg, evaluator.state.reference)
+    values = _lens_model_quantity_on_arcsec_grid(
+        evaluator,
+        best_fit,
+        x_arcsec,
+        y_arcsec,
+        caustic_source_redshift,
+        quantity,
+    )
+    return values, x_arcsec, y_arcsec
+
+
+def _kappa_model_grid_for_true_fits(
+    evaluator: ClusterJAXEvaluator,
+    best_fit: np.ndarray,
+    kappa_true_shape: tuple[int, int],
+    kappa_wcs: WCS,
+    caustic_source_redshift: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    y_pixels, x_pixels = np.indices(kappa_true_shape, dtype=float)
+    return _model_quantity_grid_for_wcs_pixels(
+        evaluator,
+        best_fit,
+        kappa_wcs,
+        x_pixels,
+        y_pixels,
+        caustic_source_redshift,
+        "kappa",
+    )
+
+
+def _quantity_recovery_bin_table(
+    true_values: np.ndarray,
+    model_values: np.ndarray,
+    quantity: str,
+    n_bins: int = MAP_RECOVERY_STAT_BINS,
+    limits: tuple[float, float] | None = None,
+) -> pd.DataFrame:
+    columns = [
+        "bin_index",
+        f"{quantity}_true_min",
+        f"{quantity}_true_max",
+        f"{quantity}_true_center",
+        "sample_count",
+        f"{quantity}_model_q16",
+        f"{quantity}_model_median",
+        f"{quantity}_model_q84",
+    ]
+    true_values = np.asarray(true_values, dtype=float).reshape(-1)
+    model_values = np.asarray(model_values, dtype=float).reshape(-1)
+    if true_values.size == 0 or model_values.size == 0:
+        return pd.DataFrame(columns=columns)
+    if limits is None:
+        lower = float(np.nanmin(true_values))
+        upper = float(np.nanmax(true_values))
+    else:
+        lower, upper = (float(value) for value in limits)
+        in_limits = (true_values >= lower) & (true_values <= upper)
+        true_values = true_values[in_limits]
+        model_values = model_values[in_limits]
+        if true_values.size == 0 or model_values.size == 0:
+            return pd.DataFrame(columns=columns)
+    if not np.isfinite(lower) or not np.isfinite(upper):
+        return pd.DataFrame(columns=columns)
+    if lower == upper:
+        span = max(abs(lower), 1.0) * 0.05
+        lower -= span
+        upper += span
+    edges = np.linspace(lower, upper, int(n_bins) + 1)
+    bin_indices = np.searchsorted(edges, true_values, side="right") - 1
+    bin_indices = np.clip(bin_indices, 0, int(n_bins) - 1)
+    rows: list[dict[str, Any]] = []
+    for bin_index in range(int(n_bins)):
+        in_bin = bin_indices == bin_index
+        if not np.any(in_bin):
+            continue
+        q16, q50, q84 = np.nanpercentile(
+            model_values[in_bin],
+            [RECOVERY_ONE_SIGMA_PERCENTILES[0], 50.0, RECOVERY_ONE_SIGMA_PERCENTILES[1]],
+        )
+        rows.append(
+            {
+                "bin_index": int(bin_index),
+                f"{quantity}_true_min": float(edges[bin_index]),
+                f"{quantity}_true_max": float(edges[bin_index + 1]),
+                f"{quantity}_true_center": float(0.5 * (edges[bin_index] + edges[bin_index + 1])),
+                "sample_count": int(np.sum(in_bin)),
+                f"{quantity}_model_q16": float(q16),
+                f"{quantity}_model_median": float(q50),
+                f"{quantity}_model_q84": float(q84),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _nanpercentile_or_nan(values: np.ndarray, percentile: float) -> float:
+    values = np.asarray(values, dtype=float).reshape(-1)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return float("nan")
+    return float(np.nanpercentile(finite, percentile))
+
+
+def _central_interval_half_width(lower: float, upper: float) -> float:
+    if not np.isfinite(lower) or not np.isfinite(upper):
+        return float("nan")
+    return 0.5 * abs(float(upper) - float(lower))
+
+
+def _quantity_recovery_limits(true_values: np.ndarray, model_values: np.ndarray) -> tuple[float, float]:
+    combined = np.concatenate([np.asarray(true_values, dtype=float).reshape(-1), np.asarray(model_values, dtype=float).reshape(-1)])
+    finite = combined[np.isfinite(combined)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    lower = float(np.nanmin(finite))
+    upper = float(np.nanmax(finite))
+    if lower == upper:
+        span = max(abs(lower), 1.0) * 0.05
+        return lower - span, upper + span
+    span = upper - lower
+    padded_lower = lower - 0.04 * span
+    padded_upper = upper + 0.04 * span
+    if lower >= 0.0:
+        padded_lower = max(0.0, padded_lower)
+    return float(padded_lower), float(padded_upper)
+
+
+def _quantity_recovery_summary_table(
+    quantity: str,
+    true_values: np.ndarray,
+    model_values: np.ndarray,
+    total_pixel_count: int,
+) -> pd.DataFrame:
+    residual = model_values - true_values
+    fractional_residual = np.full(true_values.shape, np.nan, dtype=float)
+    nonzero = true_values != 0.0
+    fractional_residual[nonzero] = residual[nonzero] / true_values[nonzero]
+    residual_q2p5 = _nanpercentile_or_nan(residual, RECOVERY_TWO_SIGMA_PERCENTILES[0])
+    residual_q16 = _nanpercentile_or_nan(residual, RECOVERY_ONE_SIGMA_PERCENTILES[0])
+    residual_median = _nanpercentile_or_nan(residual, 50.0)
+    residual_q84 = _nanpercentile_or_nan(residual, RECOVERY_ONE_SIGMA_PERCENTILES[1])
+    residual_q97p5 = _nanpercentile_or_nan(residual, RECOVERY_TWO_SIGMA_PERCENTILES[1])
+    fractional_residual_q2p5 = _nanpercentile_or_nan(
+        fractional_residual,
+        RECOVERY_TWO_SIGMA_PERCENTILES[0],
+    )
+    fractional_residual_q16 = _nanpercentile_or_nan(
+        fractional_residual,
+        RECOVERY_ONE_SIGMA_PERCENTILES[0],
+    )
+    fractional_residual_median = _nanpercentile_or_nan(fractional_residual, 50.0)
+    fractional_residual_q84 = _nanpercentile_or_nan(
+        fractional_residual,
+        RECOVERY_ONE_SIGMA_PERCENTILES[1],
+    )
+    fractional_residual_q97p5 = _nanpercentile_or_nan(
+        fractional_residual,
+        RECOVERY_TWO_SIGMA_PERCENTILES[1],
+    )
+    row = {
+        "quantity": quantity,
+        "total_pixel_count": int(total_pixel_count),
+        "finite_pixel_count": int(true_values.size),
+        f"{quantity}_true_min": float(np.nanmin(true_values)) if true_values.size else float("nan"),
+        f"{quantity}_true_max": float(np.nanmax(true_values)) if true_values.size else float("nan"),
+        f"{quantity}_model_min": float(np.nanmin(model_values)) if model_values.size else float("nan"),
+        f"{quantity}_model_max": float(np.nanmax(model_values)) if model_values.size else float("nan"),
+        f"{quantity}_residual_q2p5": residual_q2p5,
+        f"{quantity}_residual_q16": residual_q16,
+        f"{quantity}_residual_median": residual_median,
+        f"{quantity}_residual_q84": residual_q84,
+        f"{quantity}_residual_q97p5": residual_q97p5,
+        f"{quantity}_residual_sigma": _central_interval_half_width(residual_q16, residual_q84),
+        f"{quantity}_fractional_residual_q2p5": fractional_residual_q2p5,
+        f"{quantity}_fractional_residual_q16": fractional_residual_q16,
+        f"{quantity}_fractional_residual_median": fractional_residual_median,
+        f"{quantity}_fractional_residual_q84": fractional_residual_q84,
+        f"{quantity}_fractional_residual_q97p5": fractional_residual_q97p5,
+        f"{quantity}_fractional_residual_sigma": _central_interval_half_width(
+            fractional_residual_q16,
+            fractional_residual_q84,
+        ),
+    }
+    return pd.DataFrame([row])
+
+
+def _quantity_recovery_reduced(
+    true_grid: np.ndarray,
+    model_grid: np.ndarray,
+    quantity: str,
+    *,
+    histogram_bins: int = MAP_RECOVERY_HISTOGRAM_BINS,
+    stat_bins: int = MAP_RECOVERY_STAT_BINS,
+    limits: tuple[float, float] | None = None,
+    stat_limits: tuple[float, float] | None = None,
+) -> dict[str, Any]:
+    true_flat = np.asarray(true_grid, dtype=float).reshape(-1)
+    model_flat = np.asarray(model_grid, dtype=float).reshape(-1)
+    finite = np.isfinite(true_flat) & np.isfinite(model_flat)
+    true_values = true_flat[finite]
+    model_values = model_flat[finite]
+    total_pixel_count = int(true_flat.size)
+    if true_values.size == 0:
+        resolved_limits = tuple(float(value) for value in limits) if limits is not None else (0.0, 1.0)
+        hist_counts = np.zeros((int(histogram_bins), int(histogram_bins)), dtype=float)
+        hist_x_edges = np.linspace(resolved_limits[0], resolved_limits[1], int(histogram_bins) + 1)
+        hist_y_edges = hist_x_edges.copy()
+    else:
+        resolved_limits = tuple(float(value) for value in limits) if limits is not None else _quantity_recovery_limits(true_values, model_values)
+        hist_counts, hist_x_edges, hist_y_edges = np.histogram2d(
+            true_values,
+            model_values,
+            bins=int(histogram_bins),
+            range=[resolved_limits, resolved_limits],
+        )
+    return {
+        "quantity": quantity,
+        "limits": resolved_limits,
+        "hist_counts": hist_counts,
+        "hist_x_edges": hist_x_edges,
+        "hist_y_edges": hist_y_edges,
+        "bin_table": _quantity_recovery_bin_table(true_values, model_values, quantity, n_bins=stat_bins, limits=stat_limits),
+        "summary_table": _quantity_recovery_summary_table(quantity, true_values, model_values, total_pixel_count),
+        "finite_pixel_count": int(true_values.size),
+        "total_pixel_count": total_pixel_count,
+    }
+
+
+def _plot_quantity_recovery(
+    recovery: dict[str, Any],
+    output_path: Path,
+    *,
+    quantity: str,
+    true_label: str,
+    model_label: str,
+    title: str | None = None,
+    image_points: pd.DataFrame | None = None,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6.3, 5.7))
+    if int(recovery.get("finite_pixel_count", 0)) == 0:
+        ax.text(0.5, 0.5, "No finite recovery samples.", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+    else:
+        limits = tuple(float(value) for value in recovery["limits"])
+        hist_counts = np.asarray(recovery["hist_counts"], dtype=float)
+        hist_x_edges = np.asarray(recovery["hist_x_edges"], dtype=float)
+        hist_y_edges = np.asarray(recovery["hist_y_edges"], dtype=float)
+        masked_counts = np.ma.masked_less_equal(hist_counts.T, 0.0)
+        mesh = ax.pcolormesh(
+            hist_x_edges,
+            hist_y_edges,
+            masked_counts,
+            cmap="Blues",
+            norm=LogNorm(vmin=1.0, vmax=max(1.0, float(np.nanmax(hist_counts)))),
+            shading="auto",
+        )
+        colorbar = fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.04)
+        colorbar.set_label("pixel count")
+        guide_x = np.linspace(limits[0], limits[1], 256)
+        ax.plot(guide_x, guide_x, color="0.15", linewidth=1.0, linestyle="-", label="1:1")
+        summary_df = recovery["summary_table"]
+        if not summary_df.empty:
+            summary = summary_df.iloc[0]
+            one_sigma = float(summary.get(f"{quantity}_fractional_residual_sigma", np.nan))
+            if np.isfinite(one_sigma):
+                for multiple, linestyle, label in [
+                    (1.0, "--", r"1$\sigma$ recovery"),
+                    (2.0, ":", r"2$\sigma$ recovery"),
+                ]:
+                    band_width = multiple * one_sigma
+                    upper_slope = 1.0 + band_width
+                    lower_slope = 1.0 / upper_slope
+                    ax.plot(
+                        guide_x,
+                        lower_slope * guide_x,
+                        color="0.45",
+                        linewidth=0.8,
+                        linestyle=linestyle,
+                    )
+                    ax.plot(
+                        guide_x,
+                        upper_slope * guide_x,
+                        color="0.45",
+                        linewidth=0.8,
+                        linestyle=linestyle,
+                        label=label,
+                    )
+        bin_df = recovery["bin_table"]
+        if not bin_df.empty:
+            center = bin_df[f"{quantity}_true_center"].to_numpy(dtype=float)
+            median = bin_df[f"{quantity}_model_median"].to_numpy(dtype=float)
+            q16 = bin_df[f"{quantity}_model_q16"].to_numpy(dtype=float)
+            q84 = bin_df[f"{quantity}_model_q84"].to_numpy(dtype=float)
+            ax.plot(center, median, color="black", linewidth=1.8, label="median")
+            ax.plot(center, q16, color="tab:blue", linewidth=1.2, label=r"1$\sigma$ (16th/84th)")
+            ax.plot(center, q84, color="tab:blue", linewidth=1.2)
+        if image_points is not None and not image_points.empty and {"true_value", "model_value"}.issubset(image_points.columns):
+            point_true = pd.to_numeric(image_points["true_value"], errors="coerce").to_numpy(dtype=float)
+            point_model = pd.to_numeric(image_points["model_value"], errors="coerce").to_numpy(dtype=float)
+            finite_points = np.isfinite(point_true) & np.isfinite(point_model)
+            in_limits = (
+                finite_points
+                & (point_true >= limits[0])
+                & (point_true <= limits[1])
+                & (point_model >= limits[0])
+                & (point_model <= limits[1])
+            )
+            if np.any(in_limits):
+                ax.scatter(
+                    point_true[in_limits],
+                    point_model[in_limits],
+                    marker="o",
+                    s=22,
+                    facecolors="tab:orange",
+                    edgecolors="black",
+                    linewidths=0.45,
+                    alpha=0.9,
+                    label="observed images",
+                    zorder=5,
+                )
+        ax.set_xlim(*limits)
+        ax.set_ylim(*limits)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel(true_label)
+        ax.set_ylabel(model_label)
+        if title:
+            ax.set_title(title)
+        ax.legend(loc="upper left", fontsize=8, frameon=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_kappa_recovery_from_grid(
+    plot_dir: Path,
+    kappa_true: np.ndarray,
+    model_kappa: np.ndarray,
+    z_source: float,
+    *,
+    image_points: pd.DataFrame | None = None,
+) -> None:
+    recovery = _quantity_recovery_reduced(kappa_true, model_kappa, "kappa", limits=KAPPA_RECOVERY_LIMITS)
+    tables_dir = plot_dir / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    recovery["bin_table"].to_csv(tables_dir / "kappa_recovery_binned.csv", index=False)
+    recovery["summary_table"].to_csv(tables_dir / "kappa_recovery_summary.csv", index=False)
+    _plot_quantity_recovery(
+        recovery,
+        _plot_path(plot_dir, "kappa_recovery.pdf"),
+        quantity="kappa",
+        true_label=r"$\kappa_{\rm true}$",
+        model_label=r"$\kappa_{\rm model}$",
+        image_points=image_points,
+    )
+
+
+def _plot_kappa_recovery(
+    plot_dir: Path,
+    evaluator: ClusterJAXEvaluator,
+    best_fit: np.ndarray,
+    kappa_true_fits: str | Path,
+    caustic_source_redshift: float,
+    image_df: pd.DataFrame | None = None,
+) -> None:
+    z_source = float(caustic_source_redshift)
+    z_lens = getattr(evaluator.state, "z_lens", None)
+    if z_lens is not None and np.isfinite(float(z_lens)) and z_source <= float(z_lens):
+        _log(
+            None,
+            f"[plot:kappa_recovery] skipped: caustic source redshift z={z_source:g} "
+            f"is not behind lens redshift z={float(z_lens):g}",
+        )
+        return
+    kappa_true, kappa_wcs = _load_kappa_true_fits(kappa_true_fits)
+    model_kappa, _x_arcsec, _y_arcsec = _kappa_model_grid_for_true_fits(
+        evaluator,
+        best_fit,
+        kappa_true.shape,
+        kappa_wcs,
+        z_source,
+    )
+    image_points = _observed_image_recovery_points(
+        image_df,
+        evaluator,
+        best_fit,
+        kappa_true,
+        kappa_wcs,
+        z_source,
+        "kappa",
+    )
+    _write_kappa_recovery_from_grid(plot_dir, kappa_true, model_kappa, z_source, image_points=image_points)
+
+
+def _plot_kappa_true_comparison_from_grid(
+    plot_dir: Path,
+    kappa_true: np.ndarray,
+    model_kappa: np.ndarray,
+    x_arcsec: np.ndarray,
+    y_arcsec: np.ndarray,
+    z_source: float,
+) -> None:
+    def _plot_comparison_map(
+        output_name: str,
+        image_data: np.ndarray,
+        *,
+        cmap: str,
+        colorbar_label: str,
+        vmin: float | None = None,
+        vmax: float | None = None,
+        norm: Normalize | None = None,
+    ) -> None:
+        fig, ax = plt.subplots(figsize=(6.0, 5.2))
+        imshow_kwargs: dict[str, Any] = {
+            "origin": "lower",
+            "extent": extent,
+            "cmap": cmap,
+            "aspect": "equal",
+        }
+        if norm is None:
+            if vmin is not None:
+                imshow_kwargs["vmin"] = float(vmin)
+            if vmax is not None:
+                imshow_kwargs["vmax"] = float(vmax)
+        else:
+            imshow_kwargs["norm"] = norm
+        image = ax.imshow(np.ma.masked_invalid(image_data), **imshow_kwargs)
+        colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+        colorbar.set_label(colorbar_label)
+        ax.invert_xaxis()
+        ax.set_xlabel("x [arcsec]")
+        ax.set_ylabel("y [arcsec]")
+        fig.tight_layout()
+        fig.savefig(_plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
+        plt.close(fig)
+
+    valid_residual = np.isfinite(model_kappa) & np.isfinite(kappa_true) & (kappa_true > 0.0)
+    fractional_residual = np.full(kappa_true.shape, np.nan, dtype=float)
+    fractional_residual[valid_residual] = (model_kappa[valid_residual] - kappa_true[valid_residual]) / kappa_true[valid_residual]
+    extent = [
+        float(np.nanmin(x_arcsec)),
+        float(np.nanmax(x_arcsec)),
+        float(np.nanmin(y_arcsec)),
+        float(np.nanmax(y_arcsec)),
+    ]
+
+    _plot_comparison_map(
+        "kappa_model.pdf",
+        model_kappa,
+        cmap="magma",
+        vmin=0.0,
+        vmax=3.0,
+        colorbar_label=r"$\kappa_{\rm model}$",
+    )
+    _plot_comparison_map(
+        "kappa_fractional_residual.pdf",
+        fractional_residual,
+        cmap="RdBu_r",
+        norm=TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=2.0),
+        colorbar_label=r"$(\kappa_{\rm model} - \kappa_{\rm true}) / \kappa_{\rm true}$",
+    )
+
+
+def _kappa_truth_grids(
+    evaluator: ClusterJAXEvaluator,
+    best_fit: np.ndarray,
+    kappa_true_fits: str | Path,
+    caustic_source_redshift: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    kappa_true, kappa_wcs = _load_kappa_true_fits(kappa_true_fits)
+    model_kappa, x_arcsec, y_arcsec = _kappa_model_grid_for_true_fits(
+        evaluator,
+        best_fit,
+        kappa_true.shape,
+        kappa_wcs,
+        caustic_source_redshift,
+    )
+    return kappa_true, model_kappa, x_arcsec, y_arcsec
 
 
 def _plot_kappa_true_comparison(
@@ -5621,6 +6437,32 @@ def _plot_kappa_true_comparison(
             f"is not behind lens redshift z={float(z_lens):g}",
         )
         return
+    kappa_true, model_kappa, x_arcsec, y_arcsec = _kappa_truth_grids(
+        evaluator,
+        best_fit,
+        kappa_true_fits,
+        z_source,
+    )
+    _plot_kappa_true_comparison_from_grid(plot_dir, kappa_true, model_kappa, x_arcsec, y_arcsec, z_source)
+
+
+def _plot_kappa_truth_diagnostics(
+    plot_dir: Path,
+    evaluator: ClusterJAXEvaluator,
+    best_fit: np.ndarray,
+    kappa_true_fits: str | Path,
+    caustic_source_redshift: float,
+    image_df: pd.DataFrame | None = None,
+) -> None:
+    z_source = float(caustic_source_redshift)
+    z_lens = getattr(evaluator.state, "z_lens", None)
+    if z_lens is not None and np.isfinite(float(z_lens)) and z_source <= float(z_lens):
+        _log(
+            None,
+            f"[plot:kappa_truth] skipped: caustic source redshift z={z_source:g} "
+            f"is not behind lens redshift z={float(z_lens):g}",
+        )
+        return
     kappa_true, kappa_wcs = _load_kappa_true_fits(kappa_true_fits)
     model_kappa, x_arcsec, y_arcsec = _kappa_model_grid_for_true_fits(
         evaluator,
@@ -5629,9 +6471,149 @@ def _plot_kappa_true_comparison(
         kappa_wcs,
         z_source,
     )
-    valid_residual = np.isfinite(model_kappa) & np.isfinite(kappa_true) & (kappa_true > 0.0)
-    fractional_residual = np.full(kappa_true.shape, np.nan, dtype=float)
-    fractional_residual[valid_residual] = (model_kappa[valid_residual] - kappa_true[valid_residual]) / kappa_true[valid_residual]
+    _plot_kappa_true_comparison_from_grid(plot_dir, kappa_true, model_kappa, x_arcsec, y_arcsec, z_source)
+    image_points = _observed_image_recovery_points(
+        image_df,
+        evaluator,
+        best_fit,
+        kappa_true,
+        kappa_wcs,
+        z_source,
+        "kappa",
+    )
+    _write_kappa_recovery_from_grid(plot_dir, kappa_true, model_kappa, z_source, image_points=image_points)
+
+
+def _absolute_mu_truth_grid(
+    kappa_true_fits: str | Path,
+    gammax_true_fits: str | Path,
+    gammay_true_fits: str | Path,
+    *,
+    cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP,
+) -> tuple[np.ndarray, WCS]:
+    kappa_true, kappa_wcs = _load_kappa_true_fits(kappa_true_fits)
+    gammax_true, gammax_wcs = _load_kappa_true_fits(gammax_true_fits)
+    gammay_true, gammay_wcs = _load_kappa_true_fits(gammay_true_fits)
+    if gammax_true.shape != kappa_true.shape:
+        raise ValueError("gammax truth FITS shape does not match the kappa truth FITS shape.")
+    if gammay_true.shape != kappa_true.shape:
+        raise ValueError("gammay truth FITS shape does not match the kappa truth FITS shape.")
+    _validate_matching_truth_wcs(kappa_wcs, gammax_wcs, kappa_true.shape, label="gammax")
+    _validate_matching_truth_wcs(kappa_wcs, gammay_wcs, kappa_true.shape, label="gammay")
+    signed_mu_true = _signed_magnification_from_kappa_gamma(kappa_true, gammax_true, gammay_true)
+    return np.abs(signed_mu_true), kappa_wcs
+
+
+def _absolute_mu_truth_grids(
+    evaluator: ClusterJAXEvaluator,
+    best_fit: np.ndarray,
+    kappa_true_fits: str | Path,
+    gammax_true_fits: str | Path,
+    gammay_true_fits: str | Path,
+    caustic_source_redshift: float,
+    *,
+    cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    abs_mu_true, truth_wcs = _absolute_mu_truth_grid(
+        kappa_true_fits,
+        gammax_true_fits,
+        gammay_true_fits,
+        cap=cap,
+    )
+    y_pixels, x_pixels = np.indices(abs_mu_true.shape, dtype=float)
+    model_mu, x_arcsec, y_arcsec = _model_quantity_grid_for_wcs_pixels(
+        evaluator,
+        best_fit,
+        truth_wcs,
+        x_pixels,
+        y_pixels,
+        caustic_source_redshift,
+        "magnification",
+    )
+    abs_mu_model = np.abs(np.asarray(model_mu, dtype=float))
+    return abs_mu_true, abs_mu_model, x_arcsec, y_arcsec
+
+
+def _write_abs_mu_recovery_from_grid(
+    plot_dir: Path,
+    abs_mu_true: np.ndarray,
+    abs_mu_model: np.ndarray,
+    z_source: float,
+    *,
+    cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP,
+    image_points: pd.DataFrame | None = None,
+) -> None:
+    axis_limits = (0.0, float(ABSOLUTE_MAGNIFICATION_RECOVERY_AXIS_MAX))
+    recovery = _quantity_recovery_reduced(
+        abs_mu_true,
+        abs_mu_model,
+        "abs_mu",
+        limits=axis_limits,
+        stat_limits=axis_limits,
+    )
+    tables_dir = plot_dir / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    recovery["bin_table"].to_csv(tables_dir / "mu_recovery_binned.csv", index=False)
+    recovery["summary_table"].to_csv(tables_dir / "mu_recovery_summary.csv", index=False)
+    _plot_quantity_recovery(
+        recovery,
+        _plot_path(plot_dir, "mu_recovery.pdf"),
+        quantity="abs_mu",
+        true_label=r"$|\mu_{\rm true}|$",
+        model_label=r"$|\mu_{\rm model}|$",
+        image_points=image_points,
+    )
+
+
+def _plot_abs_mu_true_comparison_from_grid(
+    plot_dir: Path,
+    abs_mu_true: np.ndarray,
+    abs_mu_model: np.ndarray,
+    x_arcsec: np.ndarray,
+    y_arcsec: np.ndarray,
+    z_source: float,
+    *,
+    cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP,
+) -> None:
+    def _plot_comparison_map(
+        output_name: str,
+        image_data: np.ndarray,
+        *,
+        cmap: str,
+        colorbar_label: str,
+        vmin: float | None = None,
+        vmax: float | None = None,
+        norm: Normalize | None = None,
+    ) -> None:
+        fig, ax = plt.subplots(figsize=(6.0, 5.2))
+        imshow_kwargs: dict[str, Any] = {
+            "origin": "lower",
+            "extent": extent,
+            "cmap": cmap,
+            "aspect": "equal",
+        }
+        if norm is None:
+            if vmin is not None:
+                imshow_kwargs["vmin"] = float(vmin)
+            if vmax is not None:
+                imshow_kwargs["vmax"] = float(vmax)
+        else:
+            imshow_kwargs["norm"] = norm
+        image = ax.imshow(np.ma.masked_invalid(image_data), **imshow_kwargs)
+        colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+        colorbar.set_label(colorbar_label)
+        ax.invert_xaxis()
+        ax.set_xlabel("x [arcsec]")
+        ax.set_ylabel("y [arcsec]")
+        fig.tight_layout()
+        fig.savefig(_plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
+        plt.close(fig)
+
+    valid_residual = np.isfinite(abs_mu_model) & np.isfinite(abs_mu_true) & (abs_mu_true > 0.0)
+    fractional_residual = np.full(abs_mu_true.shape, np.nan, dtype=float)
+    fractional_residual[valid_residual] = (
+        (abs_mu_model[valid_residual] - abs_mu_true[valid_residual]) / abs_mu_true[valid_residual]
+    )
     extent = [
         float(np.nanmin(x_arcsec)),
         float(np.nanmax(x_arcsec)),
@@ -5639,39 +6621,81 @@ def _plot_kappa_true_comparison(
         float(np.nanmax(y_arcsec)),
     ]
 
-    fig, axes = plt.subplots(1, 2, figsize=(12.0, 5.2))
-    kappa_image = axes[0].imshow(
-        np.ma.masked_invalid(model_kappa),
-        origin="lower",
-        extent=extent,
-        cmap="magma",
+    _plot_comparison_map(
+        "mu_model.pdf",
+        abs_mu_model,
+        cmap="viridis",
         vmin=0.0,
-        vmax=3.0,
-        aspect="equal",
+        vmax=float(cap),
+        colorbar_label=r"$|\mu_{\rm model}|$",
     )
-    kappa_colorbar = fig.colorbar(kappa_image, ax=axes[0], fraction=0.046, pad=0.04)
-    kappa_colorbar.set_label(r"$\kappa_{\rm model}$")
-
-    residual_image = axes[1].imshow(
-        np.ma.masked_invalid(fractional_residual),
-        origin="lower",
-        extent=extent,
+    _plot_comparison_map(
+        "mu_fractional_residual.pdf",
+        fractional_residual,
         cmap="RdBu_r",
-        norm=TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=2.0),
-        aspect="equal",
+        norm=TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=4.0),
+        colorbar_label=r"$(|\mu_{\rm model}| - |\mu_{\rm true}|) / |\mu_{\rm true}|$",
     )
-    residual_colorbar = fig.colorbar(residual_image, ax=axes[1], fraction=0.046, pad=0.04)
-    residual_colorbar.set_label(r"$(\kappa_{\rm model} - \kappa_{\rm true}) / \kappa_{\rm true}$")
 
-    axes[0].set_title(fr"Model $\kappa$ (z={z_source:g})")
-    axes[1].set_title(r"Fractional $\kappa$ Residual")
-    for ax in axes:
-        ax.invert_xaxis()
-        ax.set_xlabel("x [arcsec]")
-        ax.set_ylabel("y [arcsec]")
-    fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "kappa_comparison.pdf"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
+
+def _plot_abs_mu_truth_diagnostics(
+    plot_dir: Path,
+    evaluator: ClusterJAXEvaluator,
+    best_fit: np.ndarray,
+    kappa_true_fits: str | Path,
+    gammax_true_fits: str | Path,
+    gammay_true_fits: str | Path,
+    caustic_source_redshift: float,
+    *,
+    cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP,
+    image_df: pd.DataFrame | None = None,
+) -> None:
+    z_source = float(caustic_source_redshift)
+    z_lens = getattr(evaluator.state, "z_lens", None)
+    if z_lens is not None and np.isfinite(float(z_lens)) and z_source <= float(z_lens):
+        _log(
+            None,
+            f"[plot:mu_truth] skipped: caustic source redshift z={z_source:g} "
+            f"is not behind lens redshift z={float(z_lens):g}",
+        )
+        return
+    abs_mu_true, truth_wcs = _absolute_mu_truth_grid(
+        kappa_true_fits,
+        gammax_true_fits,
+        gammay_true_fits,
+        cap=cap,
+    )
+    y_pixels, x_pixels = np.indices(abs_mu_true.shape, dtype=float)
+    model_mu, x_arcsec, y_arcsec = _model_quantity_grid_for_wcs_pixels(
+        evaluator,
+        best_fit,
+        truth_wcs,
+        x_pixels,
+        y_pixels,
+        z_source,
+        "magnification",
+    )
+    abs_mu_model = np.abs(np.asarray(model_mu, dtype=float))
+    _plot_abs_mu_true_comparison_from_grid(
+        plot_dir,
+        abs_mu_true,
+        abs_mu_model,
+        x_arcsec,
+        y_arcsec,
+        z_source,
+        cap=cap,
+    )
+    image_points = _observed_image_recovery_points(
+        image_df,
+        evaluator,
+        best_fit,
+        abs_mu_true,
+        truth_wcs,
+        z_source,
+        "magnification",
+        model_transform=np.abs,
+    )
+    _write_abs_mu_recovery_from_grid(plot_dir, abs_mu_true, abs_mu_model, z_source, cap=cap, image_points=image_points)
 
 
 def _empty_subhalo_properties_table() -> pd.DataFrame:
@@ -6800,7 +7824,7 @@ IMAGE_CATALOG_MIN_OVERVIEW_SIZE_ARCSEC = 40.0
 IMAGE_CATALOG_OVERVIEW_LABEL_FONT_SIZE = 8.6
 IMAGE_CATALOG_DETAIL_LABEL_FONT_SIZE = 8.0
 IMAGE_CATALOG_STATUS_LABEL_FONT_SIZE = 8.0
-IMAGE_CATALOG_LEGEND_FONT_SIZE = 8.0
+IMAGE_CATALOG_LEGEND_FONT_SIZE = 12.0
 IMAGE_CATALOG_TANGENTIAL_CRITICAL_COLOR = "#ffd54f"
 IMAGE_CATALOG_RADIAL_CRITICAL_COLOR = "#ff4da6"
 
@@ -6839,10 +7863,14 @@ def _image_catalog_arc_support_curve_points(data: pd.DataFrame) -> np.ndarray:
     return np.vstack(curves)
 
 
-def _image_catalog_cluster_overview_geometry(catalog_df: pd.DataFrame) -> tuple[float, float, float]:
-    return _image_catalog_geometry_from_points(
-        _image_catalog_xy_points(catalog_df, "x_obs_arcsec", "y_obs_arcsec"),
-        minimum_side_arcsec=IMAGE_CATALOG_MIN_OVERVIEW_SIZE_ARCSEC,
+def _image_catalog_cluster_overview_geometry(
+    catalog_df: pd.DataFrame,
+    extra_df: pd.DataFrame | None = None,
+) -> tuple[float, float, float]:
+    return _image_catalog_overview_geometry(
+        catalog_df,
+        extra_df if extra_df is not None else pd.DataFrame(),
+        IMAGE_CATALOG_MIN_OVERVIEW_SIZE_ARCSEC,
     )
 
 
@@ -7538,6 +8566,85 @@ def _draw_image_catalog_extra_marker(
     )
 
 
+def _draw_image_catalog_observed_row_overlays(
+    ax: plt.Axes,
+    image: Any,
+    center_coord: SkyCoord,
+    image_row: pd.Series,
+    reference: tuple[int, float, float],
+    *,
+    cutout_size_arcsec: float,
+    rendered_shape: tuple[int, int],
+    arc_curve_alpha: float = 0.60,
+    arc_curve_linewidth: float = 1.1,
+    arc_curve_zorder: float = 7,
+    residual_alpha: float = 0.72,
+) -> None:
+    target_coord = _arcsec_to_skycoord(image_row.get("x_obs_arcsec"), image_row.get("y_obs_arcsec"), reference)
+    if target_coord is None:
+        return
+    status = _image_catalog_observed_panel_status(image_row)
+    draw_arc_anchor_overlays = _image_catalog_draw_arc_anchor_overlays(image_row)
+    if draw_arc_anchor_overlays:
+        _draw_image_catalog_arc_support_curve(
+            ax,
+            image,
+            center_coord,
+            image_row,
+            reference,
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rendered_shape,
+            alpha=arc_curve_alpha,
+            linewidth=arc_curve_linewidth,
+            zorder=arc_curve_zorder,
+        )
+    _draw_image_catalog_observed_marker(
+        ax,
+        image,
+        center_coord,
+        target_coord,
+        status=status,
+        cutout_size_arcsec=cutout_size_arcsec,
+        rendered_shape=rendered_shape,
+    )
+    if draw_arc_anchor_overlays:
+        _draw_image_catalog_arc_supported_components(
+            ax,
+            image,
+            center_coord,
+            image_row,
+            reference,
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rendered_shape,
+        )
+        if not _image_catalog_point_recovered(image_row):
+            return
+    model_coord = _image_catalog_display_model_coord(image_row, reference)
+    if model_coord is None:
+        return
+    _draw_image_catalog_model_marker(
+        ax,
+        image,
+        center_coord,
+        model_coord,
+        cutout_size_arcsec=cutout_size_arcsec,
+        rendered_shape=rendered_shape,
+    )
+    _draw_cutout_segment(
+        ax,
+        image,
+        center_coord,
+        target_coord,
+        model_coord,
+        cutout_size_arcsec=cutout_size_arcsec,
+        rendered_shape=rendered_shape,
+        color="#bdbdbd",
+        linewidth=1.05,
+        alpha=residual_alpha,
+        zorder=9,
+    )
+
+
 def _draw_image_catalog_cluster_overview_panel(
     ax: plt.Axes,
     helpers: Any,
@@ -7546,9 +8653,12 @@ def _draw_image_catalog_cluster_overview_panel(
     rgb_display: Any,
     display_image: Any,
     catalog_df: pd.DataFrame,
+    extra_df: pd.DataFrame | None,
     reference: tuple[int, float, float],
 ) -> None:
-    center_x, center_y, cutout_size_arcsec = _image_catalog_cluster_overview_geometry(catalog_df)
+    if extra_df is None:
+        extra_df = pd.DataFrame()
+    center_x, center_y, cutout_size_arcsec = _image_catalog_cluster_overview_geometry(catalog_df, extra_df)
     center_coord = _arcsec_to_skycoord(center_x, center_y, reference)
     if center_coord is None:
         ax.set_axis_off()
@@ -7563,18 +8673,26 @@ def _draw_image_catalog_cluster_overview_panel(
         cutout_size_arcsec=cutout_size_arcsec,
     )
     for _, image_row in catalog_df.iterrows():
-        target_coord = _arcsec_to_skycoord(image_row.get("x_obs_arcsec"), image_row.get("y_obs_arcsec"), reference)
-        if target_coord is None:
-            continue
-        _draw_image_catalog_observed_marker(
+        _draw_image_catalog_observed_row_overlays(
             ax,
             display_image,
             center_coord,
-            target_coord,
-            status=_image_catalog_observed_panel_status(image_row),
+            image_row,
+            reference,
             cutout_size_arcsec=cutout_size_arcsec,
             rendered_shape=rgb.shape[:2],
-            zorder=10,
+        )
+    for _, extra_row in extra_df.iterrows():
+        extra_coord = _arcsec_to_skycoord(extra_row.get("x_model_arcsec"), extra_row.get("y_model_arcsec"), reference)
+        if extra_coord is None:
+            continue
+        _draw_image_catalog_extra_marker(
+            ax,
+            display_image,
+            center_coord,
+            extra_coord,
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rgb.shape[:2],
         )
     _add_image_catalog_axis_legend(ax)
 
@@ -7623,68 +8741,14 @@ def _draw_image_catalog_overview_panel(
             rendered_shape=rgb.shape[:2],
         )
     for _, image_row in block["observed"].iterrows():
-        target_coord = _arcsec_to_skycoord(image_row.get("x_obs_arcsec"), image_row.get("y_obs_arcsec"), reference)
-        if target_coord is None:
-            continue
-        status = _image_catalog_observed_panel_status(image_row)
-        draw_arc_anchor_overlays = _image_catalog_draw_arc_anchor_overlays(image_row)
-        if draw_arc_anchor_overlays:
-            _draw_image_catalog_arc_support_curve(
-                ax,
-                display_image,
-                center_coord,
-                image_row,
-                reference,
-                cutout_size_arcsec=cutout_size_arcsec,
-                rendered_shape=rgb.shape[:2],
-                alpha=0.60,
-                linewidth=1.1,
-                zorder=7,
-            )
-        _draw_image_catalog_observed_marker(
+        _draw_image_catalog_observed_row_overlays(
             ax,
             display_image,
             center_coord,
-            target_coord,
-            status=status,
+            image_row,
+            reference,
             cutout_size_arcsec=cutout_size_arcsec,
             rendered_shape=rgb.shape[:2],
-        )
-        if draw_arc_anchor_overlays:
-            _draw_image_catalog_arc_supported_components(
-                ax,
-                display_image,
-                center_coord,
-                image_row,
-                reference,
-                cutout_size_arcsec=cutout_size_arcsec,
-                rendered_shape=rgb.shape[:2],
-            )
-            if not _image_catalog_point_recovered(image_row):
-                continue
-        model_coord = _image_catalog_display_model_coord(image_row, reference)
-        if model_coord is None:
-            continue
-        _draw_image_catalog_model_marker(
-            ax,
-            display_image,
-            center_coord,
-            model_coord,
-            cutout_size_arcsec=cutout_size_arcsec,
-            rendered_shape=rgb.shape[:2],
-        )
-        _draw_cutout_segment(
-            ax,
-            display_image,
-            center_coord,
-            target_coord,
-            model_coord,
-            cutout_size_arcsec=cutout_size_arcsec,
-            rendered_shape=rgb.shape[:2],
-            color="#bdbdbd",
-            linewidth=1.05,
-            alpha=0.72,
-            zorder=9,
         )
     for _, extra_row in block["extras"].iterrows():
         extra_coord = _arcsec_to_skycoord(extra_row.get("x_model_arcsec"), extra_row.get("y_model_arcsec"), reference)
@@ -7853,6 +8917,41 @@ def _image_catalog_critical_line_model_pair(
     return cache[z_source]
 
 
+def _image_catalog_cluster_overview_figure(
+    helpers: Any,
+    band_images: dict[str, Any],
+    bands: Sequence[str],
+    rgb_display: Any,
+    display_image: Any,
+    catalog_df: pd.DataFrame,
+    extra_df: pd.DataFrame,
+    reference: tuple[int, float, float],
+    *,
+    detail_cols: int,
+) -> plt.Figure:
+    cluster_units = detail_cols
+    fig = plt.figure(
+        figsize=helpers._figure_size(cluster_units, detail_cols),
+        dpi=getattr(helpers, "CUTOUT_FIGURE_DPI", 300),
+    )
+    helpers._style_cutout_figure(fig)
+    grid = fig.add_gridspec(cluster_units, detail_cols)
+    cluster_ax = fig.add_subplot(grid[:, :])
+    helpers._style_cutout_axis(cluster_ax)
+    _draw_image_catalog_cluster_overview_panel(
+        cluster_ax,
+        helpers,
+        band_images,
+        bands,
+        rgb_display,
+        display_image,
+        catalog_df,
+        extra_df,
+        reference,
+    )
+    return fig
+
+
 def _plot_image_catalog_family_cutouts(
     run_dir: Path,
     state: BuildState,
@@ -7906,9 +9005,15 @@ def _plot_image_catalog_family_cutouts(
             "Image-catalog family cutouts",
             "No image catalog rows are available.",
         )
+        _write_placeholder_plot(
+            _plot_path(run_dir, "image_catalog_family_cluster.pdf"),
+            "Image-catalog family cluster",
+            "No image catalog rows are available.",
+        )
         return
 
     output = _plot_path(run_dir, "image_catalog_family_cutouts.pdf")
+    cluster_output = _plot_path(run_dir, "image_catalog_family_cluster.pdf")
     output.parent.mkdir(parents=True, exist_ok=True)
     detail_cols = IMAGE_CATALOG_DETAIL_COLUMNS
     blocks = _image_catalog_family_cutout_blocks(
@@ -7925,25 +9030,18 @@ def _plot_image_catalog_family_cutouts(
         best_fit_latent = None
     critical_model_pairs_by_z: dict[float, tuple[Any, list[dict[str, float]]]] = {}
     with PdfPages(output) as pdf:
-        cluster_units = detail_cols
-        fig = plt.figure(
-            figsize=helpers._figure_size(cluster_units, detail_cols),
-            dpi=getattr(helpers, "CUTOUT_FIGURE_DPI", 300),
-        )
-        helpers._style_cutout_figure(fig)
-        grid = fig.add_gridspec(cluster_units, detail_cols)
-        cluster_ax = fig.add_subplot(grid[:, :])
-        helpers._style_cutout_axis(cluster_ax)
-        _draw_image_catalog_cluster_overview_panel(
-            cluster_ax,
+        fig = _image_catalog_cluster_overview_figure(
             helpers,
             band_images,
             bands,
             rgb_display,
             display_image,
             catalog_df,
+            extra_df,
             state.reference,
+            detail_cols=detail_cols,
         )
+        fig.savefig(cluster_output, facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.02, dpi=getattr(helpers, "CUTOUT_FIGURE_DPI", 300))
         pdf.savefig(fig, facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.02, dpi=getattr(helpers, "CUTOUT_FIGURE_DPI", 300))
         plt.close(fig)
 
@@ -8385,6 +9483,10 @@ def _generate_plots_and_tables(
                 lambda: _plot_critical_arc_support_histogram(
                     image_fit_quality_df,
                     _plot_path(run_dir, "critical_arc_support_histogram.pdf"),
+                    critical_arc_base_prob=float(getattr(evaluator, "critical_arc_base_prob", CRITICAL_ARC_BASE_PROB)),
+                    critical_arc_max_prob=float(getattr(evaluator, "critical_arc_max_prob", CRITICAL_ARC_MAX_PROB)),
+                    singular_threshold=float(getattr(evaluator, "critical_arc_singular_threshold", CRITICAL_ARC_SINGULAR_THRESHOLD)),
+                    singular_softness=float(getattr(evaluator, "critical_arc_singular_softness", CRITICAL_ARC_SINGULAR_SOFTNESS)),
                 ),
             ),
             (
@@ -8453,14 +9555,15 @@ def _generate_plots_and_tables(
     if kappa_true_fits is not None and str(kappa_true_fits).strip() and not bool(getattr(args, "quick_diagnostics", False)):
         plot_tasks.append(
             (
-                "kappa_comparison",
-                "plots.kappa_comparison",
-                lambda: _plot_kappa_true_comparison(
+                "kappa_truth_diagnostics",
+                "plots.kappa_truth_diagnostics",
+                lambda: _plot_kappa_truth_diagnostics(
                     run_dir,
                     evaluator,
                     best_fit,
                     str(kappa_true_fits),
                     getattr(args, "caustic_source_redshift", 9.0),
+                    image_df=image_fit_quality_df,
                 ),
             )
         )

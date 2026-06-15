@@ -7,11 +7,13 @@ from pathlib import Path
 $JAX_NUM_CPU_DEVICES = "30"
 
 PYTHON = "/home/dutra/.conda/envs/lenstronomy/bin/python"
-output_dir = f"jun12a_nocosmo"
+
+output_dir = f"jun14e_nocosmo"
 
 HFF_RGB_BANDS = ["F435W", "F606W", "F814W", "F105W", "F125W", "F140W", "F160W"]
 HFF_RGB_DISPLAY = {"q": 6.4, "stretch": 0.0145, "minimum": -5.5e-4, "red_gain": 0.47, "green_gain": 0.91, "blue_gain": 3.95}
-FF_RGB_DISPLAY = {"q": 8.0, "stretch": 0.1, "minimum": 0.0, "red_gain": 1.0, "green_gain": 1.0, "blue_gain": 1.2}
+# h10 neutral warm from the HERA FF-SIMS ACS RGB tuning pass.
+FF_RGB_DISPLAY = {"q": 6.8, "stretch": 0.0158, "minimum": 0.00105, "red_gain": 0.62, "green_gain": 0.78, "blue_gain": 3.65}
 
 VALID_CLUSTERS = "A2744, M0416, M1206, AS1063, A307, AS1063_CAMINHA, ARES, HERA"
 BERGAMINI_CLUSTERS = {
@@ -108,7 +110,7 @@ best_par_overlay_args = ["--corner-overlay-best-par", str(BEST_PAR_PATH)] if BES
 # Mirrors the active solver-control settings in run_validation.xsh, but runs the
 # real-data cluster solver directly instead of the mock validation wrapper.
 mode = "critical_arc"  # "linear", "metric", "anchored", "critical_arc", or "fold_regularized"
-run_name = f"{cluster_config['cluster_key']}_{mode}_nuts_possigma025"
+run_name = f"{cluster_config['cluster_key']}_{mode}_nuts"
 fit_mode = "sequential"
 image_plane_modes = {
     "linear": "linearized-forward-beta-image-plane",
@@ -116,15 +118,39 @@ image_plane_modes = {
     "anchored": "anchored-solved-forward-beta-image-plane",
     "critical_arc": "critical-arc-mixture-image-plane",
     "fold_regularized": "fold-regularized-forward-beta-image-plane",
+    "catastrophe": "catastrophe-normal-form-image-plane",
 }
 image_plane_mode = image_plane_modes[mode]
 fit_method = ["svi+nuts", "svi+nuts", "svi+nuts"]
-warmup = [500, 2000, 500]
-samples = [250, 500, 250]
-svi_steps = [500, 2000, 2000]
+warmup = [500, 6000, 2000]
+samples = [250, 500, 500]
+svi_steps = [500, 1000, 2000]
+max_tree_depth = [8, 8, 8]
+quick_diagnostics = False
+target_accept = 0.8
+chains = 8
+active_scaling_galaxies = [50]
+z_bin_efficiency_tol = 0.01
+
+# Short stage4 conditioning check before a full production run: confirm the magnification fold
+# un-sticks the chains (adapted step size recovers, tree saturation drops, chains move) cheaply.
+pilot = False
+if pilot:
+    target_accept = 0.6
+    svi_steps = [500, 500, 500]
+    warmup = [500, 1000, 500]
+    samples = [250, 150, 250]
+    max_tree_depth = [8, 8, 8]
+    #quick_diagnostics = True
+    chains = 8
+    active_scaling_galaxies = [25]
+    z_bin_efficiency_tol = 0.05
+
+
+OUTPUT_DIR = f"{OUTPUT_DIR}_W{warmup[-2]}-{warmup[-1]}_S{samples[-2]}-{samples[-1]}_T{max_tree_depth[-2]}-{max_tree_depth[-1]}"
+
 start_at_stage3 = True
 skip_stage3_image_plane_local_jacobian = False
-quick_diagnostics = False
 image_catalog_family_cutout_image_dir = cluster_config.get("image_catalog_family_cutout_image_dir", "data/BUFFALO_Images")
 image_catalog_family_cutout_image_scale = cluster_config.get("image_catalog_family_cutout_image_scale", "30mas")
 image_catalog_family_cutout_bands = cluster_config.get(
@@ -151,13 +177,8 @@ kappa_true_args = ["--kappa-true-fits", kappa_true_fits] if kappa_true_fits else
 image_plane_newton_steps = 0
 linearized_beta_prior_sigma_arcsec = 3.0
 source_position_parameterization = "prior-whitened"
-target_accept = 0.7
-max_tree_depth = [8, 8, 8]
-chains = 4
 sampling_engine = "refreshing_surrogate"
-active_scaling_galaxies = [50]
-z_bin_efficiency_tol = 0.01
-pos_sigma_arcsec = 0.25
+pos_sigma_arcsec = 0.1
 anchored_args = [
     "--anchored-image-plane-solve-steps", 0,
     "--anchored-image-plane-trust-radius-arcsec", 0.3,
@@ -165,15 +186,17 @@ anchored_args = [
     "--anchored-image-plane-lm-damping-absolute", 1.0e-6,
 ] if mode == "anchored" else []
 critical_arc_args = [
-    "--critical-arc-critical-direction-sigma-arcsec", 10.0,
+    "--critical-arc-critical-direction-sigma-arcsec", 5.0,
     "--critical-arc-base-prob", 0.10,
     "--critical-arc-max-prob", 0.85,
-    "--critical-arc-singular-threshold", 0.40,
-    "--critical-arc-singular-softness", 0.10,
+    # Arc-mixture gate only -- the magnification fold now uses its own baked-in
+    # CRITICAL_ARC_FOLD_SINGULAR_THRESHOLD/SOFTNESS and ignores these. Tight so arc_prob ramps up
+    # only near real critical curves (singular_min < ~0.05); point images keep full precision.
+    "--critical-arc-singular-threshold", 0.1,
+    "--critical-arc-singular-softness", 0.02,
     "--critical-arc-lm-damping-relative", 1.0e-3,
     "--critical-arc-lm-damping-absolute", 1.0e-6,
     "--critical-arc-lm-trust-radius-arcsec", 20.0,
-    "--arc-aware-noncritical-support-radius-arcsec", 1.0,
     "--arc-aware-max-arclength-arcsec", 10.0,
     "--arc-aware-curve-step-arcsec", 0.1,
 ] if mode == "critical_arc" else []
@@ -210,7 +233,7 @@ workflow_args = [
     "--max-tree-depth", *max_tree_depth,
     "--z-bin-efficiency-tol", z_bin_efficiency_tol,
     "--linearized-beta-prior-sigma-arcsec", 3.0,
-    #"--exact-image-diagnostics-stage3",
+    "--exact-image-diagnostics-stage3",
 
     *(anchored_args),
     *(critical_arc_args),
@@ -233,8 +256,8 @@ scatter_and_stabilizer_args = [
     "--image-presence-match-radius-arcsec", 1.0,
     "--image-presence-temperature-arcsec", 0.5,
     "--image-plane-scatter-prior", "log-uniform",
-    "--image-plane-scatter-floor-arcsec", 0.1,
-    "--image-plane-scatter-upper-arcsec", 0.5,
+    "--image-plane-scatter-floor-arcsec", 0.01,
+    "--image-plane-scatter-upper-arcsec", 1.0,
     #"--scaling-scatter",
     #"--scaling-scatter-fields", "sigma,cut",
     #"--likelihood-stabilizer-max-gain", "50",
@@ -256,7 +279,6 @@ real_data_args = [
 
 debug_args = [
     "--potfile-mass-size-reparam",
-    #"--resume-fast",
     "--skip-validation",
     #"--no-dense-mass",
     #"--plots-only",
@@ -265,7 +287,7 @@ debug_args = [
 
 _run_start_monotonic = time.monotonic()
 try:
-    @(PYTHON) -m lenscluster.cluster_solver --resume \
+    @(PYTHON) -m lenscluster.cluster_solver \
       --par-path @(PAR_PATH) \
       --output-dir @(OUTPUT_DIR) \
       --run-name @(run_name) \

@@ -59,20 +59,22 @@ class PackedLensSpec:
     component_family: np.ndarray
     x_center_base: np.ndarray
     y_center_base: np.ndarray
-    ellipticite_base: np.ndarray
-    angle_pos_base: np.ndarray
+    e1_base: np.ndarray
+    e2_base: np.ndarray
     core_radius_kpc_base: np.ndarray
     cut_radius_kpc_base: np.ndarray
     v_disp_base: np.ndarray
-    gamma_base: np.ndarray
+    gamma1_base: np.ndarray
+    gamma2_base: np.ndarray
     x_center_param_index: np.ndarray
     y_center_param_index: np.ndarray
-    ellipticite_param_index: np.ndarray
-    angle_pos_param_index: np.ndarray
+    e1_param_index: np.ndarray
+    e2_param_index: np.ndarray
     core_radius_param_index: np.ndarray
     cut_radius_param_index: np.ndarray
     v_disp_param_index: np.ndarray
-    gamma_param_index: np.ndarray
+    gamma1_param_index: np.ndarray
+    gamma2_param_index: np.ndarray
     luminosity_ratio: np.ndarray
     sigma_ref_base: np.ndarray
     cut_ref_base: np.ndarray
@@ -109,6 +111,10 @@ class SurrogateBinCache:
     fold_regularized_kappa_eff: np.ndarray | None = None
     fold_regularized_near_indices: np.ndarray | None = None
     fold_regularized_far_indices: np.ndarray | None = None
+    catastrophe_kappa: np.ndarray | None = None
+    catastrophe_rho: np.ndarray | None = None
+    catastrophe_kappa_tangent_x: np.ndarray | None = None
+    catastrophe_kappa_tangent_y: np.ndarray | None = None
 
 
 @dataclass

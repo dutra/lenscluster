@@ -126,6 +126,10 @@ FIT_METHOD_NS = "ns"
 FIT_METHOD_SMC = "smc"
 SOLVER_FIT_MODE_SEQUENTIAL = "sequential"
 SOLVER_FIT_MODE_EVIDENCE_NS = "evidence-ns"
+RESUME_MODE_ALL = "all"
+RESUME_MODE_FAST = "fast"
+RESUME_MODES = (RESUME_MODE_ALL, RESUME_MODE_FAST)
+DEFAULT_MATCH_TOLERANCE = 1.5
 JAX_DEVICE_AUTO = "auto"
 JAX_DEVICE_CPU = "cpu"
 JAX_DEVICE_GPU = "gpu"
@@ -138,6 +142,7 @@ IMAGE_PLANE_MODE_FORWARD_METRIC = "forward-metric-image-plane"
 IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA = "anchored-solved-forward-beta-image-plane"
 IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE = "critical-arc-mixture-image-plane"
 IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA = "fold-regularized-forward-beta-image-plane"
+IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM = "catastrophe-normal-form-image-plane"
 EVIDENCE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE = "linearized-forward-beta-image-plane"
 EVIDENCE_LIKELIHOOD_MODES = (
     EVIDENCE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
@@ -184,10 +189,22 @@ DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS = 0.05
 DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE = 1.0e-3
 DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE = 1.0e-6
 DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC = 20.0
-DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC = 0.5
+DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC = DEFAULT_MATCH_TOLERANCE
 DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC = 5.0
 DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC = 0.1
 DEFAULT_FOLD_CURVATURE_ARCSEC_INV = 1.0
+CATASTROPHE_LIKELIHOOD_MOMENT = "moment"
+CATASTROPHE_LIKELIHOOD_ENVELOPE = "envelope"
+CATASTROPHE_LIKELIHOODS = (
+    CATASTROPHE_LIKELIHOOD_MOMENT,
+    CATASTROPHE_LIKELIHOOD_ENVELOPE,
+)
+DEFAULT_CATASTROPHE_LIKELIHOOD = CATASTROPHE_LIKELIHOOD_MOMENT
+DEFAULT_CATASTROPHE_LAMBDA_ON = 0.03
+DEFAULT_CATASTROPHE_LAMBDA_OFF = 0.08
+DEFAULT_CATASTROPHE_GAP_ON = 1.0e-5
+DEFAULT_CATASTROPHE_GAP_OFF = 1.0e-3
+DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN = 0.0
 LIKELIHOOD_STABILIZER_RESIDUAL_LOSS_GAUSSIAN = "gaussian"
 LIKELIHOOD_STABILIZER_RESIDUAL_LOSS_STUDENT_T = "student-t"
 LIKELIHOOD_STABILIZER_RESIDUAL_LOSSES = (
@@ -683,6 +700,20 @@ def _artifact_arg(artifact_args: dict[str, Any] | None, name: str, default: Any)
     return default if value is None else value
 
 
+def _resolve_arc_aware_noncritical_support_radius_arcsec(
+    value: Any,
+    match_tolerance_arcsec: Any = DEFAULT_MATCH_TOLERANCE,
+) -> float:
+    if value is None:
+        value = match_tolerance_arcsec
+    if value is None:
+        value = DEFAULT_MATCH_TOLERANCE
+    radius = float(value)
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError("arc_aware_noncritical_support_radius_arcsec must be finite and positive.")
+    return radius
+
+
 def _recovered_model_tables(
     state: Any,
     best_fit_physical: np.ndarray,
@@ -720,9 +751,10 @@ def _recovered_model_tables(
         _convert_theta_to_latent,
     )
 
+    match_tolerance_arcsec = float(_artifact_arg(artifact_args, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE))
     evaluator = ClusterJAXEvaluator(
         state=state,
-        match_tolerance_arcsec=float(_artifact_arg(artifact_args, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE)),
+        match_tolerance_arcsec=match_tolerance_arcsec,
         sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full")),
         active_scaling_galaxies=_artifact_arg(artifact_args, "active_scaling_galaxies", DEFAULT_ACTIVE_SCALING_GALAXIES),
         active_scaling_selection=str(_artifact_arg(artifact_args, "active_scaling_selection", "adaptive")),
@@ -782,12 +814,9 @@ def _recovered_model_tables(
         critical_arc_lm_trust_radius_arcsec=float(
             _artifact_arg(artifact_args, "critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
         ),
-        arc_aware_noncritical_support_radius_arcsec=float(
-            _artifact_arg(
-                artifact_args,
-                "arc_aware_noncritical_support_radius_arcsec",
-                DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
-            )
+        arc_aware_noncritical_support_radius_arcsec=_resolve_arc_aware_noncritical_support_radius_arcsec(
+            _artifact_arg(artifact_args, "arc_aware_noncritical_support_radius_arcsec", None),
+            match_tolerance_arcsec,
         ),
         arc_aware_max_arclength_arcsec=float(
             _artifact_arg(artifact_args, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
@@ -797,6 +826,18 @@ def _recovered_model_tables(
         ),
         fold_curvature_arcsec_inv=float(
             _artifact_arg(artifact_args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
+        ),
+        catastrophe_likelihood=str(_artifact_arg(artifact_args, "catastrophe_likelihood", DEFAULT_CATASTROPHE_LIKELIHOOD)),
+        catastrophe_lambda_on=float(_artifact_arg(artifact_args, "catastrophe_lambda_on", DEFAULT_CATASTROPHE_LAMBDA_ON)),
+        catastrophe_lambda_off=float(_artifact_arg(artifact_args, "catastrophe_lambda_off", DEFAULT_CATASTROPHE_LAMBDA_OFF)),
+        catastrophe_gap_on=float(_artifact_arg(artifact_args, "catastrophe_gap_on", DEFAULT_CATASTROPHE_GAP_ON)),
+        catastrophe_gap_off=float(_artifact_arg(artifact_args, "catastrophe_gap_off", DEFAULT_CATASTROPHE_GAP_OFF)),
+        catastrophe_tangential_variance_min=float(
+            _artifact_arg(
+                artifact_args,
+                "catastrophe_tangential_variance_min",
+                DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
+            )
         ),
         image_plane_scatter_floor_arcsec=float(
             _artifact_arg(artifact_args, "image_plane_scatter_floor_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC)
@@ -940,6 +981,7 @@ _VALIDATION_STAGE_ORDER = (
     "stage4_anchored_solved_image_plane",
     "stage4_critical_arc_mixture_image_plane",
     "stage4_fold_regularized_image_plane",
+    "stage4_catastrophe_normal_form_image_plane",
 )
 
 
@@ -1282,10 +1324,12 @@ def _posterior_prediction_uncertainty_tables(
         indices = np.linspace(0, sample_array.shape[0] - 1, max_draws, dtype=int)
         sample_array = sample_array[indices]
 
+    match_tolerance_arcsec = float(_artifact_arg(artifact_args, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE))
+
     def make_evaluator() -> Any:
         return ClusterJAXEvaluator(
             state=state,
-            match_tolerance_arcsec=float(_artifact_arg(artifact_args, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE)),
+            match_tolerance_arcsec=match_tolerance_arcsec,
             sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full")),
             active_scaling_galaxies=_artifact_arg(artifact_args, "active_scaling_galaxies", DEFAULT_ACTIVE_SCALING_GALAXIES),
             active_scaling_selection=str(_artifact_arg(artifact_args, "active_scaling_selection", "adaptive")),
@@ -1345,12 +1389,9 @@ def _posterior_prediction_uncertainty_tables(
             critical_arc_lm_trust_radius_arcsec=float(
                 _artifact_arg(artifact_args, "critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
             ),
-            arc_aware_noncritical_support_radius_arcsec=float(
-                _artifact_arg(
-                    artifact_args,
-                    "arc_aware_noncritical_support_radius_arcsec",
-                    DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
-                )
+            arc_aware_noncritical_support_radius_arcsec=_resolve_arc_aware_noncritical_support_radius_arcsec(
+                _artifact_arg(artifact_args, "arc_aware_noncritical_support_radius_arcsec", None),
+                match_tolerance_arcsec,
             ),
             arc_aware_max_arclength_arcsec=float(
                 _artifact_arg(artifact_args, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
@@ -1360,6 +1401,18 @@ def _posterior_prediction_uncertainty_tables(
             ),
             fold_curvature_arcsec_inv=float(
                 _artifact_arg(artifact_args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
+            ),
+            catastrophe_likelihood=str(_artifact_arg(artifact_args, "catastrophe_likelihood", DEFAULT_CATASTROPHE_LIKELIHOOD)),
+            catastrophe_lambda_on=float(_artifact_arg(artifact_args, "catastrophe_lambda_on", DEFAULT_CATASTROPHE_LAMBDA_ON)),
+            catastrophe_lambda_off=float(_artifact_arg(artifact_args, "catastrophe_lambda_off", DEFAULT_CATASTROPHE_LAMBDA_OFF)),
+            catastrophe_gap_on=float(_artifact_arg(artifact_args, "catastrophe_gap_on", DEFAULT_CATASTROPHE_GAP_ON)),
+            catastrophe_gap_off=float(_artifact_arg(artifact_args, "catastrophe_gap_off", DEFAULT_CATASTROPHE_GAP_OFF)),
+            catastrophe_tangential_variance_min=float(
+                _artifact_arg(
+                    artifact_args,
+                    "catastrophe_tangential_variance_min",
+                    DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
+                )
             ),
             image_plane_scatter_floor_arcsec=float(
                 _artifact_arg(artifact_args, "image_plane_scatter_floor_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC)
@@ -2769,6 +2822,7 @@ def write_recovery_outputs(
             lambda: _plot_critical_arc_support_histogram(
                 image_df,
                 paths["critical_arc_support_histogram_plot"],
+                artifact_args=_saved_args,
             ),
         )
         run_recovery_phase(
@@ -3733,12 +3787,24 @@ def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
     plt.close(fig)
 
 
-def _plot_critical_arc_support_histogram(image_df: pd.DataFrame, path: Path) -> None:
+def _plot_critical_arc_support_histogram(
+    image_df: pd.DataFrame,
+    path: Path,
+    *,
+    artifact_args: dict[str, Any] | None = None,
+) -> None:
     _shared_plot_critical_arc_support_histogram(
         image_df,
         path,
         curve_support_radius_arcsec=0.5,
-        singular_threshold=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+        critical_arc_base_prob=float(_artifact_arg(artifact_args, "critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)),
+        critical_arc_max_prob=float(_artifact_arg(artifact_args, "critical_arc_max_prob", DEFAULT_CRITICAL_ARC_MAX_PROB)),
+        singular_threshold=float(
+            _artifact_arg(artifact_args, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)
+        ),
+        singular_softness=float(
+            _artifact_arg(artifact_args, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
+        ),
     )
 
 
@@ -4697,6 +4763,13 @@ def _validation_fold_regularized_stage_enabled(args: argparse.Namespace) -> bool
     )
 
 
+def _validation_catastrophe_normal_form_stage_enabled(args: argparse.Namespace) -> bool:
+    return (
+        str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE))
+        == IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM
+    )
+
+
 def _validation_stage4_enabled(args: argparse.Namespace) -> bool:
     return (
         _validation_linearized_stage_enabled(args)
@@ -4704,7 +4777,22 @@ def _validation_stage4_enabled(args: argparse.Namespace) -> bool:
         or _validation_anchored_solved_stage_enabled(args)
         or _validation_critical_arc_mixture_stage_enabled(args)
         or _validation_fold_regularized_stage_enabled(args)
+        or _validation_catastrophe_normal_form_stage_enabled(args)
     )
+
+
+def _resume_mode(args: argparse.Namespace) -> str | None:
+    value = getattr(args, "resume", False)
+    if value in (False, None):
+        return None
+    mode = str(value)
+    if mode not in RESUME_MODES:
+        raise SystemExit(f"--resume must be one of {', '.join(RESUME_MODES)}.")
+    return mode
+
+
+def _resume_mode_is_fast(args: argparse.Namespace) -> bool:
+    return _resume_mode(args) == RESUME_MODE_FAST
 
 
 def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[str, ValidationStageFitControls]:
@@ -4716,8 +4804,8 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     ):
         if str(getattr(args, attr_name, JAX_DEVICE_AUTO)) not in JAX_DEVICE_CHOICES:
             raise SystemExit(f"{flag_name} must be one of {', '.join(JAX_DEVICE_CHOICES)}.")
-    if bool(getattr(args, "resume_fast", False)) and solver_fit_mode != SOLVER_FIT_MODE_SEQUENTIAL:
-        raise SystemExit("--resume-fast is only valid with --solver-fit-mode sequential.")
+    if _resume_mode_is_fast(args) and solver_fit_mode != SOLVER_FIT_MODE_SEQUENTIAL:
+        raise SystemExit("--resume fast is only valid with --solver-fit-mode sequential.")
     if bool(getattr(args, "start_at_stage3", False)):
         if solver_fit_mode != SOLVER_FIT_MODE_SEQUENTIAL:
             raise SystemExit("--start-at-stage3 is only valid with --solver-fit-mode sequential.")
@@ -4729,6 +4817,7 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
             IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
             IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+            IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
         }:
             raise SystemExit("--start-at-stage3 requires a stage-3-capable --image-plane-mode.")
         if bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)):
@@ -4937,13 +5026,13 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     )
     if not np.isfinite(critical_arc_lm_trust_radius) or critical_arc_lm_trust_radius <= 0.0:
         raise SystemExit("--critical-arc-lm-trust-radius-arcsec must be finite and positive.")
-    arc_aware_noncritical_support_radius = float(
-        getattr(
-            args,
-            "arc_aware_noncritical_support_radius_arcsec",
-            DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
+    try:
+        arc_aware_noncritical_support_radius = _resolve_arc_aware_noncritical_support_radius_arcsec(
+            getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
+            DEFAULT_MATCH_TOLERANCE,
         )
-    )
+    except ValueError as exc:
+        raise SystemExit("--arc-aware-noncritical-support-radius-arcsec must be finite and positive.") from exc
     if not np.isfinite(arc_aware_noncritical_support_radius) or arc_aware_noncritical_support_radius <= 0.0:
         raise SystemExit("--arc-aware-noncritical-support-radius-arcsec must be finite and positive.")
     arc_aware_max_arclength = float(
@@ -4957,6 +5046,35 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     fold_curvature = float(getattr(args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV))
     if not np.isfinite(fold_curvature) or fold_curvature <= 0.0:
         raise SystemExit("--fold-curvature-arcsec-inv must be finite and positive.")
+    if str(getattr(args, "catastrophe_likelihood", DEFAULT_CATASTROPHE_LIKELIHOOD)) not in CATASTROPHE_LIKELIHOODS:
+        raise SystemExit(f"--catastrophe-likelihood must be one of {', '.join(CATASTROPHE_LIKELIHOODS)}.")
+    catastrophe_lambda_on = float(getattr(args, "catastrophe_lambda_on", DEFAULT_CATASTROPHE_LAMBDA_ON))
+    catastrophe_lambda_off = float(getattr(args, "catastrophe_lambda_off", DEFAULT_CATASTROPHE_LAMBDA_OFF))
+    if (
+        not np.isfinite(catastrophe_lambda_on)
+        or not np.isfinite(catastrophe_lambda_off)
+        or catastrophe_lambda_on <= 0.0
+        or catastrophe_lambda_off <= catastrophe_lambda_on
+    ):
+        raise SystemExit("--catastrophe-lambda-on/off must satisfy 0 < on < off.")
+    catastrophe_gap_on = float(getattr(args, "catastrophe_gap_on", DEFAULT_CATASTROPHE_GAP_ON))
+    catastrophe_gap_off = float(getattr(args, "catastrophe_gap_off", DEFAULT_CATASTROPHE_GAP_OFF))
+    if (
+        not np.isfinite(catastrophe_gap_on)
+        or not np.isfinite(catastrophe_gap_off)
+        or catastrophe_gap_on <= 0.0
+        or catastrophe_gap_off <= catastrophe_gap_on
+    ):
+        raise SystemExit("--catastrophe-gap-on/off must satisfy 0 < on < off.")
+    catastrophe_vmin = float(
+        getattr(
+            args,
+            "catastrophe_tangential_variance_min",
+            DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
+        )
+    )
+    if not np.isfinite(catastrophe_vmin) or catastrophe_vmin < 0.0:
+        raise SystemExit("--catastrophe-tangential-variance-min must be finite and non-negative.")
     if solver_fit_mode == SOLVER_FIT_MODE_EVIDENCE_NS:
         if bool(getattr(args, "potfile_mass_size_reparam", False)):
             raise SystemExit(
@@ -5010,6 +5128,7 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
         IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
     }:
         if int(getattr(args, "image_plane_newton_steps", 0)) != 0:
             raise SystemExit(f"--image-plane-newton-steps must be 0 for --image-plane-mode {mode}.")
@@ -5087,6 +5206,7 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
         IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
     }
     has_stage4 = _validation_stage4_enabled(args)
     stage3_active = mode == IMAGE_PLANE_MODE_LOCAL_JACOBIAN or (
@@ -5097,6 +5217,7 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
             IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
             IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+            IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
         }
         and not bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False))
     )
@@ -5166,6 +5287,7 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
         IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
     }
     smc_stages: list[str] = []
     if controls["stage2"].fit_method == FIT_METHOD_SMC:
@@ -5222,6 +5344,8 @@ def _validation_final_stage_name(args: argparse.Namespace) -> str:
         return "stage4_critical_arc_mixture_image_plane"
     if _validation_fold_regularized_stage_enabled(args):
         return "stage4_fold_regularized_image_plane"
+    if _validation_catastrophe_normal_form_stage_enabled(args):
+        return "stage4_catastrophe_normal_form_image_plane"
     if _validation_linearized_stage_enabled(args):
         return "stage4_linearized_image_plane"
     if str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) == IMAGE_PLANE_MODE_LOCAL_JACOBIAN:
@@ -5560,6 +5684,11 @@ def _validation_configured_approximation_items(args: argparse.Namespace) -> list
             "image_plane_mode=fold-regularized-forward-beta-image-plane "
             f"fold_curvature_arcsec_inv={float(getattr(args, 'fold_curvature_arcsec_inv', DEFAULT_FOLD_CURVATURE_ARCSEC_INV)):.4g}"
         )
+    elif image_plane_mode == IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM:
+        items.append(
+            "image_plane_mode=catastrophe-normal-form-image-plane "
+            f"catastrophe_likelihood={str(getattr(args, 'catastrophe_likelihood', DEFAULT_CATASTROPHE_LIKELIHOOD))}"
+        )
 
     evidence_likelihood_mode = str(
         getattr(args, "evidence_likelihood_mode", DEFAULT_EVIDENCE_LIKELIHOOD_MODE)
@@ -5576,6 +5705,7 @@ def _validation_configured_approximation_items(args: argparse.Namespace) -> list
             IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
             IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
             IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+            IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
         }
         or (
             solver_fit_mode == SOLVER_FIT_MODE_EVIDENCE_NS
@@ -5739,6 +5869,10 @@ def _validate_validation_args(args: argparse.Namespace) -> None:
 def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: argparse.Namespace) -> Path:
     controls = _normalize_validation_stage_fit_controls(args)
     solver_fit_mode = str(getattr(args, "solver_fit_mode", SOLVER_FIT_MODE_SEQUENTIAL))
+    arc_aware_noncritical_support_radius_arcsec = _resolve_arc_aware_noncritical_support_radius_arcsec(
+        getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
+        DEFAULT_MATCH_TOLERANCE,
+    )
     cmd = [
         sys.executable,
         "-m",
@@ -5920,13 +6054,7 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
                     )
                 ),
                 "--arc-aware-noncritical-support-radius-arcsec",
-                str(
-                    getattr(
-                        args,
-                        "arc_aware_noncritical_support_radius_arcsec",
-                        DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
-                    )
-                ),
+                str(arc_aware_noncritical_support_radius_arcsec),
                 "--arc-aware-max-arclength-arcsec",
                 str(
                     getattr(
@@ -5945,6 +6073,24 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
                 ),
                 "--fold-curvature-arcsec-inv",
                 str(getattr(args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)),
+                "--catastrophe-likelihood",
+                str(getattr(args, "catastrophe_likelihood", DEFAULT_CATASTROPHE_LIKELIHOOD)),
+                "--catastrophe-lambda-on",
+                str(getattr(args, "catastrophe_lambda_on", DEFAULT_CATASTROPHE_LAMBDA_ON)),
+                "--catastrophe-lambda-off",
+                str(getattr(args, "catastrophe_lambda_off", DEFAULT_CATASTROPHE_LAMBDA_OFF)),
+                "--catastrophe-gap-on",
+                str(getattr(args, "catastrophe_gap_on", DEFAULT_CATASTROPHE_GAP_ON)),
+                "--catastrophe-gap-off",
+                str(getattr(args, "catastrophe_gap_off", DEFAULT_CATASTROPHE_GAP_OFF)),
+                "--catastrophe-tangential-variance-min",
+                str(
+                    getattr(
+                        args,
+                        "catastrophe_tangential_variance_min",
+                        DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
+                    )
+                ),
                 "--linearized-beta-prior-sigma-arcsec",
                 str(getattr(args, "linearized_beta_prior_sigma_arcsec", DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC)),
                 "--source-position-parameterization",
@@ -6025,10 +6171,11 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
             )
     if args.skip_plots:
         cmd.append("--skip-plots")
-    if bool(getattr(args, "resume", False)):
+    resume_mode = _resume_mode(args)
+    if resume_mode is not None:
         cmd.append("--resume")
-    if bool(getattr(args, "resume_fast", False)):
-        cmd.append("--resume-fast")
+        if resume_mode == RESUME_MODE_FAST:
+            cmd.append(RESUME_MODE_FAST)
     final_stage = _validation_final_stage_name(args)
     final_run_dir = (
         output_dir / run_name
@@ -6295,13 +6442,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument(
         "--resume",
-        action="store_true",
-        help="Reuse existing mock inputs, completed solver stages, and completed validation realization outputs.",
-    )
-    parser.add_argument(
-        "--resume-fast",
-        action="store_true",
-        help="Pass --resume-fast to the sequential cluster solver so each realization runs only the final enabled stage.",
+        nargs="?",
+        const=RESUME_MODE_ALL,
+        default=False,
+        choices=RESUME_MODES,
+        metavar="{all,fast}",
+        help=(
+            "Reuse existing mock inputs, completed solver stages, and completed validation realization outputs. "
+            "'all' is the default; 'fast' passes the sequential solver shortcut for final-stage-only resumes."
+        ),
     )
     parser.add_argument("--n-primary-families", type=int, default=20)
     parser.add_argument("--n-subhalo-families", type=int, default=0)
@@ -6423,6 +6572,7 @@ def _build_parser() -> argparse.ArgumentParser:
             IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
             IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
             IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+            IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
         ),
         default=IMAGE_PLANE_MODE_NONE,
         help="Optional solver image-plane refinement mode.",
@@ -6435,7 +6585,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--start-at-stage3",
         action="store_true",
-        help="Start sequential solver validation at stage3_image_plane; with --resume-fast, reuse stage 3 artifacts for later stages.",
+        help="Start sequential solver validation at stage3_image_plane; with --resume fast, reuse stage 3 artifacts for later stages.",
     )
     parser.add_argument(
         "--write-stage3-recovery",
@@ -6527,8 +6677,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--arc-aware-noncritical-support-radius-arcsec",
         type=float,
-        default=DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
-        help="Maximum support-curve distance for arc-aware image recovery validation.",
+        default=None,
+        help=(
+            "Maximum support-curve distance for arc-aware image recovery validation. "
+            "Defaults to the solver match tolerance."
+        ),
     )
     parser.add_argument(
         "--arc-aware-max-arclength-arcsec",
@@ -6547,6 +6700,42 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_FOLD_CURVATURE_ARCSEC_INV,
         help="Fallback local fold curvature scale in arcsec^-1 for direct fold-regularized helper use.",
+    )
+    parser.add_argument(
+        "--catastrophe-likelihood",
+        choices=CATASTROPHE_LIKELIHOODS,
+        default=DEFAULT_CATASTROPHE_LIKELIHOOD,
+        help="Catastrophe normal-form correction passed through to cluster_solver.",
+    )
+    parser.add_argument(
+        "--catastrophe-lambda-on",
+        type=float,
+        default=DEFAULT_CATASTROPHE_LAMBDA_ON,
+        help="Tangential-eigenvalue scale where catastrophe corrections are fully on.",
+    )
+    parser.add_argument(
+        "--catastrophe-lambda-off",
+        type=float,
+        default=DEFAULT_CATASTROPHE_LAMBDA_OFF,
+        help="Tangential-eigenvalue scale where catastrophe corrections are fully off.",
+    )
+    parser.add_argument(
+        "--catastrophe-gap-on",
+        type=float,
+        default=DEFAULT_CATASTROPHE_GAP_ON,
+        help="Eigenvalue-gap scale below which the catastrophe frame is treated as degenerate.",
+    )
+    parser.add_argument(
+        "--catastrophe-gap-off",
+        type=float,
+        default=DEFAULT_CATASTROPHE_GAP_OFF,
+        help="Eigenvalue-gap scale above which the catastrophe frame guard is fully open.",
+    )
+    parser.add_argument(
+        "--catastrophe-tangential-variance-min",
+        type=float,
+        default=DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
+        help="Small source-plane tangential variance headroom for the catastrophe correction.",
     )
     parser.add_argument(
         "--linearized-beta-prior-sigma-arcsec",

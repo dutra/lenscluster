@@ -369,6 +369,12 @@ local image-plane correction at each observed image even when
 updates before scoring the image-plane displacement. It uses its own
 `image_sigma_int` scatter parameter in image-plane units.
 
+For sequential resumes, `--resume` is equivalent to `--resume all`: completed
+stages are reused/finalized and their outputs may be refreshed. Use
+`--resume fast` to load existing previous-stage artifacts and run only the final
+enabled stage, such as a missing stage 4 initialized from an existing
+`stage3_image_plane` run.
+
 When `--image-plane-mode forward-metric-image-plane` is selected, the workflow
 adds `stage4_forward_metric_image_plane`. It samples the same explicit 2D source
 positions as the linearized forward-beta stage, but leaves the residual in source

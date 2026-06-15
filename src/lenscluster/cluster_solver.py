@@ -76,8 +76,6 @@ matplotlib_use("Agg")
 jax_config.update("jax_enable_x64", True)
 
 from jaxtronomy.LensModel.lens_model_bulk import LensModelBulk
-from jaxtronomy.Util import param_util
-
 from .lenstool_parser import load_best_par
 from .jax_cosmology import (
     DEFAULT_JAX_COSMO_DISTANCE_STEPS,
@@ -164,6 +162,9 @@ DEFAULT_NS_MAX_SAMPLES = None
 DEFAULT_NS_POSTERIOR_SAMPLES = 4096
 DEFAULT_NS_DLOGZ = 1.0e-4
 DEFAULT_POSTERIOR_LOGPROB_BATCH_SIZE = 512
+RESUME_MODE_ALL = "all"
+RESUME_MODE_FAST = "fast"
+RESUME_MODES = (RESUME_MODE_ALL, RESUME_MODE_FAST)
 DEFAULT_SMC_PARTICLES = 4096
 DEFAULT_SMC_MCMC_KERNEL = "rmh"
 SMC_MCMC_KERNELS = ("rmh", "mala")
@@ -215,16 +216,43 @@ DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_ABSOLUTE = 1.0e-6
 DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC = 5.0
 DEFAULT_CRITICAL_ARC_BASE_PROB = 0.10
 DEFAULT_CRITICAL_ARC_MAX_PROB = 0.80
-DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD = 0.20
-DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS = 0.05
+# Tightened so the always-on magnification fold (and the arc branch it gates) only engage on
+# real critical curves (singular_min < ~0.05); point images away from caustics keep full precision.
+DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD = 0.05
+DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS = 0.02
 DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE = 1.0e-3
 DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE = 1.0e-6
 DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC = 20.0
 CRITICAL_ARC_EIGENGAP_RELATIVE_SOFTENING = 1.0e-3
 CRITICAL_ARC_EIGENGAP_VALUE_ABSOLUTE_SOFTENING = 1.0e-18
+# Always-on magnification-fold of the base covariance along the critical direction:
+# cap on the inflated along-arc sigma (arcsec) and a floor on singular_min so 1/singular_min^2
+# stays finite. See _critical_arc_mixture_image_plane_terms.
+CRITICAL_ARC_FOLD_MAX_ARC_SIGMA_ARCSEC = 300.0
+CRITICAL_ARC_FOLD_SINGULAR_FLOOR = 1.0e-3
+# Gate for the fold itself. Kept SEPARATE from the user-facing arc-mixture singular_threshold/
+# softness (which historically only gated arc_prob): the fold inflates the POINT-branch covariance
+# by (sigma/singular_min)^2, so a loose arc-prob value (e.g. 0.4) would over-inflate ~every image
+# and flatten the posterior (NUTS tree saturation / Rhat blow-up). Baking these in means the fold
+# always touches only genuinely on-critical images (singular_min < ~0.05), regardless of run.xsh.
+CRITICAL_ARC_FOLD_SINGULAR_THRESHOLD = 0.05
+CRITICAL_ARC_FOLD_SINGULAR_SOFTNESS = 0.02
 CRITICAL_ARC_SINGULAR_VALUE_FLOOR = 1.0e-12
 DEFAULT_FOLD_CURVATURE_ARCSEC_INV = 1.0
 DEFAULT_FOLD_CURVATURE_FINITE_DIFFERENCE_STEP_ARCSEC = 1.0e-3
+DEFAULT_CATASTROPHE_FINITE_DIFFERENCE_STEP_ARCSEC = 1.0e-3
+DEFAULT_CATASTROPHE_LAMBDA_ON = 0.03
+DEFAULT_CATASTROPHE_LAMBDA_OFF = 0.08
+DEFAULT_CATASTROPHE_GAP_ON = 1.0e-5
+DEFAULT_CATASTROPHE_GAP_OFF = 1.0e-3
+DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN = 0.0
+CATASTROPHE_LIKELIHOOD_MOMENT = "moment"
+CATASTROPHE_LIKELIHOOD_ENVELOPE = "envelope"
+CATASTROPHE_LIKELIHOODS = (
+    CATASTROPHE_LIKELIHOOD_MOMENT,
+    CATASTROPHE_LIKELIHOOD_ENVELOPE,
+)
+DEFAULT_CATASTROPHE_LIKELIHOOD = CATASTROPHE_LIKELIHOOD_MOMENT
 DEFAULT_CAB_FINITE_DIFFERENCE_STEP_ARCSEC = 1.0e-3
 DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD = 1.0e-3
 DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV = 1.0e-4
@@ -238,7 +266,7 @@ CAB_FRAME_PHYSICAL_AMBIGUITY_FRACTION = 1.0e-1
 # curvature dimension of the CAB outlier density so the inlier/outlier handoff does
 # not depend on the absolute unit scale of the per-row curvature sigma.
 CAB_OUTLIER_CURVATURE_SIGMA_ARCSEC_INV = 0.1
-DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC = 0.5
+DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC = DEFAULT_MATCH_TOLERANCE
 DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC = 5.0
 DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC = 0.1
 DEFAULT_COVARIANCE_DIAGONAL_JITTER_RELATIVE = 1.0e-8
@@ -276,6 +304,10 @@ VDISP_TRUNCATION_FLOOR_KM_S = 1.0e-4
 NUTS_MAX_TREE_SATURATION_WARNING = 0.95
 NUTS_RHAT_EXTREME_WARNING = 2.0
 NUTS_MIN_ESS_PER_CHAIN_WARNING = 2.0
+# A warmup-adapted step size this small means the integrator step underflowed and the chains are
+# effectively frozen (the failure mode that wasted ~16 h in a2744_critical_arc_nuts_possigma025).
+# Non-fatal: warn loudly so it is obvious in the logs; do NOT condition on tree-depth saturation.
+NUTS_STEP_SIZE_UNDERFLOW_WARNING = 1.0e-10
 SVI_HEALTH_FINITE_DRAW_FRACTION_WARNING = 1.0
 SVI_HEALTH_LOGPROB_SPREAD_WARNING = 1.0e3
 SVI_HEALTH_CENTER_DROP_WARNING = 50.0
@@ -292,6 +324,7 @@ SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE = "forward-metric-image-plane"
 SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE = "anchored-solved-forward-beta-image-plane"
 SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE = "critical-arc-mixture-image-plane"
 SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE = "fold-regularized-forward-beta-image-plane"
+SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE = "catastrophe-normal-form-image-plane"
 EVIDENCE_LIKELIHOOD_MODES = (
     SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
 )
@@ -312,6 +345,7 @@ IMAGE_PLANE_MODE_FORWARD_METRIC = "forward-metric-image-plane"
 IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA = "anchored-solved-forward-beta-image-plane"
 IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE = "critical-arc-mixture-image-plane"
 IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA = "fold-regularized-forward-beta-image-plane"
+IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM = "catastrophe-normal-form-image-plane"
 FIT_MODE_SEQUENTIAL = "sequential"
 FIT_MODE_LARGE_ONLY = "large-only"
 FIT_MODE_JOINT = "joint"
@@ -331,6 +365,25 @@ def _lenstool_ellipticite_to_axis_ratio_jax(ellipticite: float | jnp.ndarray) ->
     safe_e = jnp.clip(jnp.asarray(ellipticite, dtype=jnp.float64), 0.0, 1.0 - 1.0e-9)
     q = jnp.sqrt((1.0 - safe_e) / (1.0 + safe_e))
     return jnp.clip(q, 1.0e-3, 1.0)
+
+
+def _lenstool_ellipticite_to_axis_ratio_numpy(ellipticite: float | np.ndarray) -> np.ndarray:
+    safe_e = np.clip(np.asarray(ellipticite, dtype=float), 0.0, 1.0 - 1.0e-9)
+    q = np.sqrt((1.0 - safe_e) / (1.0 + safe_e))
+    return np.clip(q, 1.0e-3, 1.0)
+
+
+def _lenstool_shape_to_e1e2(ellipticite: float, angle_pos_deg: float) -> tuple[float, float]:
+    q = _lenstool_ellipticite_to_axis_ratio_numpy(float(ellipticite))
+    modulus = (1.0 - q) / (1.0 + q)
+    phi = np.deg2rad(float(angle_pos_deg))
+    return float(modulus * np.cos(2.0 * phi)), float(modulus * np.sin(2.0 * phi))
+
+
+def _shear_polar_to_gamma1gamma2(gamma: float, angle_pos_deg: float) -> tuple[float, float]:
+    phi = np.deg2rad(float(angle_pos_deg))
+    gamma_value = float(gamma)
+    return float(gamma_value * np.cos(2.0 * phi)), float(gamma_value * np.sin(2.0 * phi))
 
 
 def _axis_ratio_to_lenstool_ellipticite(q: float) -> float:
@@ -710,6 +763,34 @@ def _finite_float_arg(value: str) -> float:
     return parsed
 
 
+def _resolve_arc_aware_noncritical_support_radius_arcsec(
+    value: Any,
+    match_tolerance_arcsec: Any = DEFAULT_MATCH_TOLERANCE,
+) -> float:
+    if value is None:
+        value = match_tolerance_arcsec
+    if value is None:
+        value = DEFAULT_MATCH_TOLERANCE
+    radius = float(value)
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError("arc_aware_noncritical_support_radius_arcsec must be finite and positive.")
+    return radius
+
+
+def _resume_mode(args: argparse.Namespace) -> str | None:
+    value = getattr(args, "resume", False)
+    if value in (False, None):
+        return None
+    mode = str(value)
+    if mode not in RESUME_MODES:
+        raise SystemExit(f"--resume must be one of {', '.join(RESUME_MODES)}.")
+    return mode
+
+
+def _resume_mode_is_fast(args: argparse.Namespace) -> bool:
+    return _resume_mode(args) == RESUME_MODE_FAST
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Cluster dPIE solver with JAXtronomy + NumPyro.")
     parser.add_argument("--par-path", required=False, help="Path to input_a_sl.par")
@@ -766,15 +847,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--plots-only", action="store_true")
     parser.add_argument(
         "--resume",
-        action="store_true",
-        help="Reuse completed run/stage artifacts and continue from the first incomplete stage.",
-    )
-    parser.add_argument(
-        "--resume-fast",
-        action="store_true",
+        nargs="?",
+        const=RESUME_MODE_ALL,
+        default=False,
+        choices=RESUME_MODES,
+        metavar="{all,fast}",
         help=(
-            "Sequential-only shortcut: skip earlier stages, load their existing artifacts, "
-            "and run only the final enabled stage."
+            "Reuse completed run/stage artifacts and continue from the first incomplete stage. "
+            "'all' is the default; 'fast' skips earlier sequential stages and runs only the final enabled stage."
         ),
     )
     parser.add_argument(
@@ -846,7 +926,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional true convergence FITS image. When set, write kappa_comparison.pdf "
-            "at --caustic-source-redshift."
+            "and kappa_recovery.pdf at --caustic-source-redshift."
         ),
     )
     parser.add_argument(
@@ -978,6 +1058,7 @@ def _parse_args() -> argparse.Namespace:
             IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
             IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
             IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+            IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
         ),
         default=IMAGE_PLANE_MODE_NONE,
         help=(
@@ -991,7 +1072,9 @@ def _parse_args() -> argparse.Namespace:
             "each observed image; "
             "'critical-arc-mixture-image-plane' adds a fast point/critical-arc mixture image-plane stage; "
             "'fold-regularized-forward-beta-image-plane' adds an experimental local signed-fold "
-            "root-distance image-plane stage near singular Jacobians."
+            "root-distance image-plane stage near singular Jacobians; "
+            "'catastrophe-normal-form-image-plane' adds a fast catastrophe-moment source metric "
+            "for critical curves."
         ),
     )
     parser.add_argument(
@@ -1016,7 +1099,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--start-at-stage3",
         action="store_true",
-        help="Start a sequential image-plane workflow at stage 3; with --resume-fast, reuse stage 3 artifacts for later stages.",
+        help="Start a sequential image-plane workflow at stage 3; with --resume fast, reuse stage 3 artifacts for later stages.",
     )
     parser.add_argument(
         "--image-plane-newton-steps",
@@ -1106,8 +1189,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--arc-aware-noncritical-support-radius-arcsec",
         type=_positive_float_arg,
-        default=DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
-        help="Maximum support-curve distance for arc-aware image recovery validation.",
+        default=None,
+        help=(
+            "Maximum support-curve distance for arc-aware image recovery validation. "
+            "Defaults to --match-tolerance-arcsec."
+        ),
     )
     parser.add_argument(
         "--arc-aware-max-arclength-arcsec",
@@ -1128,6 +1214,42 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Fallback local fold curvature scale in arcsec^-1 for direct fold-regularized helper use."
         ),
+    )
+    parser.add_argument(
+        "--catastrophe-likelihood",
+        choices=CATASTROPHE_LIKELIHOODS,
+        default=DEFAULT_CATASTROPHE_LIKELIHOOD,
+        help="Catastrophe normal-form correction used by catastrophe-normal-form-image-plane.",
+    )
+    parser.add_argument(
+        "--catastrophe-lambda-on",
+        type=_positive_float_arg,
+        default=DEFAULT_CATASTROPHE_LAMBDA_ON,
+        help="Signed tangential-eigenvalue scale where catastrophe corrections are fully on.",
+    )
+    parser.add_argument(
+        "--catastrophe-lambda-off",
+        type=_positive_float_arg,
+        default=DEFAULT_CATASTROPHE_LAMBDA_OFF,
+        help="Signed tangential-eigenvalue scale where catastrophe corrections are fully off.",
+    )
+    parser.add_argument(
+        "--catastrophe-gap-on",
+        type=_positive_float_arg,
+        default=DEFAULT_CATASTROPHE_GAP_ON,
+        help="Eigenvalue-gap scale below which the catastrophe frame is treated as degenerate.",
+    )
+    parser.add_argument(
+        "--catastrophe-gap-off",
+        type=_positive_float_arg,
+        default=DEFAULT_CATASTROPHE_GAP_OFF,
+        help="Eigenvalue-gap scale above which the catastrophe frame guard is fully open.",
+    )
+    parser.add_argument(
+        "--catastrophe-tangential-variance-min",
+        type=float,
+        default=DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
+        help="Small source-plane variance headroom for the catastrophe tangential correction.",
     )
     parser.add_argument(
         "--cab-likelihood-weight",
@@ -1602,6 +1724,10 @@ def _log_runtime_summary(args: argparse.Namespace) -> None:
     except Exception as exc:  # pragma: no cover - defensive around runtime initialization
         jax_devices = "unknown"
         jax_backend = f"unknown:{type(exc).__name__}"
+    arc_aware_noncritical_support_radius_arcsec = _resolve_arc_aware_noncritical_support_radius_arcsec(
+        getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
+        getattr(args, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE),
+    )
     _log(
         args,
         (
@@ -1623,7 +1749,7 @@ def _log_runtime_summary(args: argparse.Namespace) -> None:
             f"critical_arc_critical_direction_sigma_arcsec={getattr(args, 'critical_arc_critical_direction_sigma_arcsec', DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)} "
             f"critical_arc_prob=({getattr(args, 'critical_arc_base_prob', DEFAULT_CRITICAL_ARC_BASE_PROB)},"
             f"{getattr(args, 'critical_arc_max_prob', DEFAULT_CRITICAL_ARC_MAX_PROB)}) "
-            f"arc_aware_noncritical_support_radius_arcsec={getattr(args, 'arc_aware_noncritical_support_radius_arcsec', DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC)} "
+            f"arc_aware_noncritical_support_radius_arcsec={arc_aware_noncritical_support_radius_arcsec} "
             f"arc_aware_max_arclength_arcsec={getattr(args, 'arc_aware_max_arclength_arcsec', DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)} "
             f"arc_aware_curve_step_arcsec={getattr(args, 'arc_aware_curve_step_arcsec', DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)} "
             f"fold_curvature_arcsec_inv={getattr(args, 'fold_curvature_arcsec_inv', DEFAULT_FOLD_CURVATURE_ARCSEC_INV)} "
@@ -1862,6 +1988,11 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
             "sample_likelihood=fold-regularized-forward-beta-image-plane "
             f"fold_curvature_arcsec_inv={float(getattr(evaluator, 'fold_curvature_arcsec_inv', DEFAULT_FOLD_CURVATURE_ARCSEC_INV)):.4g}"
         )
+    elif sample_likelihood_mode == SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE:
+        items.append(
+            "sample_likelihood=catastrophe-normal-form-image-plane "
+            f"catastrophe_likelihood={str(getattr(evaluator, 'catastrophe_likelihood', DEFAULT_CATASTROPHE_LIKELIHOOD))}"
+        )
     elif sample_likelihood_mode == SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE:
         items.append(
             "sample_likelihood=anchored-solved-forward-beta-image-plane "
@@ -1880,6 +2011,7 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
         SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
     }:
         image_presence_weight = float(getattr(evaluator, "image_presence_penalty_weight", 0.0))
         if image_presence_weight > 0.0:
@@ -1981,6 +2113,7 @@ def _log_evaluator_summary(args: argparse.Namespace, evaluator: Any) -> None:
             SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
+            SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
         }
     ):
         _log(
@@ -2184,6 +2317,20 @@ def _nuts_quality_diagnostics(
                 "extreme Rhat "
                 f"{rhat_text} >= {NUTS_RHAT_EXTREME_WARNING:.3g} "
                 f"({chain_metrics.get('rhat_worst_parameter', 'unknown')})"
+            )
+    adapted_step_min = (
+        posterior.init_diagnostics.get("nuts_adapted_step_size_min")
+        if posterior.init_diagnostics is not None
+        else None
+    )
+    if adapted_step_min is not None and np.isfinite(float(adapted_step_min)):
+        metrics["nuts_step_size_underflow_threshold"] = NUTS_STEP_SIZE_UNDERFLOW_WARNING
+        if float(adapted_step_min) < NUTS_STEP_SIZE_UNDERFLOW_WARNING:
+            warnings.append(
+                "adapted step size collapsed "
+                f"{float(adapted_step_min):.3g} < {NUTS_STEP_SIZE_UNDERFLOW_WARNING:.3g} "
+                "(chains effectively frozen: the NUTS integrator step underflowed during warmup; "
+                "this is NOT a max-tree-depth problem -- raising tree depth only makes it slower)"
             )
     return metrics, warnings
 
@@ -3168,7 +3315,7 @@ def _jitter_theta_in_support(
 
 def _initial_latent_value_from_physical(physical_value: float, spec: ParameterSpec) -> float:
     latent_value = _physical_to_latent_numpy(float(physical_value), spec)
-    if spec.prior_kind != "truncated_normal":
+    if spec.prior_kind not in {"uniform", "truncated_normal"}:
         return latent_value
     return _clip_value_to_safe_bounds(
         latent_value,
@@ -3726,6 +3873,265 @@ def _forward_metric_image_plane_bin_loglike(
             jac_a01,
             jac_a10,
             jac_a11,
+            sigma_per_image,
+            image_sigma_int,
+            covariance_floor,
+            max_gain=max_gain,
+        )
+        presence_finite = jnp.all(presence_residual_finite)
+        bin_loglike = bin_loglike + _soft_observed_image_presence_loglike_from_residual2(
+            residual2=presence_residual2,
+            family_idx=family_idx,
+            n_families=int(n_families),
+            reliability_per_image=reliability,
+            image_has_constraint=image_has_constraint,
+            penalty_weight=float(image_presence_penalty_weight),
+            match_radius_arcsec=float(image_presence_match_radius_arcsec),
+            temperature_arcsec=float(image_presence_temperature_arcsec),
+            count_softness=float(image_presence_count_softness),
+            count_margin=float(image_presence_count_margin),
+        )
+    finite = (
+        jnp.all(jnp.isfinite(c00))
+        & jnp.all(jnp.isfinite(c01))
+        & jnp.all(jnp.isfinite(c11))
+        & jnp.all(jnp.isfinite(det))
+        & jnp.all(jnp.isfinite(dx))
+        & jnp.all(jnp.isfinite(dy))
+        & jnp.all(jnp.isfinite(quad))
+        & presence_finite
+        & jnp.isfinite(bin_loglike)
+    )
+    return jnp.where(finite, bin_loglike, jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64))
+
+
+def _smooth_unit_step(value: jnp.ndarray) -> jnp.ndarray:
+    x = jnp.clip(value, jnp.asarray(0.0, dtype=jnp.float64), jnp.asarray(1.0, dtype=jnp.float64))
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _catastrophe_symmetric_tangent_frame_from_jacobian(
+    jac_a00: jnp.ndarray,
+    jac_a01: jnp.ndarray,
+    jac_a10: jnp.ndarray,
+    jac_a11: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    a00 = jnp.asarray(jac_a00, dtype=jnp.float64)
+    a01 = 0.5 * (jnp.asarray(jac_a01, dtype=jnp.float64) + jnp.asarray(jac_a10, dtype=jnp.float64))
+    a11 = jnp.asarray(jac_a11, dtype=jnp.float64)
+    half_trace = 0.5 * (a00 + a11)
+    half_diff = 0.5 * (a00 - a11)
+    radius = jnp.sqrt(jnp.square(half_diff) + jnp.square(a01))
+    lambda_low = half_trace - radius
+    lambda_high = half_trace + radius
+    use_low = jnp.abs(lambda_low) <= jnp.abs(lambda_high)
+    lambda_t = jnp.where(use_low, lambda_low, lambda_high)
+    lambda_n = jnp.where(use_low, lambda_high, lambda_low)
+
+    v0_a = a01
+    v1_a = lambda_t - a00
+    v0_b = lambda_t - a11
+    v1_b = a01
+    norm2_a = jnp.square(v0_a) + jnp.square(v1_a)
+    norm2_b = jnp.square(v0_b) + jnp.square(v1_b)
+    use_a = norm2_a >= norm2_b
+    v0 = jnp.where(use_a, v0_a, v0_b)
+    v1 = jnp.where(use_a, v1_a, v1_b)
+    norm = jnp.sqrt(jnp.maximum(jnp.where(use_a, norm2_a, norm2_b), 0.0))
+    good = norm > jnp.asarray(1.0e-18, dtype=jnp.float64)
+    e_t_x = jnp.where(good, v0 / jnp.maximum(norm, 1.0e-300), jnp.ones_like(a00))
+    e_t_y = jnp.where(good, v1 / jnp.maximum(norm, 1.0e-300), jnp.zeros_like(a00))
+    gap = jnp.abs(lambda_high - lambda_low)
+    finite = (
+        jnp.isfinite(a00)
+        & jnp.isfinite(a01)
+        & jnp.isfinite(a11)
+        & jnp.isfinite(lambda_t)
+        & jnp.isfinite(lambda_n)
+        & jnp.isfinite(e_t_x)
+        & jnp.isfinite(e_t_y)
+        & jnp.isfinite(gap)
+    )
+    return e_t_x, e_t_y, lambda_t, lambda_n, finite
+
+
+def _catastrophe_projection_on_symmetric_axis(
+    jac_a00: jnp.ndarray,
+    jac_a01: jnp.ndarray,
+    jac_a10: jnp.ndarray,
+    jac_a11: jnp.ndarray,
+    axis_x: jnp.ndarray,
+    axis_y: jnp.ndarray,
+) -> jnp.ndarray:
+    a00 = jnp.asarray(jac_a00, dtype=jnp.float64)
+    a01 = 0.5 * (jnp.asarray(jac_a01, dtype=jnp.float64) + jnp.asarray(jac_a10, dtype=jnp.float64))
+    a11 = jnp.asarray(jac_a11, dtype=jnp.float64)
+    return axis_x * (a00 * axis_x + a01 * axis_y) + axis_y * (a01 * axis_x + a11 * axis_y)
+
+
+def _catastrophe_gate_from_signed_eigenvalues(
+    lambda_t: jnp.ndarray,
+    lambda_n: jnp.ndarray,
+    frame_finite: jnp.ndarray,
+    *,
+    lambda_on: float = DEFAULT_CATASTROPHE_LAMBDA_ON,
+    lambda_off: float = DEFAULT_CATASTROPHE_LAMBDA_OFF,
+    gap_on: float = DEFAULT_CATASTROPHE_GAP_ON,
+    gap_off: float = DEFAULT_CATASTROPHE_GAP_OFF,
+) -> jnp.ndarray:
+    on2 = jnp.square(jnp.asarray(float(lambda_on), dtype=jnp.float64))
+    off2 = jnp.square(jnp.asarray(float(lambda_off), dtype=jnp.float64))
+    denom = jnp.maximum(off2 - on2, jnp.asarray(1.0e-18, dtype=jnp.float64))
+    critical = _smooth_unit_step((off2 - jnp.square(lambda_t)) / denom)
+
+    gap = jnp.abs(lambda_n - lambda_t)
+    gap_on2 = jnp.square(jnp.asarray(float(gap_on), dtype=jnp.float64))
+    gap_off2 = jnp.square(jnp.asarray(float(gap_off), dtype=jnp.float64))
+    gap_denom = jnp.maximum(gap_off2 - gap_on2, jnp.asarray(1.0e-18, dtype=jnp.float64))
+    gap_gate = _smooth_unit_step((jnp.square(gap) - gap_on2) / gap_denom)
+    return jnp.where(frame_finite, critical * gap_gate, jnp.asarray(0.0, dtype=jnp.float64))
+
+
+def _catastrophe_normal_form_image_plane_bin_loglike(
+    residual_beta_x: jnp.ndarray,
+    residual_beta_y: jnp.ndarray,
+    jac_a00: jnp.ndarray,
+    jac_a01: jnp.ndarray,
+    jac_a10: jnp.ndarray,
+    jac_a11: jnp.ndarray,
+    sigma_per_image: jnp.ndarray,
+    reliability_per_image: jnp.ndarray,
+    image_has_constraint: jnp.ndarray,
+    image_sigma_int: jnp.ndarray,
+    scatter_var_x: jnp.ndarray,
+    scatter_var_y: jnp.ndarray,
+    covariance_floor: float,
+    outlier_sigma_arcsec: float,
+    catastrophe_kappa: jnp.ndarray | None = None,
+    catastrophe_rho: jnp.ndarray | None = None,
+    catastrophe_kappa_tangent_x: jnp.ndarray | None = None,
+    catastrophe_kappa_tangent_y: jnp.ndarray | None = None,
+    catastrophe_likelihood: str = DEFAULT_CATASTROPHE_LIKELIHOOD,
+    catastrophe_lambda_on: float = DEFAULT_CATASTROPHE_LAMBDA_ON,
+    catastrophe_lambda_off: float = DEFAULT_CATASTROPHE_LAMBDA_OFF,
+    catastrophe_gap_on: float = DEFAULT_CATASTROPHE_GAP_ON,
+    catastrophe_gap_off: float = DEFAULT_CATASTROPHE_GAP_OFF,
+    catastrophe_tangential_variance_min: float = DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
+    max_gain: float = DEFAULT_LIKELIHOOD_STABILIZER_MAX_GAIN,
+    max_residual_arcsec: float = DEFAULT_LIKELIHOOD_STABILIZER_MAX_RESIDUAL_ARCSEC,
+    residual_loss: str = DEFAULT_LIKELIHOOD_STABILIZER_RESIDUAL_LOSS,
+    student_t_nu: float = DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU,
+    family_idx: jnp.ndarray | None = None,
+    n_families: int | None = None,
+    image_presence_penalty_weight: float = 0.0,
+    image_presence_match_radius_arcsec: float = DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC,
+    image_presence_temperature_arcsec: float = DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC,
+    image_presence_count_softness: float = DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS,
+    image_presence_count_margin: float = DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN,
+) -> jnp.ndarray:
+    image_sigma2 = jnp.square(sigma_per_image) + jnp.square(image_sigma_int)
+    cov_floor = jnp.asarray(covariance_floor, dtype=jnp.float64)
+    a00 = jnp.asarray(jac_a00, dtype=jnp.float64)
+    a01 = 0.5 * (jnp.asarray(jac_a01, dtype=jnp.float64) + jnp.asarray(jac_a10, dtype=jnp.float64))
+    a11 = jnp.asarray(jac_a11, dtype=jnp.float64)
+
+    c00 = image_sigma2 * (jnp.square(a00) + jnp.square(a01)) + scatter_var_x + cov_floor
+    c11 = image_sigma2 * (jnp.square(a01) + jnp.square(a11)) + scatter_var_y + cov_floor
+    c01 = image_sigma2 * (a00 * a01 + a01 * a11)
+    if float(max_gain) > 0.0:
+        gain_floor = image_sigma2 / jnp.square(jnp.asarray(float(max_gain), dtype=jnp.float64))
+        c00 = c00 + gain_floor
+        c11 = c11 + gain_floor
+
+    e_t_x, e_t_y, lambda_t, lambda_n, frame_finite = _catastrophe_symmetric_tangent_frame_from_jacobian(
+        a00,
+        a01,
+        a01,
+        a11,
+    )
+    e_t_x = jax.lax.stop_gradient(e_t_x)
+    e_t_y = jax.lax.stop_gradient(e_t_y)
+    lambda_t = jax.lax.stop_gradient(lambda_t)
+    lambda_n = jax.lax.stop_gradient(lambda_n)
+    frame_finite = jax.lax.stop_gradient(frame_finite)
+    gate = jax.lax.stop_gradient(
+        _catastrophe_gate_from_signed_eigenvalues(
+            lambda_t,
+            lambda_n,
+            frame_finite,
+            lambda_on=catastrophe_lambda_on,
+            lambda_off=catastrophe_lambda_off,
+            gap_on=catastrophe_gap_on,
+            gap_off=catastrophe_gap_off,
+        )
+    )
+
+    kappa = jnp.zeros_like(lambda_t) if catastrophe_kappa is None else jnp.asarray(catastrophe_kappa, dtype=jnp.float64)
+    rho = jnp.zeros_like(lambda_t) if catastrophe_rho is None else jnp.asarray(catastrophe_rho, dtype=jnp.float64)
+    kappa = jax.lax.stop_gradient(kappa)
+    rho = jax.lax.stop_gradient(rho)
+    sigma4 = jnp.square(image_sigma2)
+    sigma6 = sigma4 * image_sigma2
+    if str(catastrophe_likelihood) == CATASTROPHE_LIKELIHOOD_ENVELOPE:
+        excess = 0.25 * jnp.square(kappa) * sigma4 + (1.0 / 36.0) * jnp.square(rho) * sigma6
+        mean_x = jnp.zeros_like(residual_beta_x)
+        mean_y = jnp.zeros_like(residual_beta_y)
+    else:
+        excess = lambda_t * rho * sigma4 + 0.5 * jnp.square(kappa) * sigma4 + (5.0 / 12.0) * jnp.square(rho) * sigma6
+        if catastrophe_kappa_tangent_x is None or catastrophe_kappa_tangent_y is None:
+            kappa_tangent_x = kappa * e_t_x
+            kappa_tangent_y = kappa * e_t_y
+        else:
+            kappa_tangent_x = jax.lax.stop_gradient(jnp.asarray(catastrophe_kappa_tangent_x, dtype=jnp.float64))
+            kappa_tangent_y = jax.lax.stop_gradient(jnp.asarray(catastrophe_kappa_tangent_y, dtype=jnp.float64))
+        mean_x = gate * 0.5 * image_sigma2 * kappa_tangent_x
+        mean_y = gate * 0.5 * image_sigma2 * kappa_tangent_y
+
+    base_t_var = jnp.square(lambda_t) * image_sigma2
+    vmin = jnp.asarray(float(catastrophe_tangential_variance_min), dtype=jnp.float64)
+    vmin = jnp.minimum(jnp.maximum(vmin, 0.0), jnp.square(jnp.asarray(float(catastrophe_lambda_off), dtype=jnp.float64)) * image_sigma2)
+    target_t_var = jnp.maximum(base_t_var + gate * excess, vmin)
+    c_t = target_t_var - base_t_var
+    c00 = c00 + c_t * jnp.square(e_t_x)
+    c11 = c11 + c_t * jnp.square(e_t_y)
+    c01 = c01 + c_t * e_t_x * e_t_y
+
+    c00 = jnp.maximum(c00, cov_floor)
+    c11 = jnp.maximum(c11, cov_floor)
+    c00, c11, det = _jittered_2x2_covariance_det(c00, c01, c11)
+    inv00 = c11 / det
+    inv11 = c00 / det
+    inv01 = -c01 / det
+
+    dx, dy = _smooth_residual_cap(residual_beta_x - mean_x, residual_beta_y - mean_y, max_residual_arcsec)
+    quad = dx * (inv00 * dx + inv01 * dy) + dy * (inv01 * dx + inv11 * dy)
+    logdet = jnp.log(det)
+    if str(residual_loss) == LIKELIHOOD_STABILIZER_RESIDUAL_LOSS_STUDENT_T:
+        family_ll = _student_t_2d_loglike_from_quad_logdet(quad, logdet, student_t_nu)
+    else:
+        family_ll = -0.5 * (quad + jnp.log(jnp.square(2.0 * jnp.pi)) + logdet)
+
+    reliability = jnp.clip(reliability_per_image, 1.0e-6, 1.0 - 1.0e-6)
+    outlier_sigma2 = jnp.square(jnp.asarray(outlier_sigma_arcsec, dtype=jnp.float64))
+    outlier_ll = -0.5 * (
+        (jnp.square(residual_beta_x) + jnp.square(residual_beta_y)) / outlier_sigma2
+        + 2.0 * jnp.log(2.0 * jnp.pi * outlier_sigma2)
+    )
+    mixture_ll = jnp.logaddexp(jnp.log(reliability) + family_ll, jnp.log1p(-reliability) + outlier_ll)
+    bin_loglike = jnp.sum(jnp.where(image_has_constraint, mixture_ll, 0.0))
+    presence_finite = jnp.asarray(True)
+    if (
+        float(image_presence_penalty_weight) > 0.0
+        and family_idx is not None
+        and n_families is not None
+    ):
+        presence_residual2, presence_residual_finite = _forward_metric_image_presence_residual2(
+            residual_beta_x,
+            residual_beta_y,
+            a00,
+            a01,
+            a01,
+            a11,
             sigma_per_image,
             image_sigma_int,
             covariance_floor,
@@ -4586,6 +4992,42 @@ class _CriticalArcMixtureResponsibilities(NamedTuple):
     outlier_responsibility: jnp.ndarray
 
 
+def _critical_arc_aniso_quad_logdet(
+    residual_x: jnp.ndarray,
+    residual_y: jnp.ndarray,
+    sigma2: jnp.ndarray,
+    extra_var: jnp.ndarray,
+    critical_p00: jnp.ndarray,
+    critical_p01: jnp.ndarray,
+    critical_p11: jnp.ndarray,
+    projector_det: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Mahalanobis quadratic and log-det for Sigma = sigma2 I + extra_var P.
+
+    P is the regularized critical-direction projector. With extra_var = 0 this reduces
+    exactly to the isotropic (sigma2 I) form, so it leaves images away from caustics
+    unchanged; with extra_var > 0 it inflates the covariance along the critical direction.
+    """
+    s00 = sigma2 + extra_var * critical_p00
+    s01 = extra_var * critical_p01
+    s11 = sigma2 + extra_var * critical_p11
+    det = (
+        jnp.square(sigma2)
+        + sigma2 * extra_var * (critical_p00 + critical_p11)
+        + jnp.square(extra_var) * projector_det
+    )
+    quad = jnp.maximum(
+        (
+            s11 * jnp.square(residual_x)
+            - 2.0 * s01 * residual_x * residual_y
+            + s00 * jnp.square(residual_y)
+        )
+        / det,
+        jnp.asarray(0.0, dtype=jnp.float64),
+    )
+    return quad, jnp.log(det)
+
+
 def _critical_arc_mixture_image_plane_terms(
     residual_x: jnp.ndarray,
     residual_y: jnp.ndarray,
@@ -4619,37 +5061,71 @@ def _critical_arc_mixture_image_plane_terms(
         critical_p01,
         critical_p11,
     )
-    point_quad = (jnp.square(residual_x) + jnp.square(residual_y)) / sigma2
-    point_logdet = 2.0 * jnp.log(sigma2)
-    # Covariance-side arc branch: Sigma = sigma2 I + sigma_arc^2 P keeps the branch a
-    # normalized density for the regularized (non-idempotent) projector. It reduces
-    # exactly to the two-axis (sigma2, sigma2 + sigma_arc^2) form when P is an exact
-    # projector and to the broad-isotropic sigma2 + sigma_arc^2/2 at degenerate frames.
-    arc_extra_var = jnp.square(jnp.asarray(float(critical_direction_sigma_arcsec), dtype=jnp.float64))
-    arc_sigma00 = sigma2 + arc_extra_var * critical_p00
-    arc_sigma01 = arc_extra_var * critical_p01
-    arc_sigma11 = sigma2 + arc_extra_var * critical_p11
     projector_det = jnp.maximum(
         critical_p00 * critical_p11 - jnp.square(critical_p01),
         jnp.asarray(0.0, dtype=jnp.float64),
     )
-    arc_det = (
-        jnp.square(sigma2)
-        + sigma2 * arc_extra_var * (critical_p00 + critical_p11)
-        + jnp.square(arc_extra_var) * projector_det
+    # Always-on magnification fold of the BASE covariance along the critical direction.
+    # Near a critical curve the tangential image position is hyper-sensitive to the lens
+    # parameters (d theta/d p ~ A^-1 ~ 1/singular_min), which collapses the NUTS step size.
+    # Inflating the base covariance along the critical direction by (sigma_per_image /
+    # singular_min)^2 cancels that 1/singular_min in the gradient (it becomes ~ singular_min
+    # / sigma_per_image^2 -> 0), while the across-arc direction keeps full sigma2 precision.
+    # The fold is gated by the same sigmoid as arc_prob (singular_threshold / softness), so
+    # only on-critical images are inflated; with fold_extra_var -> 0 the point branch reduces
+    # exactly to the original isotropic (sigma2 I) form, leaving all point images untouched.
+    #
+    # Detach singular_min from the geometric GATING (fold magnitude/gate and arc_prob). Because
+    # singular_min = sqrt(lambda_min), d(singular_min)/d(param) ~ 1/singular_min blows up in the
+    # transition zone (singular_min ~ 1e-6..1e-3), and the fold's (S0/singular_min)^2 compounds it
+    # to ~1/singular_min^4 -- an O(1e6)-per-image gradient spike that overflows the SVI/NUTS init
+    # validity check when many images sit near critical curves (the stage4-from-stage3 regression).
+    # The conditioning benefit flows through the covariance VALUE and the residual channel, not
+    # through differentiating this geometric gating, so detaching it removes the spike while leaving
+    # the fold (proxy 4255 -> 316) fully intact.
+    singular_min_gate = jax.lax.stop_gradient(singular_min)
+    # Gate the fold with its OWN baked-in threshold/softness, NOT the passed-in
+    # singular_threshold/singular_softness (those still gate arc_prob below). This keeps the
+    # point-branch fold engaged on on-critical images only, independent of the arc-mixture knob.
+    fold_gate = jax.nn.sigmoid(
+        (jnp.asarray(CRITICAL_ARC_FOLD_SINGULAR_THRESHOLD, dtype=jnp.float64) - singular_min_gate)
+        / jnp.asarray(CRITICAL_ARC_FOLD_SINGULAR_SOFTNESS, dtype=jnp.float64)
     )
-    arc_quad = jnp.maximum(
-        (
-            arc_sigma11 * jnp.square(residual_x)
-            - 2.0 * arc_sigma01 * residual_x * residual_y
-            + arc_sigma00 * jnp.square(residual_y)
-        )
-        / arc_det,
-        jnp.asarray(0.0, dtype=jnp.float64),
+    fold_singular = jnp.maximum(
+        singular_min_gate, jnp.asarray(CRITICAL_ARC_FOLD_SINGULAR_FLOOR, dtype=jnp.float64)
     )
-    arc_logdet = jnp.log(arc_det)
+    fold_cap = jnp.square(jnp.asarray(CRITICAL_ARC_FOLD_MAX_ARC_SIGMA_ARCSEC, dtype=jnp.float64))
+    fold_extra_var = jnp.minimum(
+        jnp.square(sigma_per_image / fold_singular) * fold_gate, fold_cap
+    )
+    point_quad, point_logdet = _critical_arc_aniso_quad_logdet(
+        residual_x,
+        residual_y,
+        sigma2,
+        fold_extra_var,
+        critical_p00,
+        critical_p01,
+        critical_p11,
+        projector_det,
+    )
+    # Covariance-side arc branch: Sigma = sigma2 I + (fold + sigma_arc^2) P. The fixed
+    # morphological tolerance sigma_arc^2 sits on TOP of the magnification-folded base, so it
+    # still models genuinely extended arcs without re-introducing the conditioning blow-up.
+    arc_extra_var = fold_extra_var + jnp.square(
+        jnp.asarray(float(critical_direction_sigma_arcsec), dtype=jnp.float64)
+    )
+    arc_quad, arc_logdet = _critical_arc_aniso_quad_logdet(
+        residual_x,
+        residual_y,
+        sigma2,
+        arc_extra_var,
+        critical_p00,
+        critical_p01,
+        critical_p11,
+        projector_det,
+    )
     arc_prob = _critical_arc_branch_probability(
-        singular_min,
+        singular_min_gate,
         base_prob=base_prob,
         max_prob=max_prob,
         singular_threshold=singular_threshold,
@@ -5814,18 +6290,21 @@ def _svi_initial_value_dict(
 ) -> dict[str, jnp.ndarray] | None:
     if not init_values:
         return None
+    provided_names = set(init_values)
+    theta = _default_theta(parameter_specs)
+    for idx, spec in enumerate(parameter_specs):
+        if spec.sample_name in init_values:
+            theta[idx] = float(init_values[spec.sample_name])
+    theta = _clip_theta_to_support(
+        theta,
+        parameter_specs,
+        boundary_frac=DEFAULT_NUTS_INIT_BOUNDARY_FRAC,
+    )
     payload: dict[str, jnp.ndarray] = {}
     for site in _parameter_sample_sites(parameter_specs):
-        if not all(parameter_specs[idx].sample_name in init_values for idx in site.indices):
+        if not all(parameter_specs[idx].sample_name in provided_names for idx in site.indices):
             continue
-        if len(site.indices) == 1:
-            spec = parameter_specs[site.indices[0]]
-            payload[site.name] = jnp.asarray(float(init_values[spec.sample_name]), dtype=jnp.float64)
-        else:
-            payload[site.name] = jnp.asarray(
-                [float(init_values[parameter_specs[idx].sample_name]) for idx in site.indices],
-                dtype=jnp.float64,
-            )
+        payload[site.name] = _site_value_from_theta(theta, site)
     return payload or None
 
 
@@ -7207,6 +7686,11 @@ def _run_numpyro_nuts_sampler(
     nuts_elapsed = time.time() - nuts_start
     evaluator.timing_totals["nuts_runtime"] += nuts_elapsed
 
+    _run_logged_phase(
+        args,
+        "nuts.print_summary",
+        lambda: mcmc.print_summary(),
+    )
     samples_dict = _run_logged_phase(
         args,
         "nuts.get_samples",
@@ -7223,6 +7707,16 @@ def _run_numpyro_nuts_sampler(
         lambda: _sanitize_grouped_posterior(samples_dict, extra, state.parameter_specs),
     )
     nuts_init.diagnostics.update(chain_quality_diag)
+    try:
+        _adapt_state = getattr(mcmc.last_state, "adapt_state", None)
+        if _adapt_state is not None:
+            _adapted_step = np.asarray(_adapt_state.step_size, dtype=float).reshape(-1)
+            _finite_step = _adapted_step[np.isfinite(_adapted_step)]
+            if _finite_step.size:
+                nuts_init.diagnostics["nuts_adapted_step_size_min"] = float(np.min(_finite_step))
+                nuts_init.diagnostics["nuts_adapted_step_size_max"] = float(np.max(_finite_step))
+    except Exception:
+        pass
     nuts_init.diagnostics["invalid_state_rejection_count"] = int(getattr(evaluator, "invalid_state_rejection_count", 0))
     nuts_init.diagnostics["invalid_state_reason_counts"] = {
         key: int(value) for key, value in dict(getattr(evaluator, "invalid_state_reason_counts", {})).items()
@@ -7974,6 +8468,13 @@ def _fold_regularized_stage_enabled(args: argparse.Namespace) -> bool:
     )
 
 
+def _catastrophe_normal_form_stage_enabled(args: argparse.Namespace) -> bool:
+    return (
+        str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE))
+        == IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM
+    )
+
+
 def _blocked_linearized_stage_enabled(args: argparse.Namespace) -> bool:
     return (
         str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE))
@@ -7988,6 +8489,7 @@ def _stage4_image_plane_enabled(args: argparse.Namespace) -> bool:
         or _anchored_solved_stage_enabled(args)
         or _critical_arc_mixture_stage_enabled(args)
         or _fold_regularized_stage_enabled(args)
+        or _catastrophe_normal_form_stage_enabled(args)
     )
 
 
@@ -7998,6 +8500,7 @@ def _sample_likelihood_uses_explicit_beta(sample_likelihood_mode: str) -> bool:
         SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
     }
 
 
@@ -8020,6 +8523,7 @@ def _effective_image_presence_penalty_weight(
         SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
     }:
         return 0.0
     if str(sample_likelihood_mode) == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE:
@@ -8033,6 +8537,7 @@ def _effective_image_presence_penalty_weight(
         IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
         IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
     }:
         return 0.0
     return DEFAULT_IMAGE_PRESENCE_STAGE4_PENALTY_WEIGHT
@@ -8075,6 +8580,8 @@ def _stage4_sample_likelihood_mode(args: argparse.Namespace) -> str | None:
         return SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
     if mode == IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA:
         return SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE
+    if mode == IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM:
+        return SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE
     return None
 
 
@@ -8089,6 +8596,8 @@ def _stage4_run_directory_name(args: argparse.Namespace) -> str:
         return "stage4_critical_arc_mixture_image_plane"
     if _fold_regularized_stage_enabled(args):
         return "stage4_fold_regularized_image_plane"
+    if _catastrophe_normal_form_stage_enabled(args):
+        return "stage4_catastrophe_normal_form_image_plane"
     return "stage4_linearized_image_plane"
 
 
@@ -8102,6 +8611,7 @@ SEQUENTIAL_STAGE_NAMES = {
     "stage4_anchored_solved_image_plane",
     "stage4_critical_arc_mixture_image_plane",
     "stage4_fold_regularized_image_plane",
+    "stage4_catastrophe_normal_form_image_plane",
 }
 SEQUENTIAL_STAGE_ORDER = (
     "stage1_large_only",
@@ -8112,6 +8622,8 @@ SEQUENTIAL_STAGE_ORDER = (
     "stage4_forward_metric_image_plane",
     "stage4_anchored_solved_image_plane",
     "stage4_critical_arc_mixture_image_plane",
+    "stage4_fold_regularized_image_plane",
+    "stage4_catastrophe_normal_form_image_plane",
 )
 
 
@@ -8180,6 +8692,7 @@ def _plots_only_exact_diagnostics_stage(run_dir: Path) -> str | None:
         "stage4_anchored_solved_image_plane",
         "stage4_critical_arc_mixture_image_plane",
         "stage4_fold_regularized_image_plane",
+        "stage4_catastrophe_normal_form_image_plane",
     }:
         return _sequential_stage_name(run_dir)
     sibling_stage_dirs = [run_dir.parent / stage_name for stage_name in SEQUENTIAL_STAGE_ORDER]
@@ -8197,6 +8710,7 @@ def _local_jacobian_stage_enabled(args: argparse.Namespace) -> bool:
         IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
         IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
     }:
         return not bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False))
     return False
@@ -8209,8 +8723,8 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     _validate_jax_device_controls(args)
     if bool(getattr(args, "quick_diagnostics", False)) and bool(getattr(args, "exact_image_diagnostics_stage3", False)):
         _fail("--exact-image-diagnostics-stage3 cannot be combined with --quick-diagnostics.")
-    if bool(getattr(args, "resume_fast", False)) and fit_mode != FIT_MODE_SEQUENTIAL:
-        _fail("--resume-fast is only valid with --fit-mode sequential.")
+    if _resume_mode_is_fast(args) and fit_mode != FIT_MODE_SEQUENTIAL:
+        _fail("--resume fast is only valid with --fit-mode sequential.")
     if start_at_stage3:
         if fit_mode != FIT_MODE_SEQUENTIAL:
             _fail("--start-at-stage3 is only valid with --fit-mode sequential.")
@@ -8222,6 +8736,7 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
             IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
             IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
             IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+            IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
         }:
             _fail("--start-at-stage3 requires a stage-3-capable --image-plane-mode.")
         if bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)):
@@ -8343,13 +8858,13 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     )
     if not np.isfinite(critical_arc_lm_trust_radius) or critical_arc_lm_trust_radius <= 0.0:
         _fail("--critical-arc-lm-trust-radius-arcsec must be finite and positive.")
-    arc_aware_noncritical_support_radius = float(
-        getattr(
-            args,
-            "arc_aware_noncritical_support_radius_arcsec",
-            DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
+    try:
+        arc_aware_noncritical_support_radius = _resolve_arc_aware_noncritical_support_radius_arcsec(
+            getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
+            getattr(args, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE),
         )
-    )
+    except ValueError:
+        _fail("--arc-aware-noncritical-support-radius-arcsec must be finite and positive.")
     if not np.isfinite(arc_aware_noncritical_support_radius) or arc_aware_noncritical_support_radius <= 0.0:
         _fail("--arc-aware-noncritical-support-radius-arcsec must be finite and positive.")
     arc_aware_max_arclength = float(
@@ -8363,6 +8878,35 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     fold_curvature = float(getattr(args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV))
     if not np.isfinite(fold_curvature) or fold_curvature <= 0.0:
         _fail("--fold-curvature-arcsec-inv must be finite and positive.")
+    if str(getattr(args, "catastrophe_likelihood", DEFAULT_CATASTROPHE_LIKELIHOOD)) not in CATASTROPHE_LIKELIHOODS:
+        _fail(f"--catastrophe-likelihood must be one of {', '.join(CATASTROPHE_LIKELIHOODS)}.")
+    catastrophe_lambda_on = float(getattr(args, "catastrophe_lambda_on", DEFAULT_CATASTROPHE_LAMBDA_ON))
+    catastrophe_lambda_off = float(getattr(args, "catastrophe_lambda_off", DEFAULT_CATASTROPHE_LAMBDA_OFF))
+    if (
+        not np.isfinite(catastrophe_lambda_on)
+        or not np.isfinite(catastrophe_lambda_off)
+        or catastrophe_lambda_on <= 0.0
+        or catastrophe_lambda_off <= catastrophe_lambda_on
+    ):
+        _fail("--catastrophe-lambda-on/off must satisfy 0 < on < off.")
+    catastrophe_gap_on = float(getattr(args, "catastrophe_gap_on", DEFAULT_CATASTROPHE_GAP_ON))
+    catastrophe_gap_off = float(getattr(args, "catastrophe_gap_off", DEFAULT_CATASTROPHE_GAP_OFF))
+    if (
+        not np.isfinite(catastrophe_gap_on)
+        or not np.isfinite(catastrophe_gap_off)
+        or catastrophe_gap_on <= 0.0
+        or catastrophe_gap_off <= catastrophe_gap_on
+    ):
+        _fail("--catastrophe-gap-on/off must satisfy 0 < on < off.")
+    catastrophe_vmin = float(
+        getattr(
+            args,
+            "catastrophe_tangential_variance_min",
+            DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
+        )
+    )
+    if not np.isfinite(catastrophe_vmin) or catastrophe_vmin < 0.0:
+        _fail("--catastrophe-tangential-variance-min must be finite and non-negative.")
     cab_likelihood_weight = getattr(args, "cab_likelihood_weight", None)
     if cab_likelihood_weight is not None and (
         not np.isfinite(float(cab_likelihood_weight)) or float(cab_likelihood_weight) < 0.0
@@ -8569,6 +9113,7 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
         IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
     }:
         if int(getattr(args, "image_plane_newton_steps", 0)) != 0:
             _fail(f"--image-plane-newton-steps must be 0 for --image-plane-mode {mode}.")
@@ -8626,6 +9171,7 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
         IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
     }
     has_stage4 = _stage4_image_plane_enabled(args)
     has_stage3 = _local_jacobian_stage_enabled(args)
@@ -8694,6 +9240,7 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
         IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
     }
     smc_stages: list[str] = []
     if controls["stage2"].fit_method == FIT_METHOD_SMC:
@@ -9298,6 +9845,84 @@ def _normalize_component_field_name(field_name: str) -> str:
     return field_name
 
 
+def _angle_grid_for_bounds(lower_rad: float, upper_rad: float) -> np.ndarray:
+    if not np.isfinite(lower_rad) or not np.isfinite(upper_rad) or lower_rad >= upper_rad:
+        raise ValueError("Angle prior bounds must be finite and ordered for direct Cartesian sampling.")
+    step = 0.5 * math.pi
+    values = [float(lower_rad), float(upper_rad)]
+    first = int(math.floor(lower_rad / step)) - 1
+    last = int(math.ceil(upper_rad / step)) + 1
+    for index in range(first, last + 1):
+        value = float(index * step)
+        if lower_rad <= value <= upper_rad:
+            values.append(value)
+    return np.asarray(sorted(set(values)), dtype=float)
+
+
+def _e1e2_bounds_from_lenstool_prior_box(
+    ellipticite_prior: dict[str, Any],
+    angle_pos_prior: dict[str, Any],
+    *,
+    context: str,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    if ellipticite_prior["prior_kind"] != "uniform" or angle_pos_prior["prior_kind"] != "uniform":
+        raise ValueError(
+            f"Direct e1/e2 DPIE shape sampling for {context} requires uniform ellipticite and angle_pos priors."
+        )
+    ellipticite_lower = float(ellipticite_prior["lower"])
+    ellipticite_upper = float(ellipticite_prior["upper"])
+    angle_lower = float(angle_pos_prior["lower"])
+    angle_upper = float(angle_pos_prior["upper"])
+    if not np.isfinite(ellipticite_lower) or not np.isfinite(ellipticite_upper) or ellipticite_lower >= ellipticite_upper:
+        raise ValueError(f"ellipticite prior bounds must be finite and ordered for {context}.")
+    if ellipticite_upper < 0.0 or ellipticite_lower >= 1.0:
+        raise ValueError(f"ellipticite prior bounds must overlap [0, 1) for {context}.")
+    safe_ellipticite_bounds = np.clip(
+        np.asarray([ellipticite_lower, ellipticite_upper], dtype=float),
+        0.0,
+        1.0 - 1.0e-9,
+    )
+    q_bounds = _lenstool_ellipticite_to_axis_ratio_numpy(safe_ellipticite_bounds)
+    modulus_bounds = (1.0 - q_bounds) / (1.0 + q_bounds)
+    radius_values = np.asarray([float(np.min(modulus_bounds)), float(np.max(modulus_bounds))], dtype=float)
+    theta_values = _angle_grid_for_bounds(np.deg2rad(2.0 * angle_lower), np.deg2rad(2.0 * angle_upper))
+    e1_values = np.asarray([radius * math.cos(theta) for radius in radius_values for theta in theta_values], dtype=float)
+    e2_values = np.asarray([radius * math.sin(theta) for radius in radius_values for theta in theta_values], dtype=float)
+    return (float(np.min(e1_values)), float(np.max(e1_values))), (float(np.min(e2_values)), float(np.max(e2_values)))
+
+
+def _gamma1gamma2_bounds_from_shear_prior_box(
+    gamma_prior: dict[str, Any],
+    angle_pos_prior: dict[str, Any],
+    *,
+    context: str,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    if gamma_prior["prior_kind"] != "uniform" or angle_pos_prior["prior_kind"] != "uniform":
+        raise ValueError(
+            f"Direct gamma1/gamma2 shear sampling for {context} requires uniform gamma and angle_pos priors."
+        )
+    gamma_lower = float(gamma_prior["lower"])
+    gamma_upper = float(gamma_prior["upper"])
+    angle_lower = float(angle_pos_prior["lower"])
+    angle_upper = float(angle_pos_prior["upper"])
+    if not np.isfinite(gamma_lower) or not np.isfinite(gamma_upper) or gamma_lower >= gamma_upper:
+        raise ValueError(f"gamma prior bounds must be finite and ordered for {context}.")
+    if gamma_upper < 0.0:
+        raise ValueError(f"gamma prior bounds must overlap non-negative shear amplitudes for {context}.")
+    radius_values = np.asarray([max(gamma_lower, 0.0), max(gamma_upper, 0.0)], dtype=float)
+    theta_values = _angle_grid_for_bounds(np.deg2rad(2.0 * angle_lower), np.deg2rad(2.0 * angle_upper))
+    gamma1_values = np.asarray([radius * math.cos(theta) for radius in radius_values for theta in theta_values], dtype=float)
+    gamma2_values = np.asarray([radius * math.sin(theta) for radius in radius_values for theta in theta_values], dtype=float)
+    return (
+        (float(np.min(gamma1_values)), float(np.max(gamma1_values))),
+        (float(np.min(gamma2_values)), float(np.max(gamma2_values))),
+    )
+
+
+def _shape_component_step(lower: float, upper: float) -> float:
+    return float(max(0.01 * max(float(upper) - float(lower), 0.0), 1.0e-4))
+
+
 def _log_positive_bound(value: float, floor: float) -> float:
     if not np.isfinite(value):
         return float(value)
@@ -9421,6 +10046,45 @@ def _radius_transform_for_component_prior(
     }
 
 
+def _vdisp_transform_for_component_prior(
+    decoded_prior: dict[str, Any],
+    context: str,
+) -> dict[str, Any]:
+    decoded_prior_kind = str(decoded_prior["prior_kind"])
+    prior_kind = "truncated_normal" if decoded_prior_kind == "normal" else decoded_prior_kind
+    physical_lower = (
+        VDISP_TRUNCATION_FLOOR_KM_S
+        if decoded_prior_kind == "normal"
+        else float(decoded_prior["lower"])
+    )
+    physical_upper = float("inf") if decoded_prior_kind == "normal" else float(decoded_prior["upper"])
+    physical_mean = None if decoded_prior["mean"] is None else float(decoded_prior["mean"])
+    physical_std = None if decoded_prior["std"] is None else float(decoded_prior["std"])
+    lower, upper, mean, std = _transform_positive_prior_to_log_space(
+        prior_kind,
+        physical_lower,
+        physical_upper,
+        physical_mean,
+        physical_std,
+        floor=VDISP_TRUNCATION_FLOOR_KM_S,
+        context=context,
+    )
+    return {
+        "prior_kind": prior_kind,
+        "lower": lower,
+        "upper": upper,
+        "step": float(decoded_prior["step"]),
+        "mean": mean,
+        "std": std,
+        "transform_kind": "log_positive",
+        "transform_offset": 0.0,
+        "physical_lower": physical_lower,
+        "physical_upper": None if not np.isfinite(physical_upper) else physical_upper,
+        "physical_mean": physical_mean,
+        "physical_std": physical_std,
+    }
+
+
 def _latent_prior_center_scale(spec: ParameterSpec) -> tuple[float, float]:
     if spec.prior_kind == "uniform" and np.isfinite(float(spec.lower)) and np.isfinite(float(spec.upper)):
         lower = float(spec.lower)
@@ -9483,6 +10147,122 @@ def _apply_potfile_mass_size_reparameterization(
     )
 
 
+def _append_component_parameter_spec(
+    specs: list[ParameterSpec],
+    assignments: list[tuple[str, int]],
+    *,
+    potential_id: str,
+    profile_type: int,
+    field_name: str,
+    prior_spec: dict[str, Any],
+) -> None:
+    index = len(specs)
+    specs.append(
+        ParameterSpec(
+            name=f"{potential_id}.{field_name}",
+            sample_name=_sample_name(potential_id, field_name),
+            potential_id=potential_id,
+            profile_type=profile_type,
+            field=field_name,
+            prior_kind=str(prior_spec["prior_kind"]),
+            lower=float(prior_spec["lower"]),
+            upper=float(prior_spec["upper"]),
+            step=float(prior_spec["step"]),
+            mean=prior_spec["mean"],
+            std=prior_spec["std"],
+            transform_kind=str(prior_spec["transform_kind"]),
+            physical_lower=prior_spec["physical_lower"],
+            physical_upper=prior_spec["physical_upper"],
+            physical_mean=prior_spec["physical_mean"],
+            physical_std=prior_spec["physical_std"],
+            transform_offset=float(prior_spec["transform_offset"]),
+        )
+    )
+    assignments.append((field_name, index))
+
+
+def _append_dpie_e1e2_shape_specs(
+    specs: list[ParameterSpec],
+    assignments: list[tuple[str, int]],
+    *,
+    potential_id: str,
+    profile_type: int,
+    ellipticite_prior: dict[str, Any],
+    angle_pos_prior: dict[str, Any],
+) -> None:
+    (e1_lower, e1_upper), (e2_lower, e2_upper) = _e1e2_bounds_from_lenstool_prior_box(
+        ellipticite_prior,
+        angle_pos_prior,
+        context=potential_id,
+    )
+    for field_name, lower, upper in (
+        ("e1", e1_lower, e1_upper),
+        ("e2", e2_lower, e2_upper),
+    ):
+        _append_component_parameter_spec(
+            specs,
+            assignments,
+            potential_id=potential_id,
+            profile_type=profile_type,
+            field_name=field_name,
+            prior_spec={
+                "prior_kind": "uniform",
+                "lower": lower,
+                "upper": upper,
+                "step": _shape_component_step(lower, upper),
+                "mean": None,
+                "std": None,
+                "transform_kind": "identity",
+                "transform_offset": 0.0,
+                "physical_lower": None,
+                "physical_upper": None,
+                "physical_mean": None,
+                "physical_std": None,
+            },
+        )
+
+
+def _append_shear_gamma1gamma2_specs(
+    specs: list[ParameterSpec],
+    assignments: list[tuple[str, int]],
+    *,
+    potential_id: str,
+    profile_type: int,
+    gamma_prior: dict[str, Any],
+    angle_pos_prior: dict[str, Any],
+) -> None:
+    (gamma1_lower, gamma1_upper), (gamma2_lower, gamma2_upper) = _gamma1gamma2_bounds_from_shear_prior_box(
+        gamma_prior,
+        angle_pos_prior,
+        context=potential_id,
+    )
+    for field_name, lower, upper in (
+        ("gamma1", gamma1_lower, gamma1_upper),
+        ("gamma2", gamma2_lower, gamma2_upper),
+    ):
+        _append_component_parameter_spec(
+            specs,
+            assignments,
+            potential_id=potential_id,
+            profile_type=profile_type,
+            field_name=field_name,
+            prior_spec={
+                "prior_kind": "uniform",
+                "lower": lower,
+                "upper": upper,
+                "step": _shape_component_step(lower, upper),
+                "mean": None,
+                "std": None,
+                "transform_kind": "identity",
+                "transform_offset": 0.0,
+                "physical_lower": None,
+                "physical_upper": None,
+                "physical_mean": None,
+                "physical_std": None,
+            },
+        )
+
+
 def _build_parameter_specs(
     potentials_with_priors: list[dict[str, Any]],
 ) -> tuple[list[ParameterSpec], list[list[tuple[str, int]]], list[str]]:
@@ -9499,40 +10279,79 @@ def _build_parameter_specs(
         else:
             lens_model_list.append("SHEAR")
         assignments: list[tuple[str, int]] = []
-        priors = potential.get("priors", {}) or {}
-        for field_name, prior in priors.items():
-            normalized_field_name = _normalize_component_field_name(str(field_name))
+        priors = {
+            _normalize_component_field_name(str(field_name)): prior
+            for field_name, prior in (potential.get("priors", {}) or {}).items()
+        }
+        dpie_shape_priors: dict[str, dict[str, Any]] = {}
+        if profile_type == DP_IE_PROFILE:
+            for shape_field in ("ellipticite", "angle_pos"):
+                if shape_field not in priors:
+                    continue
+                decoded_shape_prior = _decode_parameter_prior(priors[shape_field], f"{potential_id}.{shape_field}")
+                if decoded_shape_prior is not None:
+                    dpie_shape_priors[shape_field] = decoded_shape_prior
+            if dpie_shape_priors and set(dpie_shape_priors) != {"ellipticite", "angle_pos"}:
+                missing_shape = sorted({"ellipticite", "angle_pos"} - set(dpie_shape_priors))
+                present_shape = sorted(dpie_shape_priors)
+                raise ValueError(
+                    f"DPIE_NIE potential {potential_id} samples only partial shape priors "
+                    f"present={present_shape} missing={missing_shape}; direct e1/e2 sampling requires both "
+                    "ellipticite and angle_pos."
+                )
+        shear_priors: dict[str, dict[str, Any]] = {}
+        if profile_type == SHEAR_PROFILE:
+            for shear_field in ("gamma", "angle_pos"):
+                if shear_field not in priors:
+                    continue
+                decoded_shear_prior = _decode_parameter_prior(priors[shear_field], f"{potential_id}.{shear_field}")
+                if decoded_shear_prior is not None:
+                    shear_priors[shear_field] = decoded_shear_prior
+            if shear_priors and set(shear_priors) != {"gamma", "angle_pos"}:
+                missing_shear = sorted({"gamma", "angle_pos"} - set(shear_priors))
+                present_shear = sorted(shear_priors)
+                raise ValueError(
+                    f"SHEAR potential {potential_id} samples only partial shear priors "
+                    f"present={present_shear} missing={missing_shear}; direct gamma1/gamma2 sampling requires both "
+                    "gamma and angle_pos."
+                )
+        shape_specs_inserted = False
+        shear_specs_inserted = False
+        for normalized_field_name, prior in priors.items():
+            if profile_type == DP_IE_PROFILE and normalized_field_name in {"ellipticite", "angle_pos"} and dpie_shape_priors:
+                if not shape_specs_inserted:
+                    _append_dpie_e1e2_shape_specs(
+                        specs,
+                        assignments,
+                        potential_id=potential_id,
+                        profile_type=profile_type,
+                        ellipticite_prior=dpie_shape_priors["ellipticite"],
+                        angle_pos_prior=dpie_shape_priors["angle_pos"],
+                    )
+                    shape_specs_inserted = True
+                continue
+            if profile_type == SHEAR_PROFILE and normalized_field_name in {"gamma", "angle_pos"} and shear_priors:
+                if not shear_specs_inserted:
+                    _append_shear_gamma1gamma2_specs(
+                        specs,
+                        assignments,
+                        potential_id=potential_id,
+                        profile_type=profile_type,
+                        gamma_prior=shear_priors["gamma"],
+                        angle_pos_prior=shear_priors["angle_pos"],
+                    )
+                    shear_specs_inserted = True
+                continue
             decoded_prior = _decode_parameter_prior(prior, f"{potential_id}.{normalized_field_name}")
             if decoded_prior is None:
                 continue
             if profile_type == DP_IE_PROFILE and normalized_field_name in {"core_radius_kpc", "cut_radius_kpc"}:
                 prior_spec = _radius_transform_for_component_prior(potential, normalized_field_name, decoded_prior)
-            elif (
-                profile_type == DP_IE_PROFILE
-                and normalized_field_name == "v_disp"
-                and str(decoded_prior["prior_kind"]) in {"normal", "truncated_normal"}
-            ):
-                decoded_prior_kind = str(decoded_prior["prior_kind"])
-                lower = (
-                    VDISP_TRUNCATION_FLOOR_KM_S
-                    if decoded_prior_kind == "normal"
-                    else float(decoded_prior["lower"])
+            elif profile_type == DP_IE_PROFILE and normalized_field_name == "v_disp":
+                prior_spec = _vdisp_transform_for_component_prior(
+                    decoded_prior,
+                    f"{potential_id}.{normalized_field_name}",
                 )
-                upper = float("inf") if decoded_prior_kind == "normal" else float(decoded_prior["upper"])
-                prior_spec = {
-                    "prior_kind": "truncated_normal",
-                    "lower": lower,
-                    "upper": upper,
-                    "step": float(decoded_prior["step"]),
-                    "mean": float(decoded_prior["mean"]),
-                    "std": float(decoded_prior["std"]),
-                    "transform_kind": "identity",
-                    "transform_offset": 0.0,
-                    "physical_lower": lower,
-                    "physical_upper": None if not np.isfinite(upper) else upper,
-                    "physical_mean": float(decoded_prior["mean"]),
-                    "physical_std": float(decoded_prior["std"]),
-                }
             else:
                 prior_spec = {
                     "prior_kind": str(decoded_prior["prior_kind"]),
@@ -9548,29 +10367,14 @@ def _build_parameter_specs(
                     "physical_mean": None,
                     "physical_std": None,
                 }
-            index = len(specs)
-            specs.append(
-                ParameterSpec(
-                    name=f"{potential_id}.{normalized_field_name}",
-                    sample_name=_sample_name(potential_id, normalized_field_name),
-                    potential_id=potential_id,
-                    profile_type=profile_type,
-                    field=normalized_field_name,
-                    prior_kind=str(prior_spec["prior_kind"]),
-                    lower=float(prior_spec["lower"]),
-                    upper=float(prior_spec["upper"]),
-                    step=float(prior_spec["step"]),
-                    mean=prior_spec["mean"],
-                    std=prior_spec["std"],
-                    transform_kind=str(prior_spec["transform_kind"]),
-                    physical_lower=prior_spec["physical_lower"],
-                    physical_upper=prior_spec["physical_upper"],
-                    physical_mean=prior_spec["physical_mean"],
-                    physical_std=prior_spec["physical_std"],
-                    transform_offset=float(prior_spec["transform_offset"]),
-                )
+            _append_component_parameter_spec(
+                specs,
+                assignments,
+                potential_id=potential_id,
+                profile_type=profile_type,
+                field_name=normalized_field_name,
+                prior_spec=prior_spec,
             )
-            assignments.append((normalized_field_name, index))
         component_param_assignments.append(assignments)
     return specs, component_param_assignments, lens_model_list
 
@@ -10018,20 +10822,22 @@ def _build_packed_lens_spec(
     component_family = np.zeros(n_components, dtype=np.int32)
     x_center_base = np.zeros(n_components, dtype=float)
     y_center_base = np.zeros(n_components, dtype=float)
-    ellipticite_base = np.zeros(n_components, dtype=float)
-    angle_pos_base = np.zeros(n_components, dtype=float)
+    e1_base = np.zeros(n_components, dtype=float)
+    e2_base = np.zeros(n_components, dtype=float)
     core_radius_kpc_base = np.zeros(n_components, dtype=float)
     cut_radius_kpc_base = np.zeros(n_components, dtype=float)
     v_disp_base = np.zeros(n_components, dtype=float)
-    gamma_base = np.zeros(n_components, dtype=float)
+    gamma1_base = np.zeros(n_components, dtype=float)
+    gamma2_base = np.zeros(n_components, dtype=float)
     x_center_param_index = np.full(n_components, -1, dtype=np.int32)
     y_center_param_index = np.full(n_components, -1, dtype=np.int32)
-    ellipticite_param_index = np.full(n_components, -1, dtype=np.int32)
-    angle_pos_param_index = np.full(n_components, -1, dtype=np.int32)
+    e1_param_index = np.full(n_components, -1, dtype=np.int32)
+    e2_param_index = np.full(n_components, -1, dtype=np.int32)
     core_radius_param_index = np.full(n_components, -1, dtype=np.int32)
     cut_radius_param_index = np.full(n_components, -1, dtype=np.int32)
     v_disp_param_index = np.full(n_components, -1, dtype=np.int32)
-    gamma_param_index = np.full(n_components, -1, dtype=np.int32)
+    gamma1_param_index = np.full(n_components, -1, dtype=np.int32)
+    gamma2_param_index = np.full(n_components, -1, dtype=np.int32)
     luminosity_ratio = np.ones(n_components, dtype=float)
     sigma_ref_base = np.zeros(n_components, dtype=float)
     cut_ref_base = np.zeros(n_components, dtype=float)
@@ -10052,20 +10858,27 @@ def _build_packed_lens_spec(
         component_family[idx] = 0
         x_center_base[idx] = float(component.get("x_centre", 0.0))
         y_center_base[idx] = float(component.get("y_centre", 0.0))
-        ellipticite_base[idx] = float(component.get("ellipticite", 0.0))
-        angle_pos_base[idx] = float(component.get("angle_pos", 0.0))
+        angle_pos = float(component.get("angle_pos", 0.0))
+        e1_base[idx], e2_base[idx] = _lenstool_shape_to_e1e2(
+            float(component.get("ellipticite", 0.0)),
+            angle_pos,
+        )
+        gamma1_base[idx], gamma2_base[idx] = _shear_polar_to_gamma1gamma2(
+            float(component.get("gamma", 0.0)),
+            angle_pos,
+        )
         core_radius_kpc_base[idx] = float(component.get("core_radius_kpc", 0.0))
         cut_radius_kpc_base[idx] = float(component.get("cut_radius_kpc", 0.0))
         v_disp_base[idx] = float(component.get("v_disp", 0.0))
-        gamma_base[idx] = float(component.get("gamma", 0.0))
         x_center_param_index[idx] = _field_param_index(assignments, "x_centre")
         y_center_param_index[idx] = _field_param_index(assignments, "y_centre")
-        ellipticite_param_index[idx] = _field_param_index(assignments, "ellipticite")
-        angle_pos_param_index[idx] = _field_param_index(assignments, "angle_pos")
+        e1_param_index[idx] = _field_param_index(assignments, "e1")
+        e2_param_index[idx] = _field_param_index(assignments, "e2")
         core_radius_param_index[idx] = _field_param_index(assignments, "core_radius_kpc")
         cut_radius_param_index[idx] = _field_param_index(assignments, "cut_radius_kpc")
         v_disp_param_index[idx] = _field_param_index(assignments, "v_disp")
-        gamma_param_index[idx] = _field_param_index(assignments, "gamma")
+        gamma1_param_index[idx] = _field_param_index(assignments, "gamma1")
+        gamma2_param_index[idx] = _field_param_index(assignments, "gamma2")
 
     scaling_component_assignments = scaling_component_assignments or []
     for item in scaling_component_assignments:
@@ -10091,20 +10904,22 @@ def _build_packed_lens_spec(
         component_family=component_family,
         x_center_base=x_center_base,
         y_center_base=y_center_base,
-        ellipticite_base=ellipticite_base,
-        angle_pos_base=angle_pos_base,
+        e1_base=e1_base,
+        e2_base=e2_base,
         core_radius_kpc_base=core_radius_kpc_base,
         cut_radius_kpc_base=cut_radius_kpc_base,
         v_disp_base=v_disp_base,
-        gamma_base=gamma_base,
+        gamma1_base=gamma1_base,
+        gamma2_base=gamma2_base,
         x_center_param_index=x_center_param_index,
         y_center_param_index=y_center_param_index,
-        ellipticite_param_index=ellipticite_param_index,
-        angle_pos_param_index=angle_pos_param_index,
+        e1_param_index=e1_param_index,
+        e2_param_index=e2_param_index,
         core_radius_param_index=core_radius_param_index,
         cut_radius_param_index=cut_radius_param_index,
         v_disp_param_index=v_disp_param_index,
-        gamma_param_index=gamma_param_index,
+        gamma1_param_index=gamma1_param_index,
+        gamma2_param_index=gamma2_param_index,
         luminosity_ratio=luminosity_ratio,
         sigma_ref_base=sigma_ref_base,
         cut_ref_base=cut_ref_base,
@@ -10552,10 +11367,16 @@ class ClusterJAXEvaluator:
         critical_arc_lm_damping_relative: float = DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE,
         critical_arc_lm_damping_absolute: float = DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE,
         critical_arc_lm_trust_radius_arcsec: float = DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC,
-        arc_aware_noncritical_support_radius_arcsec: float = DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
+        arc_aware_noncritical_support_radius_arcsec: float | None = None,
         arc_aware_max_arclength_arcsec: float = DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC,
         arc_aware_curve_step_arcsec: float = DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC,
         fold_curvature_arcsec_inv: float = DEFAULT_FOLD_CURVATURE_ARCSEC_INV,
+        catastrophe_likelihood: str = DEFAULT_CATASTROPHE_LIKELIHOOD,
+        catastrophe_lambda_on: float = DEFAULT_CATASTROPHE_LAMBDA_ON,
+        catastrophe_lambda_off: float = DEFAULT_CATASTROPHE_LAMBDA_OFF,
+        catastrophe_gap_on: float = DEFAULT_CATASTROPHE_GAP_ON,
+        catastrophe_gap_off: float = DEFAULT_CATASTROPHE_GAP_OFF,
+        catastrophe_tangential_variance_min: float = DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
         cab_likelihood_weight: float = DEFAULT_CAB_LIKELIHOOD_WEIGHT_NO_ARCS,
         cab_finite_difference_step_arcsec: float = DEFAULT_CAB_FINITE_DIFFERENCE_STEP_ARCSEC,
         cab_tangent_sigma_floor_rad: float = DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD,
@@ -10601,6 +11422,7 @@ class ClusterJAXEvaluator:
             SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
+            SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
         }:
             raise ValueError(f"Unsupported sample_likelihood_mode={self.sample_likelihood_mode!r}.")
         requested_image_plane_newton_steps = int(image_plane_newton_steps)
@@ -10611,6 +11433,7 @@ class ClusterJAXEvaluator:
                 SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
                 SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
                 SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
+                SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
             }
             and requested_image_plane_newton_steps != 0
         ):
@@ -10664,10 +11487,19 @@ class ClusterJAXEvaluator:
         self.critical_arc_lm_damping_relative = float(critical_arc_lm_damping_relative)
         self.critical_arc_lm_damping_absolute = float(critical_arc_lm_damping_absolute)
         self.critical_arc_lm_trust_radius_arcsec = float(critical_arc_lm_trust_radius_arcsec)
-        self.arc_aware_noncritical_support_radius_arcsec = float(arc_aware_noncritical_support_radius_arcsec)
+        self.arc_aware_noncritical_support_radius_arcsec = _resolve_arc_aware_noncritical_support_radius_arcsec(
+            arc_aware_noncritical_support_radius_arcsec,
+            self.match_tolerance_arcsec,
+        )
         self.arc_aware_max_arclength_arcsec = float(arc_aware_max_arclength_arcsec)
         self.arc_aware_curve_step_arcsec = float(arc_aware_curve_step_arcsec)
         self.fold_curvature_arcsec_inv = float(fold_curvature_arcsec_inv)
+        self.catastrophe_likelihood = str(catastrophe_likelihood)
+        self.catastrophe_lambda_on = float(catastrophe_lambda_on)
+        self.catastrophe_lambda_off = float(catastrophe_lambda_off)
+        self.catastrophe_gap_on = float(catastrophe_gap_on)
+        self.catastrophe_gap_off = float(catastrophe_gap_off)
+        self.catastrophe_tangential_variance_min = float(catastrophe_tangential_variance_min)
         self.cab_likelihood_weight = float(cab_likelihood_weight)
         self.cab_finite_difference_step_arcsec = float(cab_finite_difference_step_arcsec)
         self.cab_tangent_sigma_floor_rad = float(cab_tangent_sigma_floor_rad)
@@ -10724,6 +11556,24 @@ class ClusterJAXEvaluator:
             or self.fold_curvature_arcsec_inv <= 0.0
         ):
             raise ValueError("fold_curvature_arcsec_inv must be finite and positive.")
+        if self.catastrophe_likelihood not in CATASTROPHE_LIKELIHOODS:
+            raise ValueError(f"catastrophe_likelihood must be one of {', '.join(CATASTROPHE_LIKELIHOODS)}.")
+        if (
+            not np.isfinite(self.catastrophe_lambda_on)
+            or not np.isfinite(self.catastrophe_lambda_off)
+            or self.catastrophe_lambda_on <= 0.0
+            or self.catastrophe_lambda_off <= self.catastrophe_lambda_on
+        ):
+            raise ValueError("catastrophe_lambda_on/off must satisfy 0 < on < off.")
+        if (
+            not np.isfinite(self.catastrophe_gap_on)
+            or not np.isfinite(self.catastrophe_gap_off)
+            or self.catastrophe_gap_on <= 0.0
+            or self.catastrophe_gap_off <= self.catastrophe_gap_on
+        ):
+            raise ValueError("catastrophe_gap_on/off must satisfy 0 < on < off.")
+        if not np.isfinite(self.catastrophe_tangential_variance_min) or self.catastrophe_tangential_variance_min < 0.0:
+            raise ValueError("catastrophe_tangential_variance_min must be finite and non-negative.")
         if not np.isfinite(self.cab_likelihood_weight) or self.cab_likelihood_weight < 0.0:
             raise ValueError("cab_likelihood_weight must be finite and non-negative.")
         if not np.isfinite(self.cab_finite_difference_step_arcsec) or self.cab_finite_difference_step_arcsec <= 0.0:
@@ -10932,6 +11782,7 @@ class ClusterJAXEvaluator:
                 SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
                 SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
                 SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
+                SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
             }
             and self.source_position_conditional
         ):
@@ -11021,6 +11872,7 @@ class ClusterJAXEvaluator:
                 SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
                 SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
                 SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
+                SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
             }
             and self.image_plane_newton_steps == 0
             and (
@@ -11132,18 +11984,20 @@ class ClusterJAXEvaluator:
             "x_center_param_index": jnp.asarray(spec.x_center_param_index, dtype=jnp.int32),
             "y_center_base": jnp.asarray(spec.y_center_base, dtype=jnp.float64),
             "y_center_param_index": jnp.asarray(spec.y_center_param_index, dtype=jnp.int32),
-            "ellipticite_base": jnp.asarray(spec.ellipticite_base, dtype=jnp.float64),
-            "ellipticite_param_index": jnp.asarray(spec.ellipticite_param_index, dtype=jnp.int32),
-            "angle_pos_base": jnp.asarray(spec.angle_pos_base, dtype=jnp.float64),
-            "angle_pos_param_index": jnp.asarray(spec.angle_pos_param_index, dtype=jnp.int32),
+            "e1_base": jnp.asarray(spec.e1_base, dtype=jnp.float64),
+            "e1_param_index": jnp.asarray(spec.e1_param_index, dtype=jnp.int32),
+            "e2_base": jnp.asarray(spec.e2_base, dtype=jnp.float64),
+            "e2_param_index": jnp.asarray(spec.e2_param_index, dtype=jnp.int32),
             "core_radius_kpc_base": jnp.asarray(spec.core_radius_kpc_base, dtype=jnp.float64),
             "core_radius_param_index": jnp.asarray(spec.core_radius_param_index, dtype=jnp.int32),
             "cut_radius_kpc_base": jnp.asarray(spec.cut_radius_kpc_base, dtype=jnp.float64),
             "cut_radius_param_index": jnp.asarray(spec.cut_radius_param_index, dtype=jnp.int32),
             "v_disp_base": jnp.asarray(spec.v_disp_base, dtype=jnp.float64),
             "v_disp_param_index": jnp.asarray(spec.v_disp_param_index, dtype=jnp.int32),
-            "gamma_base": jnp.asarray(spec.gamma_base, dtype=jnp.float64),
-            "gamma_param_index": jnp.asarray(spec.gamma_param_index, dtype=jnp.int32),
+            "gamma1_base": jnp.asarray(spec.gamma1_base, dtype=jnp.float64),
+            "gamma1_param_index": jnp.asarray(spec.gamma1_param_index, dtype=jnp.int32),
+            "gamma2_base": jnp.asarray(spec.gamma2_base, dtype=jnp.float64),
+            "gamma2_param_index": jnp.asarray(spec.gamma2_param_index, dtype=jnp.int32),
             "profile_type": jnp.asarray(spec.profile_type, dtype=jnp.int32),
             "component_family": jnp.asarray(spec.component_family, dtype=jnp.int32),
             "luminosity_ratio": jnp.asarray(spec.luminosity_ratio, dtype=jnp.float64),
@@ -12087,16 +12941,11 @@ class ClusterJAXEvaluator:
         kpc_per_arcsec: jnp.ndarray | None = None,
         dpie_sigma0_factor: jnp.ndarray | None = None,
     ) -> tuple[dict[str, Any], dict[str, jnp.ndarray]]:
-        spec = self.state.packed_lens_spec
         spec_jax = self.packed_spec_jax
         x_center = self._apply_param_updates(spec_jax["x_center_base"], spec_jax["x_center_param_index"], physical_params)
         y_center = self._apply_param_updates(spec_jax["y_center_base"], spec_jax["y_center_param_index"], physical_params)
-        ellipticite = self._apply_param_updates(
-            spec_jax["ellipticite_base"], spec_jax["ellipticite_param_index"], physical_params
-        )
-        angle_pos = self._apply_param_updates(
-            spec_jax["angle_pos_base"], spec_jax["angle_pos_param_index"], physical_params
-        )
+        e1 = self._apply_param_updates(spec_jax["e1_base"], spec_jax["e1_param_index"], physical_params)
+        e2 = self._apply_param_updates(spec_jax["e2_base"], spec_jax["e2_param_index"], physical_params)
         core_radius_kpc = self._apply_param_updates(
             spec_jax["core_radius_kpc_base"], spec_jax["core_radius_param_index"], physical_params
         )
@@ -12104,7 +12953,8 @@ class ClusterJAXEvaluator:
             spec_jax["cut_radius_kpc_base"], spec_jax["cut_radius_param_index"], physical_params
         )
         v_disp = self._apply_param_updates(spec_jax["v_disp_base"], spec_jax["v_disp_param_index"], physical_params)
-        gamma = self._apply_param_updates(spec_jax["gamma_base"], spec_jax["gamma_param_index"], physical_params)
+        gamma1 = self._apply_param_updates(spec_jax["gamma1_base"], spec_jax["gamma1_param_index"], physical_params)
+        gamma2 = self._apply_param_updates(spec_jax["gamma2_base"], spec_jax["gamma2_param_index"], physical_params)
 
         profile_type = spec_jax["profile_type"]
         component_family = spec_jax["component_family"]
@@ -12137,9 +12987,6 @@ class ClusterJAXEvaluator:
         core_radius_kpc = jnp.where(is_scaling, scaled_core, core_radius_kpc)
         cut_radius_kpc = jnp.where(is_scaling, scaled_cut, cut_radius_kpc)
 
-        q = _lenstool_ellipticite_to_axis_ratio_jax(ellipticite)
-        phi = jnp.deg2rad(angle_pos)
-        e1, e2 = param_util.phi_q2_ellipticity(phi, q)
         if kpc_per_arcsec is None:
             kpc_per_arcsec = self._kpc_per_arcsec_for_physical(physical_params)
         kpc_per_arcsec = jnp.asarray(kpc_per_arcsec, dtype=jnp.float64)
@@ -12153,7 +13000,6 @@ class ClusterJAXEvaluator:
             factor_array = jnp.asarray(dpie_sigma0_factor, dtype=jnp.float64)
         safe_factor = jnp.where(jnp.isfinite(factor_array), factor_array, 0.0)
         sigma0 = (v_disp**2) * safe_factor / ra
-        gamma1, gamma2 = param_util.shear_polar2cartesian(phi, gamma)
 
         packed_state = {
             "__packed__": True,
@@ -12210,7 +13056,14 @@ class ClusterJAXEvaluator:
                 ),
                 jnp.any(~jnp.isfinite(details["x_center"]) | ~jnp.isfinite(details["y_center"])),
                 jnp.any(details["is_shear"] & (~jnp.isfinite(details["gamma1"]) | ~jnp.isfinite(details["gamma2"]))),
-                jnp.any(details["is_dpie"] & (~jnp.isfinite(details["e1"]) | ~jnp.isfinite(details["e2"]))),
+                jnp.any(
+                    details["is_dpie"]
+                    & (
+                        ~jnp.isfinite(details["e1"])
+                        | ~jnp.isfinite(details["e2"])
+                        | ((jnp.square(details["e1"]) + jnp.square(details["e2"])) >= 1.0)
+                    )
+                ),
                 ~jnp.isfinite(details["factor_array"]),
             ],
             axis=0,
@@ -12330,12 +13183,8 @@ class ClusterJAXEvaluator:
         )
         x_center = self._apply_param_updates(jnp.asarray(spec.x_center_base, dtype=jnp.float64), spec.x_center_param_index, physical_params)
         y_center = self._apply_param_updates(jnp.asarray(spec.y_center_base, dtype=jnp.float64), spec.y_center_param_index, physical_params)
-        ellipticite = self._apply_param_updates(
-            jnp.asarray(spec.ellipticite_base, dtype=jnp.float64), spec.ellipticite_param_index, physical_params
-        )
-        angle_pos = self._apply_param_updates(
-            jnp.asarray(spec.angle_pos_base, dtype=jnp.float64), spec.angle_pos_param_index, physical_params
-        )
+        e1 = self._apply_param_updates(jnp.asarray(spec.e1_base, dtype=jnp.float64), spec.e1_param_index, physical_params)
+        e2 = self._apply_param_updates(jnp.asarray(spec.e2_base, dtype=jnp.float64), spec.e2_param_index, physical_params)
         core_radius_kpc = self._apply_param_updates(
             jnp.asarray(spec.core_radius_kpc_base, dtype=jnp.float64), spec.core_radius_param_index, physical_params
         )
@@ -12343,7 +13192,8 @@ class ClusterJAXEvaluator:
             jnp.asarray(spec.cut_radius_kpc_base, dtype=jnp.float64), spec.cut_radius_param_index, physical_params
         )
         v_disp = self._apply_param_updates(jnp.asarray(spec.v_disp_base, dtype=jnp.float64), spec.v_disp_param_index, physical_params)
-        gamma = self._apply_param_updates(jnp.asarray(spec.gamma_base, dtype=jnp.float64), spec.gamma_param_index, physical_params)
+        gamma1 = self._apply_param_updates(jnp.asarray(spec.gamma1_base, dtype=jnp.float64), spec.gamma1_param_index, physical_params)
+        gamma2 = self._apply_param_updates(jnp.asarray(spec.gamma2_base, dtype=jnp.float64), spec.gamma2_param_index, physical_params)
 
         profile_type = jnp.asarray(spec.profile_type, dtype=jnp.int32)
         component_family = jnp.asarray(spec.component_family, dtype=jnp.int32)
@@ -12379,9 +13229,6 @@ class ClusterJAXEvaluator:
         core_radius_kpc = jnp.where(is_scaling, scaled_core, core_radius_kpc)
         cut_radius_kpc = jnp.where(is_scaling, scaled_cut, cut_radius_kpc)
 
-        q = _lenstool_ellipticite_to_axis_ratio_jax(ellipticite)
-        phi = jnp.deg2rad(angle_pos)
-        e1, e2 = param_util.phi_q2_ellipticity(phi, q)
         kpc_per_arcsec = self._kpc_per_arcsec_for_physical(physical_params)
         ra_raw = core_radius_kpc / kpc_per_arcsec
         rs_raw = cut_radius_kpc / kpc_per_arcsec
@@ -12390,7 +13237,6 @@ class ClusterJAXEvaluator:
         factor_array = self._dpie_sigma0_factor_for_physical_z_source(physical_params, z_source)
         safe_factor = jnp.where(jnp.isfinite(factor_array), factor_array, 0.0)
         sigma0 = (v_disp**2) * safe_factor / ra
-        gamma1, gamma2 = param_util.shear_polar2cartesian(phi, gamma)
 
         packed_state = {
             "__packed__": True,
@@ -12660,6 +13506,46 @@ class ClusterJAXEvaluator:
         if image_indices is None:
             return kappa_eff
         return jnp.full_like(x_obs, jnp.asarray(fill_value, dtype=jnp.float64)).at[image_indices].set(kappa_eff)
+
+    def _catastrophe_moment_coefficients_from_observed_jacobian(
+        self,
+        z_source: float,
+        x_obs: jnp.ndarray,
+        y_obs: jnp.ndarray,
+        packed_state: dict[str, Any],
+        observed_jacobian_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+        component_indices: np.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        if not self.use_bulk_ray_shooting:
+            zeros = jnp.zeros_like(x_obs, dtype=jnp.float64)
+            return zeros, zeros, zeros, zeros
+        e_t_x, e_t_y, lambda_t, _lambda_n, frame_finite = _catastrophe_symmetric_tangent_frame_from_jacobian(
+            *observed_jacobian_entries
+        )
+        e_t_x = jax.lax.stop_gradient(e_t_x)
+        e_t_y = jax.lax.stop_gradient(e_t_y)
+        lambda_t = jax.lax.stop_gradient(lambda_t)
+        step = jnp.asarray(DEFAULT_CATASTROPHE_FINITE_DIFFERENCE_STEP_ARCSEC, dtype=jnp.float64)
+        probe_x = jnp.concatenate([x_obs + step * e_t_x, x_obs - step * e_t_x])
+        probe_y = jnp.concatenate([y_obs + step * e_t_y, y_obs - step * e_t_y])
+        packed_entries = self._lensing_jacobian_for_components(
+            z_source,
+            probe_x,
+            probe_y,
+            packed_state,
+            component_indices,
+        )
+        n_probe = int(x_obs.shape[0])
+        plus_entries = tuple(entry[:n_probe] for entry in packed_entries)
+        minus_entries = tuple(entry[n_probe:] for entry in packed_entries)
+        a_plus = _catastrophe_projection_on_symmetric_axis(*plus_entries, e_t_x, e_t_y)
+        a_minus = _catastrophe_projection_on_symmetric_axis(*minus_entries, e_t_x, e_t_y)
+        kappa = (a_plus - a_minus) / (2.0 * step)
+        rho = (a_plus - 2.0 * lambda_t + a_minus) / jnp.square(step)
+        finite = frame_finite & jnp.isfinite(kappa) & jnp.isfinite(rho)
+        kappa = jnp.where(finite, kappa, jnp.zeros_like(kappa))
+        rho = jnp.where(finite, rho, jnp.zeros_like(rho))
+        return kappa, rho, kappa * e_t_x, kappa * e_t_y
 
     def _linearized_image_plane_residuals_for_components(
         self,
@@ -13028,6 +13914,7 @@ class ClusterJAXEvaluator:
                         SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
                         SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
                         SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
+                        SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
                     }
                 ),
             )
@@ -13037,7 +13924,10 @@ class ClusterJAXEvaluator:
                 self.surrogate_reference_param_values = np.zeros(len(self.surrogate_param_indices), dtype=float)
                 return
             reference_jacobian_entries = None
-            if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE:
+            if self.sample_likelihood_mode in {
+                SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
+                SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
+            }:
                 reference_jacobian_entries = self._lensing_jacobian_for_components(
                     bin_data.effective_z_source,
                     x_obs,
@@ -13047,6 +13937,10 @@ class ClusterJAXEvaluator:
             fold_regularized_kappa_eff = None
             fold_regularized_near_indices = None
             fold_regularized_far_indices = None
+            catastrophe_kappa = None
+            catastrophe_rho = None
+            catastrophe_kappa_tangent_x = None
+            catastrophe_kappa_tangent_y = None
             if (
                 self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE
                 and reference_jacobian_entries is not None
@@ -13081,11 +13975,40 @@ class ClusterJAXEvaluator:
                         fold_kappa_eff_np,
                         float(self.fold_curvature_arcsec_inv),
                     )
+            if (
+                self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE
+                and reference_jacobian_entries is not None
+            ):
+                (
+                    catastrophe_kappa_jax,
+                    catastrophe_rho_jax,
+                    catastrophe_kappa_tangent_x_jax,
+                    catastrophe_kappa_tangent_y_jax,
+                ) = self._catastrophe_moment_coefficients_from_observed_jacobian(
+                    bin_data.effective_z_source,
+                    x_obs,
+                    y_obs,
+                    packed_state,
+                    reference_jacobian_entries,
+                    component_indices=None,
+                )
+                catastrophe_kappa = np.asarray(catastrophe_kappa_jax, dtype=float)
+                catastrophe_rho = np.asarray(catastrophe_rho_jax, dtype=float)
+                catastrophe_kappa_tangent_x = np.asarray(catastrophe_kappa_tangent_x_jax, dtype=float)
+                catastrophe_kappa_tangent_y = np.asarray(catastrophe_kappa_tangent_y_jax, dtype=float)
+                catastrophe_kappa = np.where(np.isfinite(catastrophe_kappa), catastrophe_kappa, 0.0)
+                catastrophe_rho = np.where(np.isfinite(catastrophe_rho), catastrophe_rho, 0.0)
+                catastrophe_kappa_tangent_x = np.where(np.isfinite(catastrophe_kappa_tangent_x), catastrophe_kappa_tangent_x, 0.0)
+                catastrophe_kappa_tangent_y = np.where(np.isfinite(catastrophe_kappa_tangent_y), catastrophe_kappa_tangent_y, 0.0)
             self.surrogate_cache_by_z[bin_data.effective_z_source] = SurrogateBinCache(
                 effective_z_source=float(bin_data.effective_z_source),
                 fold_regularized_kappa_eff=fold_regularized_kappa_eff,
                 fold_regularized_near_indices=fold_regularized_near_indices,
                 fold_regularized_far_indices=fold_regularized_far_indices,
+                catastrophe_kappa=catastrophe_kappa,
+                catastrophe_rho=catastrophe_rho,
+                catastrophe_kappa_tangent_x=catastrophe_kappa_tangent_x,
+                catastrophe_kappa_tangent_y=catastrophe_kappa_tangent_y,
                 **inactive_surrogate,
             )
         self.full_refresh_count += 1
@@ -13810,6 +14733,130 @@ class ClusterJAXEvaluator:
                         image_presence_count_softness=self.image_presence_count_softness,
                         image_presence_count_margin=self.image_presence_count_margin,
                     )
+                bin_loglike = bin_loglike + source_transport_correction
+            elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE:
+                observed_beta_x = beta_x
+                observed_beta_y = beta_y
+                if self.surrogate_enabled and self.surrogate_cache_by_z:
+                    observed_jacobian_entries = self._surrogate_jacobian_entries(
+                        jnp.asarray(params, dtype=jnp.float64),
+                        bin_data,
+                        packed_state,
+                        invalid,
+                    )
+                else:
+                    if fit_component_indices is None:
+                        observed_jacobian_entries = self._lensing_jacobian_for_components(
+                            bin_data.effective_z_source,
+                            x_obs,
+                            y_obs,
+                            packed_state,
+                        )
+                    else:
+                        observed_jacobian_entries = self._lensing_jacobian_for_components(
+                            bin_data.effective_z_source,
+                            x_obs,
+                            y_obs,
+                            packed_state,
+                            fit_component_indices,
+                        )
+                beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._explicit_source_position_vectors_for_bin(
+                    jnp.asarray(params, dtype=jnp.float64),
+                    physical_params,
+                    bin_data,
+                    observed_beta_x,
+                    observed_beta_y,
+                    image_sigma_int,
+                    observed_jacobian_entries,
+                )
+                invalid = invalid | (~has_source_positions)
+                residual_beta_x = observed_beta_x - beta_family_x
+                residual_beta_y = observed_beta_y - beta_family_y
+                catastrophe_cache = None
+                use_cached_catastrophe_coefficients = False
+                if self.surrogate_enabled and self.surrogate_cache_by_z:
+                    catastrophe_cache = self.surrogate_cache_by_z.get(bin_data.effective_z_source)
+                    use_cached_catastrophe_coefficients = (
+                        catastrophe_cache is not None
+                        and catastrophe_cache.catastrophe_kappa is not None
+                        and catastrophe_cache.catastrophe_rho is not None
+                        and catastrophe_cache.catastrophe_kappa_tangent_x is not None
+                        and catastrophe_cache.catastrophe_kappa_tangent_y is not None
+                    )
+                if use_cached_catastrophe_coefficients and catastrophe_cache is not None:
+                    catastrophe_kappa = jnp.asarray(catastrophe_cache.catastrophe_kappa, dtype=jnp.float64)
+                    catastrophe_rho = jnp.asarray(catastrophe_cache.catastrophe_rho, dtype=jnp.float64)
+                    catastrophe_kappa_tangent_x = jnp.asarray(
+                        catastrophe_cache.catastrophe_kappa_tangent_x,
+                        dtype=jnp.float64,
+                    )
+                    catastrophe_kappa_tangent_y = jnp.asarray(
+                        catastrophe_cache.catastrophe_kappa_tangent_y,
+                        dtype=jnp.float64,
+                    )
+                else:
+                    catastrophe_component_indices = fit_component_indices if fit_component_indices is not None else None
+                    zeros = (
+                        jnp.zeros_like(x_obs, dtype=jnp.float64),
+                        jnp.zeros_like(x_obs, dtype=jnp.float64),
+                        jnp.zeros_like(x_obs, dtype=jnp.float64),
+                        jnp.zeros_like(x_obs, dtype=jnp.float64),
+                    )
+                    (
+                        catastrophe_kappa,
+                        catastrophe_rho,
+                        catastrophe_kappa_tangent_x,
+                        catastrophe_kappa_tangent_y,
+                    ) = jax.lax.cond(
+                        invalid,
+                        lambda _: zeros,
+                        lambda _: self._catastrophe_moment_coefficients_from_observed_jacobian(
+                            bin_data.effective_z_source,
+                            x_obs,
+                            y_obs,
+                            packed_state,
+                            observed_jacobian_entries,
+                            catastrophe_component_indices,
+                        ),
+                        operand=None,
+                    )
+                bin_loglike = _catastrophe_normal_form_image_plane_bin_loglike(
+                    residual_beta_x=residual_beta_x,
+                    residual_beta_y=residual_beta_y,
+                    jac_a00=observed_jacobian_entries[0],
+                    jac_a01=observed_jacobian_entries[1],
+                    jac_a10=observed_jacobian_entries[2],
+                    jac_a11=observed_jacobian_entries[3],
+                    family_idx=family_idx,
+                    n_families=n_families,
+                    sigma_per_image=sigma_base,
+                    reliability_per_image=reliability,
+                    image_has_constraint=image_has_constraint,
+                    image_sigma_int=image_sigma_int,
+                    scatter_var_x=scatter_var_x,
+                    scatter_var_y=scatter_var_y,
+                    covariance_floor=self.source_plane_covariance_floor,
+                    outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
+                    catastrophe_kappa=catastrophe_kappa,
+                    catastrophe_rho=catastrophe_rho,
+                    catastrophe_kappa_tangent_x=catastrophe_kappa_tangent_x,
+                    catastrophe_kappa_tangent_y=catastrophe_kappa_tangent_y,
+                    catastrophe_likelihood=self.catastrophe_likelihood,
+                    catastrophe_lambda_on=self.catastrophe_lambda_on,
+                    catastrophe_lambda_off=self.catastrophe_lambda_off,
+                    catastrophe_gap_on=self.catastrophe_gap_on,
+                    catastrophe_gap_off=self.catastrophe_gap_off,
+                    catastrophe_tangential_variance_min=self.catastrophe_tangential_variance_min,
+                    max_gain=self.likelihood_stabilizer_max_gain,
+                    max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
+                    residual_loss=self.likelihood_stabilizer_residual_loss,
+                    student_t_nu=self.likelihood_stabilizer_student_t_nu,
+                    image_presence_penalty_weight=self.image_presence_penalty_weight,
+                    image_presence_match_radius_arcsec=self.image_presence_match_radius_arcsec,
+                    image_presence_temperature_arcsec=self.image_presence_temperature_arcsec,
+                    image_presence_count_softness=self.image_presence_count_softness,
+                    image_presence_count_margin=self.image_presence_count_margin,
+                )
                 bin_loglike = bin_loglike + source_transport_correction
             elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE:
                 observed_beta_x = beta_x
@@ -14946,14 +15993,19 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
                 "rerun the solver to regenerate artifacts."
             )
         packed_group = handle["state"]["packed_lens_spec"]
-        n_components = len(np.asarray(packed_group["profile_type"]))
+        missing_packed_fields = [
+            field_name for field_name in PackedLensSpec.__dataclass_fields__
+            if field_name not in packed_group
+        ]
+        if missing_packed_fields:
+            joined = ", ".join(missing_packed_fields)
+            raise ValueError(
+                f"{path} is missing current packed lens spec fields ({joined}); rerun from Stage1 "
+                "to regenerate artifacts after the direct e1/e2 DPIE shape-coordinate change."
+            )
         packed_lens_spec = PackedLensSpec(
             **{
-                field_name: (
-                    np.asarray(packed_group[field_name])
-                    if field_name in packed_group
-                    else np.full(n_components, -1, dtype=np.int32)
-                )
+                field_name: np.asarray(packed_group[field_name])
                 for field_name in PackedLensSpec.__dataclass_fields__
             }
         )
@@ -15157,9 +16209,10 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
         image_plane_mode=str(saved_args.get("image_plane_mode", IMAGE_PLANE_MODE_NONE)),
     )
     cab_likelihood_weight = _effective_cab_likelihood_weight(saved_args.get("cab_likelihood_weight"), state)
+    match_tolerance_arcsec = float(saved_args.get("match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE))
     evaluator = ClusterJAXEvaluator(
         state=state,
-        match_tolerance_arcsec=float(saved_args.get("match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE)),
+        match_tolerance_arcsec=match_tolerance_arcsec,
         sampling_engine="full",
         active_scaling_galaxies=saved_args.get("active_scaling_galaxies"),
         active_scaling_selection=str(saved_args.get("active_scaling_selection", "adaptive")),
@@ -15220,11 +16273,9 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
         critical_arc_lm_trust_radius_arcsec=float(
             saved_args.get("critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
         ),
-        arc_aware_noncritical_support_radius_arcsec=float(
-            saved_args.get(
-                "arc_aware_noncritical_support_radius_arcsec",
-                DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
-            )
+        arc_aware_noncritical_support_radius_arcsec=_resolve_arc_aware_noncritical_support_radius_arcsec(
+            saved_args.get("arc_aware_noncritical_support_radius_arcsec"),
+            match_tolerance_arcsec,
         ),
         arc_aware_max_arclength_arcsec=float(
             saved_args.get("arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
@@ -15234,6 +16285,17 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
         ),
         fold_curvature_arcsec_inv=float(
             saved_args.get("fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
+        ),
+        catastrophe_likelihood=str(saved_args.get("catastrophe_likelihood", DEFAULT_CATASTROPHE_LIKELIHOOD)),
+        catastrophe_lambda_on=float(saved_args.get("catastrophe_lambda_on", DEFAULT_CATASTROPHE_LAMBDA_ON)),
+        catastrophe_lambda_off=float(saved_args.get("catastrophe_lambda_off", DEFAULT_CATASTROPHE_LAMBDA_OFF)),
+        catastrophe_gap_on=float(saved_args.get("catastrophe_gap_on", DEFAULT_CATASTROPHE_GAP_ON)),
+        catastrophe_gap_off=float(saved_args.get("catastrophe_gap_off", DEFAULT_CATASTROPHE_GAP_OFF)),
+        catastrophe_tangential_variance_min=float(
+            saved_args.get(
+                "catastrophe_tangential_variance_min",
+                DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
+            )
         ),
         cab_likelihood_weight=cab_likelihood_weight,
         cab_finite_difference_step_arcsec=float(
@@ -16217,12 +17279,10 @@ def _build_cluster_evaluator_from_args(
         critical_arc_lm_trust_radius_arcsec=float(
             getattr(args, "critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
         ),
-        arc_aware_noncritical_support_radius_arcsec=float(
-            getattr(
-                args,
-                "arc_aware_noncritical_support_radius_arcsec",
-                DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
-            )
+        arc_aware_noncritical_support_radius_arcsec=getattr(
+            args,
+            "arc_aware_noncritical_support_radius_arcsec",
+            None,
         ),
         arc_aware_max_arclength_arcsec=float(
             getattr(args, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
@@ -16232,6 +17292,18 @@ def _build_cluster_evaluator_from_args(
         ),
         fold_curvature_arcsec_inv=float(
             getattr(args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
+        ),
+        catastrophe_likelihood=str(getattr(args, "catastrophe_likelihood", DEFAULT_CATASTROPHE_LIKELIHOOD)),
+        catastrophe_lambda_on=float(getattr(args, "catastrophe_lambda_on", DEFAULT_CATASTROPHE_LAMBDA_ON)),
+        catastrophe_lambda_off=float(getattr(args, "catastrophe_lambda_off", DEFAULT_CATASTROPHE_LAMBDA_OFF)),
+        catastrophe_gap_on=float(getattr(args, "catastrophe_gap_on", DEFAULT_CATASTROPHE_GAP_ON)),
+        catastrophe_gap_off=float(getattr(args, "catastrophe_gap_off", DEFAULT_CATASTROPHE_GAP_OFF)),
+        catastrophe_tangential_variance_min=float(
+            getattr(
+                args,
+                "catastrophe_tangential_variance_min",
+                DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
+            )
         ),
         cab_likelihood_weight=cab_likelihood_weight,
         cab_finite_difference_step_arcsec=float(
@@ -16693,6 +17765,7 @@ def _previous_stage_artifacts_dir_for_run_dir(run_dir: Path) -> Path | None:
         "stage4_anchored_solved_image_plane",
         "stage4_critical_arc_mixture_image_plane",
         "stage4_fold_regularized_image_plane",
+        "stage4_catastrophe_normal_form_image_plane",
     }:
         stage3_artifacts = run_dir.parent / "stage3_image_plane" / "artifacts"
         if _has_plot_artifacts(stage3_artifacts):
@@ -16802,9 +17875,10 @@ def _rerender_plots(
             args,
             "[plots-only] active_subset artifacts detected; using full lens model for validation and plots",
         )
+    match_tolerance_arcsec = float(saved_args.get("match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE))
     evaluator = ClusterJAXEvaluator(
         state=state,
-        match_tolerance_arcsec=float(saved_args.get("match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE)),
+        match_tolerance_arcsec=match_tolerance_arcsec,
         sampling_engine=plot_sampling_engine,
         active_scaling_galaxies=saved_args.get("active_scaling_galaxies"),
         active_scaling_selection=str(saved_args.get("active_scaling_selection", "adaptive")),
@@ -16865,11 +17939,9 @@ def _rerender_plots(
         critical_arc_lm_trust_radius_arcsec=float(
             saved_args.get("critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
         ),
-        arc_aware_noncritical_support_radius_arcsec=float(
-            saved_args.get(
-                "arc_aware_noncritical_support_radius_arcsec",
-                DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
-            )
+        arc_aware_noncritical_support_radius_arcsec=_resolve_arc_aware_noncritical_support_radius_arcsec(
+            saved_args.get("arc_aware_noncritical_support_radius_arcsec"),
+            match_tolerance_arcsec,
         ),
         arc_aware_max_arclength_arcsec=float(
             saved_args.get("arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
@@ -16879,6 +17951,17 @@ def _rerender_plots(
         ),
         fold_curvature_arcsec_inv=float(
             saved_args.get("fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
+        ),
+        catastrophe_likelihood=str(saved_args.get("catastrophe_likelihood", DEFAULT_CATASTROPHE_LIKELIHOOD)),
+        catastrophe_lambda_on=float(saved_args.get("catastrophe_lambda_on", DEFAULT_CATASTROPHE_LAMBDA_ON)),
+        catastrophe_lambda_off=float(saved_args.get("catastrophe_lambda_off", DEFAULT_CATASTROPHE_LAMBDA_OFF)),
+        catastrophe_gap_on=float(saved_args.get("catastrophe_gap_on", DEFAULT_CATASTROPHE_GAP_ON)),
+        catastrophe_gap_off=float(saved_args.get("catastrophe_gap_off", DEFAULT_CATASTROPHE_GAP_OFF)),
+        catastrophe_tangential_variance_min=float(
+            saved_args.get(
+                "catastrophe_tangential_variance_min",
+                DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
+            )
         ),
         cab_likelihood_weight=cab_likelihood_weight,
         cab_finite_difference_step_arcsec=float(
@@ -17004,6 +18087,7 @@ def _stage_banner_title_from_run_name(run_name: str) -> str:
         "stage4_anchored_solved_image_plane": "STAGE 4: stage4_anchored_solved_image_plane",
         "stage4_critical_arc_mixture_image_plane": "STAGE 4: stage4_critical_arc_mixture_image_plane",
         "stage4_fold_regularized_image_plane": "STAGE 4: stage4_fold_regularized_image_plane",
+        "stage4_catastrophe_normal_form_image_plane": "STAGE 4: stage4_catastrophe_normal_form_image_plane",
     }
     return labels.get(stage_name, stage_name or str(run_name))
 
@@ -17106,25 +18190,25 @@ def _final_enabled_sequential_stage_name(*, stage3_enabled: bool, stage4_enabled
     return "stage2"
 
 
-def _require_resume_fast_stage1_artifacts(stage1_run_dir: Path) -> None:
+def _require_fast_resume_stage1_artifacts(stage1_run_dir: Path) -> None:
     artifacts_dir = stage1_run_dir / "artifacts"
     if (artifacts_dir / "stage1_prior_summary.json").exists() or _has_plot_artifacts(artifacts_dir):
         return
     _fail(
-        "--resume-fast requires existing stage1 artifacts at "
-        f"{artifacts_dir}. Run the sequential workflow without --resume-fast first, "
+        "--resume fast requires existing stage1 artifacts at "
+        f"{artifacts_dir}. Run the sequential workflow without --resume fast first, "
         "or provide a completed stage1_large_only run."
     )
 
 
-def _require_resume_fast_plot_artifacts(stage_run_dir: Path, stage_name: str) -> None:
+def _require_fast_resume_plot_artifacts(stage_run_dir: Path, stage_name: str) -> None:
     artifacts_dir = stage_run_dir / "artifacts"
     if _has_plot_artifacts(artifacts_dir):
         return
     _fail(
-        "--resume-fast requires existing "
+        "--resume fast requires existing "
         f"{stage_name} plot artifacts at {artifacts_dir}. Run the sequential workflow "
-        "without --resume-fast first, or restore the previous-stage artifacts."
+        "without --resume fast first, or restore the previous-stage artifacts."
     )
 
 
@@ -17198,13 +18282,13 @@ def _stage_run_cosmology_compatible(stage_args: argparse.Namespace, run_dir: str
     return True, ""
 
 
-def _require_resume_fast_cosmology_compatibility(stage_args: argparse.Namespace, run_dir: Path, stage_name: str) -> None:
+def _require_fast_resume_cosmology_compatibility(stage_args: argparse.Namespace, run_dir: Path, stage_name: str) -> None:
     compatible, reason = _stage_run_cosmology_compatible(stage_args, run_dir)
     if compatible:
         return
     _fail(
-        f"--resume-fast cannot reuse {stage_name} at {run_dir}: {reason}. "
-        "Run again without --resume-fast so the stage can be regenerated."
+        f"--resume fast cannot reuse {stage_name} at {run_dir}: {reason}. "
+        "Run again without --resume fast so the stage can be regenerated."
     )
 
 
@@ -17233,6 +18317,8 @@ def _run_sequential(args: argparse.Namespace) -> None:
         return updates
 
     root_run_name = args.run_name or _make_run_name(args.par_path)
+    resume_mode = _resume_mode(args)
+    fast_resume = resume_mode == RESUME_MODE_FAST
     _log_stage_banner(
         args,
         "SEQUENTIAL WORKFLOW",
@@ -17241,7 +18327,7 @@ def _run_sequential(args: argparse.Namespace) -> None:
             f"stage3={'enabled' if stage3_enabled else 'disabled'} "
             f"stage4={'enabled' if stage4_enabled else 'disabled'} "
             f"start_at_stage3={bool(getattr(args, 'start_at_stage3', False))} "
-            f"resume_fast={bool(getattr(args, 'resume_fast', False))}"
+            f"resume_mode={resume_mode or 'none'}"
         ),
     )
     _log(
@@ -17256,8 +18342,7 @@ def _run_sequential(args: argparse.Namespace) -> None:
             f" stage4_max_tree_depth={stage4_controls.max_tree_depth if stage4_enabled else '<disabled>'}"
         ),
     )
-    resume = bool(getattr(args, "resume", False))
-    resume_fast = bool(getattr(args, "resume_fast", False))
+    resume = resume_mode is not None
     start_at_stage3 = bool(getattr(args, "start_at_stage3", False))
     final_stage_name = _final_enabled_sequential_stage_name(
         stage3_enabled=stage3_enabled,
@@ -17313,11 +18398,11 @@ def _run_sequential(args: argparse.Namespace) -> None:
             **stage_cosmology_updates(fit_stage_cosmology=False),
         )
         stage1_args = _force_quick_diagnostics_for_nonfinal_stage(stage1_args, stage1_run_name, exact_diagnostics_stage)
-        if resume_fast:
+        if fast_resume:
             stage1_run_dir = Path(args.output_dir) / stage1_run_name
-            _require_resume_fast_stage1_artifacts(stage1_run_dir)
-            _require_resume_fast_cosmology_compatibility(stage1_args, stage1_run_dir, "stage1_large_only")
-            _log(args, f"[resume-fast] skipping stage1 run_name={stage1_run_name} run_dir={stage1_run_dir}")
+            _require_fast_resume_stage1_artifacts(stage1_run_dir)
+            _require_fast_resume_cosmology_compatibility(stage1_args, stage1_run_dir, "stage1_large_only")
+            _log(args, f"[resume fast] skipping stage1 run_name={stage1_run_name} run_dir={stage1_run_dir}")
         else:
             stage1_run_dir = maybe_run_stage(
                 stage1_args,
@@ -17333,11 +18418,11 @@ def _run_sequential(args: argparse.Namespace) -> None:
             **stage_cosmology_updates(fit_stage_cosmology=False),
         )
         stage2_args = _force_quick_diagnostics_for_nonfinal_stage(stage2_args, stage2_run_name, exact_diagnostics_stage)
-        if resume_fast and final_stage_name != "stage2":
+        if fast_resume and final_stage_name != "stage2":
             stage2_run_dir = Path(args.output_dir) / stage2_run_name
-            _require_resume_fast_plot_artifacts(stage2_run_dir, "stage2_joint")
-            _require_resume_fast_cosmology_compatibility(stage2_args, stage2_run_dir, "stage2_joint")
-            _log(args, f"[resume-fast] skipping stage2 run_name={stage2_run_name} run_dir={stage2_run_dir}")
+            _require_fast_resume_plot_artifacts(stage2_run_dir, "stage2_joint")
+            _require_fast_resume_cosmology_compatibility(stage2_args, stage2_run_dir, "stage2_joint")
+            _log(args, f"[resume fast] skipping stage2 run_name={stage2_run_name} run_dir={stage2_run_dir}")
         else:
             stage2_run_dir = maybe_run_stage(
                 stage2_args,
@@ -17358,7 +18443,7 @@ def _run_sequential(args: argparse.Namespace) -> None:
         "fit_method": stage2_controls.fit_method,
         "image_plane_mode": str(args.image_plane_mode),
         "potfile_mass_size_reparam": bool(getattr(args, "potfile_mass_size_reparam", False)),
-        "resume_fast": bool(resume_fast),
+        "resume_mode": str(resume_mode or "none"),
         "start_at_stage3": bool(start_at_stage3),
         "stage_fit_controls": stage_fit_controls_payload,
         "skip_stage3_image_plane_local_jacobian": bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)),
@@ -17407,12 +18492,9 @@ def _run_sequential(args: argparse.Namespace) -> None:
         "critical_arc_lm_trust_radius_arcsec": float(
             getattr(args, "critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
         ),
-        "arc_aware_noncritical_support_radius_arcsec": float(
-            getattr(
-                args,
-                "arc_aware_noncritical_support_radius_arcsec",
-                DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
-            )
+        "arc_aware_noncritical_support_radius_arcsec": _resolve_arc_aware_noncritical_support_radius_arcsec(
+            getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
+            getattr(args, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE),
         ),
         "arc_aware_max_arclength_arcsec": float(
             getattr(args, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
@@ -17422,6 +18504,18 @@ def _run_sequential(args: argparse.Namespace) -> None:
         ),
         "fold_curvature_arcsec_inv": float(
             getattr(args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
+        ),
+        "catastrophe_likelihood": str(getattr(args, "catastrophe_likelihood", DEFAULT_CATASTROPHE_LIKELIHOOD)),
+        "catastrophe_lambda_on": float(getattr(args, "catastrophe_lambda_on", DEFAULT_CATASTROPHE_LAMBDA_ON)),
+        "catastrophe_lambda_off": float(getattr(args, "catastrophe_lambda_off", DEFAULT_CATASTROPHE_LAMBDA_OFF)),
+        "catastrophe_gap_on": float(getattr(args, "catastrophe_gap_on", DEFAULT_CATASTROPHE_GAP_ON)),
+        "catastrophe_gap_off": float(getattr(args, "catastrophe_gap_off", DEFAULT_CATASTROPHE_GAP_OFF)),
+        "catastrophe_tangential_variance_min": float(
+            getattr(
+                args,
+                "catastrophe_tangential_variance_min",
+                DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
+            )
         ),
         "cab_likelihood_weight": getattr(args, "cab_likelihood_weight", None),
         "cab_finite_difference_step_arcsec": float(
@@ -17508,11 +18602,11 @@ def _run_sequential(args: argparse.Namespace) -> None:
             **stage_cosmology_updates(fit_stage_cosmology=fit_cosmology_requested),
         )
         stage3_args = _force_quick_diagnostics_for_nonfinal_stage(stage3_args, stage3_run_name, exact_diagnostics_stage)
-        if resume_fast and final_stage_name != "stage3":
+        if fast_resume and final_stage_name != "stage3":
             stage3_run_dir = Path(args.output_dir) / stage3_run_name
-            _require_resume_fast_plot_artifacts(stage3_run_dir, "stage3_image_plane")
-            _require_resume_fast_cosmology_compatibility(stage3_args, stage3_run_dir, "stage3_image_plane")
-            _log(args, f"[resume-fast] skipping stage3 run_name={stage3_run_name} run_dir={stage3_run_dir}")
+            _require_fast_resume_plot_artifacts(stage3_run_dir, "stage3_image_plane")
+            _require_fast_resume_cosmology_compatibility(stage3_args, stage3_run_dir, "stage3_image_plane")
+            _log(args, f"[resume fast] skipping stage3 run_name={stage3_run_name} run_dir={stage3_run_dir}")
         else:
             stage3_init_values = None if start_at_stage3 else _physical_best_fit_values_from_artifacts(stage2_run_dir / "artifacts")
             stage3_run_dir = maybe_run_stage(
@@ -17537,8 +18631,8 @@ def _run_sequential(args: argparse.Namespace) -> None:
         if stage4_init_stage_dir is None:
             raise RuntimeError("Stage 4 initialization requires a completed stage 3 or stage 2 run.")
         stage4_init_artifacts_dir = stage4_init_stage_dir / "artifacts"
-        if resume_fast:
-            _require_resume_fast_plot_artifacts(stage4_init_artifacts_dir.parent, stage4_init_artifacts_dir.parent.name)
+        if fast_resume:
+            _require_fast_resume_plot_artifacts(stage4_init_artifacts_dir.parent, stage4_init_artifacts_dir.parent.name)
         stage4_run_name = str(Path(root_run_name) / _stage4_run_directory_name(args))
         stage4_init_values = _physical_best_fit_values_from_artifacts(stage4_init_artifacts_dir)
         source_position_priors = _source_position_prior_values_from_artifacts(stage4_init_artifacts_dir)
@@ -17658,6 +18752,7 @@ def _main_dispatch(args: argparse.Namespace, stage_fit_controls: dict[str, Stage
             root_dir / "stage4_anchored_solved_image_plane",
             root_dir / "stage4_critical_arc_mixture_image_plane",
             root_dir / "stage4_fold_regularized_image_plane",
+            root_dir / "stage4_catastrophe_normal_form_image_plane",
         ]
         if any(_has_plot_artifacts(stage_dir / "artifacts") for stage_dir in stage_dirs):
             exact_diagnostics_stage = _final_available_sequential_stage(stage_dirs)

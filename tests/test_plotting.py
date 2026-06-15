@@ -1730,6 +1730,8 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert "subhalo_mass_function" in captured_tasks
     assert "subhalo_radial_distribution" in captured_tasks
     assert "kappa_comparison" not in captured_tasks
+    assert "kappa_truth_diagnostics" not in captured_tasks
+    assert "kappa_recovery" not in captured_tasks
     assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" not in captured_tasks
 
@@ -1769,7 +1771,9 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
             caustic_source_redshift=9.0,
         ),
     )
-    assert "kappa_comparison" in captured_tasks
+    assert "kappa_truth_diagnostics" in captured_tasks
+    assert "kappa_comparison" not in captured_tasks
+    assert "kappa_recovery" not in captured_tasks
     assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" not in captured_tasks
 
@@ -1811,6 +1815,8 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         ),
     )
     assert "kappa_comparison" not in captured_tasks
+    assert "kappa_truth_diagnostics" not in captured_tasks
+    assert "kappa_recovery" not in captured_tasks
     assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" not in captured_tasks
 
@@ -2456,7 +2462,7 @@ def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None
             "arc_aware_reduced_chi_square": 1.8,
             "arc_aware_arc_supported_image_count": 2,
             "arc_aware_missing_image_count": 1,
-            "arc_aware_noncritical_support_radius_arcsec": 0.5,
+            "arc_aware_noncritical_support_radius_arcsec": 2.0,
             "chi_square_sigma_basis": "image_sigma_eff_arcsec",
             "chi_square_sigma_eff_median_arcsec": 0.59,
             "chi_square_sigma_eff_min_arcsec": 0.42,
@@ -2493,6 +2499,7 @@ def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None
     assert "N_missing" in text
     assert "fit-quality reference" in text
     assert "arc-aware caveat" in text
+    assert "arc_aware_noncritical_support_radius_arcsec=2" in text
     assert "diagnostic data points" not in text
     assert "diagnostic dof" not in text
     assert "AIC" not in text
@@ -3040,8 +3047,13 @@ def test_plot_kappa_true_comparison_uses_fits_grid_redshift_and_fixed_limits(
             Path(path).touch()
 
     axes = [FakeAxis(), FakeAxis()]
-    fig = FakeFig()
-    monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: (fig, axes))
+    figs = [FakeFig(), FakeFig()]
+    subplots_calls = iter(zip(figs, axes, strict=True))
+
+    def fake_subplots(*_args: Any, **_kwargs: Any) -> tuple[FakeFig, FakeAxis]:
+        return next(subplots_calls)
+
+    monkeypatch.setattr(plotting.plt, "subplots", fake_subplots)
     monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
     evaluator = FakeEvaluator()
 
@@ -3053,8 +3065,13 @@ def test_plot_kappa_true_comparison_uses_fits_grid_redshift_and_fixed_limits(
         caustic_source_redshift=9.0,
     )
 
-    assert (tmp_path / "kappa_comparison.pdf").exists()
-    assert fig.saved_paths == [tmp_path / "kappa_comparison.pdf"]
+    assert not (tmp_path / "kappa_comparison.pdf").exists()
+    assert (tmp_path / "kappa_model.pdf").exists()
+    assert (tmp_path / "kappa_fractional_residual.pdf").exists()
+    assert [path for fig in figs for path in fig.saved_paths] == [
+        tmp_path / "kappa_model.pdf",
+        tmp_path / "kappa_fractional_residual.pdf",
+    ]
     assert [float(item[0]) for item in evaluator.converted] == [4.0]
     assert evaluator.model_z == [9.0]
     assert evaluator.packed_z == [9.0]
@@ -3077,12 +3094,732 @@ def test_plot_kappa_true_comparison_uses_fits_grid_redshift_and_fixed_limits(
     assert residual_norm.vmax == pytest.approx(2.0)
     assert axes[0].inverted is True
     assert axes[1].inverted is True
-    assert axes[0].title == r"Model $\kappa$ (z=9)"
-    assert axes[1].title == r"Fractional $\kappa$ Residual"
-    assert [colorbar.labels for colorbar in fig.colorbars] == [
+    assert axes[0].title is None
+    assert axes[1].title is None
+    assert [colorbar.labels for fig in figs for colorbar in fig.colorbars] == [
         [r"$\kappa_{\rm model}$"],
         [r"$(\kappa_{\rm model} - \kappa_{\rm true}) / \kappa_{\rm true}$"],
     ]
+
+
+def test_plot_kappa_recovery_samples_every_pixel_and_writes_reduced_tables(tmp_path: Path) -> None:
+    true_path = tmp_path / "kappa_true.fits"
+    wcs = WCS(naxis=2)
+    wcs.wcs.crpix = [1.0, 1.0]
+    wcs.wcs.crval = [0.0, 0.0]
+    wcs.wcs.cdelt = [1.0 / 3600.0, 1.0 / 3600.0]
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    true_kappa = np.arange(9, dtype=np.float32).reshape(3, 3)
+    fits.PrimaryHDU(true_kappa, header=wcs.to_header()).writeto(true_path)
+
+    state = SimpleNamespace(z_lens=0.3, reference=(3, 0.0, 0.0), parameter_specs=[])
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.input_sizes: list[int] = []
+
+        def kappa(self, x: Any, y: Any, kwargs_lens: list[dict[str, float]]) -> np.ndarray:
+            assert kwargs_lens == [{"latent": 5.0}]
+            x_array = np.asarray(x, dtype=float)
+            self.input_sizes.append(int(x_array.size))
+            return 10.0 + np.arange(x_array.size, dtype=float)
+
+    class FakeEvaluator:
+        def __init__(self) -> None:
+            self.state = state
+            self.exact_models_by_z: dict[float, FakeModel] = {}
+            self.model_z: list[float] = []
+            self.packed_z: list[float] = []
+            self.model = FakeModel()
+
+        def reported_physical_to_latent_parameter_vector(self, theta: np.ndarray) -> np.ndarray:
+            return np.asarray(theta, dtype=float) + 1.0
+
+        def _get_exact_model_solver(self, z_source: float) -> tuple[FakeModel, None]:
+            self.model_z.append(float(z_source))
+            return self.model, None
+
+        def _build_packed_lens_state(self, sample_latent: Any, z_source: float) -> dict[str, float]:
+            self.packed_z.append(float(z_source))
+            return {"latent": float(np.asarray(sample_latent, dtype=float)[0])}
+
+        def _packed_to_kwargs_lens(self, packed_state: dict[str, float]) -> list[dict[str, float]]:
+            return [packed_state]
+
+    evaluator = FakeEvaluator()
+
+    plotting._plot_kappa_recovery(
+        tmp_path,
+        evaluator,
+        np.asarray([4.0], dtype=float),
+        true_path,
+        caustic_source_redshift=9.0,
+    )
+
+    assert (tmp_path / "kappa_recovery.pdf").exists()
+    binned = pd.read_csv(tmp_path / "tables" / "kappa_recovery_binned.csv")
+    summary = pd.read_csv(tmp_path / "tables" / "kappa_recovery_summary.csv")
+    assert not (tmp_path / "tables" / "kappa_recovery_samples.csv").exists()
+    assert not binned.empty
+    assert summary.loc[0, "total_pixel_count"] == 9
+    assert summary.loc[0, "finite_pixel_count"] == 9
+    assert evaluator.model.input_sizes == [9]
+    assert evaluator.model_z == [9.0]
+    assert evaluator.packed_z == [9.0]
+
+
+def test_kappa_recovery_overlays_observed_image_points(monkeypatch: Any, tmp_path: Path) -> None:
+    true_path = tmp_path / "kappa_true.fits"
+    wcs = WCS(naxis=2)
+    wcs.wcs.crpix = [1.0, 1.0]
+    wcs.wcs.crval = [0.0, 0.0]
+    wcs.wcs.cdelt = [1.0 / 3600.0, 1.0 / 3600.0]
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    fits.PrimaryHDU(np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32), header=wcs.to_header()).writeto(true_path)
+
+    state = SimpleNamespace(z_lens=0.3, reference=(3, 0.0, 0.0), parameter_specs=[])
+
+    class FakeModel:
+        def kappa(self, x: Any, y: Any, _kwargs_lens: list[dict[str, float]]) -> np.ndarray:
+            x_array = np.asarray(x, dtype=float)
+            y_array = np.asarray(y, dtype=float)
+            return 20.0 + x_array - y_array
+
+    class FakeEvaluator:
+        def __init__(self) -> None:
+            self.state = state
+            self.exact_models_by_z: dict[float, FakeModel] = {}
+            self.model = FakeModel()
+
+        def reported_physical_to_latent_parameter_vector(self, theta: np.ndarray) -> np.ndarray:
+            return np.asarray(theta, dtype=float)
+
+        def _get_exact_model_solver(self, _z_source: float) -> tuple[FakeModel, None]:
+            return self.model, None
+
+        def _build_packed_lens_state(self, _sample_latent: Any, _z_source: float) -> dict[str, float]:
+            return {}
+
+        def _packed_to_kwargs_lens(self, packed_state: dict[str, float]) -> list[dict[str, float]]:
+            return [packed_state]
+
+    captured: dict[str, Any] = {}
+
+    def fake_plot_quantity_recovery(_recovery: dict[str, Any], output_path: Path, **kwargs: Any) -> None:
+        captured.update(kwargs)
+        Path(output_path).touch()
+
+    monkeypatch.setattr(plotting, "_plot_quantity_recovery", fake_plot_quantity_recovery)
+    image_df = pd.DataFrame(
+        {
+            "family_id": ["1", "1"],
+            "image_label": ["1.a", "1.b"],
+            "x_obs_arcsec": [0.0, -1.0],
+            "y_obs_arcsec": [0.0, 0.0],
+        }
+    )
+
+    plotting._plot_kappa_recovery(
+        tmp_path,
+        FakeEvaluator(),
+        np.asarray([4.0], dtype=float),
+        true_path,
+        caustic_source_redshift=9.0,
+        image_df=image_df,
+    )
+
+    image_points = captured["image_points"]
+    np.testing.assert_allclose(image_points["true_value"].to_numpy(dtype=float), [1.0, 2.0])
+    np.testing.assert_allclose(image_points["model_value"].to_numpy(dtype=float), [20.0, 19.0])
+    assert image_points["image_label"].tolist() == ["1.a", "1.b"]
+
+
+def test_absolute_mu_truth_grid_derives_raw_abs_mu_from_kappa_and_gamma(tmp_path: Path) -> None:
+    def write_truth_fits(path: Path, data: np.ndarray) -> None:
+        wcs = WCS(naxis=2)
+        wcs.wcs.crpix = [1.0, 1.0]
+        wcs.wcs.crval = [0.0, 0.0]
+        wcs.wcs.cdelt = [1.0 / 3600.0, 1.0 / 3600.0]
+        wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        fits.PrimaryHDU(np.asarray(data, dtype=np.float32), header=wcs.to_header()).writeto(path)
+
+    kappa_path = tmp_path / "kappa.fits"
+    gammax_path = tmp_path / "gammax.fits"
+    gammay_path = tmp_path / "gammay.fits"
+    write_truth_fits(kappa_path, np.asarray([[0.0, 0.5], [1.0, np.nan]], dtype=float))
+    write_truth_fits(gammax_path, np.zeros((2, 2), dtype=float))
+    write_truth_fits(gammay_path, np.zeros((2, 2), dtype=float))
+
+    abs_mu, wcs = plotting._absolute_mu_truth_grid(kappa_path, gammax_path, gammay_path, cap=25.0)
+
+    np.testing.assert_allclose(abs_mu, [[1.0, 4.0], [np.inf, np.nan]], equal_nan=True)
+    assert wcs.has_celestial
+
+
+def test_absolute_mu_truth_grid_rejects_mismatched_truth_shapes(tmp_path: Path) -> None:
+    def write_truth_fits(path: Path, data: np.ndarray) -> None:
+        wcs = WCS(naxis=2)
+        wcs.wcs.crpix = [1.0, 1.0]
+        wcs.wcs.crval = [0.0, 0.0]
+        wcs.wcs.cdelt = [1.0 / 3600.0, 1.0 / 3600.0]
+        wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        fits.PrimaryHDU(np.asarray(data, dtype=np.float32), header=wcs.to_header()).writeto(path)
+
+    kappa_path = tmp_path / "kappa.fits"
+    gammax_path = tmp_path / "gammax.fits"
+    gammay_path = tmp_path / "gammay.fits"
+    write_truth_fits(kappa_path, np.zeros((2, 2), dtype=float))
+    write_truth_fits(gammax_path, np.zeros((2, 3), dtype=float))
+    write_truth_fits(gammay_path, np.zeros((2, 2), dtype=float))
+
+    with pytest.raises(ValueError, match="gammax truth FITS shape"):
+        plotting._absolute_mu_truth_grid(kappa_path, gammax_path, gammay_path)
+
+
+def test_plot_absolute_mu_truth_diagnostics_samples_every_pixel_and_writes_outputs(tmp_path: Path) -> None:
+    def write_truth_fits(path: Path, data: np.ndarray) -> None:
+        wcs = WCS(naxis=2)
+        wcs.wcs.crpix = [1.0, 1.0]
+        wcs.wcs.crval = [0.0, 0.0]
+        wcs.wcs.cdelt = [1.0 / 3600.0, 1.0 / 3600.0]
+        wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        fits.PrimaryHDU(np.asarray(data, dtype=np.float32), header=wcs.to_header()).writeto(path)
+
+    kappa_path = tmp_path / "kappa.fits"
+    gammax_path = tmp_path / "gammax.fits"
+    gammay_path = tmp_path / "gammay.fits"
+    write_truth_fits(kappa_path, np.zeros((3, 3), dtype=float))
+    write_truth_fits(gammax_path, np.zeros((3, 3), dtype=float))
+    write_truth_fits(gammay_path, np.zeros((3, 3), dtype=float))
+
+    state = SimpleNamespace(z_lens=0.3, reference=(3, 0.0, 0.0), parameter_specs=[])
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.input_sizes: list[int] = []
+
+        def magnification(self, x: Any, y: Any, kwargs_lens: list[dict[str, float]]) -> np.ndarray:
+            assert kwargs_lens == [{"latent": 5.0}]
+            x_array = np.asarray(x, dtype=float)
+            self.input_sizes.append(int(x_array.size))
+            return 10.0 + np.arange(x_array.size, dtype=float)
+
+    class FakeEvaluator:
+        def __init__(self) -> None:
+            self.state = state
+            self.exact_models_by_z: dict[float, FakeModel] = {}
+            self.model_z: list[float] = []
+            self.packed_z: list[float] = []
+            self.model = FakeModel()
+
+        def reported_physical_to_latent_parameter_vector(self, theta: np.ndarray) -> np.ndarray:
+            return np.asarray(theta, dtype=float) + 1.0
+
+        def _get_exact_model_solver(self, z_source: float) -> tuple[FakeModel, None]:
+            self.model_z.append(float(z_source))
+            return self.model, None
+
+        def _build_packed_lens_state(self, sample_latent: Any, z_source: float) -> dict[str, float]:
+            self.packed_z.append(float(z_source))
+            return {"latent": float(np.asarray(sample_latent, dtype=float)[0])}
+
+        def _packed_to_kwargs_lens(self, packed_state: dict[str, float]) -> list[dict[str, float]]:
+            return [packed_state]
+
+    evaluator = FakeEvaluator()
+
+    plotting._plot_abs_mu_truth_diagnostics(
+        tmp_path,
+        evaluator,
+        np.asarray([4.0], dtype=float),
+        kappa_path,
+        gammax_path,
+        gammay_path,
+        caustic_source_redshift=9.0,
+    )
+
+    assert not (tmp_path / "mu_comparison.pdf").exists()
+    assert (tmp_path / "mu_model.pdf").exists()
+    assert (tmp_path / "mu_fractional_residual.pdf").exists()
+    assert (tmp_path / "mu_recovery.pdf").exists()
+    binned = pd.read_csv(tmp_path / "tables" / "mu_recovery_binned.csv")
+    summary = pd.read_csv(tmp_path / "tables" / "mu_recovery_summary.csv")
+    assert list(binned.columns) == [
+        "bin_index",
+        "abs_mu_true_min",
+        "abs_mu_true_max",
+        "abs_mu_true_center",
+        "sample_count",
+        "abs_mu_model_q16",
+        "abs_mu_model_median",
+        "abs_mu_model_q84",
+    ]
+    assert summary.loc[0, "total_pixel_count"] == 9
+    assert summary.loc[0, "finite_pixel_count"] == 9
+    assert evaluator.model.input_sizes == [9]
+    assert evaluator.model_z == [9.0]
+    assert evaluator.packed_z == [9.0]
+
+
+def test_absolute_mu_recovery_overlays_observed_image_points(monkeypatch: Any, tmp_path: Path) -> None:
+    def write_truth_fits(path: Path, data: np.ndarray) -> None:
+        wcs = WCS(naxis=2)
+        wcs.wcs.crpix = [1.0, 1.0]
+        wcs.wcs.crval = [0.0, 0.0]
+        wcs.wcs.cdelt = [1.0 / 3600.0, 1.0 / 3600.0]
+        wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        fits.PrimaryHDU(np.asarray(data, dtype=np.float32), header=wcs.to_header()).writeto(path)
+
+    kappa_path = tmp_path / "kappa.fits"
+    gammax_path = tmp_path / "gammax.fits"
+    gammay_path = tmp_path / "gammay.fits"
+    write_truth_fits(kappa_path, np.asarray([[0.0, 0.5], [0.0, 0.0]], dtype=float))
+    write_truth_fits(gammax_path, np.zeros((2, 2), dtype=float))
+    write_truth_fits(gammay_path, np.zeros((2, 2), dtype=float))
+
+    state = SimpleNamespace(z_lens=0.3, reference=(3, 0.0, 0.0), parameter_specs=[])
+
+    class FakeModel:
+        def magnification(self, x: Any, _y: Any, _kwargs_lens: list[dict[str, float]]) -> np.ndarray:
+            x_array = np.asarray(x, dtype=float)
+            if x_array.size == 2:
+                return np.asarray([-3.0, 4.0], dtype=float)
+            return np.ones(x_array.shape, dtype=float)
+
+    class FakeEvaluator:
+        def __init__(self) -> None:
+            self.state = state
+            self.exact_models_by_z: dict[float, FakeModel] = {}
+            self.model = FakeModel()
+
+        def reported_physical_to_latent_parameter_vector(self, theta: np.ndarray) -> np.ndarray:
+            return np.asarray(theta, dtype=float)
+
+        def _get_exact_model_solver(self, _z_source: float) -> tuple[FakeModel, None]:
+            return self.model, None
+
+        def _build_packed_lens_state(self, _sample_latent: Any, _z_source: float) -> dict[str, float]:
+            return {}
+
+        def _packed_to_kwargs_lens(self, packed_state: dict[str, float]) -> list[dict[str, float]]:
+            return [packed_state]
+
+    captured: dict[str, Any] = {}
+
+    def fake_plot_quantity_recovery(_recovery: dict[str, Any], output_path: Path, **kwargs: Any) -> None:
+        captured.update(kwargs)
+        Path(output_path).touch()
+
+    monkeypatch.setattr(plotting, "_plot_abs_mu_true_comparison_from_grid", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plotting, "_plot_quantity_recovery", fake_plot_quantity_recovery)
+    image_df = pd.DataFrame(
+        {
+            "family_id": ["1", "1"],
+            "image_label": ["1.a", "1.b"],
+            "x_obs_arcsec": [0.0, -1.0],
+            "y_obs_arcsec": [0.0, 0.0],
+        }
+    )
+
+    plotting._plot_abs_mu_truth_diagnostics(
+        tmp_path,
+        FakeEvaluator(),
+        np.asarray([4.0], dtype=float),
+        kappa_path,
+        gammax_path,
+        gammay_path,
+        caustic_source_redshift=9.0,
+        image_df=image_df,
+    )
+
+    image_points = captured["image_points"]
+    np.testing.assert_allclose(image_points["true_value"].to_numpy(dtype=float), [1.0, 4.0])
+    np.testing.assert_allclose(image_points["model_value"].to_numpy(dtype=float), [3.0, 4.0])
+    assert image_points["image_label"].tolist() == ["1.a", "1.b"]
+
+
+def test_absolute_mu_comparison_labels_are_not_capped(monkeypatch: Any, tmp_path: Path) -> None:
+    class FakeColorbar:
+        def __init__(self) -> None:
+            self.labels: list[str] = []
+
+        def set_label(self, label: str) -> None:
+            self.labels.append(label)
+
+    class FakeAxis:
+        def __init__(self) -> None:
+            self.imshow_data: list[np.ndarray] = []
+            self.imshow_kwargs: list[dict[str, Any]] = []
+            self.title: str | None = None
+
+        def imshow(self, data: Any, **kwargs: Any) -> str:
+            self.imshow_data.append(np.ma.asarray(data).filled(np.nan))
+            self.imshow_kwargs.append(dict(kwargs))
+            return f"image-{len(self.imshow_kwargs)}"
+
+        def invert_xaxis(self) -> None:
+            return None
+
+        def set_xlabel(self, label: str) -> None:
+            return None
+
+        def set_ylabel(self, label: str) -> None:
+            return None
+
+        def set_title(self, title: str) -> None:
+            self.title = title
+
+    class FakeFig:
+        def __init__(self) -> None:
+            self.colorbars: list[FakeColorbar] = []
+            self.saved_paths: list[Path] = []
+
+        def colorbar(self, *_args: Any, **_kwargs: Any) -> FakeColorbar:
+            colorbar = FakeColorbar()
+            self.colorbars.append(colorbar)
+            return colorbar
+
+        def tight_layout(self) -> None:
+            return None
+
+        def savefig(self, path: Path, **_kwargs: Any) -> None:
+            self.saved_paths.append(Path(path))
+            Path(path).touch()
+
+    axes = [FakeAxis(), FakeAxis()]
+    figs = [FakeFig(), FakeFig()]
+    subplots_calls = iter(zip(figs, axes, strict=True))
+
+    def fake_subplots(*_args: Any, **_kwargs: Any) -> tuple[FakeFig, FakeAxis]:
+        return next(subplots_calls)
+
+    monkeypatch.setattr(plotting.plt, "subplots", fake_subplots)
+    monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
+
+    plotting._plot_abs_mu_true_comparison_from_grid(
+        tmp_path,
+        np.asarray([[1.0, 50.0], [0.0, np.nan]], dtype=float),
+        np.asarray([[2.0, 25.0], [5.0, 60.0]], dtype=float),
+        np.asarray([[0.0, 1.0], [0.0, 1.0]], dtype=float),
+        np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=float),
+        z_source=9.0,
+    )
+
+    assert not (tmp_path / "mu_comparison.pdf").exists()
+    assert (tmp_path / "mu_model.pdf").exists()
+    assert (tmp_path / "mu_fractional_residual.pdf").exists()
+    assert [path for fig in figs for path in fig.saved_paths] == [
+        tmp_path / "mu_model.pdf",
+        tmp_path / "mu_fractional_residual.pdf",
+    ]
+    all_text = [
+        *(label for fig in figs for colorbar in fig.colorbars for label in colorbar.labels),
+        *(axis.title or "" for axis in axes),
+    ]
+    assert all("capped" not in text.lower() for text in all_text)
+    assert axes[0].title is None
+    assert axes[1].title is None
+    np.testing.assert_allclose(axes[0].imshow_data[0], [[2.0, 25.0], [5.0, 60.0]])
+    np.testing.assert_allclose(axes[1].imshow_data[0], [[1.0, -0.5], [np.nan, np.nan]], equal_nan=True)
+    assert axes[0].imshow_kwargs[0]["vmax"] == pytest.approx(plotting.ABSOLUTE_MAGNIFICATION_PLOT_CAP)
+    residual_norm = axes[1].imshow_kwargs[0]["norm"]
+    assert isinstance(residual_norm, plotting.TwoSlopeNorm)
+    assert residual_norm.vmin == pytest.approx(-1.0)
+    assert residual_norm.vcenter == pytest.approx(0.0)
+    assert residual_norm.vmax == pytest.approx(4.0)
+    assert [colorbar.labels for fig in figs for colorbar in fig.colorbars] == [
+        [r"$|\mu_{\rm model}|$"],
+        [r"$(|\mu_{\rm model}| - |\mu_{\rm true}|) / |\mu_{\rm true}|$"],
+    ]
+
+
+def test_absolute_mu_recovery_keeps_raw_values_with_fixed_axis_and_uncapped_labels(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    class FakeColorbar:
+        def set_label(self, label: str) -> None:
+            return None
+
+    class FakeAxis:
+        def __init__(self) -> None:
+            self.xlim: tuple[float, float] | None = None
+            self.ylim: tuple[float, float] | None = None
+            self.xlabel: str | None = None
+            self.ylabel: str | None = None
+            self.title: str | None = None
+            self.plots: list[tuple[np.ndarray, np.ndarray, dict[str, Any]]] = []
+
+        def pcolormesh(self, *_args: Any, **_kwargs: Any) -> str:
+            return "mesh"
+
+        def plot(self, x: Any, y: Any, **kwargs: Any) -> None:
+            self.plots.append((np.asarray(x, dtype=float), np.asarray(y, dtype=float), dict(kwargs)))
+
+        def set_xlim(self, *args: Any) -> None:
+            self.xlim = tuple(float(value) for value in args)
+
+        def set_ylim(self, *args: Any) -> None:
+            self.ylim = tuple(float(value) for value in args)
+
+        def set_aspect(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def set_xlabel(self, label: str) -> None:
+            self.xlabel = label
+
+        def set_ylabel(self, label: str) -> None:
+            self.ylabel = label
+
+        def set_title(self, title: str) -> None:
+            self.title = title
+
+        def legend(self, **_kwargs: Any) -> None:
+            return None
+
+    class FakeFig:
+        def colorbar(self, *_args: Any, **_kwargs: Any) -> FakeColorbar:
+            return FakeColorbar()
+
+        def tight_layout(self) -> None:
+            return None
+
+        def savefig(self, path: Path, **_kwargs: Any) -> None:
+            Path(path).touch()
+
+    axis = FakeAxis()
+    monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: (FakeFig(), axis))
+    monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
+
+    plotting._write_abs_mu_recovery_from_grid(
+        tmp_path,
+        np.asarray([[1.0, 10.0, 28.0, 35.0, np.nan]], dtype=float),
+        np.asarray([[1.1, 20.0, 60.0, 100.0, 5.0]], dtype=float),
+        z_source=9.0,
+    )
+
+    summary = pd.read_csv(tmp_path / "tables" / "mu_recovery_summary.csv")
+    binned = pd.read_csv(tmp_path / "tables" / "mu_recovery_binned.csv")
+    assert summary.loc[0, "abs_mu_true_max"] == pytest.approx(35.0)
+    assert summary.loc[0, "abs_mu_model_max"] == pytest.approx(100.0)
+    assert summary.loc[0, "finite_pixel_count"] == 4
+    assert int(binned["sample_count"].sum()) == 3
+    assert float(binned["abs_mu_true_min"].min()) >= 0.0
+    assert float(binned["abs_mu_true_max"].max()) <= plotting.ABSOLUTE_MAGNIFICATION_RECOVERY_AXIS_MAX
+    assert float(binned["abs_mu_model_q84"].max()) == pytest.approx(60.0)
+    assert axis.xlim == pytest.approx((0.0, plotting.ABSOLUTE_MAGNIFICATION_RECOVERY_AXIS_MAX))
+    assert axis.ylim == pytest.approx((0.0, plotting.ABSOLUTE_MAGNIFICATION_RECOVERY_AXIS_MAX))
+    assert axis.title is None
+    assert all("capped" not in str(text).lower() for text in [axis.xlabel, axis.ylabel, axis.title])
+
+
+def test_quantity_recovery_plot_uses_sigma_percentiles(monkeypatch: Any, tmp_path: Path) -> None:
+    true_grid = np.ones((10, 10), dtype=float)
+    model_grid = np.linspace(0.4, 1.2, true_grid.size, dtype=float).reshape(true_grid.shape)
+    recovery = plotting._quantity_recovery_reduced(
+        true_grid,
+        model_grid,
+        "kappa",
+        histogram_bins=4,
+        stat_bins=1,
+        limits=(0.0, 2.0),
+    )
+
+    bin_table = recovery["bin_table"]
+    summary_table = recovery["summary_table"]
+    assert list(bin_table.columns) == [
+        "bin_index",
+        "kappa_true_min",
+        "kappa_true_max",
+        "kappa_true_center",
+        "sample_count",
+        "kappa_model_q16",
+        "kappa_model_median",
+        "kappa_model_q84",
+    ]
+    assert bin_table.loc[0, "kappa_model_q16"] == pytest.approx(np.percentile(model_grid, 16.0))
+    assert bin_table.loc[0, "kappa_model_q84"] == pytest.approx(np.percentile(model_grid, 84.0))
+    assert summary_table.loc[0, "kappa_fractional_residual_q2p5"] == pytest.approx(
+        np.percentile(model_grid - true_grid, 2.5)
+    )
+    assert summary_table.loc[0, "kappa_fractional_residual_q97p5"] == pytest.approx(
+        np.percentile(model_grid - true_grid, 97.5)
+    )
+    one_sigma_width = 0.5 * (
+        summary_table.loc[0, "kappa_fractional_residual_q84"]
+        - summary_table.loc[0, "kappa_fractional_residual_q16"]
+    )
+    assert summary_table.loc[0, "kappa_fractional_residual_sigma"] == pytest.approx(one_sigma_width)
+
+    class FakeColorbar:
+        def __init__(self) -> None:
+            self.labels: list[str] = []
+
+        def set_label(self, label: str) -> None:
+            self.labels.append(label)
+
+    class FakeAxis:
+        def __init__(self) -> None:
+            self.plots: list[tuple[Any, Any, dict[str, Any]]] = []
+
+        def pcolormesh(self, *_args: Any, **_kwargs: Any) -> str:
+            return "mesh"
+
+        def plot(self, x: Any, y: Any, **kwargs: Any) -> None:
+            self.plots.append((np.asarray(x, dtype=float), np.asarray(y, dtype=float), kwargs))
+
+        def set_xlim(self, *_args: Any) -> None:
+            return None
+
+        def set_ylim(self, *_args: Any) -> None:
+            return None
+
+        def set_aspect(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def set_xlabel(self, *_args: Any) -> None:
+            return None
+
+        def set_ylabel(self, *_args: Any) -> None:
+            return None
+
+        def set_title(self, *_args: Any) -> None:
+            return None
+
+        def legend(self, **_kwargs: Any) -> None:
+            return None
+
+    class FakeFig:
+        def colorbar(self, *_args: Any, **_kwargs: Any) -> FakeColorbar:
+            return FakeColorbar()
+
+        def tight_layout(self) -> None:
+            return None
+
+        def savefig(self, path: Path, **_kwargs: Any) -> None:
+            Path(path).touch()
+
+    axis = FakeAxis()
+    monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: (FakeFig(), axis))
+    monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
+
+    output_path = tmp_path / "kappa_recovery.pdf"
+    plotting._plot_quantity_recovery(
+        recovery,
+        output_path,
+        quantity="kappa",
+        true_label="true",
+        model_label="model",
+        title="recovery",
+    )
+
+    assert output_path.exists()
+    labels = [plot_kwargs.get("label") for _x, _y, plot_kwargs in axis.plots]
+    assert r"1$\sigma$ recovery" in labels
+    assert r"2$\sigma$ recovery" in labels
+    assert r"1$\sigma$ (16th/84th)" in labels
+    one_sigma_slopes = sorted(
+        y[-1] / x[-1]
+        for x, y, kwargs in axis.plots
+        if kwargs.get("linestyle") == "--"
+    )
+    two_sigma_slopes = sorted(
+        y[-1] / x[-1]
+        for x, y, kwargs in axis.plots
+        if kwargs.get("linestyle") == ":"
+    )
+    one_sigma_upper = 1.0 + one_sigma_width
+    two_sigma_upper = 1.0 + 2.0 * one_sigma_width
+    assert one_sigma_slopes == pytest.approx([1.0 / one_sigma_upper, one_sigma_upper])
+    assert two_sigma_slopes == pytest.approx([1.0 / two_sigma_upper, two_sigma_upper])
+    assert np.prod(one_sigma_slopes) == pytest.approx(1.0)
+    assert np.prod(two_sigma_slopes) == pytest.approx(1.0)
+
+
+def test_quantity_recovery_plot_overlays_observed_image_points(monkeypatch: Any, tmp_path: Path) -> None:
+    recovery = plotting._quantity_recovery_reduced(
+        np.asarray([[0.5, 1.5], [2.5, np.nan]], dtype=float),
+        np.asarray([[0.6, 1.6], [1.0, 0.2]], dtype=float),
+        "kappa",
+        histogram_bins=4,
+        stat_bins=1,
+        limits=(0.0, 2.0),
+    )
+    image_points = pd.DataFrame(
+        {
+            "true_value": [0.25, 1.5, 2.5, np.nan],
+            "model_value": [0.5, 1.4, 1.5, 0.7],
+        }
+    )
+
+    class FakeColorbar:
+        def set_label(self, _label: str) -> None:
+            return None
+
+    class FakeAxis:
+        def __init__(self) -> None:
+            self.scatters: list[tuple[np.ndarray, np.ndarray, dict[str, Any]]] = []
+
+        def pcolormesh(self, *_args: Any, **_kwargs: Any) -> str:
+            return "mesh"
+
+        def plot(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def scatter(self, x: Any, y: Any, **kwargs: Any) -> None:
+            self.scatters.append((np.asarray(x, dtype=float), np.asarray(y, dtype=float), dict(kwargs)))
+
+        def set_xlim(self, *_args: Any) -> None:
+            return None
+
+        def set_ylim(self, *_args: Any) -> None:
+            return None
+
+        def set_aspect(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def set_xlabel(self, *_args: Any) -> None:
+            return None
+
+        def set_ylabel(self, *_args: Any) -> None:
+            return None
+
+        def set_title(self, *_args: Any) -> None:
+            return None
+
+        def legend(self, **_kwargs: Any) -> None:
+            return None
+
+    class FakeFig:
+        def colorbar(self, *_args: Any, **_kwargs: Any) -> FakeColorbar:
+            return FakeColorbar()
+
+        def tight_layout(self) -> None:
+            return None
+
+        def savefig(self, path: Path, **_kwargs: Any) -> None:
+            Path(path).touch()
+
+    axis = FakeAxis()
+    monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: (FakeFig(), axis))
+    monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
+
+    plotting._plot_quantity_recovery(
+        recovery,
+        tmp_path / "kappa_recovery.pdf",
+        quantity="kappa",
+        true_label="true",
+        model_label="model",
+        image_points=image_points,
+    )
+
+    assert len(axis.scatters) == 1
+    scatter_x, scatter_y, scatter_kwargs = axis.scatters[0]
+    np.testing.assert_allclose(scatter_x, [0.25, 1.5])
+    np.testing.assert_allclose(scatter_y, [0.5, 1.4])
+    assert scatter_kwargs["label"] == "observed images"
+    assert scatter_kwargs["facecolors"] == "tab:orange"
+    assert scatter_kwargs["edgecolors"] == "black"
 
 
 def test_image_plane_fit_uses_family_colored_observed_cross_and_model_point(monkeypatch: Any, tmp_path: Path) -> None:

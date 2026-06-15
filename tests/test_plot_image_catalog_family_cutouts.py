@@ -397,6 +397,25 @@ def test_image_catalog_family_cutout_compact_labels_and_legend_handles() -> None
     assert handle_by_label["radial critical line"].get_linestyle() == "--"
 
 
+def test_image_catalog_axis_legend_uses_larger_font(monkeypatch: pytest.MonkeyPatch) -> None:
+    legend_calls: list[dict[str, object]] = []
+    original_legend = solver_plotting.plt.Axes.legend
+
+    def recording_legend(self: object, *args: object, **kwargs: object) -> object:
+        legend_calls.append(kwargs.copy())
+        return original_legend(self, *args, **kwargs)
+
+    monkeypatch.setattr(solver_plotting.plt.Axes, "legend", recording_legend)
+    fig, ax = plt.subplots()
+    try:
+        solver_plotting._add_image_catalog_axis_legend(ax)
+    finally:
+        plt.close(fig)
+
+    assert legend_calls
+    assert legend_calls[0]["fontsize"] == pytest.approx(12.0)
+
+
 def test_image_catalog_arc_support_geometry_uses_closest_curve_point() -> None:
     row = pd.Series(
         {
@@ -600,25 +619,46 @@ def test_image_catalog_overview_geometry_gates_arc_anchor_bounds() -> None:
     assert arc_size == pytest.approx(130.0)
 
 
-def test_image_catalog_cluster_overview_uses_observed_positions_only(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_image_catalog_cluster_overview_includes_model_extra_and_arc_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     catalog_df = pd.DataFrame(
         {
+            "image_label": ["1.1", "1.2"],
             "x_obs_arcsec": [0.0, 50.0],
             "y_obs_arcsec": [0.0, 10.0],
-            "x_model_arcsec": [1000.0, 1000.0],
-            "y_model_arcsec": [0.0, 0.0],
+            "x_model_arcsec": [2.0, np.nan],
+            "y_model_arcsec": [0.0, np.nan],
             "image_recovery_status": ["recovered", "not_recovered"],
-            "arc_recovery_status": ["point_recovered", "not_recovered"],
+            "arc_recovery_status": ["point_recovered", "arc_supported"],
+            "arc_candidate_supported": [False, True],
+            "arc_candidate_image_residual_arcsec": [np.nan, 0.25],
+            "arc_support_anchor_x_arcsec": [np.nan, 100.0],
+            "arc_support_anchor_y_arcsec": [np.nan, 0.0],
+            "arc_support_curve_x_arcsec": ["[]", "[50.0,100.0,120.0]"],
+            "arc_support_curve_y_arcsec": ["[]", "[10.0,0.0,0.0]"],
+            "arc_supported": [False, True],
+        }
+    )
+    extra_df = pd.DataFrame(
+        {
+            "x_model_arcsec": [-40.0],
+            "y_model_arcsec": [-10.0],
         }
     )
 
-    center_x, center_y, size = solver_plotting._image_catalog_cluster_overview_geometry(catalog_df)
+    center_x, center_y, size = solver_plotting._image_catalog_cluster_overview_geometry(catalog_df, extra_df)
 
-    assert center_x == pytest.approx(25.0)
-    assert center_y == pytest.approx(5.0)
-    assert size == pytest.approx(65.0)
+    assert center_x == pytest.approx(40.0)
+    assert center_y == pytest.approx(0.0)
+    assert size == pytest.approx(208.0)
 
     observed_statuses: list[str] = []
+    model_marker_count = 0
+    extra_marker_count = 0
+    residual_segment_count = 0
+    arc_curve_labels: list[str] = []
+    arc_component_labels: list[str] = []
 
     def fake_rgb(*_args: object, **_kwargs: object) -> np.ndarray:
         return np.zeros((100, 100, 3), dtype=np.uint8)
@@ -626,15 +666,34 @@ def test_image_catalog_cluster_overview_uses_observed_positions_only(monkeypatch
     def fake_observed_marker(*_args: object, status: str, **_kwargs: object) -> None:
         observed_statuses.append(status)
 
-    def fail_if_called(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("cluster overview should draw observed markers only")
+    def fake_model_marker(*_args: object, **_kwargs: object) -> None:
+        nonlocal model_marker_count
+        model_marker_count += 1
+
+    def fake_extra_marker(*_args: object, **_kwargs: object) -> None:
+        nonlocal extra_marker_count
+        extra_marker_count += 1
+
+    def fake_segment(*_args: object, **_kwargs: object) -> tuple[float, float]:
+        nonlocal residual_segment_count
+        residual_segment_count += 1
+        return (0.0, 0.0)
+
+    def fake_arc_curve(_ax: object, _image: object, _center: object, row: pd.Series, *_args: object, **_kwargs: object) -> bool:
+        arc_curve_labels.append(str(row.get("image_label", "")))
+        return True
+
+    def fake_arc_components(_ax: object, _image: object, _center: object, row: pd.Series, *_args: object, **_kwargs: object) -> bool:
+        arc_component_labels.append(str(row.get("image_label", "")))
+        return True
 
     monkeypatch.setattr(solver_plotting, "_image_catalog_draw_rgb_cutout", fake_rgb)
     monkeypatch.setattr(solver_plotting, "_draw_image_catalog_observed_marker", fake_observed_marker)
-    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_model_marker", fail_if_called)
-    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_extra_marker", fail_if_called)
-    monkeypatch.setattr(solver_plotting, "_draw_cutout_segment", fail_if_called)
-    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_arc_support_curve", fail_if_called)
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_model_marker", fake_model_marker)
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_extra_marker", fake_extra_marker)
+    monkeypatch.setattr(solver_plotting, "_draw_cutout_segment", fake_segment)
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_arc_support_curve", fake_arc_curve)
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_arc_supported_components", fake_arc_components)
 
     fig, ax = plt.subplots()
     try:
@@ -646,12 +705,18 @@ def test_image_catalog_cluster_overview_uses_observed_positions_only(monkeypatch
             object(),
             object(),
             catalog_df,
+            extra_df,
             (3, 10.0, 0.0),
         )
     finally:
         plt.close(fig)
 
-    assert observed_statuses == ["POINT_RECOVERED", "MISSED"]
+    assert observed_statuses == ["POINT_RECOVERED", "ARC_RECOVERED"]
+    assert model_marker_count == 1
+    assert extra_marker_count == 1
+    assert residual_segment_count == 1
+    assert arc_curve_labels == ["1.2"]
+    assert arc_component_labels == ["1.2"]
 
 
 def test_lock_cutout_axis_to_image_disables_autoscale() -> None:
@@ -838,8 +903,11 @@ def test_stage_image_catalog_family_cutouts_include_solver_diagnostics(
     )
 
     output = run_dir / "image_catalog_family_cutouts.pdf"
+    cluster_output = run_dir / "image_catalog_family_cluster.pdf"
     assert output.exists()
     assert output.stat().st_size > 0
+    assert cluster_output.exists()
+    assert cluster_output.stat().st_size > 0
     assert [call.tolist() for call in conversion_calls] == [[4.0]]
     assert z_calls == [2.3]
     assert packed_z_calls == [2.3]

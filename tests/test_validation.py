@@ -35,6 +35,7 @@ from lenscluster.jax_cosmology import (
 )
 from lenscluster.cluster_solver import (
     IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+    IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
     IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
     IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
     IMAGE_PLANE_MODE_FORWARD_METRIC,
@@ -43,6 +44,7 @@ from lenscluster.cluster_solver import (
     IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
     IMAGE_PLANE_MODE_NONE,
     SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
+    SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
     SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
     SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
     SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
@@ -53,6 +55,7 @@ from lenscluster.cluster_solver import (
     _anchored_solved_image_plane_step_from_jacobian,
     _build_cosmology,
     _build_parameter_specs,
+    _catastrophe_normal_form_image_plane_bin_loglike,
     _critical_arc_branch_probability,
     _critical_arc_geometry_from_jacobian,
     _critical_arc_lm_step_from_jacobian,
@@ -2910,19 +2913,26 @@ def test_plot_critical_arc_support_histogram_uses_q50_and_thresholds(
         }
     )
     hist_values: list[np.ndarray] = []
+    scatter_xy: list[tuple[np.ndarray, np.ndarray]] = []
     axvline_values: list[float] = []
     original_hist = Axes.hist
+    original_scatter = Axes.scatter
     original_axvline = Axes.axvline
 
     def record_hist(self: Axes, values: Any, *args: Any, **kwargs: Any) -> Any:
         hist_values.append(np.asarray(values, dtype=float))
         return original_hist(self, values, *args, **kwargs)
 
+    def record_scatter(self: Axes, x: Any, y: Any, *args: Any, **kwargs: Any) -> Any:
+        scatter_xy.append((np.asarray(x, dtype=float), np.asarray(y, dtype=float)))
+        return original_scatter(self, x, y, *args, **kwargs)
+
     def record_axvline(self: Axes, x: Any = 0, *args: Any, **kwargs: Any) -> Any:
         axvline_values.append(float(x))
         return original_axvline(self, x, *args, **kwargs)
 
     monkeypatch.setattr(Axes, "hist", record_hist)
+    monkeypatch.setattr(Axes, "scatter", record_scatter)
     monkeypatch.setattr(Axes, "axvline", record_axvline)
 
     validation._plot_critical_arc_support_histogram(
@@ -2932,8 +2942,60 @@ def test_plot_critical_arc_support_histogram_uses_q50_and_thresholds(
 
     assert any(np.allclose(values, [0.02, 0.2]) for values in hist_values)
     assert any(np.allclose(values, [0.04, 0.45]) for values in hist_values)
+    expected_log_s_min = np.log10(np.asarray([0.04, 0.5], dtype=float))
+    assert any(np.allclose(np.sort(values), np.sort(expected_log_s_min)) for values in hist_values)
+    probability_points = [
+        (x_values, y_values)
+        for x_values, y_values in scatter_xy
+        if y_values.size and np.all(np.isin(np.round(y_values, 8), np.round([0.75, 0.12], 8)))
+    ]
+    all_probability_x = np.concatenate([item[0] for item in probability_points])
+    all_probability_y = np.concatenate([item[1] for item in probability_points])
+    np.testing.assert_allclose(np.sort(all_probability_x), np.sort(expected_log_s_min))
+    np.testing.assert_allclose(np.sort(all_probability_y), [0.12, 0.75])
     assert any(value == pytest.approx(0.5) for value in axvline_values)
-    assert any(value == pytest.approx(0.2) for value in axvline_values)
+    assert any(value == pytest.approx(float(np.log10(0.2))) for value in axvline_values)
+
+
+def test_plot_critical_arc_support_histogram_overlays_configured_sigmoid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from matplotlib.axes import Axes
+
+    image_df = pd.DataFrame(
+        {
+            "arc_s_min": [0.02, 0.08, 0.3],
+            "arc_prior_probability": [0.65, 0.45, 0.22],
+            "arc_curve_distance_arcsec": [0.03, 0.2, 0.8],
+            "arc_recovery_status": ["arc_supported", "point_recovered", "not_recovered"],
+        }
+    )
+    sigmoid_curves: list[tuple[np.ndarray, np.ndarray]] = []
+    original_plot = Axes.plot
+
+    def record_plot(self: Axes, x: Any, y: Any, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("label") == "configured sigmoid":
+            sigmoid_curves.append((np.asarray(x, dtype=float), np.asarray(y, dtype=float)))
+        return original_plot(self, x, y, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "plot", record_plot)
+
+    validation._shared_plot_critical_arc_support_histogram(
+        image_df,
+        tmp_path / "critical_arc_support_histogram.pdf",
+        curve_support_radius_arcsec=0.5,
+        critical_arc_base_prob=0.20,
+        critical_arc_max_prob=0.70,
+        singular_threshold=0.08,
+        singular_softness=0.03,
+    )
+
+    assert len(sigmoid_curves) == 1
+    x_values, y_values = sigmoid_curves[0]
+    s_values = np.power(10.0, x_values)
+    expected = 0.20 + (0.70 - 0.20) / (1.0 + np.exp(-((0.08 - s_values) / 0.03)))
+    np.testing.assert_allclose(y_values, expected, rtol=1.0e-12, atol=1.0e-12)
 
 
 def test_plot_critical_arc_support_phase_space_draws_support_lines(
@@ -4012,20 +4074,22 @@ def _minimal_stage4_surrogate_state(*, fit_cosmology_flat_wcdm: bool = False) ->
         component_family=np.asarray([0, 1], dtype=np.int32),
         x_center_base=np.asarray([0.0, 1.0], dtype=float),
         y_center_base=np.asarray([0.0, 1.0], dtype=float),
-        ellipticite_base=float_zero.copy(),
-        angle_pos_base=float_zero.copy(),
+        e1_base=float_zero.copy(),
+        e2_base=float_zero.copy(),
         core_radius_kpc_base=np.asarray([5.0, 1.0], dtype=float),
         cut_radius_kpc_base=np.asarray([100.0, 20.0], dtype=float),
         v_disp_base=np.asarray([900.0, 120.0], dtype=float),
-        gamma_base=float_zero.copy(),
+        gamma1_base=float_zero.copy(),
+        gamma2_base=float_zero.copy(),
         x_center_param_index=int_minus_one.copy(),
         y_center_param_index=int_minus_one.copy(),
-        ellipticite_param_index=int_minus_one.copy(),
-        angle_pos_param_index=int_minus_one.copy(),
+        e1_param_index=int_minus_one.copy(),
+        e2_param_index=int_minus_one.copy(),
         core_radius_param_index=int_minus_one.copy(),
         cut_radius_param_index=int_minus_one.copy(),
         v_disp_param_index=int_minus_one.copy(),
-        gamma_param_index=int_minus_one.copy(),
+        gamma1_param_index=int_minus_one.copy(),
+        gamma2_param_index=int_minus_one.copy(),
         luminosity_ratio=np.ones(n_components, dtype=float),
         sigma_ref_base=np.asarray([0.0, 120.0], dtype=float),
         cut_ref_base=np.asarray([0.0, 20.0], dtype=float),
@@ -4184,6 +4248,26 @@ def test_fold_regularized_stage4_refreshing_surrogate_enables_with_zero_newton_s
     assert evaluator.image_presence_penalty_weight == pytest.approx(2.0)
 
 
+def test_catastrophe_stage4_refreshing_surrogate_enables_with_zero_newton_steps() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=_minimal_stage4_surrogate_state(),
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
+        image_plane_newton_steps=0,
+        catastrophe_likelihood="moment",
+        catastrophe_lambda_on=0.02,
+        catastrophe_lambda_off=0.07,
+        image_presence_penalty_weight=2.0,
+    )
+
+    assert evaluator.surrogate_enabled is True
+    assert evaluator.catastrophe_likelihood == "moment"
+    assert evaluator.catastrophe_lambda_on == pytest.approx(0.02)
+    assert evaluator.catastrophe_lambda_off == pytest.approx(0.07)
+    assert evaluator.image_presence_penalty_weight == pytest.approx(2.0)
+
+
 def test_zero_step_anchored_stage4_refreshing_surrogate_enables() -> None:
     evaluator = cluster_solver.ClusterJAXEvaluator(
         state=_minimal_stage4_surrogate_state(),
@@ -4297,6 +4381,33 @@ def test_fold_regularized_refresh_surrogate_populates_cached_curvature_and_masks
     far_indices = np.asarray(cache.fold_regularized_far_indices, dtype=np.int32)
     np.testing.assert_array_equal(np.sort(np.concatenate([near_indices, far_indices])), np.arange(n_obs, dtype=np.int32))
     assert np.intersect1d(near_indices, far_indices).size == 0
+
+
+def test_catastrophe_refresh_surrogate_populates_cached_moment_coefficients() -> None:
+    state = _minimal_stage4_surrogate_state()
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
+        image_plane_newton_steps=0,
+    )
+
+    evaluator.refresh_surrogate(cluster_solver._default_theta(state.parameter_specs), reason="test")
+
+    assert evaluator.surrogate_cache_by_z
+    cache = next(iter(evaluator.surrogate_cache_by_z.values()))
+    n_obs = len(state.bin_data[0].x_obs)
+    for field_name in (
+        "catastrophe_kappa",
+        "catastrophe_rho",
+        "catastrophe_kappa_tangent_x",
+        "catastrophe_kappa_tangent_y",
+    ):
+        value = getattr(cache, field_name)
+        assert value is not None
+        np.testing.assert_equal(np.asarray(value).shape, (n_obs,))
+        assert np.isfinite(value).all()
 
 
 def _fold_regularized_source_loglike_fake(
@@ -4513,9 +4624,55 @@ def test_refreshing_surrogate_enables_with_sampled_flat_wcdm_cosmology() -> None
     assert evaluator.surrogate_param_indices.tolist() == [0, 1, 2]
 
 
-def test_packed_lens_state_uses_lenstool_sigma0_and_ellipticity() -> None:
+def test_packed_lens_spec_converts_fixed_lenstool_shape_to_e1e2_base() -> None:
+    packed = cluster_solver._build_packed_lens_spec(
+        [
+            {
+                "profil": cluster_solver.DP_IE_PROFILE,
+                "ellipticite": 0.28,
+                "angle_pos": 12.0,
+                "core_radius_kpc": 5.0,
+                "cut_radius_kpc": 100.0,
+                "v_disp": 900.0,
+            },
+        ],
+        [[]],
+    )
+
+    expected_e1, expected_e2 = cluster_solver._lenstool_shape_to_e1e2(0.28, 12.0)
+
+    np.testing.assert_allclose(packed.e1_base, [expected_e1])
+    np.testing.assert_allclose(packed.e2_base, [expected_e2])
+    np.testing.assert_array_equal(packed.e1_param_index, [-1])
+    np.testing.assert_array_equal(packed.e2_param_index, [-1])
+
+
+def test_packed_lens_spec_converts_fixed_shear_to_gamma1gamma2_base() -> None:
+    packed = cluster_solver._build_packed_lens_spec(
+        [
+            {
+                "profil": cluster_solver.SHEAR_PROFILE,
+                "gamma": 0.04,
+                "angle_pos": 40.0,
+            },
+        ],
+        [[]],
+    )
+
+    expected_gamma1, expected_gamma2 = cluster_solver._shear_polar_to_gamma1gamma2(0.04, 40.0)
+
+    np.testing.assert_allclose(packed.gamma1_base, [expected_gamma1])
+    np.testing.assert_allclose(packed.gamma2_base, [expected_gamma2])
+    np.testing.assert_array_equal(packed.gamma1_param_index, [-1])
+    np.testing.assert_array_equal(packed.gamma2_param_index, [-1])
+
+
+def test_packed_lens_state_uses_direct_e1e2_and_lenstool_sigma0() -> None:
     state = _minimal_stage4_surrogate_state()
-    state.packed_lens_spec.ellipticite_base[:] = np.asarray([0.28, 0.12], dtype=float)
+    state.packed_lens_spec.e1_base[:] = np.asarray([0.02, 0.04], dtype=float)
+    state.packed_lens_spec.e2_base[:] = np.asarray([-0.01, 0.03], dtype=float)
+    state.packed_lens_spec.e1_param_index[0] = 0
+    state.packed_lens_spec.e2_param_index[0] = 1
     evaluator = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
@@ -4525,7 +4682,7 @@ def test_packed_lens_state_uses_lenstool_sigma0_and_ellipticity() -> None:
     )
 
     packed_state, details = evaluator._build_packed_lens_state_details_from_physical(
-        jnp.asarray([1.0], dtype=jnp.float64),
+        jnp.asarray([0.11, -0.07], dtype=jnp.float64),
         2.0,
         kpc_per_arcsec=jnp.asarray(10.0, dtype=jnp.float64),
         dpie_sigma0_factor=jnp.asarray(1.0, dtype=jnp.float64),
@@ -4533,10 +4690,39 @@ def test_packed_lens_state_uses_lenstool_sigma0_and_ellipticity() -> None:
 
     np.testing.assert_allclose(np.asarray(details["sigma0"]), [900.0**2 / 0.5, 120.0**2 / 0.1])
     np.testing.assert_allclose(np.asarray(packed_state["sigma0"]), [900.0**2 / 0.5, 120.0**2 / 0.1])
-    expected_q = np.sqrt((1.0 - np.asarray([0.28, 0.12])) / (1.0 + np.asarray([0.28, 0.12])))
-    expected_e1 = (1.0 - expected_q) / (1.0 + expected_q)
-    np.testing.assert_allclose(np.asarray(details["e1"]), expected_e1)
-    np.testing.assert_allclose(np.asarray(details["e2"]), [0.0, 0.0], atol=1.0e-15)
+    np.testing.assert_allclose(np.asarray(details["e1"]), [0.11, 0.04])
+    np.testing.assert_allclose(np.asarray(details["e2"]), [-0.07, 0.03])
+    np.testing.assert_allclose(np.asarray(packed_state["e1"]), [0.11, 0.04])
+    np.testing.assert_allclose(np.asarray(packed_state["e2"]), [-0.07, 0.03])
+
+
+def test_packed_lens_state_uses_direct_gamma1gamma2_for_shear() -> None:
+    state = _minimal_stage4_surrogate_state()
+    state.packed_lens_spec.profile_type[:] = np.asarray([cluster_solver.DP_IE_PROFILE, cluster_solver.SHEAR_PROFILE])
+    state.packed_lens_spec.component_family[:] = np.asarray([0, 0])
+    state.packed_lens_spec.gamma1_base[:] = np.asarray([0.0, 0.01], dtype=float)
+    state.packed_lens_spec.gamma2_base[:] = np.asarray([0.0, -0.02], dtype=float)
+    state.packed_lens_spec.gamma1_param_index[1] = 0
+    state.packed_lens_spec.gamma2_param_index[1] = 1
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
+        image_plane_newton_steps=0,
+    )
+
+    packed_state, details = evaluator._build_packed_lens_state_details_from_physical(
+        jnp.asarray([0.12, -0.08], dtype=jnp.float64),
+        2.0,
+        kpc_per_arcsec=jnp.asarray(10.0, dtype=jnp.float64),
+        dpie_sigma0_factor=jnp.asarray(1.0, dtype=jnp.float64),
+    )
+
+    np.testing.assert_allclose(np.asarray(details["gamma1"]), [0.0, 0.12])
+    np.testing.assert_allclose(np.asarray(details["gamma2"]), [0.0, -0.08])
+    np.testing.assert_allclose(np.asarray(packed_state["gamma1"]), [0.0, 0.12])
+    np.testing.assert_allclose(np.asarray(packed_state["gamma2"]), [0.0, -0.08])
 
 
 def test_sampled_cosmology_geometry_vectorizes_effective_redshift_factors() -> None:
@@ -5597,6 +5783,24 @@ def test_critical_arc_mixture_terms_sum_to_bin_loglike_without_presence_penalty(
     assert float(direct) == pytest.approx(float(expected), abs=1.0e-12)
 
 
+def _expected_fold_extra_var(
+    sigma_per_image: float,
+    singular_min: float,
+    singular_threshold: float,
+    singular_softness: float,
+) -> float:
+    """Independent re-derivation of the always-on magnification-fold extra variance.
+
+    Mirrors the formula in ``_critical_arc_mixture_image_plane_terms``: near a critical curve
+    the base covariance is inflated along the critical direction by ``(sigma_per_image /
+    singular_min)^2``, gated by the same sigmoid as ``arc_prob`` and capped.
+    """
+    gate = 1.0 / (1.0 + math.exp(-(singular_threshold - singular_min) / singular_softness))
+    floor = float(cluster_solver.CRITICAL_ARC_FOLD_SINGULAR_FLOOR)
+    cap = float(cluster_solver.CRITICAL_ARC_FOLD_MAX_ARC_SIGMA_ARCSEC)
+    return min((sigma_per_image / max(singular_min, floor)) ** 2 * gate, cap**2)
+
+
 def _critical_arc_terms_for_projector_test(
     projector_entries: tuple[float, float, float],
     residual_x: float,
@@ -5631,7 +5835,15 @@ def test_critical_arc_arc_branch_degenerate_limit_is_isotropic() -> None:
     sigma_arc = 5.0
     terms = _critical_arc_terms_for_projector_test((0.5, 0.0, 0.5), residual_x, residual_y, sigma_arc)
     sigma2 = 0.05**2 + 1.0e-12
-    isotropic_var = sigma2 + 0.5 * sigma_arc**2
+    # Fold gate is decoupled from the arc-mixture singular_threshold/softness: it uses its own
+    # baked-in constants, so the expected arc-branch fold must use them too.
+    fold = _expected_fold_extra_var(
+        0.05,
+        0.05,
+        cluster_solver.CRITICAL_ARC_FOLD_SINGULAR_THRESHOLD,
+        cluster_solver.CRITICAL_ARC_FOLD_SINGULAR_SOFTNESS,
+    )
+    isotropic_var = sigma2 + 0.5 * (sigma_arc**2 + fold)
     expected_arc_ll = (
         -math.log(2.0 * math.pi * isotropic_var)
         - (residual_x**2 + residual_y**2) / (2.0 * isotropic_var)
@@ -5649,7 +5861,15 @@ def test_critical_arc_arc_branch_reduces_to_two_axis_form_for_exact_projector(
     terms = _critical_arc_terms_for_projector_test(projector_entries, residual_x, residual_y, sigma_arc)
     p00, p01, p11 = projector_entries
     sigma2 = 0.05**2 + 1.0e-12
-    sigma_parallel2 = sigma2 + sigma_arc**2
+    # Fold gate is decoupled from the arc-mixture singular_threshold/softness: it uses its own
+    # baked-in constants, so the expected arc-branch fold must use them too.
+    fold = _expected_fold_extra_var(
+        0.05,
+        0.05,
+        cluster_solver.CRITICAL_ARC_FOLD_SINGULAR_THRESHOLD,
+        cluster_solver.CRITICAL_ARC_FOLD_SINGULAR_SOFTNESS,
+    )
+    sigma_parallel2 = sigma2 + sigma_arc**2 + fold
     critical_quad = residual_x**2 * p00 + 2.0 * residual_x * residual_y * p01 + residual_y**2 * p11
     noncritical_quad = residual_x**2 + residual_y**2 - critical_quad
     expected_arc_ll = -0.5 * (
@@ -5703,7 +5923,13 @@ def test_critical_arc_arc_branch_is_normalized_density_for_regularized_projector
         ]
     )
     sigma2 = 0.05**2 + 1.0e-12
-    covariance = sigma2 * np.eye(2) + sigma_arc**2 * projector
+    fold = _expected_fold_extra_var(
+        0.05,
+        float(np.asarray(singular_min)[0]),
+        cluster_solver.CRITICAL_ARC_FOLD_SINGULAR_THRESHOLD,
+        cluster_solver.CRITICAL_ARC_FOLD_SINGULAR_SOFTNESS,
+    )
+    covariance = sigma2 * np.eye(2) + (sigma_arc**2 + fold) * projector
     expected_arc_ll = -0.5 * (
         float(residual @ np.linalg.solve(covariance, residual))
         + 2.0 * math.log(2.0 * math.pi)
@@ -5712,6 +5938,87 @@ def test_critical_arc_arc_branch_is_normalized_density_for_regularized_projector
 
     assert bool(np.asarray(jnp.all(finite)))
     assert float(terms.arc_ll[0]) == pytest.approx(expected_arc_ll, rel=1.0e-12)
+
+
+def _critical_arc_point_ll_for_fold_test(singular_min: float, residual_x: float):
+    # Exact projector P = diag(1, 0): the critical (tangential) direction is axis 0.
+    return cluster_solver._critical_arc_mixture_image_plane_terms(
+        residual_x=jnp.asarray([residual_x], dtype=jnp.float64),
+        residual_y=jnp.asarray([0.0], dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([0.25], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999], dtype=jnp.float64),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        covariance_floor=0.0,
+        outlier_sigma_arcsec=50.0,
+        singular_min=jnp.asarray([singular_min], dtype=jnp.float64),
+        critical_direction_projector_entries=(
+            jnp.asarray([1.0], dtype=jnp.float64),
+            jnp.asarray([0.0], dtype=jnp.float64),
+            jnp.asarray([0.0], dtype=jnp.float64),
+        ),
+        residual_loss="gaussian",
+        critical_direction_sigma_arcsec=0.0,
+        base_prob=0.10,
+        max_prob=0.80,
+        singular_threshold=0.05,
+        singular_softness=0.02,
+    ).point_ll[0]
+
+
+def test_critical_arc_magnification_fold_off_far_from_critical() -> None:
+    # singular_min >> threshold: the gate is closed, so the point branch is the original
+    # isotropic sigma^2 I form -- point images away from caustics are untouched.
+    sigma2 = 0.25**2
+    point_ll = float(_critical_arc_point_ll_for_fold_test(1.0, 0.4))
+    expected_iso = -0.5 * (
+        0.4**2 / sigma2 + 2.0 * math.log(2.0 * math.pi) + 2.0 * math.log(sigma2)
+    )
+    assert point_ll == pytest.approx(expected_iso, rel=1.0e-9)
+
+
+def test_critical_arc_magnification_fold_bounds_tangential_gradient_on_critical() -> None:
+    # The whole point of the fold: on a critical curve the tangential-residual gradient of the
+    # point branch collapses (instead of blowing up with magnification), so NUTS can move.
+    g_far = float(jax.grad(lambda r: _critical_arc_point_ll_for_fold_test(1.0, r))(jnp.asarray(0.4)))
+    g_near = float(jax.grad(lambda r: _critical_arc_point_ll_for_fold_test(1.0e-6, r))(jnp.asarray(0.4)))
+    assert abs(g_near) < 1.0e-3 * abs(g_far)
+
+
+@pytest.mark.parametrize("lambda_min", [1.0e-2, 1.0e-4, 1.0e-6, 1.0e-8, 1.0e-12])
+def test_critical_arc_gating_gradient_does_not_explode_through_singular_min(lambda_min: float) -> None:
+    # Regression: stage4 SVI init failed ("Cannot find valid initial parameters") because the
+    # geometric gating (fold + arc_prob) is differentiated through singular_min = sqrt(lambda_min),
+    # whose 1/singular_min slope in the transition zone made d(loglike)/d(lambda_min) spike to
+    # ~1e6 per image and overflow numpyro's init check. The gating is detached (stop_gradient),
+    # so its lambda_min-channel gradient must be ~0 (it can only flow through residuals/sigma2).
+    def loglike_from_lambda(lam: jnp.ndarray) -> jnp.ndarray:
+        singular_min = jnp.sqrt(jnp.maximum(lam, 0.0) + 1.0e-24).reshape((1,))
+        terms = cluster_solver._critical_arc_mixture_image_plane_terms(
+            residual_x=jnp.asarray([0.5], dtype=jnp.float64),
+            residual_y=jnp.asarray([0.4], dtype=jnp.float64),
+            sigma_per_image=jnp.asarray([0.25], dtype=jnp.float64),
+            reliability_per_image=jnp.asarray([0.999], dtype=jnp.float64),
+            image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+            covariance_floor=1.0e-12,
+            outlier_sigma_arcsec=50.0,
+            singular_min=singular_min,
+            critical_direction_projector_entries=(
+                jnp.asarray([1.0], dtype=jnp.float64),
+                jnp.asarray([0.0], dtype=jnp.float64),
+                jnp.asarray([0.0], dtype=jnp.float64),
+            ),
+            residual_loss="gaussian",
+            critical_direction_sigma_arcsec=10.0,
+            base_prob=0.10,
+            max_prob=0.85,
+            singular_threshold=0.05,
+            singular_softness=0.02,
+        )
+        return jnp.sum(terms.mixture_ll)
+
+    grad = float(jax.grad(loglike_from_lambda)(jnp.asarray(lambda_min)))
+    assert np.isfinite(grad)
+    assert abs(grad) < 1.0e-6  # detached gating -> no lambda_min-channel gradient
 
 
 @pytest.mark.parametrize(
@@ -6020,6 +6327,7 @@ def test_critical_arc_aware_support_rejects_large_noncritical_direction_residual
         theta_obs_x=np.asarray([0.0]),
         theta_obs_y=np.asarray([0.0]),
         jacobian_at=_constant_arc_jacobian(0.05),
+        noncritical_support_radius_arcsec=0.5,
         lm_damping_relative=0.0,
         lm_damping_absolute=0.0,
     )
@@ -6043,6 +6351,7 @@ def test_critical_arc_aware_support_rejects_beyond_arclength_cap() -> None:
         theta_obs_x=np.asarray([0.0]),
         theta_obs_y=np.asarray([0.0]),
         jacobian_at=_constant_arc_jacobian(eps),
+        noncritical_support_radius_arcsec=0.5,
         lm_damping_relative=0.0,
         lm_damping_absolute=0.0,
     )
@@ -7060,7 +7369,122 @@ def test_decode_mode9_prior_accepts_finite_and_lower_only_truncation() -> None:
         cluster_solver._decode_parameter_prior([9, 900.0, 100.0, 300.0, 300.0], "halo.v_disp")
 
 
-def test_dpie_v_disp_normal_prior_uses_truncated_identity_transform() -> None:
+def test_dpie_elliptic_shape_priors_emit_direct_e1e2_specs() -> None:
+    specs, assignments, _lens_model_list = _build_parameter_specs(
+        [
+            {
+                "id": "halo",
+                "profil": cluster_solver.DP_IE_PROFILE,
+                "priors": {
+                    "ellipticite": [1, 0.0, 0.8, 0.02],
+                    "angle_pos": [1, -180.0, 180.0, 0.5],
+                },
+            },
+        ],
+    )
+
+    fields = [spec.field for spec in specs]
+    sample_names = [spec.sample_name for spec in specs]
+
+    assert fields == ["e1", "e2"]
+    assert sample_names == ["halo_e1", "halo_e2"]
+    assert assignments == [[("e1", 0), ("e2", 1)]]
+    assert all(spec.prior_kind == "uniform" for spec in specs)
+    assert all(spec.transform_kind == "identity" for spec in specs)
+    np.testing.assert_allclose([specs[0].lower, specs[0].upper], [-0.5, 0.5], atol=1.0e-12)
+    np.testing.assert_allclose([specs[1].lower, specs[1].upper], [-0.5, 0.5], atol=1.0e-12)
+
+
+def test_dpie_elliptic_shape_partial_prior_raises() -> None:
+    with pytest.raises(ValueError, match="partial shape priors"):
+        _build_parameter_specs(
+            [
+                {
+                    "id": "halo",
+                    "profil": cluster_solver.DP_IE_PROFILE,
+                    "priors": {"ellipticite": [1, 0.0, 0.8, 0.02]},
+                },
+            ],
+        )
+
+
+def test_real_inputs_emit_direct_dpie_shape_specs_without_ff_sims_shear() -> None:
+    a2744_path = Path("data/Bergamini/A2744_Bergamini23/Bergamini23_A2744_Normal.par")
+    hera_path = Path("data/ff_sims/hera/hera_lenscluster.par")
+    _parsed, _potentials_df, _images_df, _arcs_df, a2744_potentials = load_best_par(a2744_path)
+    _parsed, _potentials_df, _images_df, _arcs_df, hera_potentials = load_best_par(hera_path)
+
+    a2744_specs, _a2744_assignments, _a2744_lens = _build_parameter_specs(a2744_potentials)
+    hera_specs, _hera_assignments, _hera_lens = _build_parameter_specs(hera_potentials)
+
+    a2744_shape_fields = [spec.field for spec in a2744_specs if spec.potential_id in {str(i) for i in range(1, 9)}]
+    hera_shape_specs = [
+        spec
+        for spec in hera_specs
+        if spec.potential_id in {"O1", "O2"} and spec.field in {"e1", "e2", "ellipticite", "angle_pos"}
+    ]
+    hera_shear_specs = [spec for spec in hera_specs if spec.potential_id == "S1"]
+
+    assert a2744_shape_fields.count("e1") == 8
+    assert a2744_shape_fields.count("e2") == 8
+    assert "ellipticite" not in a2744_shape_fields
+    assert "angle_pos" not in a2744_shape_fields
+    assert [spec.sample_name for spec in hera_shape_specs] == ["O1_e1", "O1_e2", "O2_e1", "O2_e2"]
+    assert hera_shear_specs == []
+
+
+def test_shear_gamma_angle_priors_emit_direct_gamma1gamma2_specs() -> None:
+    specs, assignments, lens_model_list = _build_parameter_specs(
+        [
+            {
+                "id": "S1",
+                "profil": cluster_solver.SHEAR_PROFILE,
+                "priors": {
+                    "gamma": [1, 0.0, 0.3, 0.005],
+                    "angle_pos": [1, -180.0, 180.0, 0.5],
+                },
+            },
+        ],
+    )
+
+    assert lens_model_list == ["SHEAR"]
+    assert [spec.field for spec in specs] == ["gamma1", "gamma2"]
+    assert [spec.sample_name for spec in specs] == ["S1_gamma1", "S1_gamma2"]
+    assert assignments == [[("gamma1", 0), ("gamma2", 1)]]
+    assert all(spec.prior_kind == "uniform" for spec in specs)
+    assert all(spec.transform_kind == "identity" for spec in specs)
+    np.testing.assert_allclose([specs[0].lower, specs[0].upper], [-0.3, 0.3], atol=1.0e-12)
+    np.testing.assert_allclose([specs[1].lower, specs[1].upper], [-0.3, 0.3], atol=1.0e-12)
+
+
+def test_shear_partial_or_nonuniform_polar_prior_raises() -> None:
+    with pytest.raises(ValueError, match="partial shear priors"):
+        _build_parameter_specs(
+            [
+                {
+                    "id": "S1",
+                    "profil": cluster_solver.SHEAR_PROFILE,
+                    "priors": {"gamma": [1, 0.0, 0.3, 0.005]},
+                },
+            ],
+        )
+
+    with pytest.raises(ValueError, match="requires uniform gamma and angle_pos priors"):
+        _build_parameter_specs(
+            [
+                {
+                    "id": "S1",
+                    "profil": cluster_solver.SHEAR_PROFILE,
+                    "priors": {
+                        "gamma": [3, 0.04, 0.01],
+                        "angle_pos": [1, -180.0, 180.0, 0.5],
+                    },
+                },
+            ],
+        )
+
+
+def test_dpie_v_disp_normal_prior_uses_log_positive_transform() -> None:
     specs, _assignments, _lens_model_list = _build_parameter_specs(
         [
             {
@@ -7072,7 +7496,15 @@ def test_dpie_v_disp_normal_prior_uses_truncated_identity_transform() -> None:
     )
 
     spec = specs[0]
-    latent = np.asarray([[cluster_solver.VDISP_TRUNCATION_FLOOR_KM_S], [1.0], [float(spec.mean)]], dtype=float)
+    expected_mean, expected_std = cluster_solver._positive_lognormal_parameters(
+        900.0,
+        600.0,
+        floor=cluster_solver.VDISP_TRUNCATION_FLOOR_KM_S,
+    )
+    latent = np.asarray(
+        [[spec.lower], [np.log(1.0)], [float(spec.mean)]],
+        dtype=float,
+    )
     physical = cluster_solver._convert_sample_matrix_to_physical(
         latent,
         specs,
@@ -7081,19 +7513,25 @@ def test_dpie_v_disp_normal_prior_uses_truncated_identity_transform() -> None:
 
     assert spec.name == "halo.v_disp"
     assert spec.prior_kind == "truncated_normal"
-    assert spec.transform_kind == "identity"
-    assert spec.lower == pytest.approx(cluster_solver.VDISP_TRUNCATION_FLOOR_KM_S)
+    assert spec.transform_kind == "log_positive"
+    assert spec.lower == pytest.approx(np.log(cluster_solver.VDISP_TRUNCATION_FLOOR_KM_S))
     assert np.isinf(spec.upper)
-    assert spec.mean == pytest.approx(900.0)
-    assert spec.std == pytest.approx(600.0)
-    np.testing.assert_allclose(physical, latent)
-    assert np.isfinite(float(prior.log_prob(jnp.asarray(1.0))))
+    assert spec.mean == pytest.approx(expected_mean)
+    assert spec.std == pytest.approx(expected_std)
+    assert spec.physical_lower == pytest.approx(cluster_solver.VDISP_TRUNCATION_FLOOR_KM_S)
+    assert spec.physical_mean == pytest.approx(900.0)
+    assert spec.physical_std == pytest.approx(600.0)
+    np.testing.assert_allclose(
+        physical[:, 0],
+        [cluster_solver.VDISP_TRUNCATION_FLOOR_KM_S, 1.0, math.exp(expected_mean)],
+    )
+    assert np.isfinite(float(prior.log_prob(jnp.asarray(np.log(1.0)))))
     with pytest.warns(UserWarning, match="Out-of-support values"):
-        below_floor_log_prob = prior.log_prob(jnp.asarray(0.0))
+        below_floor_log_prob = prior.log_prob(jnp.asarray(spec.lower - 1.0))
     assert float(below_floor_log_prob) == -np.inf
 
 
-def test_dpie_v_disp_mode9_prior_uses_decoded_truncation_bounds() -> None:
+def test_dpie_v_disp_mode9_prior_uses_log_positive_truncation_bounds() -> None:
     specs, _assignments, _lens_model_list = _build_parameter_specs(
         [
             {
@@ -7105,16 +7543,52 @@ def test_dpie_v_disp_mode9_prior_uses_decoded_truncation_bounds() -> None:
     )
 
     spec = specs[0]
+    expected_mean, expected_std = cluster_solver._positive_lognormal_parameters(
+        900.0,
+        100.0,
+        floor=cluster_solver.VDISP_TRUNCATION_FLOOR_KM_S,
+    )
 
     assert spec.name == "halo.v_disp"
     assert spec.prior_kind == "truncated_normal"
-    assert spec.transform_kind == "identity"
-    assert spec.lower == pytest.approx(300.0)
-    assert spec.upper == pytest.approx(1500.0)
-    assert spec.mean == pytest.approx(900.0)
-    assert spec.std == pytest.approx(100.0)
+    assert spec.transform_kind == "log_positive"
+    assert spec.lower == pytest.approx(np.log(300.0))
+    assert spec.upper == pytest.approx(np.log(1500.0))
+    assert spec.mean == pytest.approx(expected_mean)
+    assert spec.std == pytest.approx(expected_std)
     assert spec.physical_lower == pytest.approx(300.0)
     assert spec.physical_upper == pytest.approx(1500.0)
+    assert spec.physical_mean == pytest.approx(900.0)
+    assert spec.physical_std == pytest.approx(100.0)
+
+
+def test_dpie_v_disp_uniform_prior_uses_log_positive_bounds() -> None:
+    specs, _assignments, _lens_model_list = _build_parameter_specs(
+        [
+            {
+                "id": "halo",
+                "profil": cluster_solver.DP_IE_PROFILE,
+                "priors": {"v_disp": [1, 450.0, 1200.0, 10.0]},
+            },
+        ],
+    )
+
+    spec = specs[0]
+    physical_values = np.asarray([450.0, 900.0, 1200.0], dtype=float)
+    latent = cluster_solver._convert_theta_to_latent(physical_values, specs * 3).reshape(-1)
+
+    assert spec.name == "halo.v_disp"
+    assert spec.prior_kind == "uniform"
+    assert spec.transform_kind == "log_positive"
+    assert spec.lower == pytest.approx(np.log(450.0))
+    assert spec.upper == pytest.approx(np.log(1200.0))
+    assert spec.physical_lower == pytest.approx(450.0)
+    assert spec.physical_upper == pytest.approx(1200.0)
+    assert np.log(450.0) <= float(latent[0]) <= np.log(1200.0)
+    assert np.log(450.0) <= float(latent[1]) <= np.log(1200.0)
+    assert np.log(450.0) <= float(latent[2]) <= np.log(1200.0)
+    np.testing.assert_allclose(latent, np.log(physical_values))
+    np.testing.assert_allclose(cluster_solver._convert_theta_to_physical(latent, specs * 3), physical_values)
 
 
 def test_potfile_mode9_scaling_priors_transform_bounds_to_latent_log_space() -> None:
@@ -7270,7 +7744,84 @@ def test_potfile_mass_size_reparam_vector_site_init_and_extraction() -> None:
     np.testing.assert_allclose(extracted, np.asarray([[[0.1, -0.2], [0.3, -0.4]]], dtype=float))
 
 
-def test_stage2_large_priors_keep_truncated_vdisp_identity_summary_values() -> None:
+def test_svi_initial_value_dict_preserves_potfile_mass_size_reparam_vector_coordinates() -> None:
+    specs, _param_indices, _ = cluster_solver._build_scaling_parameter_specs(
+        [
+            {
+                "id": "members",
+                "type": cluster_solver.DP_IE_PROFILE,
+                "catalog_df": pd.DataFrame({"id": ["member"]}),
+                "core_arcsec": 0.1,
+                "sigma": [9, 245.0, 55.0, 190.0, 300.0],
+                "cut": [9, 5.25, 4.75, 0.5, 10.0],
+            }
+        ],
+        kpc_per_arcsec=10.0,
+        potfile_mass_size_reparam=True,
+    )
+    site_name = specs[0].sample_site_name
+
+    payload = cluster_solver._svi_initial_value_dict(
+        specs,
+        {
+            specs[0].sample_name: 0.0,
+            specs[1].sample_name: 0.0,
+        },
+    )
+    assert payload is not None
+    assert site_name is not None
+
+    unconstrained = cluster_solver.unconstrain_fn(
+        cluster_solver._sample_site_model(specs),
+        model_args=(),
+        model_kwargs={},
+        params=payload,
+    )
+
+    np.testing.assert_allclose(np.asarray(payload[site_name], dtype=float), [0.0, 0.0])
+    assert np.all(np.isfinite(np.asarray(unconstrained[site_name], dtype=float)))
+
+
+def _log_uniform_image_plane_scatter_spec(floor_arcsec: float = 0.1, upper_arcsec: float = 0.5) -> ParameterSpec:
+    return cluster_solver._build_image_scatter_parameter_spec(
+        0,
+        floor_arcsec=floor_arcsec,
+        upper_arcsec=upper_arcsec,
+        prior=cluster_solver.IMAGE_PLANE_SCATTER_PRIOR_LOG_UNIFORM,
+    )
+
+
+def test_initial_latent_value_from_physical_clips_log_uniform_image_plane_scatter_floor() -> None:
+    spec = _log_uniform_image_plane_scatter_spec()
+
+    clipped_init = cluster_solver._initial_latent_value_from_physical(0.1, spec)
+
+    assert spec.lower < clipped_init < spec.upper
+    assert clipped_init == pytest.approx(
+        spec.lower + cluster_solver.DEFAULT_NUTS_INIT_BOUNDARY_FRAC * (spec.upper - spec.lower)
+    )
+    assert math.exp(clipped_init) == pytest.approx(0.10327, rel=1.0e-4)
+
+
+def test_svi_initial_value_dict_clips_exact_bound_image_plane_scatter_init() -> None:
+    spec = _log_uniform_image_plane_scatter_spec()
+
+    payload = cluster_solver._svi_initial_value_dict([spec], {"image_sigma_int": spec.lower})
+    assert payload is not None
+
+    unconstrained = cluster_solver.unconstrain_fn(
+        cluster_solver._sample_site_model([spec]),
+        model_args=(),
+        model_kwargs={},
+        params=payload,
+    )
+
+    clipped_value = float(np.asarray(payload["image_sigma_int"], dtype=float))
+    assert spec.lower < clipped_value < spec.upper
+    assert np.all(np.isfinite(np.asarray(unconstrained["image_sigma_int"], dtype=float)))
+
+
+def test_stage2_large_priors_convert_log_vdisp_summary_values_to_latent_moments() -> None:
     large_specs, _assignments, _lens_model_list = _build_parameter_specs(
         [
             {
@@ -7288,14 +7839,21 @@ def test_stage2_large_priors_keep_truncated_vdisp_identity_summary_values() -> N
 
     stage2_specs = cluster_solver._build_stage2_large_parameter_specs(large_specs, summary)
     stage2_spec = stage2_specs[0]
+    expected_mean, expected_std = cluster_solver._positive_lognormal_parameters(
+        900.0,
+        90.0,
+        floor=cluster_solver.VDISP_TRUNCATION_FLOOR_KM_S,
+    )
     physical_center = cluster_solver._convert_theta_to_physical(np.asarray([stage2_spec.mean]), stage2_specs)[0]
 
     assert stage2_spec.prior_kind == "truncated_normal"
-    assert stage2_spec.transform_kind == "identity"
-    assert stage2_spec.lower == pytest.approx(cluster_solver.VDISP_TRUNCATION_FLOOR_KM_S)
-    assert stage2_spec.mean == pytest.approx(900.0)
-    assert stage2_spec.std == pytest.approx(90.0)
-    assert physical_center == pytest.approx(900.0)
+    assert stage2_spec.transform_kind == "log_positive"
+    assert stage2_spec.lower == pytest.approx(np.log(cluster_solver.VDISP_TRUNCATION_FLOOR_KM_S))
+    assert stage2_spec.mean == pytest.approx(expected_mean)
+    assert stage2_spec.std == pytest.approx(expected_std)
+    assert stage2_spec.physical_mean == pytest.approx(900.0)
+    assert stage2_spec.physical_std == pytest.approx(90.0)
+    assert physical_center == pytest.approx(math.exp(expected_mean))
 
 
 def test_truncated_vdisp_default_theta_and_init_are_clipped_to_support() -> None:
@@ -7356,6 +7914,15 @@ def test_packed_lens_validity_allows_negative_finite_vdisp_and_rejects_nonfinite
 
     assert bool(validity["is_valid"]) is False
     assert bool(np.asarray(validity["reason_flags"])[reason_index]) is True
+
+    details["v_disp"] = jnp.asarray([500.0, -10.0])
+    details["e1"] = jnp.asarray([0.8, 0.0])
+    details["e2"] = jnp.asarray([0.7, 0.0])
+    validity = cluster_solver.ClusterJAXEvaluator._packed_lens_validity(evaluator, details)
+    shape_reason_index = cluster_solver.INVALID_STATE_REASON_NAMES.index("nonfinite_shape")
+
+    assert bool(validity["is_valid"]) is False
+    assert bool(np.asarray(validity["reason_flags"])[shape_reason_index]) is True
 
 
 def test_nuts_quality_diagnostics_flag_stuck_tree_depth_and_rhat() -> None:
@@ -8195,7 +8762,8 @@ def test_cluster_solver_accepts_start_at_stage3_for_local_jacobian(monkeypatch: 
             "--image-plane-mode",
             IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
             "--start-at-stage3",
-            "--resume-fast",
+            "--resume",
+            "fast",
             "--fit-method",
             "svi+nuts",
             "svi",
@@ -8215,7 +8783,7 @@ def test_cluster_solver_accepts_start_at_stage3_for_local_jacobian(monkeypatch: 
     controls = _normalize_stage_fit_controls(args)
 
     assert args.start_at_stage3 is True
-    assert args.resume_fast is True
+    assert args.resume == "fast"
     assert controls["stage3"].fit_method == "svi"
     assert controls["stage3"].svi_steps == 400
     assert controls["stage3"].warmup == 0
@@ -8245,7 +8813,7 @@ def test_cluster_solver_rejects_invalid_start_at_stage3_controls(
         image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
         start_at_stage3=True,
         skip_stage3_image_plane_local_jacobian=False,
-        resume_fast=False,
+        resume=False,
         fit_method=["svi+nuts", "svi"],
         svi_steps=[1000, 400],
         warmup=[200, 0],
@@ -8428,6 +8996,32 @@ def test_cluster_solver_accepts_critical_arc_mixture_image_plane_mode(
     assert controls["stage4"].fit_method == "svi+nuts"
 
 
+def test_cluster_solver_arc_aware_support_radius_defaults_to_match_tolerance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+            "--match-tolerance-arcsec",
+            "2.0",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.arc_aware_noncritical_support_radius_arcsec is None
+    assert cluster_solver._resolve_arc_aware_noncritical_support_radius_arcsec(
+        args.arc_aware_noncritical_support_radius_arcsec,
+        args.match_tolerance_arcsec,
+    ) == pytest.approx(2.0)
+
+
 def test_cluster_solver_accepts_fold_regularized_image_plane_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8459,6 +9053,55 @@ def test_cluster_solver_accepts_fold_regularized_image_plane_mode(
         == SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE
     )
     assert cluster_solver._stage4_run_directory_name(args) == "stage4_fold_regularized_image_plane"
+    assert controls["stage4"].fit_method == "svi+nuts"
+
+
+def test_cluster_solver_accepts_catastrophe_normal_form_image_plane_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
+            "--sampling-engine",
+            "refreshing_surrogate",
+            "--catastrophe-likelihood",
+            "envelope",
+            "--catastrophe-lambda-on",
+            "0.02",
+            "--catastrophe-lambda-off",
+            "0.09",
+            "--catastrophe-gap-on",
+            "1e-6",
+            "--catastrophe-gap-off",
+            "1e-3",
+            "--catastrophe-tangential-variance-min",
+            "1e-10",
+            "--image-plane-newton-steps",
+            "0",
+        ],
+    )
+
+    args = _parse_args()
+    controls = _normalize_stage_fit_controls(args)
+
+    assert args.image_plane_mode == IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM
+    assert args.catastrophe_likelihood == "envelope"
+    assert args.catastrophe_lambda_on == pytest.approx(0.02)
+    assert args.catastrophe_lambda_off == pytest.approx(0.09)
+    assert args.catastrophe_gap_on == pytest.approx(1.0e-6)
+    assert args.catastrophe_gap_off == pytest.approx(1.0e-3)
+    assert args.catastrophe_tangential_variance_min == pytest.approx(1.0e-10)
+    assert (
+        cluster_solver._stage4_sample_likelihood_mode(args)
+        == SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE
+    )
+    assert cluster_solver._stage4_run_directory_name(args) == "stage4_catastrophe_normal_form_image_plane"
     assert controls["stage4"].fit_method == "svi+nuts"
 
 
@@ -8872,6 +9515,9 @@ def test_numpyro_nuts_sampler_passes_dense_mass_to_numpyro(
         def run(self, *_args, **_kwargs) -> None:
             return None
 
+        def print_summary(self) -> None:
+            captured["print_summary_calls"] = captured.get("print_summary_calls", 0) + 1
+
         def get_samples(self, group_by_chain: bool = False):
             assert group_by_chain is True
             return {"halo_x": jnp.asarray([[0.1, 0.2]], dtype=jnp.float64)}
@@ -8922,6 +9568,7 @@ def test_numpyro_nuts_sampler_passes_dense_mass_to_numpyro(
     posterior = cluster_solver._run_numpyro_nuts_sampler(args, state, evaluator, object(), init)
 
     assert captured["nuts_kwargs"]["dense_mass"] is dense_mass
+    assert captured["print_summary_calls"] == 1
     assert posterior.init_diagnostics["dense_mass"] is dense_mass
     assert posterior.init_diagnostics["nuts_dense_mass"] is dense_mass
 
@@ -10423,7 +11070,7 @@ def test_validation_stage_fit_controls_accept_start_at_stage3() -> None:
         image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
         start_at_stage3=True,
         skip_stage3_image_plane_local_jacobian=False,
-        resume_fast=True,
+        resume="fast",
     )
 
     controls = _normalize_validation_stage_fit_controls(args)
@@ -10468,7 +11115,7 @@ def test_validation_stage_fit_controls_reject_invalid_start_at_stage3_controls(
         image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
         start_at_stage3=True,
         skip_stage3_image_plane_local_jacobian=False,
-        resume_fast=False,
+        resume=False,
     )
     payload.update(updates)
 
@@ -11276,6 +11923,43 @@ def test_validation_parser_accepts_fold_regularized_image_plane_controls() -> No
     assert controls["stage4"].fit_method == "svi+nuts"
 
 
+def test_validation_parser_accepts_catastrophe_normal_form_image_plane_controls() -> None:
+    args = validation._build_parser().parse_args(
+        [
+            "--image-plane-mode",
+            IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
+            "--sampling-engine",
+            "refreshing_surrogate",
+            "--catastrophe-likelihood",
+            "envelope",
+            "--catastrophe-lambda-on",
+            "0.02",
+            "--catastrophe-lambda-off",
+            "0.09",
+            "--catastrophe-gap-on",
+            "1e-6",
+            "--catastrophe-gap-off",
+            "1e-3",
+            "--catastrophe-tangential-variance-min",
+            "1e-10",
+            "--image-plane-newton-steps",
+            "0",
+        ]
+    )
+
+    controls = _normalize_validation_stage_fit_controls(args)
+
+    assert args.image_plane_mode == IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM
+    assert args.catastrophe_likelihood == "envelope"
+    assert args.catastrophe_lambda_on == pytest.approx(0.02)
+    assert args.catastrophe_lambda_off == pytest.approx(0.09)
+    assert args.catastrophe_gap_on == pytest.approx(1.0e-6)
+    assert args.catastrophe_gap_off == pytest.approx(1.0e-3)
+    assert args.catastrophe_tangential_variance_min == pytest.approx(1.0e-10)
+    assert validation._validation_final_stage_name(args) == "stage4_catastrophe_normal_form_image_plane"
+    assert controls["stage4"].fit_method == "svi+nuts"
+
+
 @pytest.mark.parametrize(
     ("flag", "value"),
     [
@@ -11298,19 +11982,18 @@ def test_validation_parser_rejects_removed_critical_arc_speed_controls(flag: str
 def test_run_xsh_critical_arc_mode_selects_new_image_plane_mode() -> None:
     text = (Path(__file__).resolve().parents[1] / "run.xsh").read_text(encoding="utf-8")
 
-    assert 'mode = "critical_arc"' in text
     assert '"fold_regularized": "fold-regularized-forward-beta-image-plane"' in text
     assert '"--fold-curvature-arcsec-inv", 1.0' in text
     assert '"critical_arc": "critical-arc-mixture-image-plane"' in text
     assert 'sampling_engine = "refreshing_surrogate"' in text
-    assert '"--critical-arc-critical-direction-sigma-arcsec", 10.0' in text
+    assert '"--critical-arc-critical-direction-sigma-arcsec", 5.0' in text
     assert '"--critical-arc-base-prob", 0.10' in text
     assert '"--critical-arc-max-prob", 0.85' in text
-    assert '"--critical-arc-singular-threshold", 0.40' in text
-    assert '"--critical-arc-singular-softness", 0.10' in text
+    assert '"--critical-arc-singular-threshold", 0.05' in text
+    assert '"--critical-arc-singular-softness", 0.02' in text
     assert '"--critical-arc-lm-trust-radius-arcsec", 20.0' in text
     assert "--critical-arc-speed-mode" not in text
-    assert '"--arc-aware-noncritical-support-radius-arcsec", 1.0' in text
+    assert '"--arc-aware-noncritical-support-radius-arcsec"' not in text
     assert '"--arc-aware-max-arclength-arcsec", 10.0' in text
     assert '"--arc-aware-curve-step-arcsec", 0.1' in text
     assert '"--match-tolerance-arcsec", 2.0' in text
@@ -11560,14 +12243,21 @@ def test_validation_parser_rejects_removed_ott_sinkhorn_image_plane_mode() -> No
 
 def test_validation_parser_accepts_resume_flag() -> None:
     args = validation._build_parser().parse_args(["--resume"])
+    explicit_args = validation._build_parser().parse_args(["--resume", "all"])
 
-    assert args.resume is True
+    assert args.resume == "all"
+    assert explicit_args.resume == "all"
 
 
-def test_validation_parser_accepts_resume_fast_flag() -> None:
-    args = validation._build_parser().parse_args(["--resume-fast"])
+def test_validation_parser_accepts_resume_fast_keyword() -> None:
+    args = validation._build_parser().parse_args(["--resume", "fast"])
 
-    assert args.resume_fast is True
+    assert args.resume == "fast"
+
+
+def test_validation_parser_rejects_resume_fast_flag() -> None:
+    with pytest.raises(SystemExit):
+        validation._build_parser().parse_args(["--resume-fast"])
 
 
 def test_validation_parser_accepts_jax_device_flags() -> None:
@@ -11582,15 +12272,32 @@ def test_cluster_solver_parser_accepts_resume_flag(monkeypatch: pytest.MonkeyPat
 
     args = _parse_args()
 
-    assert args.resume is True
+    assert args.resume == "all"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cluster_solver", "--par-path", "data/clustersim/input.par", "--resume", "all"],
+    )
+
+    explicit_args = _parse_args()
+
+    assert explicit_args.resume == "all"
 
 
-def test_cluster_solver_parser_accepts_resume_fast_flag(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "data/clustersim/input.par", "--resume-fast"])
+def test_cluster_solver_parser_accepts_resume_fast_keyword(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "data/clustersim/input.par", "--resume", "fast"])
 
     args = _parse_args()
 
-    assert args.resume_fast is True
+    assert args.resume == "fast"
+
+
+def test_cluster_solver_parser_rejects_resume_fast_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "data/clustersim/input.par", "--resume-fast"])
+
+    with pytest.raises(SystemExit):
+        _parse_args()
 
 
 def test_cluster_solver_parser_accepts_jax_device_flags(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -11615,16 +12322,16 @@ def test_cluster_solver_parser_accepts_jax_device_flags(monkeypatch: pytest.Monk
 
 
 def test_cluster_solver_rejects_resume_fast_outside_sequential() -> None:
-    with pytest.raises(SystemExit, match="--resume-fast"):
+    with pytest.raises(SystemExit, match="--resume fast"):
         cluster_solver._normalize_stage_fit_controls(
-            argparse.Namespace(fit_mode=cluster_solver.FIT_MODE_EVIDENCE_NS, resume_fast=True)
+            argparse.Namespace(fit_mode=cluster_solver.FIT_MODE_EVIDENCE_NS, resume="fast")
         )
 
 
 def test_validation_rejects_resume_fast_outside_sequential() -> None:
-    with pytest.raises(SystemExit, match="--resume-fast"):
+    with pytest.raises(SystemExit, match="--resume fast"):
         validation._normalize_validation_stage_fit_controls(
-            argparse.Namespace(solver_fit_mode=validation.SOLVER_FIT_MODE_EVIDENCE_NS, resume_fast=True)
+            argparse.Namespace(solver_fit_mode=validation.SOLVER_FIT_MODE_EVIDENCE_NS, resume="fast")
         )
 
 
@@ -11904,7 +12611,6 @@ def _validation_solver_args(**updates) -> argparse.Namespace:
         exact_image_diagnostics_stage3=False,
         quiet=False,
         resume=False,
-        resume_fast=False,
         recovery_profile_draws=validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
         write_stage3_recovery=False,
     )
@@ -12597,14 +13303,14 @@ def test_validation_run_cluster_solver_forwards_resume_flag(monkeypatch: pytest.
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(validation.subprocess, "run", fake_run)
-    args = _validation_solver_args(resume=True)
+    args = _validation_solver_args(resume="all")
 
     validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
 
     assert "--resume" in captured["cmd"]
 
 
-def test_validation_run_cluster_solver_forwards_resume_fast_flag(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_validation_run_cluster_solver_forwards_resume_fast_keyword(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured: dict[str, list[str]] = {}
 
     def fake_run(cmd, cwd, check):
@@ -12612,11 +13318,11 @@ def test_validation_run_cluster_solver_forwards_resume_fast_flag(monkeypatch: py
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(validation.subprocess, "run", fake_run)
-    args = _validation_solver_args(resume_fast=True)
+    args = _validation_solver_args(resume="fast")
 
     validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
 
-    assert "--resume-fast" in captured["cmd"]
+    assert _option_values(captured["cmd"], "--resume") == ["fast"]
 
 
 def test_validation_run_cluster_solver_forwards_jax_device_flags(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -13848,6 +14554,44 @@ def test_plot_bundle_round_trips_ns_diagnostics(tmp_path: Path) -> None:
     assert "samples" not in arrays["ns_diagnostics"]
 
 
+def test_plot_bundle_missing_direct_e1e2_fields_requires_stage1_rerun(tmp_path: Path) -> None:
+    path = tmp_path / "plot_bundle.h5"
+    missing_shape_fields = {"e1_base", "e2_base", "e1_param_index", "e2_param_index"}
+    with cluster_solver.h5py.File(path, "w") as handle:
+        state_group = handle.create_group("state")
+        state_group.create_dataset(
+            "build_state_meta_json",
+            data=json.dumps({"source_position_parameterization": "direct"}),
+        )
+        packed_group = state_group.create_group("packed_lens_spec")
+        for field_name in PackedLensSpec.__dataclass_fields__:
+            if field_name in missing_shape_fields:
+                continue
+            packed_group.create_dataset(field_name, data=np.asarray([], dtype=float))
+
+    with pytest.raises(ValueError, match="missing current packed lens spec fields .*e1_base.*rerun from Stage1"):
+        cluster_solver._rebuild_state_from_h5(path)
+
+
+def test_plot_bundle_missing_direct_gamma_fields_requires_stage1_rerun(tmp_path: Path) -> None:
+    path = tmp_path / "plot_bundle.h5"
+    missing_shear_fields = {"gamma1_base", "gamma2_base", "gamma1_param_index", "gamma2_param_index"}
+    with cluster_solver.h5py.File(path, "w") as handle:
+        state_group = handle.create_group("state")
+        state_group.create_dataset(
+            "build_state_meta_json",
+            data=json.dumps({"source_position_parameterization": "direct"}),
+        )
+        packed_group = state_group.create_group("packed_lens_spec")
+        for field_name in PackedLensSpec.__dataclass_fields__:
+            if field_name in missing_shear_fields:
+                continue
+            packed_group.create_dataset(field_name, data=np.asarray([], dtype=float))
+
+    with pytest.raises(ValueError, match="missing current packed lens spec fields .*gamma1_base.*rerun from Stage1"):
+        cluster_solver._rebuild_state_from_h5(path)
+
+
 def test_plot_bundle_round_trips_independent_cab_arc_data(tmp_path: Path) -> None:
     packed = PackedLensSpec(
         **{
@@ -14341,7 +15085,7 @@ def test_validation_resume_reuses_existing_mock(monkeypatch: pytest.MonkeyPatch,
         "write_validation_run_summary",
         lambda _solver_run_dir, _truth_path, output_dir, run_name, seed: Path(output_dir) / "run_summary.txt",
     )
-    args = _validation_run_args(tmp_path, resume=True)
+    args = _validation_run_args(tmp_path, resume="all")
 
     outputs = validation.run_single_bcg_validation(args)
     validation._close_debug_log()
@@ -14413,7 +15157,7 @@ def test_validation_resume_refreshes_complete_realization_outputs(monkeypatch: p
     monkeypatch.setattr(validation, "_run_cluster_solver", fake_solver)
     monkeypatch.setattr(validation, "write_recovery_outputs", fake_recovery)
     monkeypatch.setattr(validation, "write_validation_run_summary", fake_summary)
-    args = _validation_run_args(tmp_path, resume=True)
+    args = _validation_run_args(tmp_path, resume="all")
 
     outputs = validation.run_single_bcg_validation(args)
     validation._close_debug_log()
@@ -14889,6 +15633,141 @@ def test_fold_regularized_image_plane_matches_linearized_identity_with_zero_curv
     )
 
     np.testing.assert_allclose(float(fold_regularized), float(linearized), rtol=1.0e-7, atol=1.0e-10)
+
+
+def test_catastrophe_normal_form_matches_forward_metric_when_gate_off() -> None:
+    residual_x = jnp.asarray([0.03, -0.02], dtype=jnp.float64)
+    residual_y = jnp.asarray([0.01, 0.04], dtype=jnp.float64)
+    common = dict(
+        sigma_per_image=jnp.asarray([0.1, 0.2], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.95, 0.80], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True]),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        scatter_var_x=jnp.asarray([1.0e-4, 2.0e-4], dtype=jnp.float64),
+        scatter_var_y=jnp.asarray([2.0e-4, 1.0e-4], dtype=jnp.float64),
+        covariance_floor=1.0e-6,
+        outlier_sigma_arcsec=10.0,
+        max_gain=0.0,
+        max_residual_arcsec=0.0,
+        residual_loss="gaussian",
+    )
+    jacobian = dict(
+        jac_a00=jnp.asarray([1.0, 1.2], dtype=jnp.float64),
+        jac_a01=jnp.asarray([0.2, -0.1], dtype=jnp.float64),
+        jac_a10=jnp.asarray([0.2, -0.1], dtype=jnp.float64),
+        jac_a11=jnp.asarray([1.5, 1.4], dtype=jnp.float64),
+    )
+    catastrophe = _catastrophe_normal_form_image_plane_bin_loglike(
+        residual_beta_x=residual_x,
+        residual_beta_y=residual_y,
+        catastrophe_kappa=jnp.asarray([100.0, -50.0], dtype=jnp.float64),
+        catastrophe_rho=jnp.asarray([-20.0, 30.0], dtype=jnp.float64),
+        catastrophe_lambda_on=0.03,
+        catastrophe_lambda_off=0.08,
+        catastrophe_tangential_variance_min=0.0,
+        **jacobian,
+        **common,
+    )
+    forward = _forward_metric_image_plane_bin_loglike(
+        residual_beta_x=residual_x,
+        residual_beta_y=residual_y,
+        **jacobian,
+        **common,
+    )
+
+    np.testing.assert_allclose(float(catastrophe), float(forward), rtol=1.0e-10, atol=1.0e-10)
+
+
+def test_catastrophe_normal_form_zero_jacobian_has_finite_value_and_gradient() -> None:
+    def loglike(rx):
+        return _catastrophe_normal_form_image_plane_bin_loglike(
+            residual_beta_x=jnp.asarray([rx], dtype=jnp.float64),
+            residual_beta_y=jnp.asarray([0.2], dtype=jnp.float64),
+            jac_a00=jnp.zeros(1, dtype=jnp.float64),
+            jac_a01=jnp.zeros(1, dtype=jnp.float64),
+            jac_a10=jnp.zeros(1, dtype=jnp.float64),
+            jac_a11=jnp.zeros(1, dtype=jnp.float64),
+            sigma_per_image=jnp.asarray([1.0], dtype=jnp.float64),
+            reliability_per_image=jnp.asarray([1.0], dtype=jnp.float64),
+            image_has_constraint=jnp.asarray([True]),
+            image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+            scatter_var_x=jnp.zeros(1, dtype=jnp.float64),
+            scatter_var_y=jnp.zeros(1, dtype=jnp.float64),
+            covariance_floor=1.0e-6,
+            outlier_sigma_arcsec=1.0e-3,
+            catastrophe_kappa=jnp.asarray([2.0], dtype=jnp.float64),
+            catastrophe_rho=jnp.asarray([0.0], dtype=jnp.float64),
+            max_gain=0.0,
+            max_residual_arcsec=0.0,
+            residual_loss="gaussian",
+        )
+
+    value = loglike(jnp.asarray(0.1, dtype=jnp.float64))
+    grad = jax.grad(loglike)(jnp.asarray(0.1, dtype=jnp.float64))
+
+    assert np.isfinite(float(value))
+    assert np.isfinite(float(grad))
+
+
+def test_catastrophe_normal_form_near_critical_has_finite_jacobian_gradient() -> None:
+    def loglike(a00):
+        return _catastrophe_normal_form_image_plane_bin_loglike(
+            residual_beta_x=jnp.asarray([0.08], dtype=jnp.float64),
+            residual_beta_y=jnp.asarray([0.02], dtype=jnp.float64),
+            jac_a00=jnp.asarray([a00], dtype=jnp.float64),
+            jac_a01=jnp.zeros(1, dtype=jnp.float64),
+            jac_a10=jnp.zeros(1, dtype=jnp.float64),
+            jac_a11=jnp.ones(1, dtype=jnp.float64),
+            sigma_per_image=jnp.asarray([0.1], dtype=jnp.float64),
+            reliability_per_image=jnp.asarray([1.0], dtype=jnp.float64),
+            image_has_constraint=jnp.asarray([True]),
+            image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+            scatter_var_x=jnp.zeros(1, dtype=jnp.float64),
+            scatter_var_y=jnp.zeros(1, dtype=jnp.float64),
+            covariance_floor=1.0e-6,
+            outlier_sigma_arcsec=1.0e-3,
+            catastrophe_kappa=jnp.asarray([2.0], dtype=jnp.float64),
+            catastrophe_rho=jnp.asarray([0.0], dtype=jnp.float64),
+            catastrophe_lambda_on=0.03,
+            catastrophe_lambda_off=0.08,
+            max_gain=0.0,
+            max_residual_arcsec=0.0,
+            residual_loss="gaussian",
+        )
+
+    value = loglike(jnp.asarray(0.0, dtype=jnp.float64))
+    grad = jax.grad(loglike)(jnp.asarray(0.0, dtype=jnp.float64))
+
+    assert np.isfinite(float(value))
+    assert np.isfinite(float(grad))
+
+
+def test_catastrophe_normal_form_negative_correction_stays_finite() -> None:
+    value = _catastrophe_normal_form_image_plane_bin_loglike(
+        residual_beta_x=jnp.asarray([0.02], dtype=jnp.float64),
+        residual_beta_y=jnp.asarray([0.01], dtype=jnp.float64),
+        jac_a00=jnp.asarray([0.02], dtype=jnp.float64),
+        jac_a01=jnp.zeros(1, dtype=jnp.float64),
+        jac_a10=jnp.zeros(1, dtype=jnp.float64),
+        jac_a11=jnp.ones(1, dtype=jnp.float64),
+        sigma_per_image=jnp.asarray([0.1], dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([1.0], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True]),
+        image_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(1, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(1, dtype=jnp.float64),
+        covariance_floor=1.0e-6,
+        outlier_sigma_arcsec=1.0e-3,
+        catastrophe_kappa=jnp.asarray([0.0], dtype=jnp.float64),
+        catastrophe_rho=jnp.asarray([-4.0], dtype=jnp.float64),
+        catastrophe_lambda_on=0.03,
+        catastrophe_lambda_off=0.08,
+        max_gain=0.0,
+        max_residual_arcsec=0.0,
+        residual_loss="gaussian",
+    )
+
+    assert np.isfinite(float(value))
 
 
 def _synthetic_fold_jacobian_entries(x: Any, y: Any) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -16681,7 +17560,7 @@ def test_sequential_resume_skips_completed_stage1_and_runs_stage2(monkeypatch: p
         samples=250,
         image_plane_mode=IMAGE_PLANE_MODE_NONE,
         fit_mode="sequential",
-        resume=True,
+        resume="all",
         skip_plots=False,
     )
 
@@ -16730,7 +17609,7 @@ def test_sequential_resume_reruns_stage1_with_old_cosmology_sampled_artifact(
         samples=250,
         image_plane_mode=IMAGE_PLANE_MODE_NONE,
         fit_mode="sequential",
-        resume=True,
+        resume="all",
         skip_plots=False,
         fit_cosmology_flat_wcdm=True,
     )
@@ -16775,7 +17654,7 @@ def test_sequential_resume_finalizes_checkpointed_stage1_and_runs_stage2(
         samples=250,
         image_plane_mode=IMAGE_PLANE_MODE_NONE,
         fit_mode="sequential",
-        resume=True,
+        resume="all",
         skip_plots=True,
     )
 
@@ -17487,6 +18366,7 @@ def test_sequential_adds_local_jacobian_stage3(monkeypatch: pytest.MonkeyPatch, 
     assert [item[8] for item in calls] == [True, True, False]
     assert "stage3=enabled" in str(banners[0][1])
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["resume_mode"] == "none"
     assert summary["stage_fit_controls"] == {
         "stage2": {"fit_method": "svi+nuts", "svi_steps": 2000, "warmup": 2000, "samples": 250, "max_tree_depth": 10},
         "stage3": {"fit_method": "svi", "svi_steps": 2000, "warmup": 0, "samples": 100, "max_tree_depth": 10},
@@ -17713,7 +18593,7 @@ def test_sequential_resume_skips_completed_stage1_and_stage2_then_runs_stage3(
         samples=[250, 100],
         image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
         fit_mode="sequential",
-        resume=True,
+        resume="all",
         skip_plots=False,
     )
 
@@ -17752,7 +18632,7 @@ def test_sequential_resume_skip_plots_reuses_without_rerendering(monkeypatch: py
         samples=250,
         image_plane_mode=IMAGE_PLANE_MODE_NONE,
         fit_mode="sequential",
-        resume=True,
+        resume="all",
         skip_plots=True,
     )
 
@@ -18736,8 +19616,7 @@ def test_sequential_resume_fast_runs_only_stage4_from_stage3(
         skip_stage3_image_plane_local_jacobian=False,
         skip_critical_det_diagnostic=False,
         fit_mode="sequential",
-        resume_fast=True,
-        resume=False,
+        resume="fast",
     )
 
     cluster_solver._run_sequential(args)
@@ -18753,7 +19632,8 @@ def test_sequential_resume_fast_runs_only_stage4_from_stage3(
     ]
     assert diagnostic_calls == [tmp_path / "fit" / "stage3_image_plane"]
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
-    assert summary["resume_fast"] is True
+    assert summary["resume_mode"] == "fast"
+    assert "resume_fast" not in summary
     assert summary["stage2_run_dir"].endswith("stage2_joint")
     assert summary["stage3_run_dir"].endswith("stage3_image_plane")
     assert summary["stage4_run_dir"].endswith("stage4_linearized_image_plane")
@@ -18809,8 +19689,7 @@ def test_sequential_start_at_stage3_resume_fast_runs_only_stage4_from_stage3(
         skip_stage3_image_plane_local_jacobian=False,
         skip_critical_det_diagnostic=True,
         fit_mode="sequential",
-        resume_fast=True,
-        resume=False,
+        resume="fast",
         start_at_stage3=True,
     )
 
@@ -18826,7 +19705,8 @@ def test_sequential_start_at_stage3_resume_fast_runs_only_stage4_from_stage3(
         )
     ]
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
-    assert summary["resume_fast"] is True
+    assert summary["resume_mode"] == "fast"
+    assert "resume_fast" not in summary
     assert summary["start_at_stage3"] is True
     assert "stage1_run_dir" not in summary
     assert "stage2_run_dir" not in summary
@@ -18876,8 +19756,7 @@ def test_sequential_resume_fast_stage4_skip_stage3_uses_stage2(
         image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
         skip_stage3_image_plane_local_jacobian=True,
         fit_mode="sequential",
-        resume_fast=True,
-        resume=False,
+        resume="fast",
     )
 
     cluster_solver._run_sequential(args)
@@ -18914,8 +19793,7 @@ def test_sequential_resume_fast_runs_only_stage3_from_stage2(
         samples=[250, 20],
         image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
         fit_mode="sequential",
-        resume_fast=True,
-        resume=False,
+        resume="fast",
     )
 
     cluster_solver._run_sequential(args)
@@ -18963,8 +19841,7 @@ def test_sequential_start_at_stage3_resume_fast_runs_stage3_without_previous_art
         image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
         skip_critical_det_diagnostic=True,
         fit_mode="sequential",
-        resume_fast=True,
-        resume=False,
+        resume="fast",
         start_at_stage3=True,
     )
 
@@ -18972,7 +19849,8 @@ def test_sequential_start_at_stage3_resume_fast_runs_stage3_without_previous_art
 
     assert calls == [("joint", "fit/stage3_image_plane", None, None)]
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
-    assert summary["resume_fast"] is True
+    assert summary["resume_mode"] == "fast"
+    assert "resume_fast" not in summary
     assert summary["start_at_stage3"] is True
     assert "stage1_run_dir" not in summary
     assert "stage2_run_dir" not in summary
@@ -19003,8 +19881,7 @@ def test_sequential_resume_fast_runs_only_stage2_from_stage1_summary(
         samples=250,
         image_plane_mode=IMAGE_PLANE_MODE_NONE,
         fit_mode="sequential",
-        resume_fast=True,
-        resume=False,
+        resume="fast",
     )
 
     cluster_solver._run_sequential(args)
@@ -19019,7 +19896,7 @@ def test_sequential_resume_fast_requires_stage1_artifacts(
     monkeypatch.setattr(
         cluster_solver,
         "_run_single_stage",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("resume-fast should fail before running")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("resume fast should fail before running")),
     )
     monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
     args = argparse.Namespace(
@@ -19031,8 +19908,7 @@ def test_sequential_resume_fast_requires_stage1_artifacts(
         samples=250,
         image_plane_mode=IMAGE_PLANE_MODE_NONE,
         fit_mode="sequential",
-        resume_fast=True,
-        resume=False,
+        resume="fast",
     )
 
     with pytest.raises(SystemExit, match="stage1 artifacts"):
@@ -19047,7 +19923,7 @@ def test_sequential_resume_fast_requires_previous_stage_artifacts(
     monkeypatch.setattr(
         cluster_solver,
         "_run_single_stage",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("resume-fast should fail before final stage")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("resume fast should fail before final stage")),
     )
     monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
     args = argparse.Namespace(
@@ -19059,8 +19935,7 @@ def test_sequential_resume_fast_requires_previous_stage_artifacts(
         samples=[250, 20],
         image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
         fit_mode="sequential",
-        resume_fast=True,
-        resume=False,
+        resume="fast",
     )
 
     with pytest.raises(SystemExit, match="stage2_joint plot artifacts"):
@@ -19074,7 +19949,7 @@ def test_sequential_start_at_stage3_resume_fast_stage4_requires_stage3_artifacts
     monkeypatch.setattr(
         cluster_solver,
         "_run_single_stage",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("resume-fast should fail before running")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("resume fast should fail before running")),
     )
     monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
     args = argparse.Namespace(
@@ -19087,8 +19962,7 @@ def test_sequential_start_at_stage3_resume_fast_stage4_requires_stage3_artifacts
         image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
         skip_stage3_image_plane_local_jacobian=False,
         fit_mode="sequential",
-        resume_fast=True,
-        resume=False,
+        resume="fast",
         start_at_stage3=True,
     )
 
@@ -19133,8 +20007,7 @@ def test_sequential_resume_fast_with_resume_only_rerenders_final_stage(
         skip_stage3_image_plane_local_jacobian=False,
         skip_critical_det_diagnostic=False,
         fit_mode="sequential",
-        resume_fast=True,
-        resume=True,
+        resume="fast",
     )
 
     cluster_solver._run_sequential(args)
@@ -20444,7 +21317,7 @@ def test_write_recovery_outputs_always_includes_critical_arc_support_plots(
     monkeypatch.setattr(validation, "_plot_absolute_magnification_recovery", lambda _grid, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_image_recovery", lambda _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_image_residual_histogram", lambda _df, path: touch(Path(path)))
-    monkeypatch.setattr(validation, "_plot_critical_arc_support_histogram", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_critical_arc_support_histogram", lambda _df, path, **_kwargs: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_critical_arc_support_phase_space", lambda _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_critical_arc_recovery_by_family", lambda _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_source_recovery", lambda _df, path: touch(Path(path)))
