@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "astropy>=5",
     "blackjax>=1.5",
+    "graphviz>=0.21",
     "jax-cosmo>=0.1.0",
     "jax>=0.4",
     "matplotlib>=3.7",

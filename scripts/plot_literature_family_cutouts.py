@@ -114,6 +114,19 @@ UNKNOWN_QUALITY_COLOR = "0.82"
 PANEL_SPACING = 0.015
 FIGURE_MARGIN = 0.005
 SAVEFIG_KWARGS = {"bbox_inches": "tight", "pad_inches": 0.02, "dpi": CUTOUT_FIGURE_DPI}
+FAMILY_CUTOUT_MODE_FULL = "full"
+FAMILY_CUTOUT_MODE_FAST = "fast"
+FAMILY_CUTOUT_MODE_CHOICES = (FAMILY_CUTOUT_MODE_FULL, FAMILY_CUTOUT_MODE_FAST)
+FAMILY_CUTOUT_CRITICAL_LINES_AUTO = "auto"
+FAMILY_CUTOUT_CRITICAL_LINES_ON = "on"
+FAMILY_CUTOUT_CRITICAL_LINES_OFF = "off"
+FAMILY_CUTOUT_CRITICAL_LINE_CHOICES = (
+    FAMILY_CUTOUT_CRITICAL_LINES_AUTO,
+    FAMILY_CUTOUT_CRITICAL_LINES_ON,
+    FAMILY_CUTOUT_CRITICAL_LINES_OFF,
+)
+FAST_CUTOUT_FIGURE_DPI = 150
+FAST_CUTOUT_MAX_SIDE_PIXELS = 384
 RGB_RED_GAIN = DEFAULT_RGB_CHANNEL_GAINS["red"]
 RGB_GREEN_GAIN = DEFAULT_RGB_CHANNEL_GAINS["green"]
 RGB_BLUE_GAIN = DEFAULT_RGB_CHANNEL_GAINS["blue"]
@@ -157,6 +170,14 @@ CLUSTER_IMAGE_TOKENS = {
 
 
 @dataclass(frozen=True)
+class FamilyCutoutRenderConfig:
+    mode: str = FAMILY_CUTOUT_MODE_FULL
+    dpi: int = CUTOUT_FIGURE_DPI
+    max_side_pixels: int | None = None
+    draw_critical_lines: bool = True
+
+
+@dataclass(frozen=True)
 class BandImage:
     band: str
     path: Path
@@ -181,6 +202,86 @@ class CutoutWindow:
     src_y1: int
     dst_x0: int
     dst_y0: int
+
+
+def build_family_cutout_render_config(
+    *,
+    mode: str = FAMILY_CUTOUT_MODE_FULL,
+    dpi: int | None = None,
+    max_side_pixels: int | None = None,
+    critical_lines: str = FAMILY_CUTOUT_CRITICAL_LINES_AUTO,
+) -> FamilyCutoutRenderConfig:
+    mode_key = str(mode).strip().lower()
+    if mode_key not in FAMILY_CUTOUT_MODE_CHOICES:
+        raise ValueError(f"Unsupported family cutout mode {mode!r}. Valid choices: {FAMILY_CUTOUT_MODE_CHOICES}.")
+    critical_key = str(critical_lines).strip().lower()
+    if critical_key not in FAMILY_CUTOUT_CRITICAL_LINE_CHOICES:
+        raise ValueError(
+            f"Unsupported family cutout critical-lines setting {critical_lines!r}. "
+            f"Valid choices: {FAMILY_CUTOUT_CRITICAL_LINE_CHOICES}."
+        )
+    resolved_dpi = FAST_CUTOUT_FIGURE_DPI if mode_key == FAMILY_CUTOUT_MODE_FAST else CUTOUT_FIGURE_DPI
+    if dpi is not None:
+        resolved_dpi = int(dpi)
+    if resolved_dpi <= 0:
+        raise ValueError("family cutout dpi must be positive.")
+    resolved_max_side = FAST_CUTOUT_MAX_SIDE_PIXELS if mode_key == FAMILY_CUTOUT_MODE_FAST else None
+    if max_side_pixels is not None:
+        resolved_max_side = int(max_side_pixels)
+    if resolved_max_side is not None and resolved_max_side <= 0:
+        raise ValueError("family cutout max side pixels must be positive.")
+    if critical_key == FAMILY_CUTOUT_CRITICAL_LINES_AUTO:
+        draw_critical_lines = mode_key == FAMILY_CUTOUT_MODE_FULL
+    else:
+        draw_critical_lines = critical_key == FAMILY_CUTOUT_CRITICAL_LINES_ON
+    return FamilyCutoutRenderConfig(
+        mode=mode_key,
+        dpi=int(resolved_dpi),
+        max_side_pixels=resolved_max_side,
+        draw_critical_lines=bool(draw_critical_lines),
+    )
+
+
+def _coerce_family_cutout_render_config(
+    render_config: FamilyCutoutRenderConfig | None,
+) -> FamilyCutoutRenderConfig:
+    return render_config if render_config is not None else build_family_cutout_render_config()
+
+
+def downsample_rgb_for_render(rgb: np.ndarray, max_side_pixels: int | None) -> np.ndarray:
+    image = np.asarray(rgb)
+    if max_side_pixels is None or image.ndim < 2:
+        return image
+    max_side = int(max(image.shape[:2]))
+    if max_side <= int(max_side_pixels):
+        return image
+    scale = float(max_side_pixels) / float(max_side)
+    out_height = max(1, int(math.floor(float(image.shape[0]) * scale)))
+    out_width = max(1, int(math.floor(float(image.shape[1]) * scale)))
+    y_indices = np.rint(np.linspace(0, image.shape[0] - 1, out_height)).astype(int)
+    x_indices = np.rint(np.linspace(0, image.shape[1] - 1, out_width)).astype(int)
+    return image[np.ix_(y_indices, x_indices)]
+
+
+def render_rgb_cutout_on_axis(
+    ax: plt.Axes,
+    rgb: np.ndarray,
+    *,
+    render_config: FamilyCutoutRenderConfig | None = None,
+) -> np.ndarray:
+    config = _coerce_family_cutout_render_config(render_config)
+    native_height, native_width = np.asarray(rgb).shape[:2]
+    display_rgb = downsample_rgb_for_render(rgb, config.max_side_pixels)
+    ax.imshow(
+        display_rgb,
+        origin="lower",
+        interpolation="none",
+        extent=(-0.5, native_width - 0.5, -0.5, native_height - 0.5),
+    )
+    ax.set_xlim(-0.5, native_width - 0.5)
+    ax.set_ylim(-0.5, native_height - 0.5)
+    ax.set_autoscale_on(False)
+    return display_rgb
 
 
 def _safe_filename(value: str) -> str:
@@ -542,22 +643,14 @@ def _draw_rgb_cutout(
     center_coord: SkyCoord,
     *,
     cutout_size_arcsec: float,
+    render_config: FamilyCutoutRenderConfig | None = None,
 ) -> np.ndarray:
     cutouts = {
         str(band): extract_band_cutout(band_images[str(band)], center_coord, cutout_size_arcsec=cutout_size_arcsec)
         for band in bands
     }
     rgb = make_rgb_cutout(cutouts, bands=bands, rgb_display=rgb_display)
-    height, width = rgb.shape[:2]
-    ax.imshow(
-        rgb,
-        origin="lower",
-        interpolation="none",
-        extent=(-0.5, width - 0.5, -0.5, height - 0.5),
-    )
-    ax.set_xlim(-0.5, width - 0.5)
-    ax.set_ylim(-0.5, height - 0.5)
-    ax.set_autoscale_on(False)
+    render_rgb_cutout_on_axis(ax, rgb, render_config=render_config)
     return rgb
 
 
@@ -1345,6 +1438,8 @@ def _draw_literature_cluster_overview_panel(
     bands: Sequence[str],
     rgb_display: RGBDisplayConfig,
     data: pd.DataFrame,
+    *,
+    render_config: FamilyCutoutRenderConfig | None = None,
 ) -> None:
     display_image = band_images[str(bands[-1])]
     center_coord, cutout_size_arcsec = _overview_geometry_for_coords(
@@ -1358,6 +1453,7 @@ def _draw_literature_cluster_overview_panel(
         rgb_display,
         center_coord,
         cutout_size_arcsec=cutout_size_arcsec,
+        render_config=render_config,
     )
     for _, image_row in data.iterrows():
         coord = _safe_row_coord(image_row)
@@ -1383,6 +1479,7 @@ def _draw_literature_family_overview_panel(
     family: pd.DataFrame,
     *,
     max_images_per_family: int,
+    render_config: FamilyCutoutRenderConfig | None = None,
 ) -> None:
     display_image = band_images[str(bands[-1])]
     center_coord, cutout_size_arcsec = _overview_geometry_for_coords(
@@ -1396,6 +1493,7 @@ def _draw_literature_family_overview_panel(
         rgb_display,
         center_coord,
         cutout_size_arcsec=cutout_size_arcsec,
+        render_config=render_config,
     )
     for _, image_row in family.iterrows():
         coord = _safe_row_coord(image_row)
@@ -1441,6 +1539,7 @@ def _draw_literature_detail_panel(
     image_row: pd.Series,
     *,
     cutout_size_arcsec: float,
+    render_config: FamilyCutoutRenderConfig | None = None,
 ) -> None:
     coord = _safe_row_coord(image_row)
     if coord is None:
@@ -1454,6 +1553,7 @@ def _draw_literature_detail_panel(
         rgb_display,
         coord,
         cutout_size_arcsec=cutout_size_arcsec,
+        render_config=render_config,
     )
     _draw_literature_marker(
         ax,
@@ -1515,6 +1615,7 @@ def write_family_cutout_pdf(
     cutout_size_arcsec: float = DEFAULT_CUTOUT_SIZE_ARCSEC,
     families_per_page: int = DEFAULT_FAMILIES_PER_PAGE,
     max_images_per_family: int = DEFAULT_MAX_IMAGES_PER_FAMILY,
+    render_config: FamilyCutoutRenderConfig | None = None,
 ) -> int:
     if catalog.data.empty:
         raise ValueError(f"Selected catalog has no images: {catalog.path}")
@@ -1525,11 +1626,13 @@ def write_family_cutout_pdf(
     output = Path(output).with_suffix(".pdf")
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    render_config = _coerce_family_cutout_render_config(render_config)
+    savefig_kwargs = {**SAVEFIG_KWARGS, "dpi": render_config.dpi}
     rgb_display = build_rgb_display(band_images, bands=bands)
     family_ids = _family_ids_in_catalog_order(catalog.data)
     detail_cols = FAMILY_CUTOUT_DETAIL_COLUMNS
     with PdfPages(output) as pdf:
-        fig = plt.figure(figsize=_figure_size(detail_cols, detail_cols), dpi=CUTOUT_FIGURE_DPI)
+        fig = plt.figure(figsize=_figure_size(detail_cols, detail_cols), dpi=render_config.dpi)
         _style_cutout_figure(fig)
         grid = fig.add_gridspec(detail_cols, detail_cols)
         cluster_ax = fig.add_subplot(grid[:, :])
@@ -1540,8 +1643,9 @@ def write_family_cutout_pdf(
             bands,
             rgb_display,
             catalog.data.reset_index(drop=True),
+            render_config=render_config,
         )
-        pdf.savefig(fig, facecolor=fig.get_facecolor(), **SAVEFIG_KWARGS)
+        pdf.savefig(fig, facecolor=fig.get_facecolor(), **savefig_kwargs)
         plt.close(fig)
 
         for family_id in family_ids:
@@ -1549,7 +1653,7 @@ def write_family_cutout_pdf(
             overview_units = detail_cols
             detail_rows = max(1, int(math.ceil(float(len(family)) / float(detail_cols))))
             n_rows = overview_units + detail_rows
-            fig = plt.figure(figsize=_figure_size(n_rows, detail_cols), dpi=CUTOUT_FIGURE_DPI)
+            fig = plt.figure(figsize=_figure_size(n_rows, detail_cols), dpi=render_config.dpi)
             _style_cutout_figure(fig)
             grid = fig.add_gridspec(n_rows, detail_cols)
             overview_ax = fig.add_subplot(grid[:overview_units, :])
@@ -1562,6 +1666,7 @@ def write_family_cutout_pdf(
                 str(family_id),
                 family,
                 max_images_per_family=max_images_per_family,
+                render_config=render_config,
             )
             for panel_index, image_row in family.iterrows():
                 detail_row = overview_units + int(panel_index) // detail_cols
@@ -1575,6 +1680,7 @@ def write_family_cutout_pdf(
                     rgb_display,
                     image_row,
                     cutout_size_arcsec=cutout_size_arcsec,
+                    render_config=render_config,
                 )
             for blank_index in range(len(family), detail_rows * detail_cols):
                 detail_row = overview_units + blank_index // detail_cols
@@ -1582,7 +1688,7 @@ def write_family_cutout_pdf(
                 ax = fig.add_subplot(grid[detail_row, detail_col])
                 _style_cutout_axis(ax)
                 ax.set_axis_off()
-            pdf.savefig(fig, facecolor=fig.get_facecolor(), **SAVEFIG_KWARGS)
+            pdf.savefig(fig, facecolor=fig.get_facecolor(), **savefig_kwargs)
             plt.close(fig)
     return 1 + len(family_ids)
 

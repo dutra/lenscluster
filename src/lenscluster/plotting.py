@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import importlib
 import json
 import math
@@ -96,13 +97,95 @@ RECOVERY_IMAGE_POINT_COLUMNS = [
     "true_value",
     "model_value",
 ]
-CRITICAL_ARC_CURVE_SUPPORT_RADIUS_ARCSEC = 0.5
+CRITICAL_ARC_MIXTURE_IMAGE_PLANE_MODE = "critical-arc-mixture-image-plane"
+CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE_MODE = "critical-arc-mixture-centroid-image-plane"
+CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD = 0.5
 CRITICAL_ARC_BASE_PROB = 0.10
 CRITICAL_ARC_MAX_PROB = 0.80
 CRITICAL_ARC_SINGULAR_THRESHOLD = 0.20
 CRITICAL_ARC_SINGULAR_SOFTNESS = 0.05
+CRITICAL_ARC_SINGULAR_THRESHOLD_SAMPLE_NAME = "critical_arc_singular_threshold"
+CRITICAL_ARC_SINGULAR_SOFTNESS_SAMPLE_NAME = "critical_arc_singular_softness"
 CRITICAL_ARC_LOG_S_MIN_FLOOR = 1.0e-12
 SUBHALO_TOTAL_MASS_RADIUS_FACTOR = 1.0e6
+NUMPYRO_MODEL_PLOT_FILENAME = "numpyro_model.pdf"
+NUMPYRO_MODEL_DEFAULT_LIKELIHOOD_MODE = "source"
+NUMPYRO_MODEL_ROLE_PRIORITY = (
+    "critical_arc_hyperparameter",
+    "image_scatter",
+    "source_scatter",
+    "source_position",
+    "cosmology",
+    "scaling_scatter",
+    "scaling",
+    "large",
+    "other",
+)
+NUMPYRO_MODEL_ROLE_STYLE = {
+    "critical_arc_hyperparameter": {
+        "title": "Critical-arc gate",
+        "detail": "singular-threshold controls",
+        "fill": "#FDECEC",
+        "line": "#C62828",
+        "font": "#5C1616",
+    },
+    "image_scatter": {
+        "title": "Intrinsic image scatter",
+        "detail": "image-plane uncertainty",
+        "fill": "#F3EAF7",
+        "line": "#7B3F98",
+        "font": "#3B2147",
+    },
+    "source_scatter": {
+        "title": "Intrinsic source scatter",
+        "detail": "source-plane uncertainty",
+        "fill": "#EDE7F6",
+        "line": "#5E35B1",
+        "font": "#311B92",
+    },
+    "source_position": {
+        "title": "Source positions",
+        "detail": "sampled source coordinates",
+        "fill": "#FFF3E0",
+        "line": "#C77700",
+        "font": "#4E342E",
+    },
+    "cosmology": {
+        "title": "Sampled cosmology",
+        "detail": "geometry parameters",
+        "fill": "#EEF2FF",
+        "line": "#3F51B5",
+        "font": "#1A237E",
+    },
+    "scaling_scatter": {
+        "title": "Scaling-law scatter",
+        "detail": "member-galaxy intrinsic scatter",
+        "fill": "#E0F2F1",
+        "line": "#00897B",
+        "font": "#004D40",
+    },
+    "scaling": {
+        "title": "Member scaling law",
+        "detail": "galaxy-scale lens parameters",
+        "fill": "#E8F6EF",
+        "line": "#2E7D4F",
+        "font": "#174B31",
+    },
+    "large": {
+        "title": "Large-scale lens",
+        "detail": "cluster-scale lens parameters",
+        "fill": "#E8F1FA",
+        "line": "#2B6CB0",
+        "font": "#17324D",
+    },
+    "other": {
+        "title": "Other sampled parameters",
+        "detail": "uncategorized solver parameters",
+        "fill": "#F7F9FA",
+        "line": "#607D8B",
+        "font": "#263238",
+    },
+}
 SUBHALO_PROPERTIES_COLUMNS = [
     "component_index",
     "potfile_id",
@@ -138,20 +221,6 @@ def _first_int_value(value: Any, default: int) -> int:
     return int(value)
 
 
-def _resolve_arc_aware_noncritical_support_radius_arcsec(
-    value: Any,
-    match_tolerance_arcsec: Any = 1.5,
-) -> float:
-    if value is None:
-        value = match_tolerance_arcsec
-    if value is None:
-        value = 1.5
-    radius = float(value)
-    if not np.isfinite(radius) or radius <= 0.0:
-        raise ValueError("arc_aware_noncritical_support_radius_arcsec must be finite and positive.")
-    return radius
-
-
 def plot_path(root: Path, name: str) -> Path:
     """Return an output plot path, creating the output directory first."""
     root.mkdir(parents=True, exist_ok=True)
@@ -166,6 +235,204 @@ def _plot_path(root: Path, name: str) -> Path:
 
 
 PlotTask = tuple[str, str, Callable[[], Any]]
+
+
+def _active_sample_likelihood_mode(evaluator: Any, args: argparse.Namespace) -> str:
+    mode = getattr(evaluator, "sample_likelihood_mode", None)
+    if mode is None:
+        mode = getattr(args, "sample_likelihood_mode", NUMPYRO_MODEL_DEFAULT_LIKELIHOOD_MODE)
+    if mode is None:
+        mode = NUMPYRO_MODEL_DEFAULT_LIKELIHOOD_MODE
+    return str(mode)
+
+
+def _uses_arc_aware_diagnostics(sample_likelihood_mode: Any) -> bool:
+    return str(sample_likelihood_mode or "").strip() in {
+        CRITICAL_ARC_MIXTURE_IMAGE_PLANE_MODE,
+        CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE_MODE,
+    }
+
+
+def _summary_uses_arc_aware_diagnostics(summary: dict[str, Any]) -> bool:
+    return _uses_arc_aware_diagnostics(summary.get("sample_likelihood_mode"))
+
+
+def _parameter_sample_sites_for_rendering(parameter_specs: list[ParameterSpec]) -> list[Any]:
+    if not parameter_specs:
+        return []
+    from .cluster_solver import _parameter_sample_sites  # local import avoids a module import cycle at plotting import time
+
+    return _parameter_sample_sites(parameter_specs)
+
+
+def _numpyro_model_role_for_family(component_family: str) -> str:
+    family = str(component_family or "").strip()
+    return family if family in NUMPYRO_MODEL_ROLE_PRIORITY and family != "other" else "other"
+
+
+def _numpyro_model_role_for_site(site: Any, parameter_specs: list[ParameterSpec]) -> str:
+    roles: set[str] = set()
+    for index in getattr(site, "indices", ()):
+        idx = int(index)
+        if 0 <= idx < len(parameter_specs):
+            roles.add(_numpyro_model_role_for_family(str(getattr(parameter_specs[idx], "component_family", ""))))
+    for role in NUMPYRO_MODEL_ROLE_PRIORITY:
+        if role in roles:
+            return role
+    return "other"
+
+
+def _numpyro_model_role_counts(
+    parameter_specs: list[ParameterSpec],
+    sample_sites: list[Any],
+) -> tuple[Counter[str], Counter[str]]:
+    parameter_counts: Counter[str] = Counter()
+    for spec in parameter_specs:
+        parameter_counts[_numpyro_model_role_for_family(str(getattr(spec, "component_family", "")))] += 1
+    site_counts: Counter[str] = Counter()
+    for site in sample_sites:
+        site_counts[_numpyro_model_role_for_site(site, parameter_specs)] += 1
+    return parameter_counts, site_counts
+
+
+def _plural_count(count: int, singular: str, plural: str | None = None) -> str:
+    word = singular if int(count) == 1 else str(plural or f"{singular}s")
+    return f"{int(count)} {word}"
+
+
+def _state_family_and_image_counts(state: Any) -> tuple[int, int]:
+    family_data = list(getattr(state, "family_data", []) or [])
+    image_count = 0
+    for family in family_data:
+        value = family.get("n_images", 0) if isinstance(family, dict) else getattr(family, "n_images", 0)
+        try:
+            image_count += int(value)
+        except (TypeError, ValueError):
+            continue
+    return len(family_data), image_count
+
+
+def _numpyro_model_likelihood_label(sample_likelihood_mode: str) -> str:
+    labels = {
+        "source": "ln ℒ(η)\nsource-plane likelihood",
+        "local-jacobian": "ln ℒ(η)\nlocal image-plane likelihood",
+        "critical-arc-mixture-image-plane": "ln ℒ(η, {β_f})\ncritical-arc image-plane likelihood",
+        "critical-arc-mixture-centroid-image-plane": "ln ℒ(η)\ncritical-arc centroid image-plane likelihood",
+    }
+    return labels.get(str(sample_likelihood_mode), f"ln ℒ(η)\n{str(sample_likelihood_mode).replace('-', ' ')} likelihood")
+
+
+def _compact_numpyro_role_label(role: str, parameter_count: int, site_count: int) -> str:
+    style = NUMPYRO_MODEL_ROLE_STYLE[role]
+    return (
+        f"{style['title']}\n"
+        f"{_plural_count(parameter_count, 'parameter')} / {_plural_count(site_count, 'site')}"
+    )
+
+
+def _build_compact_numpyro_model_graph(
+    *,
+    state: BuildState,
+    parameter_specs: list[ParameterSpec],
+    sample_sites: list[Any],
+    sample_likelihood_mode: str,
+) -> Any:
+    from graphviz import Digraph
+
+    family_count, image_count = _state_family_and_image_counts(state)
+    parameter_counts, site_counts = _numpyro_model_role_counts(parameter_specs, sample_sites)
+    present_roles = [
+        role
+        for role in NUMPYRO_MODEL_ROLE_PRIORITY
+        if int(parameter_counts.get(role, 0)) > 0 or int(site_counts.get(role, 0)) > 0
+    ]
+    graph = Digraph(name="numpyro_model")
+    graph.attr(
+        rankdir="LR",
+        bgcolor="white",
+        pad="0.18",
+        nodesep="0.36",
+        ranksep="0.72",
+        splines="spline",
+        concentrate="true",
+        outputorder="edgesfirst",
+        fontname="Helvetica",
+    )
+    graph.attr("node", shape="box", style="rounded,filled", fontname="Helvetica", fontsize="12", margin="0.10,0.07", penwidth="1.45")
+    graph.attr("edge", color="#52656F", arrowsize="0.75", penwidth="1.1", fontname="Helvetica", fontsize="10")
+
+    for role in present_roles:
+        style = NUMPYRO_MODEL_ROLE_STYLE[role]
+        graph.node(
+            role,
+            _compact_numpyro_role_label(role, int(parameter_counts.get(role, 0)), int(site_counts.get(role, 0))),
+            fillcolor=style["fill"],
+            color=style["line"],
+            fontcolor=style["font"],
+        )
+    if not present_roles:
+        graph.node(
+            "fixed_model",
+            "Fixed model\nno sampled parameters",
+            fillcolor="#F7F9FA",
+            color="#607D8B",
+            fontcolor="#263238",
+        )
+
+    theta_label = "θ\nlatent parameter vector" if sample_sites else "fixed parameter vector\nno sample sites"
+    graph.node(
+        "theta",
+        theta_label,
+        shape="box",
+        style="rounded,filled,dashed",
+        fillcolor="#F7F9FA",
+        color="#78909C",
+        fontcolor="#263238",
+    )
+    graph.node(
+        "likelihood",
+        _numpyro_model_likelihood_label(sample_likelihood_mode),
+        shape="box",
+        style="rounded,filled,bold",
+        fillcolor="#263238",
+        color="#263238",
+        fontcolor="white",
+        penwidth="1.8",
+    )
+    for role in present_roles:
+        graph.edge(role, "theta")
+    if not present_roles:
+        graph.edge("fixed_model", "theta")
+    graph.edge("theta", "likelihood")
+    if family_count > 0:
+        graph.node(
+            "observed_catalog",
+            f"Observed image positions\n{_plural_count(image_count, 'position')}",
+            shape="box",
+            style="rounded,filled",
+            fillcolor="#ECEFF1",
+            color="#607D8B",
+            fontcolor="#263238",
+        )
+        graph.edge("observed_catalog", "likelihood", style="dashed", color="#78909C")
+    return graph
+
+
+def _plot_numpyro_model(run_dir: Path, state: BuildState, evaluator: Any, args: argparse.Namespace) -> Path:
+    parameter_specs = list(getattr(state, "parameter_specs", []) or [])
+    sample_likelihood_mode = _active_sample_likelihood_mode(evaluator, args)
+    sample_sites = _parameter_sample_sites_for_rendering(parameter_specs)
+    compact_graph = _build_compact_numpyro_model_graph(
+        state=state,
+        parameter_specs=parameter_specs,
+        sample_sites=sample_sites,
+        sample_likelihood_mode=sample_likelihood_mode,
+    )
+    output_path = _plot_path(run_dir, NUMPYRO_MODEL_PLOT_FILENAME)
+    rendered_path = Path(compact_graph.render(str(output_path.with_suffix("")), format="pdf", cleanup=True))
+    if rendered_path != output_path and rendered_path.exists() and not output_path.exists():
+        rendered_path.replace(output_path)
+    return output_path
 
 
 def _run_plot_tasks_with_progress(args: argparse.Namespace, plot_tasks: list[PlotTask]) -> None:
@@ -814,6 +1081,8 @@ def _red1_pos_sigma_arcsec(
 def _fit_quality_chi_square_summary(
     image_fit_quality_df: pd.DataFrame | None,
     state: BuildState,
+    *,
+    use_arc_aware_diagnostics: bool = False,
 ) -> dict[str, Any]:
     parameter_specs = list(getattr(state, "parameter_specs", []))
     n_families = int(len(getattr(state, "family_data", [])))
@@ -843,12 +1112,15 @@ def _fit_quality_chi_square_summary(
         "headline_reduced_chi_square": None,
         "headline_point_image_count": 0,
         "headline_missing_image_count": n_observed_images,
+        "point_recovered_image_count": 0,
+        "point_image_rms_arcsec": None,
         "arc_aware_chi_square": None,
         "arc_aware_n_data": 0,
         "arc_aware_dof": int(-k_effective),
         "arc_aware_reduced_chi_square": None,
         "arc_aware_point_image_count": 0,
         "arc_aware_arc_supported_image_count": 0,
+        "arc_aware_recovered_image_count": 0,
         "arc_aware_missing_image_count": n_observed_images,
         "image_residual_mean_arcsec": None,
         "image_residual_median_arcsec": None,
@@ -896,6 +1168,18 @@ def _fit_quality_chi_square_summary(
         arc_supported = df["arc_supported"].astype(bool).to_numpy()
     else:
         arc_supported = arc_recovery_status == "arc_supported"
+    if "p_arc" in df.columns:
+        p_arc = pd.to_numeric(df["p_arc"], errors="coerce").to_numpy(dtype=float)
+        if "arc_recovery_p_arc_threshold" in df.columns:
+            threshold = pd.to_numeric(df["arc_recovery_p_arc_threshold"], errors="coerce").to_numpy(dtype=float)
+            threshold = np.where(
+                np.isfinite(threshold) & (threshold >= 0.0) & (threshold <= 1.0),
+                threshold,
+                CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD,
+            )
+        else:
+            threshold = np.full(len(df), CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD, dtype=float)
+        arc_supported = arc_supported | (np.isfinite(p_arc) & (p_arc >= threshold))
     has_image_recovery_status = "image_recovery_status" in df.columns
     has_recovery_status = has_image_recovery_status or "arc_recovery_status" in df.columns
     if has_image_recovery_status:
@@ -936,115 +1220,156 @@ def _fit_quality_chi_square_summary(
     point_count = int(np.sum(point_valid))
     headline_n_data = int(2 * point_count)
     headline_dof = int(headline_n_data - k_effective)
+    coverage_fraction = None
+    if "covered_xy_1sigma" in df.columns:
+        coverage_values = df.loc[point_valid, "covered_xy_1sigma"].astype(bool).to_numpy()
+        coverage_fraction = float(np.mean(coverage_values)) if coverage_values.size else None
+    point_sum_squares = float(np.sum(point_residual2))
+    headline_red1_total_sigma = (
+        float(math.sqrt(point_sum_squares / headline_dof)) if headline_dof > 0 and point_count else None
+    )
+    point_image_sigma_int = image_sigma_int[point_valid] if image_sigma_int is not None else None
+    point_covariance_floor = covariance_floor[point_valid] if covariance_floor is not None else None
 
-    if "arc_aware_image_residual_arcsec" in df.columns:
-        arc_residual = pd.to_numeric(df["arc_aware_image_residual_arcsec"], errors="coerce").to_numpy(dtype=float)
-    else:
-        arc_residual = np.full(len(df), np.nan, dtype=float)
-    if "arc_curve_distance_arcsec" in df.columns:
-        curve_distance = pd.to_numeric(df["arc_curve_distance_arcsec"], errors="coerce").to_numpy(dtype=float)
-        arc_residual = np.where(np.isfinite(arc_residual), arc_residual, curve_distance)
+    def _final_summary(chi_sigma_values: np.ndarray, arc_fields: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "observed_image_count": observed_image_count,
+            "n_effective_parameters": k_effective,
+            "sampled_non_source_position_parameters": sampled_non_source_parameters,
+            "source_position_parameters": source_position_parameters,
+            "chi_square_sigma_basis": "image_sigma_eff_arcsec",
+            "chi_square_sigma_eff_median_arcsec": float(np.median(chi_sigma_values)) if chi_sigma_values.size else None,
+            "chi_square_sigma_eff_min_arcsec": float(np.min(chi_sigma_values)) if chi_sigma_values.size else None,
+            "chi_square_sigma_eff_max_arcsec": float(np.max(chi_sigma_values)) if chi_sigma_values.size else None,
+            "chi_square_red1_calibration_note": "post-fit diagnostic; holds image_sigma_int fixed",
+            "headline_chi_square_red1_total_sigma_arcsec": headline_red1_total_sigma,
+            "headline_chi_square_red1_pos_sigma_arcsec": _red1_pos_sigma_arcsec(
+                point_residual2,
+                point_image_sigma_int,
+                point_covariance_floor,
+                headline_dof,
+            ),
+            "headline_chi_square": point_chi_square,
+            "headline_n_data": headline_n_data,
+            "headline_dof": headline_dof,
+            "headline_reduced_chi_square": float(point_chi_square / headline_dof) if headline_dof > 0 else None,
+            "headline_point_image_count": point_count,
+            "headline_missing_image_count": int(max(0, observed_image_count - point_count)),
+            "point_recovered_image_count": point_count,
+            "point_image_rms_arcsec": float(np.sqrt(np.mean(point_residual2))) if point_residual2.size else None,
+            "image_residual_mean_arcsec": float(np.mean(residuals)) if residuals.size else None,
+            "image_residual_median_arcsec": float(np.median(residuals)) if residuals.size else None,
+            "image_residual_max_arcsec": float(np.max(residuals)) if residuals.size else None,
+            "covered_xy_1sigma_fraction": coverage_fraction,
+            **arc_fields,
+        }
+
+    if not use_arc_aware_diagnostics:
+        return _final_summary(
+            sigma_eff[point_valid],
+            {
+                "arc_aware_chi_square_red1_total_sigma_arcsec": None,
+                "arc_aware_chi_square_red1_pos_sigma_arcsec": None,
+                "arc_aware_chi_square": None,
+                "arc_aware_n_data": 0,
+                "arc_aware_dof": int(-k_effective),
+                "arc_aware_reduced_chi_square": None,
+                "arc_aware_point_image_count": 0,
+                "arc_aware_arc_supported_image_count": 0,
+                "arc_aware_recovered_image_count": 0,
+                "arc_aware_missing_image_count": observed_image_count,
+                "arc_aware_valid_image_count": 0,
+                "arc_aware_image_rms_arcsec": None,
+                "arc_aware_image_residual_mean_arcsec": None,
+                "arc_aware_image_residual_median_arcsec": None,
+                "arc_aware_image_residual_max_arcsec": None,
+            },
+        )
+
+    arc_residual = _fit_quality_value(
+        df,
+        "arc_candidate_image_residual_arcsec",
+        "arc_aware_image_residual_arcsec",
+        "arc_curve_distance_arcsec",
+    )
+    arc_aware_point_valid = point_valid & (~arc_supported)
+    arc_aware_dx = x_model[arc_aware_point_valid] - x_obs[arc_aware_point_valid]
+    arc_aware_dy = y_model[arc_aware_point_valid] - y_obs[arc_aware_point_valid]
+    arc_aware_point_residual2 = np.square(arc_aware_dx) + np.square(arc_aware_dy)
+    arc_aware_point_residuals = np.sqrt(arc_aware_point_residual2)
+    arc_aware_point_chi_square = (
+        float(np.sum(arc_aware_point_residual2 / np.square(sigma_eff[arc_aware_point_valid])))
+        if arc_aware_dx.size
+        else 0.0
+    )
+    arc_aware_point_count = int(np.sum(arc_aware_point_valid))
     arc_valid = (
-        (~point_recovered)
-        & arc_supported
+        arc_supported
         & np.isfinite(arc_residual + sigma_eff)
         & (sigma_eff > 0.0)
     )
     arc_supported_count = int(np.sum(arc_valid))
     arc_residual2 = np.square(arc_residual[arc_valid])
     arc_chi_square = (
-        point_chi_square + float(np.sum(arc_residual2 / np.square(sigma_eff[arc_valid])))
-        if point_count or arc_supported_count
+        arc_aware_point_chi_square + float(np.sum(arc_residual2 / np.square(sigma_eff[arc_valid])))
+        if arc_aware_point_count or arc_supported_count
         else 0.0
     )
-    arc_aware_n_data = int(2 * point_count + arc_supported_count)
+    arc_aware_n_data = int(2 * arc_aware_point_count + arc_supported_count)
     arc_aware_dof = int(arc_aware_n_data - k_effective)
     arc_aware_residuals = (
-        np.concatenate([residuals, arc_residual[arc_valid]])
-        if point_count or arc_supported_count
+        np.concatenate([arc_aware_point_residuals, arc_residual[arc_valid]])
+        if arc_aware_point_count or arc_supported_count
         else np.asarray([])
     )
-    coverage_fraction = None
-    if "covered_xy_1sigma" in df.columns:
-        coverage_values = df.loc[point_valid, "covered_xy_1sigma"].astype(bool).to_numpy()
-        coverage_fraction = float(np.mean(coverage_values)) if coverage_values.size else None
-    chi_sigma_values = sigma_eff[point_valid | arc_valid]
-    point_sum_squares = float(np.sum(point_residual2))
-    arc_sum_squares = point_sum_squares + float(np.sum(arc_residual2))
-    headline_red1_total_sigma = (
-        float(math.sqrt(point_sum_squares / headline_dof)) if headline_dof > 0 and point_count else None
-    )
+    arc_sum_squares = float(np.sum(arc_aware_point_residual2)) + float(np.sum(arc_residual2))
     arc_aware_red1_total_sigma = (
         float(math.sqrt(arc_sum_squares / arc_aware_dof))
-        if arc_aware_dof > 0 and (point_count or arc_supported_count)
+        if arc_aware_dof > 0 and (arc_aware_point_count or arc_supported_count)
         else None
     )
-    point_image_sigma_int = image_sigma_int[point_valid] if image_sigma_int is not None else None
-    point_covariance_floor = covariance_floor[point_valid] if covariance_floor is not None else None
     arc_aware_residual2 = (
-        np.concatenate([point_residual2, arc_residual2])
-        if point_count or arc_supported_count
+        np.concatenate([arc_aware_point_residual2, arc_residual2])
+        if arc_aware_point_count or arc_supported_count
         else np.asarray([], dtype=float)
     )
     arc_aware_image_sigma_int = (
-        np.concatenate([image_sigma_int[point_valid], image_sigma_int[arc_valid]])
-        if image_sigma_int is not None and (point_count or arc_supported_count)
+        np.concatenate([image_sigma_int[arc_aware_point_valid], image_sigma_int[arc_valid]])
+        if image_sigma_int is not None and (arc_aware_point_count or arc_supported_count)
         else None
     )
     arc_aware_covariance_floor = (
-        np.concatenate([covariance_floor[point_valid], covariance_floor[arc_valid]])
-        if covariance_floor is not None and (point_count or arc_supported_count)
+        np.concatenate([covariance_floor[arc_aware_point_valid], covariance_floor[arc_valid]])
+        if covariance_floor is not None and (arc_aware_point_count or arc_supported_count)
         else None
     )
-    return {
-        "observed_image_count": observed_image_count,
-        "n_effective_parameters": k_effective,
-        "sampled_non_source_position_parameters": sampled_non_source_parameters,
-        "source_position_parameters": source_position_parameters,
-        "chi_square_sigma_basis": "image_sigma_eff_arcsec",
-        "chi_square_sigma_eff_median_arcsec": float(np.median(chi_sigma_values)) if chi_sigma_values.size else None,
-        "chi_square_sigma_eff_min_arcsec": float(np.min(chi_sigma_values)) if chi_sigma_values.size else None,
-        "chi_square_sigma_eff_max_arcsec": float(np.max(chi_sigma_values)) if chi_sigma_values.size else None,
-        "chi_square_red1_calibration_note": "post-fit diagnostic; holds image_sigma_int fixed",
-        "headline_chi_square_red1_total_sigma_arcsec": headline_red1_total_sigma,
-        "headline_chi_square_red1_pos_sigma_arcsec": _red1_pos_sigma_arcsec(
-            point_residual2,
-            point_image_sigma_int,
-            point_covariance_floor,
-            headline_dof,
-        ),
-        "arc_aware_chi_square_red1_total_sigma_arcsec": arc_aware_red1_total_sigma,
-        "arc_aware_chi_square_red1_pos_sigma_arcsec": _red1_pos_sigma_arcsec(
-            arc_aware_residual2,
-            arc_aware_image_sigma_int,
-            arc_aware_covariance_floor,
-            arc_aware_dof,
-        ),
-        "headline_chi_square": point_chi_square,
-        "headline_n_data": headline_n_data,
-        "headline_dof": headline_dof,
-        "headline_reduced_chi_square": float(point_chi_square / headline_dof) if headline_dof > 0 else None,
-        "headline_point_image_count": point_count,
-        "headline_missing_image_count": int(max(0, observed_image_count - point_count)),
-        "arc_aware_chi_square": arc_chi_square,
-        "arc_aware_n_data": arc_aware_n_data,
-        "arc_aware_dof": arc_aware_dof,
-        "arc_aware_reduced_chi_square": float(arc_chi_square / arc_aware_dof) if arc_aware_dof > 0 else None,
-        "arc_aware_point_image_count": point_count,
-        "arc_aware_arc_supported_image_count": arc_supported_count,
-        "arc_aware_missing_image_count": int(max(0, observed_image_count - point_count - arc_supported_count)),
-        "image_residual_mean_arcsec": float(np.mean(residuals)) if residuals.size else None,
-        "image_residual_median_arcsec": float(np.median(residuals)) if residuals.size else None,
-        "image_residual_max_arcsec": float(np.max(residuals)) if residuals.size else None,
-        "arc_aware_valid_image_count": int(point_count + arc_supported_count),
-        "arc_aware_image_rms_arcsec": (
-            float(np.sqrt(np.mean(np.square(arc_aware_residuals)))) if arc_aware_residuals.size else None
-        ),
-        "arc_aware_image_residual_mean_arcsec": float(np.mean(arc_aware_residuals)) if arc_aware_residuals.size else None,
-        "arc_aware_image_residual_median_arcsec": float(np.median(arc_aware_residuals)) if arc_aware_residuals.size else None,
-        "arc_aware_image_residual_max_arcsec": float(np.max(arc_aware_residuals)) if arc_aware_residuals.size else None,
-        "covered_xy_1sigma_fraction": coverage_fraction,
-    }
+    return _final_summary(
+        sigma_eff[point_valid | arc_valid],
+        {
+            "arc_aware_chi_square_red1_total_sigma_arcsec": arc_aware_red1_total_sigma,
+            "arc_aware_chi_square_red1_pos_sigma_arcsec": _red1_pos_sigma_arcsec(
+                arc_aware_residual2,
+                arc_aware_image_sigma_int,
+                arc_aware_covariance_floor,
+                arc_aware_dof,
+            ),
+            "arc_aware_chi_square": arc_chi_square,
+            "arc_aware_n_data": arc_aware_n_data,
+            "arc_aware_dof": arc_aware_dof,
+            "arc_aware_reduced_chi_square": float(arc_chi_square / arc_aware_dof) if arc_aware_dof > 0 else None,
+            "arc_aware_point_image_count": arc_aware_point_count,
+            "arc_aware_arc_supported_image_count": arc_supported_count,
+            "arc_aware_recovered_image_count": int(arc_aware_point_count + arc_supported_count),
+            "arc_aware_missing_image_count": int(max(0, observed_image_count - arc_aware_point_count - arc_supported_count)),
+            "arc_aware_valid_image_count": int(arc_aware_point_count + arc_supported_count),
+            "arc_aware_image_rms_arcsec": (
+                float(np.sqrt(np.mean(np.square(arc_aware_residuals)))) if arc_aware_residuals.size else None
+            ),
+            "arc_aware_image_residual_mean_arcsec": float(np.mean(arc_aware_residuals)) if arc_aware_residuals.size else None,
+            "arc_aware_image_residual_median_arcsec": float(np.median(arc_aware_residuals)) if arc_aware_residuals.size else None,
+            "arc_aware_image_residual_max_arcsec": float(np.max(arc_aware_residuals)) if arc_aware_residuals.size else None,
+        },
+    )
 
 
 def _chain_diagnostics_summary(results: PosteriorResults, parameter_specs: list[ParameterSpec]) -> dict[str, Any]:
@@ -1414,11 +1739,16 @@ def _run_summary(
     init_diagnostics = dict(results.init_diagnostics or {})
     run_name = str(getattr(args, "run_name", None) or state.run_name)
     geometry_cache = getattr(state, "geometry_cache", None)
-    sample_likelihood_mode = str(getattr(args, "sample_likelihood_mode", "source"))
+    sample_likelihood_mode = _active_sample_likelihood_mode(evaluator, args)
+    use_arc_aware_diagnostics = _uses_arc_aware_diagnostics(sample_likelihood_mode)
     source_redshifts = np.asarray([float(family.z_source) for family in state.family_data], dtype=float)
     finite_source_redshifts = source_redshifts[np.isfinite(source_redshifts)]
     lens_redshift = getattr(state, "z_lens", None)
-    chi_square_summary = _fit_quality_chi_square_summary(image_fit_quality_df, state)
+    chi_square_summary = _fit_quality_chi_square_summary(
+        image_fit_quality_df,
+        state,
+        use_arc_aware_diagnostics=use_arc_aware_diagnostics,
+    )
     image_count_summary = _image_count_recovery_summary(image_count_recovery_df)
     chain_summary = _chain_diagnostics_summary(results, state.parameter_specs)
     def _cosmology_summary_fields() -> dict[str, Any]:
@@ -1479,13 +1809,12 @@ def _run_summary(
         "quick_diagnostics": bool(getattr(args, "quick_diagnostics", False)),
         "image_plane_newton_steps": int(getattr(args, "image_plane_newton_steps", 0)),
         "image_plane_scatter_floor_arcsec": float(getattr(args, "image_plane_scatter_floor_arcsec", 0.0)),
-        "arc_aware_noncritical_support_radius_arcsec": _resolve_arc_aware_noncritical_support_radius_arcsec(
-            getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
+        "arc_recovery_p_arc_threshold": float(
             getattr(
                 args,
-                "match_tolerance_arcsec",
-                getattr(evaluator, "arc_aware_noncritical_support_radius_arcsec", getattr(evaluator, "match_tolerance_arcsec", 1.5)),
-            ),
+                "arc_recovery_p_arc_threshold",
+                getattr(evaluator, "arc_recovery_p_arc_threshold", CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD),
+            )
         ),
         "arc_aware_max_arclength_arcsec": float(
             getattr(
@@ -1739,6 +2068,58 @@ def _run_summary(
                     "max": float(np.max(sigma_eff2)),
                 }
             summary["image_sigma_int_posterior"]["fixed"] = False
+    critical_arc_threshold_indices = [
+        idx
+        for idx, spec in enumerate(state.parameter_specs)
+        if getattr(spec, "sample_name", "") == CRITICAL_ARC_SINGULAR_THRESHOLD_SAMPLE_NAME
+    ]
+    summary["critical_arc_singular_threshold_sampled"] = bool(critical_arc_threshold_indices)
+    if critical_arc_threshold_indices:
+        idx = int(critical_arc_threshold_indices[0])
+        values = np.asarray(results.samples, dtype=float)[:, idx]
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            spec = state.parameter_specs[idx]
+            q16, q50, q84 = np.quantile(finite, [0.16, 0.5, 0.84])
+            lower_value = getattr(spec, "physical_lower", None)
+            upper_value = getattr(spec, "physical_upper", None)
+            lower = float(lower_value) if lower_value is not None else float("nan")
+            upper = float(upper_value) if upper_value is not None else float("nan")
+            summary["critical_arc_singular_threshold_posterior"] = {
+                "q16": float(q16),
+                "median": float(q50),
+                "q84": float(q84),
+                "lower": lower,
+                "upper": upper,
+                "near_lower_bound": bool(np.isfinite(lower) and q16 <= max(1.1 * lower, lower + 1.0e-9)),
+                "near_upper_bound": bool(np.isfinite(upper) and q84 >= 0.9 * upper),
+            }
+    critical_arc_softness_indices = [
+        idx
+        for idx, spec in enumerate(state.parameter_specs)
+        if getattr(spec, "sample_name", "") == CRITICAL_ARC_SINGULAR_SOFTNESS_SAMPLE_NAME
+    ]
+    summary["critical_arc_singular_softness_sampled"] = bool(critical_arc_softness_indices)
+    if critical_arc_softness_indices:
+        idx = int(critical_arc_softness_indices[0])
+        values = np.asarray(results.samples, dtype=float)[:, idx]
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            spec = state.parameter_specs[idx]
+            q16, q50, q84 = np.quantile(finite, [0.16, 0.5, 0.84])
+            lower_value = getattr(spec, "physical_lower", None)
+            upper_value = getattr(spec, "physical_upper", None)
+            lower = float(lower_value) if lower_value is not None else float("nan")
+            upper = float(upper_value) if upper_value is not None else float("nan")
+            summary["critical_arc_singular_softness_posterior"] = {
+                "q16": float(q16),
+                "median": float(q50),
+                "q84": float(q84),
+                "lower": lower,
+                "upper": upper,
+                "near_lower_bound": bool(np.isfinite(lower) and q16 <= max(1.1 * lower, lower + 1.0e-9)),
+                "near_upper_bound": bool(np.isfinite(upper) and q84 >= 0.9 * upper),
+            }
     return summary
 
 
@@ -1746,20 +2127,88 @@ def _format_run_summary_text(summary: dict[str, Any]) -> str:
     source_range = "na"
     if summary.get("z_source_min") is not None and summary.get("z_source_max") is not None:
         source_range = f"{_metric_text(summary.get('z_source_min'))}-{_metric_text(summary.get('z_source_max'))}"
+    use_arc_aware_diagnostics = _summary_uses_arc_aware_diagnostics(summary)
     headline_chi_square = summary.get("headline_chi_square")
     headline_dof = summary.get("headline_dof")
     headline_reduced_chi_square = summary.get("headline_reduced_chi_square")
     arc_aware_chi_square = summary.get("arc_aware_chi_square")
     arc_aware_dof = summary.get("arc_aware_dof")
     arc_aware_reduced_chi_square = summary.get("arc_aware_reduced_chi_square")
+    observed_image_count = summary.get("observed_image_count")
+    point_recovered_count = summary.get("point_recovered_image_count")
+    arc_aware_recovered_count = summary.get("arc_aware_recovered_image_count")
     arc_supported_count = summary.get("arc_aware_arc_supported_image_count")
     missing_count = summary.get("arc_aware_missing_image_count")
-    support_radius = summary.get("arc_aware_noncritical_support_radius_arcsec")
-    caveat = (
-        "arc-aware caveat: arc support is censored by "
-        f"arc_aware_noncritical_support_radius_arcsec={_metric_text(support_radius)}; "
-        "still-missing images have no supporting arc."
+    p_arc_threshold = summary.get("arc_recovery_p_arc_threshold", CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD)
+    recovery_gate_note = (
+        "arc-aware recovery gate: "
+        f"arc_recovery_p_arc_threshold={_metric_text(p_arc_threshold)}; "
+        "support-curve distance is diagnostic only."
     )
+    quality_items: list[tuple[str, Any]] = [
+        ("headline_chi_square", headline_chi_square),
+        ("headline dof", headline_dof),
+        ("headline_reduced_chi_square", headline_reduced_chi_square),
+        ("point image RMS arcsec", summary.get("point_image_rms_arcsec")),
+        ("point recovered images", f"{_metric_text(point_recovered_count)}/{_metric_text(observed_image_count)}"),
+    ]
+    if use_arc_aware_diagnostics:
+        quality_items.extend(
+            [
+                ("arc_aware_chi_square", arc_aware_chi_square),
+                ("arc-aware dof", arc_aware_dof),
+                ("arc_aware_reduced_chi_square", arc_aware_reduced_chi_square),
+                ("arc-aware image RMS arcsec", summary.get("arc_aware_image_rms_arcsec")),
+                ("arc-aware recovered images", f"{_metric_text(arc_aware_recovered_count)}/{_metric_text(observed_image_count)}"),
+            ]
+        )
+    quality_items.extend(
+        [
+            ("chi-square sigma basis", summary.get("chi_square_sigma_basis")),
+            ("chi-square median sigma arcsec", summary.get("chi_square_sigma_eff_median_arcsec")),
+            ("chi-square min sigma arcsec", summary.get("chi_square_sigma_eff_min_arcsec")),
+            ("chi-square max sigma arcsec", summary.get("chi_square_sigma_eff_max_arcsec")),
+            (
+                "headline red1 total sigma arcsec",
+                summary.get("headline_chi_square_red1_total_sigma_arcsec"),
+            ),
+            (
+                "headline red1 pos_sigma_arcsec",
+                summary.get("headline_chi_square_red1_pos_sigma_arcsec"),
+            ),
+        ]
+    )
+    if use_arc_aware_diagnostics:
+        quality_items.extend(
+            [
+                (
+                    "arc-aware red1 total sigma arcsec",
+                    summary.get("arc_aware_chi_square_red1_total_sigma_arcsec"),
+                ),
+                (
+                    "arc-aware red1 pos_sigma_arcsec",
+                    summary.get("arc_aware_chi_square_red1_pos_sigma_arcsec"),
+                ),
+            ]
+        )
+    quality_items.extend(
+        [
+            ("chi-square red1 calibration", summary.get("chi_square_red1_calibration_note")),
+            ("effective parameters", summary.get("n_effective_parameters")),
+            ("fit-quality reference", summary.get("fit_quality_reference_sample_kind")),
+            ("fit-quality sample index", summary.get("fit_quality_reference_sample_index")),
+            ("fit-quality source log likelihood", summary.get("fit_quality_reference_source_loglike")),
+            ("fit-quality log probability", summary.get("fit_quality_reference_log_prob")),
+        ]
+    )
+    if use_arc_aware_diagnostics:
+        quality_items.extend(
+            [
+                ("N_arc_supported", arc_supported_count),
+                ("N_missing", missing_count),
+            ]
+        )
+    quality_footer = [recovery_gate_note] if use_arc_aware_diagnostics else []
     lines = [
         "Cluster Solver Run Summary",
         f"run_name={_metric_text(summary.get('run_name'))}",
@@ -1800,47 +2249,8 @@ def _format_run_summary_text(summary: dict[str, Any]) -> str:
         "",
         "Quality Of Fit",
         "chi-square sigma: total image-plane sigma (image_sigma_eff_arcsec)",
-        *(
-            _key_value_lines(
-                [
-                    ("headline_chi_square", headline_chi_square),
-                    ("headline dof", headline_dof),
-                    ("headline_reduced_chi_square", headline_reduced_chi_square),
-                    ("arc_aware_chi_square", arc_aware_chi_square),
-                    ("arc-aware dof", arc_aware_dof),
-                    ("arc_aware_reduced_chi_square", arc_aware_reduced_chi_square),
-                    ("chi-square sigma basis", summary.get("chi_square_sigma_basis")),
-                    ("chi-square median sigma arcsec", summary.get("chi_square_sigma_eff_median_arcsec")),
-                    ("chi-square min sigma arcsec", summary.get("chi_square_sigma_eff_min_arcsec")),
-                    ("chi-square max sigma arcsec", summary.get("chi_square_sigma_eff_max_arcsec")),
-                    (
-                        "headline red1 total sigma arcsec",
-                        summary.get("headline_chi_square_red1_total_sigma_arcsec"),
-                    ),
-                    (
-                        "headline red1 pos_sigma_arcsec",
-                        summary.get("headline_chi_square_red1_pos_sigma_arcsec"),
-                    ),
-                    (
-                        "arc-aware red1 total sigma arcsec",
-                        summary.get("arc_aware_chi_square_red1_total_sigma_arcsec"),
-                    ),
-                    (
-                        "arc-aware red1 pos_sigma_arcsec",
-                        summary.get("arc_aware_chi_square_red1_pos_sigma_arcsec"),
-                    ),
-                    ("chi-square red1 calibration", summary.get("chi_square_red1_calibration_note")),
-                    ("N_arc_supported", arc_supported_count),
-                    ("N_missing", missing_count),
-                    ("effective parameters", summary.get("n_effective_parameters")),
-                    ("fit-quality reference", summary.get("fit_quality_reference_sample_kind")),
-                    ("fit-quality sample index", summary.get("fit_quality_reference_sample_index")),
-                    ("fit-quality source log likelihood", summary.get("fit_quality_reference_source_loglike")),
-                    ("fit-quality log probability", summary.get("fit_quality_reference_log_prob")),
-                ]
-            )
-        ),
-        caveat,
+        *_key_value_lines(quality_items),
+        *quality_footer,
     ]
     return "\n".join(lines).rstrip() + "\n"
 
@@ -1858,7 +2268,7 @@ def _format_sequential_run_summary_text(
         "",
         "Stage Quality Comparison",
     ]
-    columns = [
+    base_columns = [
         ("stage", "stage"),
         ("fit", "fit_method"),
         ("likelihood", "sample_likelihood_mode"),
@@ -1868,17 +2278,37 @@ def _format_sequential_run_summary_text(
         ("headline_chi2", "headline_chi_square"),
         ("headline_dof", "headline_dof"),
         ("headline_red", "headline_reduced_chi_square"),
+        ("point_RMS", "point_image_rms_arcsec"),
+        ("N_point", "point_recovered_image_count"),
+    ]
+    arc_columns = [
         ("arc_chi2", "arc_aware_chi_square"),
         ("arc_dof", "arc_aware_dof"),
         ("arc_red", "arc_aware_reduced_chi_square"),
         ("N_arc", "arc_aware_arc_supported_image_count"),
+        ("N_arcaware", "arc_aware_recovered_image_count"),
         ("N_missing", "arc_aware_missing_image_count"),
         ("arc_RMS", "arc_aware_image_rms_arcsec"),
+    ]
+    tail_columns = [
         ("ESS_min", "ess_min"),
         ("Rhat_max", "rhat_max"),
         ("runtime_s", "runtime_sec"),
     ]
-    lines.extend(_table_text(stage_summaries, columns))
+    include_arc_columns = any(_summary_uses_arc_aware_diagnostics(summary) for summary in stage_summaries)
+    if include_arc_columns:
+        rows = []
+        for summary in stage_summaries:
+            row = dict(summary)
+            if not _summary_uses_arc_aware_diagnostics(summary):
+                for _header, key in arc_columns:
+                    row[key] = None
+            rows.append(row)
+        columns = [*base_columns, *arc_columns, *tail_columns]
+    else:
+        rows = stage_summaries
+        columns = [*base_columns, *tail_columns]
+    lines.extend(_table_text(rows, columns))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -3595,7 +4025,11 @@ def _capped_fit_quality_samples(samples: np.ndarray, max_draws: int) -> np.ndarr
 def _reported_physical_to_latent_vector(evaluator: Any, theta: np.ndarray) -> np.ndarray:
     if hasattr(evaluator, "reported_physical_to_latent_parameter_vector"):
         return np.asarray(evaluator.reported_physical_to_latent_parameter_vector(theta), dtype=float)
-    return _convert_theta_to_latent(np.asarray(theta, dtype=float), evaluator.state.parameter_specs)
+    state = getattr(evaluator, "state", None)
+    parameter_specs = list(getattr(state, "parameter_specs", []))
+    if not parameter_specs:
+        return np.asarray(theta, dtype=float).copy()
+    return _convert_theta_to_latent(np.asarray(theta, dtype=float), parameter_specs)
 
 
 def _fit_quality_image_sigma_int(evaluator: Any, params_latent: np.ndarray) -> float:
@@ -3606,6 +4040,36 @@ def _fit_quality_image_sigma_int(evaluator: Any, params_latent: np.ndarray) -> f
     except Exception:
         return 0.0
     return value if np.isfinite(value) else 0.0
+
+
+def _fit_quality_critical_arc_singular_threshold(evaluator: Any, params_latent: np.ndarray) -> float:
+    if hasattr(evaluator, "_critical_arc_singular_threshold_numpy"):
+        try:
+            value = float(evaluator._critical_arc_singular_threshold_numpy(params_latent))
+        except Exception:
+            value = float("nan")
+        if np.isfinite(value):
+            return value
+    try:
+        value = float(getattr(evaluator, "critical_arc_singular_threshold"))
+    except Exception:
+        value = float("nan")
+    return value if np.isfinite(value) else CRITICAL_ARC_SINGULAR_THRESHOLD
+
+
+def _fit_quality_critical_arc_singular_softness(evaluator: Any, params_latent: np.ndarray) -> float:
+    if hasattr(evaluator, "_critical_arc_singular_softness_numpy"):
+        try:
+            value = float(evaluator._critical_arc_singular_softness_numpy(params_latent))
+        except Exception:
+            value = float("nan")
+        if np.isfinite(value):
+            return value
+    try:
+        value = float(getattr(evaluator, "critical_arc_singular_softness"))
+    except Exception:
+        value = float("nan")
+    return value if np.isfinite(value) else CRITICAL_ARC_SINGULAR_SOFTNESS
 
 
 def _fit_quality_image_sigma_eff(
@@ -3721,6 +4185,7 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
         DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE,
         DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS,
         DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC,
+        DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD,
         DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC,
         DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC,
         DEFAULT_CRITICAL_ARC_BASE_PROB,
@@ -3731,6 +4196,9 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
         DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
         DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
         DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+        DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC,
+        DEFAULT_EXACT_IMAGE_NUM_ITER_MAX,
+        DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
         DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
         DEFAULT_MATCH_TOLERANCE,
         DEFAULT_REFRESH_EVERY,
@@ -3742,22 +4210,34 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
     match_tolerance_arcsec = float(
         getattr(args, "match_tolerance_arcsec", getattr(evaluator, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE))
     )
-    arc_aware_noncritical_support_radius_arcsec = _resolve_arc_aware_noncritical_support_radius_arcsec(
-        getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
+    exact_image_min_distance_arcsec = float(
         getattr(
             args,
-            "match_tolerance_arcsec",
-            getattr(
-                evaluator,
-                "arc_aware_noncritical_support_radius_arcsec",
-                getattr(evaluator, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE),
-            ),
-        ),
+            "exact_image_min_distance_arcsec",
+            getattr(evaluator, "exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC),
+        )
+    )
+    exact_image_precision_limit = float(
+        getattr(
+            args,
+            "exact_image_precision_limit",
+            getattr(evaluator, "exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT),
+        )
+    )
+    exact_image_num_iter_max = int(
+        getattr(
+            args,
+            "exact_image_num_iter_max",
+            getattr(evaluator, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX),
+        )
     )
 
     return ClusterJAXEvaluator(
         state=evaluator.state,
         match_tolerance_arcsec=match_tolerance_arcsec,
+        exact_image_min_distance_arcsec=exact_image_min_distance_arcsec,
+        exact_image_precision_limit=exact_image_precision_limit,
+        exact_image_num_iter_max=exact_image_num_iter_max,
         sampling_engine=str(getattr(args, "sampling_engine", getattr(evaluator, "sampling_engine", "full"))),
         active_scaling_galaxies=getattr(args, "active_scaling_galaxies", None),
         active_scaling_selection=str(
@@ -3865,7 +4345,13 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
                 getattr(evaluator, "critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC),
             )
         ),
-        arc_aware_noncritical_support_radius_arcsec=arc_aware_noncritical_support_radius_arcsec,
+        arc_recovery_p_arc_threshold=float(
+            getattr(
+                args,
+                "arc_recovery_p_arc_threshold",
+                getattr(evaluator, "arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD),
+            )
+        ),
         arc_aware_max_arclength_arcsec=float(
             getattr(
                 args,
@@ -4065,8 +4551,14 @@ def _fit_quality_prediction_for_latent(
     return prediction
 
 
-def _fit_quality_family_cost_metadata(family: Any) -> dict[str, Any]:
-    min_distance = 0.2
+def _fit_quality_family_cost_metadata(
+    family: Any,
+    *,
+    min_distance_arcsec: float = 0.2,
+) -> dict[str, Any]:
+    min_distance = _finite_or(min_distance_arcsec, 0.2)
+    if min_distance <= 0.0:
+        min_distance = 0.2
     search_window = _finite_or(getattr(family, "search_window", np.nan))
     if not np.isfinite(search_window):
         x_obs = np.asarray(getattr(family, "x_obs", []), dtype=float)
@@ -4129,7 +4621,17 @@ def _posterior_fit_quality_predictions(
     family_predictions: list[list[dict[str, list[dict[str, Any]]] | None]] = [
         [None] * n_families for _ in sample_latents
     ]
-    family_costs = [_fit_quality_family_cost_metadata(family) for family in state.family_data]
+    exact_image_min_distance_arcsec = _finite_or(
+        getattr(evaluator, "exact_image_min_distance_arcsec", 0.2),
+        0.2,
+    )
+    family_costs = [
+        _fit_quality_family_cost_metadata(
+            family,
+            min_distance_arcsec=exact_image_min_distance_arcsec,
+        )
+        for family in state.family_data
+    ]
     task_indices = [
         (sample_index, family_index)
         for sample_index in range(len(sample_latents))
@@ -4440,6 +4942,8 @@ def _plot_image_recovery_fit_quality(
     image_df: pd.DataFrame,
     path: Path,
     extra_image_df: pd.DataFrame | None = None,
+    *,
+    use_arc_aware_diagnostics: bool = False,
 ) -> None:
     if image_df.empty:
         return
@@ -4454,7 +4958,16 @@ def _plot_image_recovery_fit_quality(
     x_model = np.where(np.isfinite(x_model), x_model, x_best)
     y_model = np.where(np.isfinite(y_model), y_model, y_best)
 
-    status = _image_catalog_effective_recovery_statuses(image_df)
+    if use_arc_aware_diagnostics:
+        status = _image_catalog_effective_recovery_statuses(image_df)
+    else:
+        status = np.asarray(
+            [
+                "POINT_RECOVERED" if _image_catalog_point_recovered(row) else "MISSED"
+                for _, row in image_df.iterrows()
+            ],
+            dtype=object,
+        )
     point_recovered = status == "POINT_RECOVERED"
     arc_recovered = status == "ARC_RECOVERED"
     missed = status == "MISSED"
@@ -4546,10 +5059,14 @@ def _plot_image_recovery_fit_quality(
             ecolor="tab:blue",
             markersize=3,
         )
-    arc_residual_best = _fit_quality_value(image_df, "arc_aware_image_residual_arcsec")
-    arc_residual = _fit_quality_value(image_df, "arc_aware_image_residual_q50", "arc_aware_image_residual_arcsec")
-    arc_residual = np.where(np.isfinite(arc_residual), arc_residual, arc_residual_best)
-    finite_arc_residual = np.isfinite(arc_residual)
+    if use_arc_aware_diagnostics:
+        arc_residual_best = _fit_quality_value(image_df, "arc_aware_image_residual_arcsec")
+        arc_residual = _fit_quality_value(image_df, "arc_aware_image_residual_q50", "arc_aware_image_residual_arcsec")
+        arc_residual = np.where(np.isfinite(arc_residual), arc_residual, arc_residual_best)
+        finite_arc_residual = np.isfinite(arc_residual)
+    else:
+        arc_residual = np.full(len(image_df), np.nan, dtype=float)
+        finite_arc_residual = np.zeros(len(image_df), dtype=bool)
     if finite_arc_residual.any():
         axes[1].scatter(
             x_index[finite_arc_residual],
@@ -4572,7 +5089,12 @@ def _plot_image_recovery_fit_quality(
     plt.close(fig)
 
 
-def _plot_image_count_recovery(image_count_df: pd.DataFrame, path: Path) -> None:
+def _plot_image_count_recovery(
+    image_count_df: pd.DataFrame,
+    path: Path,
+    *,
+    use_arc_aware_diagnostics: bool = False,
+) -> None:
     if image_count_df.empty:
         return
     required = {"family_id", "observed_image_count", "recovered_image_count", "produced_image_count"}
@@ -4582,7 +5104,7 @@ def _plot_image_count_recovery(image_count_df: pd.DataFrame, path: Path) -> None
     recovered = pd.to_numeric(image_count_df["recovered_image_count"], errors="coerce").to_numpy(dtype=float)
     arc_aware_recovered = (
         pd.to_numeric(image_count_df["arc_aware_recovered_image_count"], errors="coerce").to_numpy(dtype=float)
-        if "arc_aware_recovered_image_count" in image_count_df.columns
+        if use_arc_aware_diagnostics and "arc_aware_recovered_image_count" in image_count_df.columns
         else np.full(len(image_count_df), np.nan, dtype=float)
     )
     produced = pd.to_numeric(image_count_df["produced_image_count"], errors="coerce").to_numpy(dtype=float)
@@ -4743,25 +5265,40 @@ def _write_placeholder_plot(path: Path, title: str, message: str) -> None:
     plt.close(fig)
 
 
-def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
-    strict_residual = _fit_quality_value(image_df, "image_residual_q50", "image_residual_arcsec")
-    arc_residual = _fit_quality_value(
-        image_df,
-        "arc_aware_image_residual_q50",
-        "arc_aware_image_residual_arcsec",
-        "arc_curve_distance_arcsec",
-    )
+def _plot_image_residual_histogram(
+    image_df: pd.DataFrame,
+    path: Path,
+    *,
+    use_arc_aware_diagnostics: bool = False,
+) -> None:
+    point_residual_all = _fit_quality_value(image_df, "point_image_residual_arcsec", "image_residual_arcsec")
     if any(column in image_df.columns for column in ("image_recovery_status", "arc_recovery_status", "exact_image_prediction_failed")):
         status = _image_catalog_effective_recovery_statuses(image_df)
+        point_mask = np.asarray([_image_catalog_point_recovered(row) for _, row in image_df.iterrows()], dtype=bool)
+        arc_mask = np.asarray([_image_catalog_arc_recovered(row) for _, row in image_df.iterrows()], dtype=bool)
     else:
-        status = np.where(np.isfinite(strict_residual), "POINT_RECOVERED", "MISSED")
+        status = np.where(np.isfinite(point_residual_all), "POINT_RECOVERED", "MISSED")
+        point_mask = status == "POINT_RECOVERED"
+        arc_mask = np.zeros(len(image_df), dtype=bool)
+    if not use_arc_aware_diagnostics:
+        status = np.where(point_mask, "POINT_RECOVERED", "MISSED")
+        arc_mask = np.zeros(len(image_df), dtype=bool)
 
-    point_mask = status == "POINT_RECOVERED"
-    arc_mask = status == "ARC_RECOVERED"
-    point_residual = strict_residual[point_mask & np.isfinite(strict_residual)]
-    arc_recovered_residual = arc_residual[arc_mask & np.isfinite(arc_residual)]
-    best_residual = np.concatenate([point_residual, arc_recovered_residual])
-    finite_for_bins = np.concatenate([point_residual, arc_recovered_residual])
+    point_residual = point_residual_all[point_mask & np.isfinite(point_residual_all)]
+    if use_arc_aware_diagnostics:
+        arc_candidate_residual_all = _fit_quality_value(
+            image_df,
+            "arc_candidate_image_residual_arcsec",
+            "arc_aware_image_residual_arcsec",
+            "arc_curve_distance_arcsec",
+        )
+        arc_aware_mask = arc_mask | (point_mask & ~arc_mask)
+        arc_residual_all = np.where(arc_mask, arc_candidate_residual_all, np.where(point_mask, point_residual_all, np.nan))
+        arc_aware_residual = arc_residual_all[arc_aware_mask & np.isfinite(arc_residual_all)]
+        finite_for_bins = np.concatenate([point_residual, arc_aware_residual])
+    else:
+        arc_aware_residual = np.asarray([], dtype=float)
+        finite_for_bins = point_residual
     if finite_for_bins.size == 0:
         _write_placeholder_plot(
             path,
@@ -4774,65 +5311,58 @@ def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
     bin_count = min(48, max(14, int(np.sqrt(max(1, finite_for_bins.size)) * 2.4)))
     max_residual = float(np.nanmax(finite_for_bins))
     bins = np.linspace(0.0, max(max_residual * 1.04, 1.0e-6), bin_count + 1)
-    point_color = "#64748b"
+    point_color = "#4da3ff"
     arc_color = _image_catalog_status_color("ARC_RECOVERED")
-    best_color = "#2e7d32"
 
     def rms(values: np.ndarray) -> float:
         return float(np.sqrt(np.mean(np.square(values)))) if values.size else np.nan
 
     point_rms = rms(point_residual)
-    arc_rms = rms(arc_recovered_residual)
-    best_rms = rms(best_residual)
+    arc_aware_rms = rms(arc_aware_residual)
+    total_count = int(len(image_df))
 
     if point_residual.size:
         ax.hist(
             point_residual,
             bins=bins,
             color=point_color,
-            alpha=0.52,
-            edgecolor="#334155",
+            alpha=0.5,
+            edgecolor="#1d4ed8",
             linewidth=0.85,
-            label=f"point recovered  N={point_residual.size}  RMS={point_rms:.3g}\"",
+            label=f"point recovery  {point_residual.size}/{total_count}  RMS={point_rms:.3g}\"",
             zorder=2,
         )
         ax.axvline(point_rms, color=point_color, linestyle="-", linewidth=1.35, alpha=0.9)
-    if arc_recovered_residual.size:
+    if use_arc_aware_diagnostics and arc_aware_residual.size:
         ax.hist(
-            arc_recovered_residual,
-            bins=bins,
-            color=arc_color,
-            alpha=0.58,
-            edgecolor="#b7791f",
-            linewidth=0.9,
-            label=f"arc recovered  N={arc_recovered_residual.size}  RMS={arc_rms:.3g}\"",
-            zorder=4,
-        )
-        ax.axvline(arc_rms, color="#b7791f", linestyle="-", linewidth=1.45, alpha=0.95)
-    if best_residual.size:
-        ax.hist(
-            best_residual,
+            arc_aware_residual,
             bins=bins,
             histtype="step",
-            color=best_color,
-            linestyle=(0, (5, 2)),
-            linewidth=2.2,
-            label=f"best point+arc  N={best_residual.size}  RMS={best_rms:.3g}\"",
-            zorder=5,
+            color=arc_color,
+            linewidth=2.0,
+            label=f"arc-aware  {arc_aware_residual.size}/{total_count}  RMS={arc_aware_rms:.3g}\"",
+            zorder=4,
         )
-        ax.axvline(best_rms, color=best_color, linestyle=(0, (5, 2)), linewidth=1.8, alpha=0.95)
+        ax.axvline(arc_aware_rms, color="#b7791f", linestyle="-", linewidth=1.45, alpha=0.95)
     missed_count = int(np.sum(status == "MISSED"))
-    rms_annotation = "\n".join(
-        [
-            "RMS by recovery mode",
-            f"point: {point_rms:.3g}\"  (N={point_residual.size})" if point_residual.size else "point: na  (N=0)",
-            f"arc: {arc_rms:.3g}\"  (N={arc_recovered_residual.size})"
-            if arc_recovered_residual.size
-            else "arc: na  (N=0)",
-            f"best: {best_rms:.3g}\"  (N={best_residual.size})",
-            f"missed by both: {missed_count}",
-        ]
-    )
+    arc_supported_count = int(np.sum(arc_mask))
+    annotation_lines = [
+        "Image RMS",
+        f"point: {point_rms:.3g}\"  ({point_residual.size}/{total_count})"
+        if point_residual.size
+        else f"point: na  (0/{total_count})",
+    ]
+    if use_arc_aware_diagnostics:
+        annotation_lines.extend(
+            [
+                f"arc-aware: {arc_aware_rms:.3g}\"  ({arc_aware_residual.size}/{total_count})"
+                if arc_aware_residual.size
+                else f"arc-aware: na  (0/{total_count})",
+                f"arc-supported: {arc_supported_count}/{total_count}",
+            ]
+        )
+    annotation_lines.append(f"missed: {missed_count}/{total_count}")
+    rms_annotation = "\n".join(annotation_lines)
     ax.text(
         0.98,
         0.95,
@@ -4850,7 +5380,11 @@ def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
     )
     ax.set_xlabel("image residual [arcsec]")
     ax.set_ylabel("N images")
-    ax.set_title("Image Residuals: Point, Arc, and Best Recovery")
+    ax.set_title(
+        "Image Residuals: Point and Arc-Aware Recovery"
+        if use_arc_aware_diagnostics
+        else "Image Residuals: Point Recovery"
+    )
     ax.grid(axis="y", alpha=0.22, linewidth=0.8)
     ax.grid(axis="x", alpha=0.10, linewidth=0.7)
     for spine in ("top", "right"):
@@ -4874,6 +5408,7 @@ def _critical_arc_support_available(image_df: pd.DataFrame | None) -> bool:
         "arc_noncritical_direction_residual_arcsec",
         "arc_aware_image_residual_arcsec",
         "arc_aware_image_residual_q50",
+        "p_arc",
         "arc_prior_probability",
     ):
         if column in image_df.columns and np.isfinite(pd.to_numeric(image_df[column], errors="coerce").to_numpy(dtype=float)).any():
@@ -4931,7 +5466,7 @@ def _plot_critical_arc_support_histogram(
     image_df: pd.DataFrame,
     path: Path,
     *,
-    curve_support_radius_arcsec: float = CRITICAL_ARC_CURVE_SUPPORT_RADIUS_ARCSEC,
+    arc_recovery_p_arc_threshold: float = CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD,
     critical_arc_base_prob: float = CRITICAL_ARC_BASE_PROB,
     critical_arc_max_prob: float = CRITICAL_ARC_MAX_PROB,
     singular_threshold: float = CRITICAL_ARC_SINGULAR_THRESHOLD,
@@ -4953,9 +5488,11 @@ def _plot_critical_arc_support_histogram(
     critical_direction_residual = _finite_plot_values(_fit_quality_value(image_df, "arc_critical_direction_residual_arcsec"))
     s_min_raw = _fit_quality_value(image_df, "arc_s_min")
     arc_prior_raw = _fit_quality_value(image_df, "arc_prior_probability")
+    p_arc_raw = _fit_quality_value(image_df, "p_arc")
     curve_distance = _finite_plot_values(curve_distance_raw)
     s_min = _finite_plot_values(s_min_raw)
     arc_prior = _finite_plot_values(arc_prior_raw)
+    p_arc_values = _finite_plot_values(p_arc_raw)
     finite_s_min = np.isfinite(s_min_raw)
     log_s_min_raw = np.full_like(s_min_raw, np.nan, dtype=float)
     log_s_min_raw[finite_s_min] = _log10_s_min_values(s_min_raw[finite_s_min])
@@ -5010,11 +5547,9 @@ def _plot_critical_arc_support_histogram(
         noncritical_ax.hist(curve_distance, bins=_histogram_bins(curve_distance), color="tab:green", alpha=0.75)
     else:
         _mark_panel_unavailable(noncritical_ax)
-    noncritical_ax.axvline(float(curve_support_radius_arcsec), color="black", linestyle="--", linewidth=1.1, label="curve support radius")
     noncritical_ax.set_xlabel("support-curve distance [arcsec]")
     noncritical_ax.set_ylabel("N images")
-    noncritical_ax.set_title("Critical-Arc Support-Curve Distance")
-    noncritical_ax.legend(loc="best", fontsize=8)
+    noncritical_ax.set_title("Support-Curve Distance Diagnostic")
 
     if critical_direction_residual.size:
         critical_direction_log = np.log10(np.maximum(critical_direction_residual, 1.0e-6))
@@ -5042,14 +5577,14 @@ def _plot_critical_arc_support_histogram(
     if log_s_min.size and np.isfinite(threshold_log):
         singular_ax.legend(loc="best", fontsize=8)
 
-    finite_probability = finite_s_min & np.isfinite(arc_prior_raw)
+    finite_probability = finite_s_min & np.isfinite(p_arc_raw)
     if finite_probability.any():
         for status_name, color in status_colors.items():
             mask = finite_probability & (status == status_name)
             if mask.any():
                 probability_ax.scatter(
                     log_s_min_raw[mask],
-                    arc_prior_raw[mask],
+                    p_arc_raw[mask],
                     s=28.0,
                     color=color,
                     alpha=0.78,
@@ -5059,7 +5594,7 @@ def _plot_critical_arc_support_histogram(
                 )
         other_mask = finite_probability & ~np.isin(status, list(status_colors))
         if other_mask.any():
-            probability_ax.scatter(log_s_min_raw[other_mask], arc_prior_raw[other_mask], s=28.0, color="0.4", alpha=0.65, label="other")
+            probability_ax.scatter(log_s_min_raw[other_mask], p_arc_raw[other_mask], s=28.0, color="0.4", alpha=0.65, label="other")
         finite_log_s = log_s_min_raw[finite_probability]
         curve_log_min = float(np.nanmin(finite_log_s))
         curve_log_max = float(np.nanmax(finite_log_s))
@@ -5070,34 +5605,57 @@ def _plot_critical_arc_support_histogram(
             curve_log_max = curve_log_min + 1.0
         curve_log_s = np.linspace(curve_log_min, curve_log_max, 256)
         curve_s = np.power(10.0, curve_log_s)
-        probability_ax.plot(
-            curve_log_s,
-            _critical_arc_probability_curve(
-                curve_s,
-                base_prob=critical_arc_base_prob,
-                max_prob=critical_arc_max_prob,
-                singular_threshold=threshold,
-                singular_softness=softness,
-            ),
-            color="black",
-            linewidth=1.2,
-            label="configured sigmoid",
-        )
+        if np.isfinite(arc_prior_raw).any():
+            probability_ax.plot(
+                curve_log_s,
+                _critical_arc_probability_curve(
+                    curve_s,
+                    base_prob=critical_arc_base_prob,
+                    max_prob=critical_arc_max_prob,
+                    singular_threshold=threshold,
+                    singular_softness=softness,
+                ),
+                color="0.25",
+                linestyle=":",
+                linewidth=1.2,
+                label="p_arc sigmoid",
+            )
         if np.isfinite(threshold_log):
             probability_ax.axvline(threshold_log, color="black", linestyle="--", linewidth=1.0)
+        probability_ax.axhline(
+            float(arc_recovery_p_arc_threshold),
+            color="tab:red",
+            linestyle="-.",
+            linewidth=1.2,
+            label="p_arc threshold",
+        )
+        probability_ax.legend(loc="best", fontsize=7.5)
+    elif p_arc_values.size:
+        probability_ax.hist(p_arc_values, bins=_histogram_bins(p_arc_values), color="tab:cyan", alpha=0.72)
+        probability_ax.axvline(
+            float(arc_recovery_p_arc_threshold),
+            color="tab:red",
+            linestyle="-.",
+            linewidth=1.2,
+            label="p_arc threshold",
+        )
+        probability_ax.set_xlabel("p_arc")
         probability_ax.legend(loc="best", fontsize=7.5)
     else:
         _mark_panel_unavailable(probability_ax)
-    probability_ax.set_xlabel("log10 smallest singular value")
-    probability_ax.set_ylabel("arc prior probability")
-    probability_ax.set_title("Arc Prior Gate")
+    if finite_probability.any():
+        probability_ax.set_xlabel("log10 smallest singular value")
+        probability_ax.set_ylabel("p_arc")
+    elif p_arc_values.size:
+        probability_ax.set_ylabel("N images")
+    probability_ax.set_title("Singular-Value p_arc Gate")
 
-    finite_tuning = finite_s_min & np.isfinite(curve_distance_raw) & np.isfinite(arc_prior_raw)
+    finite_tuning = finite_s_min & np.isfinite(curve_distance_raw) & np.isfinite(p_arc_raw)
     if finite_tuning.any():
         tuning_scatter = tuning_ax.scatter(
             log_s_min_raw[finite_tuning],
             curve_distance_raw[finite_tuning],
-            c=arc_prior_raw[finite_tuning],
+            c=p_arc_raw[finite_tuning],
             cmap="viridis",
             vmin=0.0,
             vmax=1.0,
@@ -5106,16 +5664,15 @@ def _plot_critical_arc_support_histogram(
             edgecolors="white",
             linewidths=0.35,
         )
-        fig.colorbar(tuning_scatter, ax=tuning_ax, label="arc prior probability")
+        fig.colorbar(tuning_scatter, ax=tuning_ax, label="p_arc")
         if np.isfinite(threshold_log):
             tuning_ax.axvline(threshold_log, color="black", linestyle="--", linewidth=1.0, label="singular threshold")
-        tuning_ax.axhline(float(curve_support_radius_arcsec), color="0.25", linestyle=":", linewidth=1.2, label="curve support radius")
         tuning_ax.legend(loc="best", fontsize=7.5)
     else:
         _mark_panel_unavailable(tuning_ax)
     tuning_ax.set_xlabel("log10 smallest singular value")
     tuning_ax.set_ylabel("support-curve distance [arcsec]")
-    tuning_ax.set_title("Gate vs Support Distance")
+    tuning_ax.set_title("p_arc vs Support Distance")
 
     fig.tight_layout()
     fig.savefig(path, dpi=180, bbox_inches="tight")
@@ -5126,12 +5683,13 @@ def _plot_critical_arc_support_phase_space(
     image_df: pd.DataFrame,
     path: Path,
     *,
-    curve_support_radius_arcsec: float = CRITICAL_ARC_CURVE_SUPPORT_RADIUS_ARCSEC,
+    arc_recovery_p_arc_threshold: float = CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD,
+    critical_arc_base_prob: float = CRITICAL_ARC_BASE_PROB,
+    critical_arc_max_prob: float = CRITICAL_ARC_MAX_PROB,
     singular_threshold: float = CRITICAL_ARC_SINGULAR_THRESHOLD,
+    singular_softness: float = CRITICAL_ARC_SINGULAR_SOFTNESS,
 ) -> None:
-    has_curve_distance = "arc_curve_distance_arcsec" in image_df.columns
-    has_legacy_distance = "arc_noncritical_direction_residual_arcsec" in image_df.columns
-    if image_df.empty or "arc_s_min" not in image_df.columns or not (has_curve_distance or has_legacy_distance):
+    if image_df.empty or "arc_s_min" not in image_df.columns or "p_arc" not in image_df.columns:
         _write_placeholder_plot(
             path,
             "Critical-arc support phase space",
@@ -5139,9 +5697,8 @@ def _plot_critical_arc_support_phase_space(
         )
         return
     s_min = _fit_quality_value(image_df, "arc_s_min")
-    support_curve_distance = _fit_quality_value(image_df, "arc_curve_distance_arcsec", "arc_noncritical_direction_residual_arcsec")
-    critical_direction = _fit_quality_value(image_df, "arc_critical_direction_residual_arcsec")
-    finite = np.isfinite(s_min) & np.isfinite(support_curve_distance)
+    p_arc = _fit_quality_value(image_df, "p_arc")
+    finite = np.isfinite(s_min) & np.isfinite(p_arc)
     if not finite.any():
         _write_placeholder_plot(
             path,
@@ -5150,40 +5707,89 @@ def _plot_critical_arc_support_phase_space(
         )
         return
     status = _image_catalog_effective_recovery_statuses(image_df)
+    log_s_min = _log10_s_min_values(s_min)
     colors = {
         "POINT_RECOVERED": _image_catalog_status_color("POINT_RECOVERED"),
         "ARC_RECOVERED": _image_catalog_status_color("ARC_RECOVERED"),
         "MISSED": _image_catalog_status_color("MISSED"),
     }
-    finite_critical_direction = np.where(np.isfinite(critical_direction), critical_direction, 0.0)
-    critical_direction_scale = np.log10(np.maximum(finite_critical_direction, 1.0e-6))
-    critical_direction_scale = critical_direction_scale - np.nanmin(critical_direction_scale[finite]) if np.any(finite) else critical_direction_scale
-    max_scale = np.nanmax(critical_direction_scale[finite]) if np.any(np.isfinite(critical_direction_scale[finite])) else 0.0
-    sizes = 24.0 + 55.0 * (critical_direction_scale / max(max_scale, 1.0e-12))
-    sizes = np.clip(sizes, 24.0, 90.0)
+    threshold = float(singular_threshold)
+    softness = float(singular_softness)
+    threshold_log = np.log10(threshold) if np.isfinite(threshold) and threshold > 0.0 else np.nan
+    finite_log_s = log_s_min[finite]
 
     fig, ax = plt.subplots(figsize=(7.2, 5.4))
+    curve_log_min = float(np.nanmin(finite_log_s))
+    curve_log_max = float(np.nanmax(finite_log_s))
+    if np.isfinite(threshold_log):
+        curve_log_min = min(curve_log_min, threshold_log - 1.0)
+        curve_log_max = max(curve_log_max, threshold_log + 1.0)
+    if curve_log_max <= curve_log_min:
+        curve_log_max = curve_log_min + 1.0
+    curve_log_s = np.linspace(curve_log_min, curve_log_max, 256)
+    curve_s = np.power(10.0, curve_log_s)
+    if (
+        np.isfinite(threshold)
+        and threshold > 0.0
+        and np.isfinite(softness)
+        and softness > 0.0
+        and np.isfinite(float(critical_arc_base_prob))
+        and np.isfinite(float(critical_arc_max_prob))
+    ):
+        ax.plot(
+            curve_log_s,
+            _critical_arc_probability_curve(
+                curve_s,
+                base_prob=float(critical_arc_base_prob),
+                max_prob=float(critical_arc_max_prob),
+                singular_threshold=threshold,
+                singular_softness=softness,
+            ),
+            color="0.25",
+            linestyle=":",
+            linewidth=1.3,
+            label=r"$p_{\rm arc}$ sigmoid",
+            zorder=1,
+        )
     for status_name, color in colors.items():
         mask = finite & (status == status_name)
         if mask.any():
             ax.scatter(
-                s_min[mask],
-                support_curve_distance[mask],
-                s=sizes[mask],
+                log_s_min[mask],
+                p_arc[mask],
+                s=34.0,
                 color=color,
-                alpha=0.72,
+                alpha=0.78,
                 edgecolors="white",
                 linewidths=0.35,
                 label=_image_catalog_status_display_text(status_name),
+                zorder=3,
             )
     other_mask = finite & ~np.isin(status, list(colors))
     if other_mask.any():
-        ax.scatter(s_min[other_mask], support_curve_distance[other_mask], s=sizes[other_mask], color="0.4", alpha=0.65, label="other")
-    ax.axvline(float(singular_threshold), color="black", linestyle="--", linewidth=1.0, label="singular threshold")
-    ax.axhline(float(curve_support_radius_arcsec), color="0.25", linestyle=":", linewidth=1.2, label="curve support radius")
-    ax.set_xlabel("smallest singular value")
-    ax.set_ylabel("support-curve distance [arcsec]")
-    ax.set_title("Critical-Arc Support Phase Space")
+        ax.scatter(
+            log_s_min[other_mask],
+            p_arc[other_mask],
+            s=34.0,
+            color="0.4",
+            alpha=0.65,
+            edgecolors="white",
+            linewidths=0.35,
+            label="other",
+            zorder=3,
+        )
+    if np.isfinite(threshold_log):
+        ax.axvline(threshold_log, color="black", linestyle="--", linewidth=1.0, label="singular threshold")
+    ax.axhline(
+        float(arc_recovery_p_arc_threshold),
+        color="tab:red",
+        linestyle="-.",
+        linewidth=1.2,
+        label=r"$p_{\rm arc}$ threshold",
+    )
+    ax.set_xlabel(r"$\log_{10} s_{\min}$")
+    ax.set_ylabel(r"$p_{\rm arc}$")
+    ax.set_ylim(-0.02, 1.02)
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=180, bbox_inches="tight")
@@ -6954,9 +7560,7 @@ def _image_catalog_family_cutout_enabled(args: argparse.Namespace, run_dir: Path
     if image_dir is None or not str(image_dir).strip():
         return False
     stage_name = Path(run_dir).name
-    if stage_name == "stage4_critical_arc_mixture_image_plane":
-        return True
-    return stage_name == "stage3_image_plane" and bool(getattr(args, "exact_image_diagnostics_stage3", False))
+    return stage_name == "stage4_critical_arc_mixture_image_plane"
 
 
 def _infer_image_catalog_cutout_cluster(state: BuildState) -> str:
@@ -7469,7 +8073,7 @@ def _format_image_catalog_diagnostic_label(row: pd.Series) -> str:
         (
             f"arc={arc_status} "
             f"r_arc={_format_cutout_float(row.get('arc_candidate_image_residual_arcsec', row.get('arc_curve_distance_arcsec')))}"
-            f" p_arc={_format_cutout_float(row.get('arc_prior_probability'))}"
+            f" p_arc={_format_cutout_float(row.get('p_arc'))}"
         ),
         (
             f"N={_format_cutout_float(row.get('arc_noncritical_direction_residual_arcsec'))} "
@@ -7728,44 +8332,32 @@ def _image_catalog_preferred_point_recovered(row: pd.Series) -> bool:
 
 
 def _image_catalog_arc_recovered(row: pd.Series) -> bool:
-    if _image_catalog_point_recovered(row):
-        return False
-    arc_statuses = {
-        str(row.get(column, "")).strip().lower()
-        for column in ("preferred_recovery_status", "arc_recovery_status")
-    }
-    if arc_statuses & {"arc_supported", "arc_recovered"}:
-        return True
-    if _image_catalog_truthy(row.get("arc_supported", False)):
-        return True
+    return _image_catalog_truthy(row.get("arc_supported", False)) or _image_catalog_arc_candidate_supported(row)
+
+
+def _image_catalog_arc_recovery_p_arc_threshold(row: pd.Series) -> float:
     try:
-        arc_residual = float(row.get("arc_aware_image_residual_arcsec", np.nan))
+        threshold = float(row.get("arc_recovery_p_arc_threshold", CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD))
     except (TypeError, ValueError):
-        arc_residual = np.nan
-    return bool(np.isfinite(arc_residual))
+        threshold = float(CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD)
+    if not np.isfinite(threshold) or threshold < 0.0 or threshold > 1.0:
+        return float(CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD)
+    return threshold
 
 
 def _image_catalog_arc_candidate_supported(row: pd.Series) -> bool:
-    if _image_catalog_truthy(row.get("arc_candidate_supported", False)):
-        return True
     try:
-        candidate_residual = float(row.get("arc_candidate_image_residual_arcsec", np.nan))
+        p_arc = float(row.get("p_arc", np.nan))
     except (TypeError, ValueError):
-        candidate_residual = np.nan
-    if np.isfinite(candidate_residual):
-        return True
-    arc_statuses = {
-        str(row.get(column, "")).strip().lower()
-        for column in ("preferred_recovery_status", "arc_recovery_status")
-    }
-    return _image_catalog_truthy(row.get("arc_supported", False)) or bool(arc_statuses & {"arc_supported", "arc_recovered"})
+        p_arc = np.nan
+    return bool(np.isfinite(p_arc) and p_arc >= _image_catalog_arc_recovery_p_arc_threshold(row))
 
 
 def _image_catalog_effective_recovery_status(row: pd.Series) -> str:
-    if _image_catalog_point_recovered(row):
-        return "POINT_RECOVERED"
     if _image_catalog_arc_recovered(row):
         return "ARC_RECOVERED"
+    if _image_catalog_point_recovered(row):
+        return "POINT_RECOVERED"
     return "MISSED"
 
 
@@ -7780,7 +8372,7 @@ def _image_catalog_observed_panel_status(row: pd.Series) -> str:
 
 
 def _image_catalog_draw_arc_anchor_overlays(row: pd.Series) -> bool:
-    return _image_catalog_arc_candidate_supported(row)
+    return _image_catalog_arc_recovered(row)
 
 
 def _image_catalog_display_model_arcsec(row: pd.Series) -> tuple[float, float] | None:
@@ -7882,7 +8474,8 @@ def _image_catalog_overview_geometry(
     arc_anchor_observed = _image_catalog_arc_anchor_overlay_rows(observed)
     point_model_observed = observed.loc[
         [
-            _image_catalog_point_recovered(row) or not _image_catalog_draw_arc_anchor_overlays(row)
+            (not _image_catalog_arc_recovered(row))
+            and (_image_catalog_point_recovered(row) or not _image_catalog_draw_arc_anchor_overlays(row))
             for _, row in observed.iterrows()
         ]
     ] if not observed.empty else observed
@@ -8121,12 +8714,12 @@ IMAGE_CATALOG_PANEL_TEXT_BBOX = {"facecolor": "black", "alpha": 0.38, "edgecolor
 
 
 def _image_catalog_compact_status_text(row: pd.Series, fallback: str) -> str:
+    if _image_catalog_arc_recovered(row):
+        return "arc recovered"
     if _image_catalog_point_recovered(row):
         if _image_catalog_arc_candidate_supported(row):
             return "point recovered (arc supported)"
         return "point recovered"
-    if _image_catalog_arc_recovered(row):
-        return "arc recovered"
     value = row.get("arc_recovery_status", fallback)
     text = str(value).strip()
     if not text or text.lower() in {"nan", "none", "null"}:
@@ -8198,7 +8791,7 @@ def _format_image_catalog_compact_detail_label(row: pd.Series) -> str:
     lines.append(f"point={point_status}  r_point={_format_cutout_float(point_residual)}")
     lines.append(
         f"arc={arc_status}  r_arc={_format_cutout_float(arc_residual)}  "
-        f"p_arc={_format_cutout_float(row.get('arc_prior_probability'))}"
+        f"p_arc={_format_cutout_float(row.get('p_arc'))}"
     )
     lines.append(
         f"d_curve={_format_cutout_float(row.get('arc_curve_distance_arcsec'))}  "
@@ -8376,6 +8969,7 @@ def _image_catalog_draw_rgb_cutout(
     center_coord: SkyCoord,
     *,
     cutout_size_arcsec: float,
+    render_config: Any | None = None,
 ) -> np.ndarray:
     cutouts = {
         str(band): helpers.extract_band_cutout(
@@ -8386,14 +8980,7 @@ def _image_catalog_draw_rgb_cutout(
         for band in bands
     }
     rgb = helpers.make_rgb_cutout(cutouts, bands=bands, rgb_display=rgb_display)
-    height, width = rgb.shape[:2]
-    ax.imshow(
-        rgb,
-        origin="lower",
-        interpolation="none",
-        extent=(-0.5, width - 0.5, -0.5, height - 0.5),
-    )
-    _lock_cutout_axis_to_image(ax, rgb.shape)
+    helpers.render_rgb_cutout_on_axis(ax, rgb, render_config=render_config)
     return rgb
 
 
@@ -8617,7 +9204,7 @@ def _draw_image_catalog_observed_row_overlays(
             cutout_size_arcsec=cutout_size_arcsec,
             rendered_shape=rendered_shape,
         )
-        if not _image_catalog_point_recovered(image_row):
+        if _image_catalog_arc_recovered(image_row):
             return
     model_coord = _image_catalog_display_model_coord(image_row, reference)
     if model_coord is None:
@@ -8655,6 +9242,7 @@ def _draw_image_catalog_cluster_overview_panel(
     catalog_df: pd.DataFrame,
     extra_df: pd.DataFrame | None,
     reference: tuple[int, float, float],
+    render_config: Any | None = None,
 ) -> None:
     if extra_df is None:
         extra_df = pd.DataFrame()
@@ -8671,6 +9259,7 @@ def _draw_image_catalog_cluster_overview_panel(
         rgb_display,
         center_coord,
         cutout_size_arcsec=cutout_size_arcsec,
+        render_config=render_config,
     )
     for _, image_row in catalog_df.iterrows():
         _draw_image_catalog_observed_row_overlays(
@@ -8707,6 +9296,8 @@ def _draw_image_catalog_overview_panel(
     block: dict[str, Any],
     reference: tuple[int, float, float],
     model_pair: tuple[Any, list[dict[str, float]]] | None,
+    render_config: Any | None = None,
+    include_critical_lines: bool = True,
 ) -> None:
     center_coord = _arcsec_to_skycoord(
         block["overview_center_x_arcsec"],
@@ -8725,8 +9316,9 @@ def _draw_image_catalog_overview_panel(
         rgb_display,
         center_coord,
         cutout_size_arcsec=cutout_size_arcsec,
+        render_config=render_config,
     )
-    if model_pair is not None:
+    if model_pair is not None and include_critical_lines:
         model, kwargs_lens = model_pair
         _draw_image_catalog_critical_lines(
             ax,
@@ -8763,7 +9355,7 @@ def _draw_image_catalog_overview_panel(
             rendered_shape=rgb.shape[:2],
         )
     _draw_image_catalog_panel_text(ax, _format_image_catalog_overview_label(block), fontsize=IMAGE_CATALOG_OVERVIEW_LABEL_FONT_SIZE)
-    _add_image_catalog_axis_legend(ax, include_critical_lines=model_pair is not None)
+    _add_image_catalog_axis_legend(ax, include_critical_lines=model_pair is not None and include_critical_lines)
 
 
 def _draw_image_catalog_detail_panel(
@@ -8776,6 +9368,8 @@ def _draw_image_catalog_detail_panel(
     row: pd.Series,
     reference: tuple[int, float, float],
     model_pair: tuple[Any, list[dict[str, float]]] | None,
+    render_config: Any | None = None,
+    include_critical_lines: bool = True,
 ) -> None:
     center_coord, center_x, center_y = _image_catalog_panel_center(row, reference)
     if center_coord is None:
@@ -8790,8 +9384,9 @@ def _draw_image_catalog_detail_panel(
         rgb_display,
         center_coord,
         cutout_size_arcsec=cutout_size_arcsec,
+        render_config=render_config,
     )
-    if model_pair is not None:
+    if model_pair is not None and include_critical_lines:
         model, kwargs_lens = model_pair
         _draw_image_catalog_critical_lines(
             ax,
@@ -8855,7 +9450,7 @@ def _draw_image_catalog_detail_panel(
                 cutout_size_arcsec=cutout_size_arcsec,
                 rendered_shape=rgb.shape[:2],
             )
-        if (not draw_arc_anchor_overlays) or _image_catalog_point_recovered(row):
+        if not _image_catalog_arc_recovered(row):
             model_coord = _image_catalog_display_model_coord(row, reference)
             if model_coord is not None:
                 _draw_image_catalog_model_marker(
@@ -8928,11 +9523,13 @@ def _image_catalog_cluster_overview_figure(
     reference: tuple[int, float, float],
     *,
     detail_cols: int,
+    render_config: Any | None = None,
 ) -> plt.Figure:
+    dpi = int(getattr(render_config, "dpi", getattr(helpers, "CUTOUT_FIGURE_DPI", 300)))
     cluster_units = detail_cols
     fig = plt.figure(
         figsize=helpers._figure_size(cluster_units, detail_cols),
-        dpi=getattr(helpers, "CUTOUT_FIGURE_DPI", 300),
+        dpi=dpi,
     )
     helpers._style_cutout_figure(fig)
     grid = fig.add_gridspec(cluster_units, detail_cols)
@@ -8948,6 +9545,7 @@ def _image_catalog_cluster_overview_figure(
         catalog_df,
         extra_df,
         reference,
+        render_config,
     )
     return fig
 
@@ -8972,6 +9570,20 @@ def _plot_image_catalog_family_cutouts(
     cluster = _infer_image_catalog_cutout_cluster(state)
     band_paths = helpers.find_rgb_band_paths(image_dir, cluster=cluster, bands=bands, image_scale=image_scale)
     band_images = helpers.load_rgb_metadata(band_paths, bands=bands)
+    render_config = helpers.build_family_cutout_render_config(
+        mode=str(getattr(args, "image_catalog_family_cutout_mode", getattr(helpers, "FAMILY_CUTOUT_MODE_FULL", "full"))),
+        dpi=getattr(args, "image_catalog_family_cutout_dpi", None),
+        max_side_pixels=getattr(args, "image_catalog_family_cutout_max_side_pixels", None),
+        critical_lines=str(
+            getattr(
+                args,
+                "image_catalog_family_cutout_critical_lines",
+                getattr(helpers, "FAMILY_CUTOUT_CRITICAL_LINES_AUTO", "auto"),
+            )
+        ),
+    )
+    render_dpi = int(getattr(render_config, "dpi", getattr(helpers, "CUTOUT_FIGURE_DPI", 300)))
+    savefig_kwargs = {"bbox_inches": "tight", "pad_inches": 0.02, "dpi": render_dpi}
     rgb_kwargs: dict[str, Any] = {}
     for arg_name, kwarg_name in (
         ("image_catalog_family_cutout_rgb_q", "q"),
@@ -8997,7 +9609,22 @@ def _plot_image_catalog_family_cutouts(
     rgb_display = helpers.build_rgb_display(band_images, bands=bands, **rgb_kwargs)
     reference_band = str(getattr(helpers, "DEFAULT_HFF_RGB_REFERENCE_BAND", bands[-1]))
     display_image = band_images[reference_band] if reference_band in band_images else band_images[str(bands[-1])]
+    arc_recovery_p_arc_threshold = float(
+        getattr(
+            evaluator,
+            "arc_recovery_p_arc_threshold",
+            getattr(args, "arc_recovery_p_arc_threshold", CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD),
+        )
+    )
+    if (
+        not np.isfinite(arc_recovery_p_arc_threshold)
+        or arc_recovery_p_arc_threshold < 0.0
+        or arc_recovery_p_arc_threshold > 1.0
+    ):
+        arc_recovery_p_arc_threshold = float(CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD)
     catalog_df = _image_catalog_cutout_rows(state, image_df)
+    if not catalog_df.empty:
+        catalog_df["arc_recovery_p_arc_threshold"] = arc_recovery_p_arc_threshold
     extra_df = _image_catalog_extra_cutout_rows(state, extra_image_df)
     if catalog_df.empty and extra_df.empty:
         _write_placeholder_plot(
@@ -9023,10 +9650,14 @@ def _plot_image_catalog_family_cutouts(
         detail_cols=detail_cols,
         default_cutout_size_arcsec=cutout_size_arcsec,
     )
-    try:
-        best_fit_latent = _reported_physical_to_latent_vector(evaluator, np.asarray(best_fit, dtype=float))
-    except Exception as exc:
-        _log(None, f"[plot:image_catalog_family_cutouts] skipped critical lines: best-fit conversion failed: {exc}")
+    draw_critical_lines = bool(getattr(render_config, "draw_critical_lines", True))
+    if draw_critical_lines:
+        try:
+            best_fit_latent = _reported_physical_to_latent_vector(evaluator, np.asarray(best_fit, dtype=float))
+        except Exception as exc:
+            _log(None, f"[plot:image_catalog_family_cutouts] skipped critical lines: best-fit conversion failed: {exc}")
+            best_fit_latent = None
+    else:
         best_fit_latent = None
     critical_model_pairs_by_z: dict[float, tuple[Any, list[dict[str, float]]]] = {}
     with PdfPages(output) as pdf:
@@ -9040,9 +9671,10 @@ def _plot_image_catalog_family_cutouts(
             extra_df,
             state.reference,
             detail_cols=detail_cols,
+            render_config=render_config,
         )
-        fig.savefig(cluster_output, facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.02, dpi=getattr(helpers, "CUTOUT_FIGURE_DPI", 300))
-        pdf.savefig(fig, facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.02, dpi=getattr(helpers, "CUTOUT_FIGURE_DPI", 300))
+        fig.savefig(cluster_output, facecolor=fig.get_facecolor(), **savefig_kwargs)
+        pdf.savefig(fig, facecolor=fig.get_facecolor(), **savefig_kwargs)
         plt.close(fig)
 
         for block in blocks:
@@ -9060,7 +9692,7 @@ def _plot_image_catalog_family_cutouts(
             n_cols = detail_cols
             fig = plt.figure(
                 figsize=helpers._figure_size(n_rows, n_cols),
-                dpi=getattr(helpers, "CUTOUT_FIGURE_DPI", 300),
+                dpi=render_dpi,
             )
             helpers._style_cutout_figure(fig)
             grid = fig.add_gridspec(n_rows, n_cols)
@@ -9077,6 +9709,8 @@ def _plot_image_catalog_family_cutouts(
                 block,
                 state.reference,
                 model_pair,
+                render_config=render_config,
+                include_critical_lines=draw_critical_lines,
             )
             for panel_index, panel in enumerate(block["detail_panels"]):
                 detail_row = overview_units + panel_index // detail_cols
@@ -9093,8 +9727,10 @@ def _plot_image_catalog_family_cutouts(
                     pd.Series(panel),
                     state.reference,
                     model_pair,
+                    render_config=render_config,
+                    include_critical_lines=draw_critical_lines,
                 )
-            pdf.savefig(fig, facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.02, dpi=getattr(helpers, "CUTOUT_FIGURE_DPI", 300))
+            pdf.savefig(fig, facecolor=fig.get_facecolor(), **savefig_kwargs)
             plt.close(fig)
 
 
@@ -9110,6 +9746,8 @@ def _generate_plots_and_tables(
 ) -> None:
     tables_dir = run_dir / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
+    sample_likelihood_mode = _active_sample_likelihood_mode(evaluator, args)
+    use_arc_aware_diagnostics = _uses_arc_aware_diagnostics(sample_likelihood_mode)
     summary_df = _run_logged_phase(
         args,
         "plots.summary_table",
@@ -9136,16 +9774,17 @@ def _generate_plots_and_tables(
         "plots.image_count_recovery_table",
         lambda: _image_count_recovery_table(state, image_fit_quality_df),
     )
-    arc_aware_family_df = _run_logged_phase(
-        args,
-        "plots.arc_aware_family_diagnostics_table",
-        lambda: _arc_aware_family_diagnostics_from_image_rows(image_fit_quality_df),
-    )
-    if not arc_aware_family_df.empty:
-        family_df = family_df.copy()
-        family_df["family_id"] = family_df["family_id"].astype(str)
-        arc_aware_family_df["family_id"] = arc_aware_family_df["family_id"].astype(str)
-        family_df = family_df.merge(arc_aware_family_df, on="family_id", how="left")
+    if use_arc_aware_diagnostics:
+        arc_aware_family_df = _run_logged_phase(
+            args,
+            "plots.arc_aware_family_diagnostics_table",
+            lambda: _arc_aware_family_diagnostics_from_image_rows(image_fit_quality_df),
+        )
+        if not arc_aware_family_df.empty:
+            family_df = family_df.copy()
+            family_df["family_id"] = family_df["family_id"].astype(str)
+            arc_aware_family_df["family_id"] = arc_aware_family_df["family_id"].astype(str)
+            family_df = family_df.merge(arc_aware_family_df, on="family_id", how="left")
     max_tree_depth = _first_int_value(getattr(args, "max_tree_depth", 10), 10)
     chain_health_df = _run_logged_phase(
         args,
@@ -9199,6 +9838,15 @@ def _generate_plots_and_tables(
     best_fit_values = _best_fit_values_for_specs(state.parameter_specs, best_fit)
     scaling_best_fit_values = _best_fit_values_for_specs(scaling_specs, scaling_best_fit)
     cosmology_best_fit_values = _best_fit_values_for_specs(cosmology_specs, cosmology_best_fit)
+    best_fit_latent = _reported_physical_to_latent_vector(evaluator, np.asarray(best_fit, dtype=float))
+    critical_arc_singular_threshold_best_fit = _fit_quality_critical_arc_singular_threshold(
+        evaluator,
+        best_fit_latent,
+    )
+    critical_arc_singular_softness_best_fit = _fit_quality_critical_arc_singular_softness(
+        evaluator,
+        best_fit_latent,
+    )
     previous_stage_best_values = getattr(state, "previous_stage_best_values", None)
     potfile_constraint_df = _run_logged_phase(
         args,
@@ -9302,6 +9950,7 @@ def _generate_plots_and_tables(
     )
 
     plot_tasks: list[PlotTask] = [
+        ("numpyro_model", "plots.numpyro_model", lambda: _plot_numpyro_model(run_dir, state, evaluator, args)),
         (
             "corner",
             "plots.corner",
@@ -9386,6 +10035,7 @@ def _generate_plots_and_tables(
                 image_fit_quality_df,
                 _plot_path(run_dir, "image_recovery.pdf"),
                 image_recovery_extra_df,
+                use_arc_aware_diagnostics=use_arc_aware_diagnostics,
             ),
         ),
         *(
@@ -9410,7 +10060,11 @@ def _generate_plots_and_tables(
         (
             "image_count_recovery",
             "plots.image_count_recovery",
-            lambda: _plot_image_count_recovery(image_count_recovery_df, _plot_path(run_dir, "image_count_recovery.pdf")),
+            lambda: _plot_image_count_recovery(
+                image_count_recovery_df,
+                _plot_path(run_dir, "image_count_recovery.pdf"),
+                use_arc_aware_diagnostics=use_arc_aware_diagnostics,
+            ),
         ),
         (
             "model_magnification",
@@ -9425,7 +10079,11 @@ def _generate_plots_and_tables(
         (
             "image_residual_histogram",
             "plots.image_residual_histogram",
-            lambda: _plot_image_residual_histogram(image_fit_quality_df, _plot_path(run_dir, "image_residual_histogram.pdf")),
+            lambda: _plot_image_residual_histogram(
+                image_fit_quality_df,
+                _plot_path(run_dir, "image_residual_histogram.pdf"),
+                use_arc_aware_diagnostics=use_arc_aware_diagnostics,
+            ),
         ),
         (
             "residual_vs_magnification",
@@ -9475,38 +10133,49 @@ def _generate_plots_and_tables(
         ("refresh_diagnostics", "plots.refresh_diagnostics", lambda: _plot_refresh_diagnostics(run_dir, family_df)),
         ("timing_profile", "plots.timing_profile", lambda: _plot_timing_profile(run_dir, evaluator)),
     ]
-    plot_tasks.extend(
-        [
-            (
-                "critical_arc_support_histogram",
-                "plots.critical_arc_support_histogram",
-                lambda: _plot_critical_arc_support_histogram(
-                    image_fit_quality_df,
-                    _plot_path(run_dir, "critical_arc_support_histogram.pdf"),
-                    critical_arc_base_prob=float(getattr(evaluator, "critical_arc_base_prob", CRITICAL_ARC_BASE_PROB)),
-                    critical_arc_max_prob=float(getattr(evaluator, "critical_arc_max_prob", CRITICAL_ARC_MAX_PROB)),
-                    singular_threshold=float(getattr(evaluator, "critical_arc_singular_threshold", CRITICAL_ARC_SINGULAR_THRESHOLD)),
-                    singular_softness=float(getattr(evaluator, "critical_arc_singular_softness", CRITICAL_ARC_SINGULAR_SOFTNESS)),
+    if use_arc_aware_diagnostics:
+        plot_tasks.extend(
+            [
+                (
+                    "critical_arc_support_histogram",
+                    "plots.critical_arc_support_histogram",
+                    lambda: _plot_critical_arc_support_histogram(
+                        image_fit_quality_df,
+                        _plot_path(run_dir, "critical_arc_support_histogram.pdf"),
+                        arc_recovery_p_arc_threshold=float(
+                            getattr(evaluator, "arc_recovery_p_arc_threshold", CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD)
+                        ),
+                        critical_arc_base_prob=float(getattr(evaluator, "critical_arc_base_prob", CRITICAL_ARC_BASE_PROB)),
+                        critical_arc_max_prob=float(getattr(evaluator, "critical_arc_max_prob", CRITICAL_ARC_MAX_PROB)),
+                        singular_threshold=float(critical_arc_singular_threshold_best_fit),
+                        singular_softness=float(critical_arc_singular_softness_best_fit),
+                    ),
                 ),
-            ),
-            (
-                "critical_arc_support_phase_space",
-                "plots.critical_arc_support_phase_space",
-                lambda: _plot_critical_arc_support_phase_space(
-                    image_fit_quality_df,
-                    _plot_path(run_dir, "critical_arc_support_phase_space.pdf"),
+                (
+                    "critical_arc_support_phase_space",
+                    "plots.critical_arc_support_phase_space",
+                    lambda: _plot_critical_arc_support_phase_space(
+                        image_fit_quality_df,
+                        _plot_path(run_dir, "critical_arc_support_phase_space.pdf"),
+                        arc_recovery_p_arc_threshold=float(
+                            getattr(evaluator, "arc_recovery_p_arc_threshold", CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD)
+                        ),
+                        critical_arc_base_prob=float(getattr(evaluator, "critical_arc_base_prob", CRITICAL_ARC_BASE_PROB)),
+                        critical_arc_max_prob=float(getattr(evaluator, "critical_arc_max_prob", CRITICAL_ARC_MAX_PROB)),
+                        singular_threshold=float(critical_arc_singular_threshold_best_fit),
+                        singular_softness=float(critical_arc_singular_softness_best_fit),
+                    ),
                 ),
-            ),
-            (
-                "critical_arc_recovery_by_family",
-                "plots.critical_arc_recovery_by_family",
-                lambda: _plot_critical_arc_recovery_by_family(
-                    image_count_recovery_df,
-                    _plot_path(run_dir, "critical_arc_recovery_by_family.pdf"),
+                (
+                    "critical_arc_recovery_by_family",
+                    "plots.critical_arc_recovery_by_family",
+                    lambda: _plot_critical_arc_recovery_by_family(
+                        image_count_recovery_df,
+                        _plot_path(run_dir, "critical_arc_recovery_by_family.pdf"),
+                    ),
                 ),
-            ),
-        ]
-    )
+            ]
+        )
     if cosmology_specs:
         plot_tasks.insert(
             1,
@@ -9551,8 +10220,13 @@ def _generate_plots_and_tables(
                 ),
             ]
         )
+    skip_grid_diagnostics = bool(getattr(args, "skip_grid_diagnostics", False))
+    if skip_grid_diagnostics:
+        _log(args, "[plots] grid diagnostics skipped by skip_grid_diagnostics=True")
     kappa_true_fits = getattr(args, "kappa_true_fits", None)
-    if kappa_true_fits is not None and str(kappa_true_fits).strip() and not bool(getattr(args, "quick_diagnostics", False)):
+    gammax_true_fits = getattr(args, "gammax_true_fits", None)
+    gammay_true_fits = getattr(args, "gammay_true_fits", None)
+    if not skip_grid_diagnostics and kappa_true_fits is not None and str(kappa_true_fits).strip():
         plot_tasks.append(
             (
                 "kappa_truth_diagnostics",
@@ -9567,7 +10241,29 @@ def _generate_plots_and_tables(
                 ),
             )
         )
-    if bool(getattr(args, "plot_caustics", False)) and not bool(getattr(args, "quick_diagnostics", False)):
+        if (
+            gammax_true_fits is not None
+            and str(gammax_true_fits).strip()
+            and gammay_true_fits is not None
+            and str(gammay_true_fits).strip()
+        ):
+            plot_tasks.append(
+                (
+                    "mu_truth_diagnostics",
+                    "plots.mu_truth_diagnostics",
+                    lambda: _plot_abs_mu_truth_diagnostics(
+                        run_dir,
+                        evaluator,
+                        best_fit,
+                        str(kappa_true_fits),
+                        str(gammax_true_fits),
+                        str(gammay_true_fits),
+                        getattr(args, "caustic_source_redshift", 9.0),
+                        image_df=image_fit_quality_df,
+                    ),
+                )
+            )
+    if not skip_grid_diagnostics:
         caustic_plot_grid_scale_arcsec = getattr(
             args,
             "caustic_plot_grid_scale_arcsec",

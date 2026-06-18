@@ -4,11 +4,13 @@ This repository now has two public fitting workflows: the sequential optimizer/s
 
 1. Fit the large-scale cluster model with SVI.
 2. Fit the joint large+small model with SVI, initialized from the large-scale SVI solution.
-3. Optionally run NUTS on the joint model with `--fit-method svi+nuts`.
+3. Optionally run NUTS on the joint model with `--fit-method svi+nuts`, or use a direct sampler with `--fit-method mchmc` / `--fit-method mclmc`.
 4. Optionally run an image-plane refinement stage with `--image-plane-mode local-jacobian`.
-5. Optionally run a final image-plane stage using `--image-plane-mode linearized-forward-beta-image-plane`, `--image-plane-mode forward-metric-image-plane`, or `--image-plane-mode fold-regularized-forward-beta-image-plane`.
+5. Optionally run a final image-plane stage using `--image-plane-mode linearized-forward-beta-image-plane`, `--image-plane-mode forward-metric-image-plane`, `--image-plane-mode critical-arc-mixture-image-plane`, or `--image-plane-mode fold-regularized-forward-beta-image-plane`.
 
-Use `--fit-method svi` for a fast variational result or `--fit-method svi+nuts` for SVI initialization followed by joint posterior sampling. In the optional sequential image-plane workflow, `--fit-method`, `--svi-steps`, `--warmup`, `--samples`, and `--max-tree-depth` may each take one value for all sampled stages, two values mapping to `stage2_joint` and `stage3_image_plane`, or three values when a final stage-4 image-plane mode is enabled. Nested sampling is reserved for the one-shot evidence workflow: use `--fit-mode evidence-ns` with an explicit `--evidence-source-prior-sigma-arcsec`; `--fit-method`, `--svi-steps`, `--warmup`, and `--samples` are ignored in that mode.
+Use `--fit-method svi` for a fast variational result, `--fit-method svi+nuts` for SVI initialization followed by joint posterior sampling, or `--fit-method mchmc` / `--fit-method mclmc` for direct BlackJAX microcanonical sampling in the model's latent parameter space. In the optional sequential image-plane workflow, `--fit-method`, `--svi-steps`, `--warmup`, `--samples`, and `--max-tree-depth` may each take one value for all sampled stages, two values mapping to `stage2_joint` and `stage3_image_plane`, or three values when both stage 3 and a final stage-4 image-plane mode are enabled. Nested sampling is reserved for the one-shot evidence workflow: use `--fit-mode evidence-ns` with an explicit `--evidence-source-prior-sigma-arcsec`; `--fit-method`, `--svi-steps`, `--warmup`, and `--samples` are ignored in that mode.
+
+For `mchmc` and `mclmc`, `--warmup` controls BlackJAX tuning/adaptation and `--samples` controls production transitions per chain. Prefer `mchmc` when asymptotic Metropolis correction is required. Unadjusted `mclmc` can be faster, but each saved draw is one integration transition and the run should be checked by increasing samples or reducing the tuned step size in a sensitivity run.
 
 ## Run
 
@@ -56,7 +58,7 @@ python -m cluster_solver \
   --plot-caustics
 ```
 
-The same command with scalar `--fit-method svi` skips NUTS in every sampled stage and writes the AutoNormal guide posterior. A mixed command such as `--fit-method svi+nuts svi --svi-steps 2000 500 --warmup 1000 0 --samples 250 100 --max-tree-depth 8 6` runs NUTS in stage 2 and an SVI-only image-plane stage 3; with stage 4 enabled, a third value controls the final stage-4 directory.
+The same command with scalar `--fit-method svi` skips NUTS in every sampled stage and writes the AutoNormal guide posterior. A mixed command such as `--fit-method svi+nuts svi --svi-steps 2000 500 --warmup 1000 0 --samples 250 100 --max-tree-depth 8 6` runs NUTS in stage 2 and an SVI-only image-plane stage 3; when stage 3 is skipped before stage 4, the second value controls stage 4, and when both stage 3 and stage 4 run, a third value controls the final stage-4 directory. A scalar `--fit-method mchmc` or `--fit-method mclmc` runs the selected microcanonical sampler in every sampled stage; staged values can mix them with `svi` or `svi+nuts`.
 
 One-shot evidence nested sampling example:
 
@@ -358,10 +360,22 @@ scalar magnification weighting with the full local 2x2 lensing Jacobian
 covariance at each observed image. It is still a differentiable local
 approximation, not a full image-finding likelihood.
 
+Stage 3 can also be selected explicitly with `--stage3-image-plane-mode`.
+The default `auto` preserves the historical behavior: local-Jacobian stage 3
+for `--image-plane-mode local-jacobian`, and local-Jacobian stage 3 before a
+final stage 4 unless `--skip-stage3-image-plane-local-jacobian` is passed.
+Use `--image-plane-mode none --stage3-image-plane-mode critical-arc-mixture-image-plane`
+to run `stage3_image_plane` with a critical-arc point/arc mixture likelihood
+but without sampled source coordinates. In that stage-3 centroid mode, each
+family source position is recomputed at every likelihood evaluation as the
+current weighted centroid of the ray-shot image positions, with weights
+proportional to reliability divided by image-plane variance.
+
 When `--image-plane-mode linearized-forward-beta-image-plane` is selected, the
 workflow adds `stage4_linearized_image_plane`. By default it also runs
-`stage3_image_plane` first; pass `--skip-stage3-image-plane-local-jacobian` to
-initialize stage 4 directly from `stage2_joint`. This final stage samples the lens
+`stage3_image_plane` first; pass `--skip-stage3-image-plane-local-jacobian` or
+`--stage3-image-plane-mode none` to initialize stage 4 directly from
+`stage2_joint`. This final stage samples the lens
 parameters plus explicit 2D source positions for each multiply imaged family,
 initialized from the previous sampled stage's source centroids. The sampled likelihood computes one
 local image-plane correction at each observed image even when
@@ -402,11 +416,14 @@ requires `--image-plane-newton-steps 0` and does not support
 `source-position-parameterization=conditional-whitened`.
 
 When `--image-plane-mode critical-arc-mixture-image-plane` is selected, the
-stage-4 likelihood uses an observed-anchor LM image-plane correction and a
-point/arc residual mixture whose broad critical-direction branch turns on near
-singular local Jacobians. The critical-arc likelihood always evaluates the full
-exact point/arc mixture; there are no speed-mode approximations or masked
-near-critical row splits.
+stage-4 likelihood uses explicit sampled source coordinates, an observed-anchor
+LM image-plane correction, and a point/arc residual mixture whose broad
+critical-direction branch turns on near singular local Jacobians. The
+critical-arc likelihood always evaluates the full exact point/arc mixture;
+there are no speed-mode approximations or masked near-critical row splits. Use
+`--stage3-image-plane-mode critical-arc-mixture-image-plane` when the same
+critical-arc residual model should be used in stage 3 with centroid source
+positions instead of sampled explicit source coordinates.
 
 Optional CAB arc-morphology constraints are supplied by `image.arcfile` as an
 independent arc catalog, not as image annotations. Rows have the form
@@ -468,7 +485,7 @@ For `--run-name joint_workflow`, outputs are written to:
 
 - `plots/m0416_original/joint_workflow/stage1_large_only/`
 - `plots/m0416_original/joint_workflow/stage2_joint/`
-- `plots/m0416_original/joint_workflow/stage3_image_plane/` when `--image-plane-mode local-jacobian`, or before stage 4 unless skipped
+- `plots/m0416_original/joint_workflow/stage3_image_plane/` when `--image-plane-mode local-jacobian`, when `--stage3-image-plane-mode critical-arc-mixture-image-plane`, or before stage 4 unless skipped
 - `plots/m0416_original/joint_workflow/stage4_linearized_image_plane/` when `--image-plane-mode linearized-forward-beta-image-plane`
 - `plots/m0416_original/joint_workflow/stage4_forward_metric_image_plane/` when `--image-plane-mode forward-metric-image-plane`
 - `plots/m0416_original/joint_workflow/stage4_fold_regularized_image_plane/` when `--image-plane-mode fold-regularized-forward-beta-image-plane`

@@ -26,7 +26,12 @@ from plot_literature_family_cutouts import (  # noqa: E402
     DEFAULT_IMAGE_DIR,
     DEFAULT_IMAGE_SCALE,
     DEFAULT_MAX_IMAGES_PER_FAMILY,
+    FAMILY_CUTOUT_CRITICAL_LINE_CHOICES,
+    FAMILY_CUTOUT_CRITICAL_LINES_AUTO,
+    FAMILY_CUTOUT_MODE_CHOICES,
+    FAMILY_CUTOUT_MODE_FULL,
     IMAGE_SCALE_CHOICES,
+    build_family_cutout_render_config,
     find_rgb_band_paths,
     load_rgb_metadata,
     write_family_cutout_pdf,
@@ -78,6 +83,16 @@ def canonical_cluster(value: str) -> str:
 
 def default_output_path(cluster: str, image_catalog_path: Path) -> Path:
     return DEFAULT_OUTPUT_DIR / f"{_safe_filename(cluster)}_{_safe_filename(Path(image_catalog_path).stem)}_family_cutouts.pdf"
+
+
+def _positive_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def load_image_catalog(
@@ -142,6 +157,10 @@ def run(
     families_per_page: int = DEFAULT_FAMILIES_PER_PAGE,
     max_images_per_family: int = DEFAULT_MAX_IMAGES_PER_FAMILY,
     par_path: Path | None = None,
+    cutout_mode: str = FAMILY_CUTOUT_MODE_FULL,
+    cutout_dpi: int | None = None,
+    cutout_max_side_pixels: int | None = None,
+    cutout_critical_lines: str = FAMILY_CUTOUT_CRITICAL_LINES_AUTO,
 ) -> Path:
     if len(bands) < 3:
         raise ValueError("--bands must provide at least three bands.")
@@ -149,6 +168,12 @@ def run(
     catalog = load_image_catalog(cluster_key, Path(image_catalog_path), par_path=par_path)
     band_paths = find_rgb_band_paths(Path(image_dir), cluster=cluster_key, bands=bands, image_scale=image_scale)
     band_images = load_rgb_metadata(band_paths, bands=bands)
+    render_config = build_family_cutout_render_config(
+        mode=cutout_mode,
+        dpi=cutout_dpi,
+        max_side_pixels=cutout_max_side_pixels,
+        critical_lines=cutout_critical_lines,
+    )
     output_path = Path(output) if output is not None else default_output_path(cluster_key, Path(image_catalog_path))
     write_family_cutout_pdf(
         catalog,
@@ -158,6 +183,7 @@ def run(
         cutout_size_arcsec=cutout_size_arcsec,
         families_per_page=families_per_page,
         max_images_per_family=max_images_per_family,
+        render_config=render_config,
     )
     return output_path.with_suffix(".pdf")
 
@@ -174,6 +200,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--families-per-page", type=int, default=DEFAULT_FAMILIES_PER_PAGE)
     parser.add_argument("--max-images-per-family", type=int, default=DEFAULT_MAX_IMAGES_PER_FAMILY)
     parser.add_argument("--par-path", type=Path, default=None)
+    parser.add_argument("--image-catalog-family-cutout-mode", choices=FAMILY_CUTOUT_MODE_CHOICES, default=FAMILY_CUTOUT_MODE_FULL)
+    parser.add_argument("--image-catalog-family-cutout-dpi", type=_positive_int_arg, default=None)
+    parser.add_argument("--image-catalog-family-cutout-max-side-pixels", type=_positive_int_arg, default=None)
+    parser.add_argument(
+        "--image-catalog-family-cutout-critical-lines",
+        choices=FAMILY_CUTOUT_CRITICAL_LINE_CHOICES,
+        default=FAMILY_CUTOUT_CRITICAL_LINES_AUTO,
+    )
     return parser.parse_args(argv)
 
 
@@ -191,6 +225,10 @@ def main(argv: list[str] | None = None) -> int:
             families_per_page=args.families_per_page,
             max_images_per_family=args.max_images_per_family,
             par_path=args.par_path,
+            cutout_mode=args.image_catalog_family_cutout_mode,
+            cutout_dpi=args.image_catalog_family_cutout_dpi,
+            cutout_max_side_pixels=args.image_catalog_family_cutout_max_side_pixels,
+            cutout_critical_lines=args.image_catalog_family_cutout_critical_lines,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

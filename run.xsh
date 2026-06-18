@@ -4,11 +4,13 @@ import time
 import sys
 from pathlib import Path
 
-$JAX_NUM_CPU_DEVICES = "30"
+cores = 4
+
+$JAX_NUM_CPU_DEVICES = cores
 
 PYTHON = "/home/dutra/.conda/envs/lenstronomy/bin/python"
 
-output_dir = f"jun14e_nocosmo"
+output_dir = f"jun18b_prod_nozeff_newpriors"
 
 HFF_RGB_BANDS = ["F435W", "F606W", "F814W", "F105W", "F125W", "F140W", "F160W"]
 HFF_RGB_DISPLAY = {"q": 6.4, "stretch": 0.0145, "minimum": -5.5e-4, "red_gain": 0.47, "green_gain": 0.91, "blue_gain": 3.95}
@@ -68,6 +70,8 @@ BERGAMINI_CLUSTERS = {
         "image_catalog_family_cutout_bands": ["F435W", "F606W", "F814W"],
         "image_catalog_family_cutout_rgb": dict(FF_RGB_DISPLAY),
         "kappa_true_fits": "data/ff_sims/ares/kappa_z9_0.fits",
+        "gammax_true_fits": "data/ff_sims/ares/gammax_z9_0.fits",
+        "gammay_true_fits": "data/ff_sims/ares/gammay_z9_0.fits",
     },
     "HERA": {
         "cluster_key": "hera",
@@ -78,6 +82,8 @@ BERGAMINI_CLUSTERS = {
         "image_catalog_family_cutout_bands": ["F435W", "F606W", "F814W"],
         "image_catalog_family_cutout_rgb": dict(FF_RGB_DISPLAY),
         "kappa_true_fits": "data/ff_sims/hera/kappa_z9_0.fits",
+        "gammax_true_fits": "data/ff_sims/hera/gammax_z9_0.fits",
+        "gammay_true_fits": "data/ff_sims/hera/gammay_z9_0.fits",
     },
 }
 CLUSTER_ALIASES = {}
@@ -109,10 +115,11 @@ best_par_overlay_args = ["--corner-overlay-best-par", str(BEST_PAR_PATH)] if BES
 
 # Mirrors the active solver-control settings in run_validation.xsh, but runs the
 # real-data cluster solver directly instead of the mock validation wrapper.
-mode = "critical_arc"  # "linear", "metric", "anchored", "critical_arc", or "fold_regularized"
-run_name = f"{cluster_config['cluster_key']}_{mode}_nuts"
+mode = "none"  # "linear", "metric", "anchored", "critical_arc", or "fold_regularized"
+run_name = f"{cluster_config['cluster_key']}_{mode}_nuts_nozeff"
 fit_mode = "sequential"
 image_plane_modes = {
+    "none": "none",
     "linear": "linearized-forward-beta-image-plane",
     "metric": "forward-metric-image-plane",
     "anchored": "anchored-solved-forward-beta-image-plane",
@@ -121,33 +128,40 @@ image_plane_modes = {
     "catastrophe": "catastrophe-normal-form-image-plane",
 }
 image_plane_mode = image_plane_modes[mode]
-fit_method = ["svi+nuts", "svi+nuts", "svi+nuts"]
-warmup = [500, 6000, 2000]
-samples = [250, 500, 500]
-svi_steps = [500, 1000, 2000]
-max_tree_depth = [8, 8, 8]
+stage3_mode = "local-jacobian" #"critical-arc-mixture-image-plane"
+
+fit_method = ["svi+nuts", "svi+nuts"]#, "svi+nuts"]
+refresh_every = 1000
+svi_steps = [500, 4000]#, 6000]
+warmup = [500, 4000]#, 2000]
+samples = [250, 500]#, 500]
+max_tree_depth = [8, 8]#, 8]
 quick_diagnostics = False
 target_accept = 0.8
-chains = 8
-active_scaling_galaxies = [50]
-z_bin_efficiency_tol = 0.01
+chains = cores
+active_scaling_galaxies = [128]
+z_bin_efficiency_tol = 0.0
 
 # Short stage4 conditioning check before a full production run: confirm the magnification fold
 # un-sticks the chains (adapted step size recovers, tree saturation drops, chains move) cheaply.
 pilot = False
 if pilot:
-    target_accept = 0.6
+    refresh_every = 500
+    target_accept = 0.8
     svi_steps = [500, 500, 500]
-    warmup = [500, 1000, 500]
-    samples = [250, 150, 250]
+    fit_method = ["svi+nuts", "mchmc", "mchmc"]
+    fit_method = ["svi+nuts", "svi+nuts", "svi+nuts"]
+    warmup = [500, 5000, 500]
+    samples = [250, 500, 250]
     max_tree_depth = [8, 8, 8]
     #quick_diagnostics = True
-    chains = 8
-    active_scaling_galaxies = [25]
-    z_bin_efficiency_tol = 0.05
+    chains = cores
+    active_scaling_galaxies = [128]
+    z_bin_efficiency_tol = 0.0000001
 
 
-OUTPUT_DIR = f"{OUTPUT_DIR}_W{warmup[-2]}-{warmup[-1]}_S{samples[-2]}-{samples[-1]}_T{max_tree_depth[-2]}-{max_tree_depth[-1]}"
+OUTPUT_DIR = f"{OUTPUT_DIR}_ASG{active_scaling_galaxies[-1]}_T{max_tree_depth[-2]}W{warmup[-2]}S{samples[-2]}_T{max_tree_depth[-1]}W{warmup[-1]}S{samples[-1]}"
+OUTPUT_DIR += "_prior_whitened_densestructured_refreshing_surrogateflat"
 
 start_at_stage3 = True
 skip_stage3_image_plane_local_jacobian = False
@@ -174,11 +188,18 @@ image_catalog_family_cutout_args = [
 ] if image_catalog_family_cutout_image_dir else []
 kappa_true_fits = cluster_config.get("kappa_true_fits")
 kappa_true_args = ["--kappa-true-fits", kappa_true_fits] if kappa_true_fits else []
+gammax_true_fits = cluster_config.get("gammax_true_fits")
+gammay_true_fits = cluster_config.get("gammay_true_fits")
+gamma_true_args = [
+    *(["--gammax-true-fits", gammax_true_fits] if gammax_true_fits else []),
+    *(["--gammay-true-fits", gammay_true_fits] if gammay_true_fits else []),
+]
 image_plane_newton_steps = 0
 linearized_beta_prior_sigma_arcsec = 3.0
-source_position_parameterization = "prior-whitened"
-sampling_engine = "refreshing_surrogate"
-pos_sigma_arcsec = 0.1
+source_position_parameterization = "prior-whitened" #conditional-whitened" #"prior-whitened"
+sampling_engine = "refreshing_surrogate_flat" # "full" #"refreshing_surrogate"
+stage4_sampling_engine = "refreshing_surrogate_flat" # full_flat
+pos_sigma_arcsec = 0.3
 anchored_args = [
     "--anchored-image-plane-solve-steps", 0,
     "--anchored-image-plane-trust-radius-arcsec", 0.3,
@@ -186,19 +207,28 @@ anchored_args = [
     "--anchored-image-plane-lm-damping-absolute", 1.0e-6,
 ] if mode == "anchored" else []
 critical_arc_args = [
-    "--critical-arc-critical-direction-sigma-arcsec", 5.0,
+    "--critical-arc-critical-direction-sigma-arcsec", 10.0,
     "--critical-arc-base-prob", 0.10,
     "--critical-arc-max-prob", 0.85,
-    # Arc-mixture gate only -- the magnification fold now uses its own baked-in
-    # CRITICAL_ARC_FOLD_SINGULAR_THRESHOLD/SOFTNESS and ignores these. Tight so arc_prob ramps up
-    # only near real critical curves (singular_min < ~0.05); point images keep full precision.
-    "--critical-arc-singular-threshold", 0.1,
-    "--critical-arc-singular-softness", 0.02,
+    # Arc-mixture gate only -- the magnification fold uses its own baked-in threshold/softness.
+    "--sample-critical-arc-singular-threshold",
+    "--critical-arc-singular-threshold", 0.4,
+    "--critical-arc-singular-threshold-prior-median", 0.15,
+    "--critical-arc-singular-threshold-prior-log-sigma", 0.5,
+    "--critical-arc-singular-threshold-lower", 0.03,
+    "--critical-arc-singular-threshold-upper", 0.40,
+    "--sample-critical-arc-singular-softness",
+    "--critical-arc-singular-softness", 0.05,
+    "--critical-arc-singular-softness-prior-median", 0.05,
+    "--critical-arc-singular-softness-prior-log-sigma", 0.5,
+    "--critical-arc-singular-softness-lower", 0.005,
+    "--critical-arc-singular-softness-upper", 0.20,
     "--critical-arc-lm-damping-relative", 1.0e-3,
     "--critical-arc-lm-damping-absolute", 1.0e-6,
-    "--critical-arc-lm-trust-radius-arcsec", 20.0,
+    "--critical-arc-lm-trust-radius-arcsec", 10.0,
+    "--arc-recovery-p-arc-threshold", 0.5,
     "--arc-aware-max-arclength-arcsec", 10.0,
-    "--arc-aware-curve-step-arcsec", 0.1,
+    "--arc-aware-curve-step-arcsec", 0.01,
 ] if mode == "critical_arc" else []
 fold_regularized_args = [
     "--fold-curvature-arcsec-inv", 1.0,
@@ -214,26 +244,28 @@ smc_args = [
     "--smc-mala-step-size", 0.03,
 ] if mode == "critical_arc" else []
 
+
 workflow_args = [
+    "--potfile-member-mag-max", 22.0,
     *(["--start-at-stage3"] if start_at_stage3 else []),
     "--fit-mode", fit_mode,
+    "--stage3-image-plane-mode", stage3_mode,
     "--image-plane-mode", image_plane_mode,
     *(["--skip-stage3-image-plane-local-jacobian"] if skip_stage3_image_plane_local_jacobian else []),
-    *(["--quick-diagnostics"] if quick_diagnostics else []),
-    *(image_catalog_family_cutout_args),
     "--image-plane-newton-steps", image_plane_newton_steps,
     "--linearized-beta-prior-sigma-arcsec", linearized_beta_prior_sigma_arcsec,
     "--source-position-parameterization", source_position_parameterization,
+    "--stage4-fresh-process",
+    "--stage4-sampling-engine", stage4_sampling_engine,
     "--fit-method", *fit_method,
     "--warmup", *warmup,
     "--samples", *samples,
+    "--refresh-every", refresh_every,
     "--svi-steps", *svi_steps,
     "--chains", chains,
     "--target-accept", target_accept,
     "--max-tree-depth", *max_tree_depth,
     "--z-bin-efficiency-tol", z_bin_efficiency_tol,
-    "--linearized-beta-prior-sigma-arcsec", 3.0,
-    "--exact-image-diagnostics-stage3",
 
     *(anchored_args),
     *(critical_arc_args),
@@ -251,15 +283,14 @@ active_scaling_args = [
 
 scatter_and_stabilizer_args = [
     "--pos-sigma-arcsec", pos_sigma_arcsec,
-    "--match-tolerance-arcsec", 2.0,
-    "--image-presence-penalty-weight", 0.0,
+    "--image-presence-penalty-weight", 2.0,
     "--image-presence-match-radius-arcsec", 1.0,
     "--image-presence-temperature-arcsec", 0.5,
     "--image-plane-scatter-prior", "log-uniform",
     "--image-plane-scatter-floor-arcsec", 0.01,
     "--image-plane-scatter-upper-arcsec", 1.0,
     #"--scaling-scatter",
-    #"--scaling-scatter-fields", "sigma,cut",
+    "--scaling-scatter-fields", "sigma",
     #"--likelihood-stabilizer-max-gain", "50",
     # "--likelihood-stabilizer-max-residual-arcsec", "5",
     # "--likelihood-stabilizer-residual-loss", "student-t",
@@ -268,26 +299,40 @@ scatter_and_stabilizer_args = [
 
 ]
 
-real_data_args = [
-    #"--plot-caustics",
+validation_args = [
+    *(["--quick-diagnostics"] if quick_diagnostics else []),
+    "--exact-image-min-distance-arcsec", 0.5,
+    "--exact-image-precision-limit", 1.0e-2,
+    "--exact-image-num-iter-max", 20,
+    "--match-tolerance-arcsec", 2.0,
     "--caustic-source-redshift", 9.0,
+    *(image_catalog_family_cutout_args),
     *(kappa_true_args),
-    #"--fit-quality-workers", 32,
+    *(gamma_true_args),
+]
+
+real_data_args = [
     #"--fov-limit-radius", 200,
     #"--fit-cosmology-flat-wcdm"
 ]
 
 debug_args = [
-    "--potfile-mass-size-reparam",
+    "--no-jax-clear-caches-after-svi-refresh",
+    "--quick-diagnostics",
+    "--image-catalog-family-cutout-mode", "fast",
+    "--numpyro-print-summary",
+    "--nuts-chain-method", "parallel",
+    #"--potfile-mass-size-reparam",
     "--skip-validation",
-    #"--no-dense-mass",
+    "--dense-mass", "structured",
     #"--plots-only",
-    "--debug-sampler-diagnostics"
+    "--debug-sampler-diagnostics",
+    #"--fix-image-sigma-int-arcsec", "0.5",
 ]
 
 _run_start_monotonic = time.monotonic()
 try:
-    @(PYTHON) -m lenscluster.cluster_solver \
+    @(PYTHON) -m lenscluster.cluster_solver --resume all \
       --par-path @(PAR_PATH) \
       --output-dir @(OUTPUT_DIR) \
       --run-name @(run_name) \
@@ -295,6 +340,7 @@ try:
       @(workflow_args) \
       @(active_scaling_args) \
       @(scatter_and_stabilizer_args) \
+      @(validation_args) \
       @(real_data_args) \
       @(bayes_overlay_args) \
       @(best_par_overlay_args)
@@ -318,3 +364,4 @@ try:
 
 finally:
     print(f"[timing] elapsed={time.monotonic() - _run_start_monotonic:.2f}s")
+    printf '\033[?1000l\033[?1002l\033[?1003l\033[?1005l\033[?1006l\033[?1015l'

@@ -17,8 +17,11 @@ from .jax_cosmology import kpc_per_arcsec_from_config
 
 try:
     from rich.console import Console
+    from rich.table import Table
     from rich.text import Text
+    RICH_AVAILABLE = True
 except ModuleNotFoundError:  # pragma: no cover - exercised only in minimal test environments
+    RICH_AVAILABLE = False
     class _FallbackSpan:
         def __init__(self, style: str | None) -> None:
             self.style = style or ""
@@ -40,6 +43,16 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only in minimal test
         def print(self, value: Any) -> None:
             print(getattr(value, "plain", value))
 
+    class Table:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.rows: list[tuple[str, ...]] = []
+
+        def add_column(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def add_row(self, *values: Any, **kwargs: Any) -> None:
+            self.rows.append(tuple(str(value) for value in values))
+
 _DEBUG_LOG_PATH: Path | None = None
 _DEBUG_LOG_HANDLE = None
 _DEBUG_LOG_STDOUT_ENABLED = True
@@ -48,6 +61,7 @@ _TAG_STYLES = {
     "main": "bold cyan",
     "load": "bold blue",
     "input": "bold blue",
+    "input-archive": "bold blue",
     "runtime": "bold cyan",
     "stage": "bold magenta",
     "model": "bold green",
@@ -58,6 +72,7 @@ _TAG_STYLES = {
     "svi": "bold magenta",
     "nuts": "bold red",
     "validation": "bold yellow",
+    "approximations": "bold yellow",
     "output": "bold green",
     "plots-only": "bold cyan",
     "phase": "bold white",
@@ -71,12 +86,14 @@ _CONSOLE_VISIBLE_TAGS = {
     "runtime",
     "stage",
     "load",
+    "input-archive",
     "model",
     "compile",
     "smc",
     "svi",
     "nuts",
     "validation",
+    "approximations",
     "output",
     "plots-only",
     "resume",
@@ -271,12 +288,16 @@ def _rich_log_text(timestamp: str, message: str) -> Text:
     return text
 
 
-def log_message(args: argparse.Namespace | None, message: str) -> None:
+def log_message(args: argparse.Namespace | None, message: str, *, renderable: Any | None = None) -> None:
     timestamp = datetime.now().isoformat(timespec="seconds")
     memory = format_memory_snapshot()
     line = f"{timestamp} {message} {memory}"
     if should_log(args) and _should_log_to_console(message):
-        _CONSOLE.print(_rich_log_text(timestamp, message))
+        if renderable is not None and RICH_AVAILABLE:
+            _CONSOLE.print(_rich_log_text(timestamp, str(message).splitlines()[0]))
+            _CONSOLE.print(renderable)
+        else:
+            _CONSOLE.print(_rich_log_text(timestamp, message))
     debug_log_line(line)
 
 

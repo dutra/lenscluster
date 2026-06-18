@@ -39,7 +39,7 @@ def test_image_catalog_family_cutout_stage_eligibility(tmp_path: Path) -> None:
         tmp_path / "fit" / "stage3_image_plane",
     )
     args.exact_image_diagnostics_stage3 = True
-    assert plotting._image_catalog_family_cutout_enabled(
+    assert not plotting._image_catalog_family_cutout_enabled(
         args,
         tmp_path / "fit" / "stage3_image_plane",
     )
@@ -1710,7 +1710,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         best_eval=SimpleNamespace(loglike=0.0),
         results=results,
         runtime_sec=0.0,
-        args=argparse.Namespace(quiet=True, plot_caustics=False),
+        args=argparse.Namespace(quiet=True),
     )
 
     assert (tmp_path / "tables" / "image_fit_quality.csv").exists()
@@ -1719,6 +1719,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert (tmp_path / "tables" / "model_magnification.csv").exists()
     assert (tmp_path / "tables" / "subhalo_properties.csv").exists()
     assert (tmp_path / "tables" / "run_summary.txt").exists()
+    assert "numpyro_model" in captured_tasks
     assert "image_recovery" in captured_tasks
     assert "image_count_recovery" in captured_tasks
     assert "model_magnification" in captured_tasks
@@ -1729,13 +1730,56 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert "posterior_predictive_coverage" in captured_tasks
     assert "subhalo_mass_function" in captured_tasks
     assert "subhalo_radial_distribution" in captured_tasks
+    assert "critical_arc_support_histogram" not in captured_tasks
+    assert "critical_arc_support_phase_space" not in captured_tasks
+    assert "critical_arc_recovery_by_family" not in captured_tasks
     assert "kappa_comparison" not in captured_tasks
     assert "kappa_truth_diagnostics" not in captured_tasks
     assert "kappa_recovery" not in captured_tasks
-    assert "absolute_magnification" not in captured_tasks
-    assert "caustic_overlay" not in captured_tasks
+    assert "mu_truth_diagnostics" not in captured_tasks
+    assert "absolute_magnification" in captured_tasks
+    assert "caustic_overlay" in captured_tasks
 
     captured_tasks.clear()
+    evaluator.sample_likelihood_mode = "local-jacobian"
+    plotting._generate_plots_and_tables(
+        run_dir=tmp_path,
+        state=state,
+        evaluator=evaluator,
+        best_fit=np.empty((0,), dtype=float),
+        best_eval=SimpleNamespace(loglike=0.0),
+        results=results,
+        runtime_sec=0.0,
+        args=argparse.Namespace(quiet=True),
+    )
+    assert "numpyro_model" in captured_tasks
+    assert "absolute_magnification" in captured_tasks
+    assert "caustic_overlay" in captured_tasks
+    assert "critical_arc_support_histogram" not in captured_tasks
+    assert "critical_arc_support_phase_space" not in captured_tasks
+    assert "critical_arc_recovery_by_family" not in captured_tasks
+
+    captured_tasks.clear()
+    evaluator.sample_likelihood_mode = "critical-arc-mixture-image-plane"
+    plotting._generate_plots_and_tables(
+        run_dir=tmp_path,
+        state=state,
+        evaluator=evaluator,
+        best_fit=np.empty((0,), dtype=float),
+        best_eval=SimpleNamespace(loglike=0.0),
+        results=results,
+        runtime_sec=0.0,
+        args=argparse.Namespace(quiet=True),
+    )
+    assert "numpyro_model" in captured_tasks
+    assert "absolute_magnification" in captured_tasks
+    assert "caustic_overlay" in captured_tasks
+    assert "critical_arc_support_histogram" in captured_tasks
+    assert "critical_arc_support_phase_space" in captured_tasks
+    assert "critical_arc_recovery_by_family" in captured_tasks
+
+    captured_tasks.clear()
+    evaluator.sample_likelihood_mode = "source"
     state.fit_mode = "large-only"
     plotting._generate_plots_and_tables(
         run_dir=tmp_path,
@@ -1747,52 +1791,11 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         runtime_sec=0.0,
         args=argparse.Namespace(
             quiet=True,
-            plot_caustics=False,
             caustic_plot_grid_scale_arcsec=0.2,
             caustic_source_redshift=9.0,
         ),
     )
-    assert "absolute_magnification" not in captured_tasks
-    assert "caustic_overlay" not in captured_tasks
-
-    captured_tasks.clear()
-    plotting._generate_plots_and_tables(
-        run_dir=tmp_path,
-        state=state,
-        evaluator=evaluator,
-        best_fit=np.empty((0,), dtype=float),
-        best_eval=SimpleNamespace(loglike=0.0),
-        results=results,
-        runtime_sec=0.0,
-        args=argparse.Namespace(
-            quiet=True,
-            plot_caustics=False,
-            kappa_true_fits="data/ff_sims/hera/kappa_z9_0.fits",
-            caustic_source_redshift=9.0,
-        ),
-    )
-    assert "kappa_truth_diagnostics" in captured_tasks
-    assert "kappa_comparison" not in captured_tasks
-    assert "kappa_recovery" not in captured_tasks
-    assert "absolute_magnification" not in captured_tasks
-    assert "caustic_overlay" not in captured_tasks
-
-    captured_tasks.clear()
-    plotting._generate_plots_and_tables(
-        run_dir=tmp_path,
-        state=state,
-        evaluator=evaluator,
-        best_fit=np.empty((0,), dtype=float),
-        best_eval=SimpleNamespace(loglike=0.0),
-        results=results,
-        runtime_sec=0.0,
-        args=argparse.Namespace(
-            quiet=True,
-            plot_caustics=True,
-            caustic_plot_grid_scale_arcsec=0.2,
-            caustic_source_redshift=9.0,
-        ),
-    )
+    assert "numpyro_model" in captured_tasks
     assert "absolute_magnification" in captured_tasks
     assert "caustic_overlay" in captured_tasks
 
@@ -1807,18 +1810,218 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         runtime_sec=0.0,
         args=argparse.Namespace(
             quiet=True,
-            plot_caustics=True,
+            kappa_true_fits="data/ff_sims/hera/kappa_z9_0.fits",
+            caustic_source_redshift=9.0,
+        ),
+    )
+    assert "numpyro_model" in captured_tasks
+    assert "kappa_truth_diagnostics" in captured_tasks
+    assert "kappa_comparison" not in captured_tasks
+    assert "kappa_recovery" not in captured_tasks
+    assert "mu_truth_diagnostics" not in captured_tasks
+    assert "absolute_magnification" in captured_tasks
+    assert "caustic_overlay" in captured_tasks
+
+    captured_tasks.clear()
+    plotting._generate_plots_and_tables(
+        run_dir=tmp_path,
+        state=state,
+        evaluator=evaluator,
+        best_fit=np.empty((0,), dtype=float),
+        best_eval=SimpleNamespace(loglike=0.0),
+        results=results,
+        runtime_sec=0.0,
+        args=argparse.Namespace(
+            quiet=True,
+            caustic_plot_grid_scale_arcsec=0.2,
+            caustic_source_redshift=9.0,
+            kappa_true_fits="data/ff_sims/hera/kappa_z9_0.fits",
+            gammax_true_fits="data/ff_sims/hera/gammax_z9_0.fits",
+            gammay_true_fits="data/ff_sims/hera/gammay_z9_0.fits",
+        ),
+    )
+    assert "numpyro_model" in captured_tasks
+    assert "kappa_truth_diagnostics" in captured_tasks
+    assert "mu_truth_diagnostics" in captured_tasks
+    assert "absolute_magnification" in captured_tasks
+    assert "caustic_overlay" in captured_tasks
+
+    captured_tasks.clear()
+    plotting._generate_plots_and_tables(
+        run_dir=tmp_path,
+        state=state,
+        evaluator=evaluator,
+        best_fit=np.empty((0,), dtype=float),
+        best_eval=SimpleNamespace(loglike=0.0),
+        results=results,
+        runtime_sec=0.0,
+        args=argparse.Namespace(
+            quiet=True,
             quick_diagnostics=True,
             caustic_plot_grid_scale_arcsec=0.2,
             caustic_source_redshift=9.0,
             kappa_true_fits="data/ff_sims/hera/kappa_z9_0.fits",
+            gammax_true_fits="data/ff_sims/hera/gammax_z9_0.fits",
+            gammay_true_fits="data/ff_sims/hera/gammay_z9_0.fits",
         ),
     )
+    assert "numpyro_model" in captured_tasks
     assert "kappa_comparison" not in captured_tasks
-    assert "kappa_truth_diagnostics" not in captured_tasks
     assert "kappa_recovery" not in captured_tasks
-    assert "absolute_magnification" not in captured_tasks
-    assert "caustic_overlay" not in captured_tasks
+    assert "kappa_truth_diagnostics" in captured_tasks
+    assert "mu_truth_diagnostics" in captured_tasks
+    assert "absolute_magnification" in captured_tasks
+    assert "caustic_overlay" in captured_tasks
+
+
+def test_compact_numpyro_model_graph_groups_sample_sites_by_role() -> None:
+    specs = [
+        ParameterSpec("large.x", "large_x", "mock", 81, "x", "uniform", -1.0, 1.0, 0.1, component_family="large"),
+        ParameterSpec(
+            "scaling.sigma",
+            "scaling_sigma",
+            "mock",
+            81,
+            "sigma",
+            "uniform",
+            0.0,
+            10.0,
+            0.1,
+            component_family="scaling",
+            sample_site_name="scaling_vector",
+            sample_site_index=0,
+        ),
+        ParameterSpec(
+            "scaling.cut",
+            "scaling_cut",
+            "mock",
+            81,
+            "cut",
+            "uniform",
+            0.0,
+            10.0,
+            0.1,
+            component_family="scaling",
+            sample_site_name="scaling_vector",
+            sample_site_index=1,
+        ),
+        ParameterSpec(
+            "source.1.beta_x",
+            "source_1_beta_x",
+            "1",
+            0,
+            "beta_x",
+            "normal",
+            -np.inf,
+            np.inf,
+            0.1,
+            component_family="source_position",
+        ),
+        ParameterSpec("image.sigma", "image_sigma", "image", 0, "sigma", "uniform", 0.0, 1.0, 0.1, component_family="image_scatter"),
+        ParameterSpec(
+            "critical.singular_threshold",
+            "critical_arc_singular_threshold",
+            "critical_arc",
+            0,
+            "singular_threshold",
+            "uniform",
+            0.05,
+            0.5,
+            0.01,
+            component_family="critical_arc_hyperparameter",
+        ),
+    ]
+    sample_sites = [
+        SimpleNamespace(name="large_x_site", indices=(0,)),
+        SimpleNamespace(name="scaling_vector_site", indices=(1, 2)),
+        SimpleNamespace(name="source_position_site", indices=(3,)),
+        SimpleNamespace(name="image_scatter_site", indices=(4,)),
+        SimpleNamespace(name="critical_arc_threshold_site", indices=(5,)),
+    ]
+
+    graph = plotting._build_compact_numpyro_model_graph(
+        state=SimpleNamespace(family_data=[SimpleNamespace(n_images=2), SimpleNamespace(n_images=3)]),
+        parameter_specs=specs,
+        sample_sites=sample_sites,
+        sample_likelihood_mode="critical-arc-mixture-image-plane",
+    )
+    source = graph.source
+
+    assert "Critical-arc-mixture image-plane NumPyro model" not in source
+    assert "Generated from numpyro.render_model" not in source
+    assert "render_model trace" not in source
+    assert "Critical-arc gate" in source
+    assert "Intrinsic image scatter" in source
+    assert "Source positions" in source
+    assert "Member scaling law" in source
+    assert "Large-scale lens" in source
+    assert "2 parameters / 1 site" in source
+    assert "ln ℒ(η, {β_f})" in source
+    assert "critical-arc image-plane likelihood" in source
+    assert "θ" in source
+    assert "latent parameter vector" in source
+    assert "theta = stack(sample sites)" not in source
+    assert "numpyro.factor" not in source
+    assert "Observed image positions" in source
+    assert "5 positions" in source
+    assert "large_x_site" not in source
+    assert "scaling_vector_site" not in source
+    assert "critical_arc_threshold_site" not in source
+
+
+def test_plot_numpyro_model_writes_fixed_pdf_and_no_full_artifact(tmp_path: Path, monkeypatch: Any) -> None:
+    specs = [
+        ParameterSpec(
+            "critical.singular_threshold",
+            "critical_arc_singular_threshold",
+            "critical_arc",
+            0,
+            "singular_threshold",
+            "uniform",
+            0.05,
+            0.5,
+            0.01,
+            component_family="critical_arc_hyperparameter",
+        )
+    ]
+    render_calls: list[dict[str, Any]] = []
+    build_calls: list[dict[str, Any]] = []
+
+    class CompactGraph:
+        def render(self, filename: str, *, format: str, cleanup: bool) -> str:
+            render_calls.append({"filename": filename, "format": format, "cleanup": cleanup})
+            path = Path(f"{filename}.{format}")
+            path.write_bytes(b"%PDF-1.4\n")
+            return str(path)
+
+    def fake_build_compact_graph(**kwargs: Any) -> CompactGraph:
+        build_calls.append(kwargs)
+        return CompactGraph()
+
+    monkeypatch.setattr(plotting, "_parameter_sample_sites_for_rendering", lambda _specs: [SimpleNamespace(name="p", indices=(0,))])
+    monkeypatch.setattr(plotting, "_build_compact_numpyro_model_graph", fake_build_compact_graph)
+
+    output = plotting._plot_numpyro_model(
+        tmp_path,
+        SimpleNamespace(parameter_specs=specs),
+        SimpleNamespace(sample_likelihood_mode="critical-arc-mixture-image-plane"),
+        argparse.Namespace(),
+    )
+
+    assert output == tmp_path / "numpyro_model.pdf"
+    assert (tmp_path / "numpyro_model.pdf").exists()
+    assert render_calls == [
+        {
+            "filename": str(tmp_path / "numpyro_model"),
+            "format": "pdf",
+            "cleanup": True,
+        }
+    ]
+    assert build_calls[0]["parameter_specs"] == specs
+    assert build_calls[0]["sample_likelihood_mode"] == "critical-arc-mixture-image-plane"
+    assert "exact_graph" not in build_calls[0]
+    assert not list(tmp_path.glob("*_full.pdf"))
+    assert not list(tmp_path.glob("numpyro_critical_arc_mixture_image_plane*.pdf"))
 
 
 def test_subhalo_properties_table_uses_all_potfile_members_and_mass_radii(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2003,17 +2206,20 @@ def test_run_summary_quality_metrics_from_image_fit_quality() -> None:
         }
     )
 
-    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+    summary = plotting._fit_quality_chi_square_summary(image_df, state, use_arc_aware_diagnostics=True)
 
     assert summary["headline_chi_square"] == pytest.approx(0.07)
     assert summary["headline_point_image_count"] == 3
     assert summary["headline_missing_image_count"] == 1
+    assert summary["point_recovered_image_count"] == 3
+    assert summary["point_image_rms_arcsec"] == pytest.approx(math.sqrt(7.0 / 3.0))
     assert summary["headline_n_data"] == 6
     assert summary["headline_dof"] == 3
     assert summary["headline_reduced_chi_square"] == pytest.approx(0.07 / 3.0)
     assert summary["arc_aware_chi_square"] == pytest.approx(0.07)
     assert summary["arc_aware_point_image_count"] == 3
     assert summary["arc_aware_arc_supported_image_count"] == 0
+    assert summary["arc_aware_recovered_image_count"] == 3
     assert summary["arc_aware_missing_image_count"] == 1
     assert summary["arc_aware_n_data"] == 6
     assert summary["arc_aware_dof"] == 3
@@ -2060,12 +2266,14 @@ def test_run_summary_arc_aware_chi_square_counts_arc_supported_rows() -> None:
         }
     )
 
-    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+    summary = plotting._fit_quality_chi_square_summary(image_df, state, use_arc_aware_diagnostics=True)
 
     assert summary["headline_chi_square"] == pytest.approx(1.25)
     assert summary["headline_n_data"] == 4
     assert summary["headline_dof"] == 1
     assert summary["headline_reduced_chi_square"] == pytest.approx(1.25)
+    assert summary["point_recovered_image_count"] == 2
+    assert summary["point_image_rms_arcsec"] == pytest.approx(math.sqrt((1.0**2 + 2.0**2) / 2.0))
     assert summary["headline_missing_image_count"] == 2
     assert summary["arc_aware_chi_square"] == pytest.approx(5.25)
     assert summary["arc_aware_n_data"] == 5
@@ -2073,6 +2281,7 @@ def test_run_summary_arc_aware_chi_square_counts_arc_supported_rows() -> None:
     assert summary["arc_aware_reduced_chi_square"] == pytest.approx(2.625)
     assert summary["arc_aware_point_image_count"] == 2
     assert summary["arc_aware_arc_supported_image_count"] == 1
+    assert summary["arc_aware_recovered_image_count"] == 3
     assert summary["arc_aware_missing_image_count"] == 1
     assert summary["chi_square_sigma_eff_median_arcsec"] == pytest.approx(1.0)
     assert summary["chi_square_sigma_eff_min_arcsec"] == pytest.approx(0.25)
@@ -2104,18 +2313,51 @@ def test_run_summary_arc_aware_keeps_point_recovered_rows_point_first() -> None:
         }
     )
 
-    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+    summary = plotting._fit_quality_chi_square_summary(image_df, state, use_arc_aware_diagnostics=True)
 
     assert summary["headline_chi_square"] == pytest.approx(5.0)
     assert summary["headline_point_image_count"] == 2
     assert summary["headline_missing_image_count"] == 1
+    assert summary["point_recovered_image_count"] == 2
+    assert summary["point_image_rms_arcsec"] == pytest.approx(math.sqrt((1.0**2 + 2.0**2) / 2.0))
     assert summary["arc_aware_chi_square"] == pytest.approx(5.0)
     assert summary["arc_aware_point_image_count"] == 2
     assert summary["arc_aware_arc_supported_image_count"] == 0
+    assert summary["arc_aware_recovered_image_count"] == 2
     assert summary["arc_aware_missing_image_count"] == 1
     assert summary["arc_aware_n_data"] == 4
     assert summary["arc_aware_valid_image_count"] == 2
     assert summary["arc_aware_image_rms_arcsec"] == pytest.approx(math.sqrt((1.0**2 + 2.0**2) / 2.0))
+
+
+def test_run_summary_point_only_ignores_arc_aware_columns() -> None:
+    state = SimpleNamespace(parameter_specs=[], family_data=[SimpleNamespace(family_id="1", n_images=3)])
+    image_df = pd.DataFrame(
+        {
+            "x_obs_arcsec": [0.0, 0.0, 0.0],
+            "y_obs_arcsec": [0.0, 0.0, 0.0],
+            "x_model_arcsec": [1.0, 0.0, np.nan],
+            "y_model_arcsec": [0.0, 2.0, np.nan],
+            "sigma_arcsec": [1.0, 1.0, 1.0],
+            "image_sigma_eff_arcsec": [1.0, 1.0, 1.0],
+            "image_recovery_status": ["recovered", "recovered", "not_recovered"],
+            "arc_recovery_status": ["point_recovered", "arc_supported", "arc_supported"],
+            "arc_supported": [False, True, True],
+            "arc_aware_image_residual_arcsec": [1.0, 0.1, 0.2],
+            "exact_image_prediction_failed": [False, False, True],
+        }
+    )
+
+    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+
+    assert summary["headline_chi_square"] == pytest.approx(5.0)
+    assert summary["headline_n_data"] == 4
+    assert summary["point_recovered_image_count"] == 2
+    assert summary["point_image_rms_arcsec"] == pytest.approx(math.sqrt((1.0**2 + 2.0**2) / 2.0))
+    assert summary["arc_aware_chi_square"] is None
+    assert summary["arc_aware_n_data"] == 0
+    assert summary["arc_aware_recovered_image_count"] == 0
+    assert summary["arc_aware_image_rms_arcsec"] is None
 
 
 def test_run_summary_chi_square_requires_image_sigma_eff_arcsec() -> None:
@@ -2136,7 +2378,7 @@ def test_run_summary_chi_square_requires_image_sigma_eff_arcsec() -> None:
         }
     )
 
-    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+    summary = plotting._fit_quality_chi_square_summary(image_df, state, use_arc_aware_diagnostics=True)
 
     assert summary["headline_chi_square"] is None
     assert summary["headline_n_data"] == 0
@@ -2170,7 +2412,7 @@ def test_run_summary_chi_square_excludes_invalid_image_sigma_eff_rows() -> None:
         }
     )
 
-    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+    summary = plotting._fit_quality_chi_square_summary(image_df, state, use_arc_aware_diagnostics=True)
 
     assert summary["headline_chi_square"] == pytest.approx(4.0)
     assert summary["headline_point_image_count"] == 1
@@ -2203,7 +2445,7 @@ def test_run_summary_chi_square_red1_calibration_solves_pos_sigma_with_intrinsic
         }
     )
 
-    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+    summary = plotting._fit_quality_chi_square_summary(image_df, state, use_arc_aware_diagnostics=True)
 
     assert summary["headline_chi_square_red1_total_sigma_arcsec"] == pytest.approx(math.sqrt(2.0))
     assert summary["headline_chi_square_red1_pos_sigma_arcsec"] == pytest.approx(1.0)
@@ -2229,7 +2471,7 @@ def test_run_summary_chi_square_red1_pos_sigma_zero_when_intrinsic_scatter_is_su
         }
     )
 
-    summary = plotting._fit_quality_chi_square_summary(image_df, state)
+    summary = plotting._fit_quality_chi_square_summary(image_df, state, use_arc_aware_diagnostics=True)
 
     assert summary["headline_chi_square_red1_total_sigma_arcsec"] == pytest.approx(math.sqrt(0.5))
     assert summary["headline_chi_square_red1_pos_sigma_arcsec"] == pytest.approx(0.0)
@@ -2449,7 +2691,7 @@ def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None
         {
             "run_name": "mock",
             "fit_mode": "joint",
-            "sample_likelihood_mode": "source",
+            "sample_likelihood_mode": "critical-arc-mixture-image-plane",
             "sampler": "numpyro_nuts",
             "n_families": 2,
             "n_images": 6,
@@ -2460,9 +2702,14 @@ def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None
             "arc_aware_chi_square": 9.0,
             "arc_aware_dof": 5,
             "arc_aware_reduced_chi_square": 1.8,
+            "observed_image_count": 6,
+            "point_recovered_image_count": 4,
+            "point_image_rms_arcsec": 0.42,
+            "arc_aware_recovered_image_count": 5,
+            "arc_aware_image_rms_arcsec": 0.39,
             "arc_aware_arc_supported_image_count": 2,
             "arc_aware_missing_image_count": 1,
-            "arc_aware_noncritical_support_radius_arcsec": 2.0,
+            "arc_recovery_p_arc_threshold": 0.65,
             "chi_square_sigma_basis": "image_sigma_eff_arcsec",
             "chi_square_sigma_eff_median_arcsec": 0.59,
             "chi_square_sigma_eff_min_arcsec": 0.42,
@@ -2487,6 +2734,12 @@ def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None
     assert "Quality Of Fit" in text
     assert "headline_chi_square" in text
     assert "arc_aware_chi_square" in text
+    assert "point image RMS arcsec" in text
+    assert "point recovered images" in text
+    assert "4/6" in text
+    assert "arc-aware image RMS arcsec" in text
+    assert "arc-aware recovered images" in text
+    assert "5/6" in text
     assert "total image-plane sigma" in text
     assert "chi-square sigma basis" in text
     assert "chi-square median sigma arcsec" in text
@@ -2498,14 +2751,111 @@ def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None
     assert "N_arc_supported" in text
     assert "N_missing" in text
     assert "fit-quality reference" in text
-    assert "arc-aware caveat" in text
-    assert "arc_aware_noncritical_support_radius_arcsec=2" in text
+    assert "arc-aware recovery gate" in text
+    assert "arc_recovery_p_arc_threshold=0.65" in text
     assert "diagnostic data points" not in text
     assert "diagnostic dof" not in text
     assert "AIC" not in text
     assert "BIC" not in text
     assert "Rhat max" not in text
     assert "SVI health warnings" not in text
+
+
+def test_format_run_summary_text_omits_arc_aware_metrics_for_noncritical_mode() -> None:
+    text = plotting._format_run_summary_text(
+        {
+            "run_name": "mock",
+            "fit_mode": "joint",
+            "sample_likelihood_mode": "source",
+            "sampler": "numpyro_nuts",
+            "n_families": 1,
+            "n_images": 3,
+            "n_parameters": 2,
+            "headline_chi_square": 5.0,
+            "headline_dof": 2,
+            "headline_reduced_chi_square": 2.5,
+            "observed_image_count": 3,
+            "point_recovered_image_count": 2,
+            "point_image_rms_arcsec": 0.4,
+            "arc_aware_chi_square": 1.0,
+            "arc_aware_recovered_image_count": 3,
+            "arc_aware_image_rms_arcsec": 0.1,
+            "arc_aware_arc_supported_image_count": 1,
+            "arc_aware_missing_image_count": 0,
+            "arc_aware_chi_square_red1_total_sigma_arcsec": 0.2,
+            "arc_aware_chi_square_red1_pos_sigma_arcsec": 0.2,
+            "chi_square_sigma_basis": "image_sigma_eff_arcsec",
+            "chi_square_red1_calibration_note": "post-fit diagnostic; holds image_sigma_int fixed",
+        }
+    )
+
+    assert "headline_chi_square" in text
+    assert "point image RMS arcsec" in text
+    assert "point recovered images" in text
+    assert "arc_aware_chi_square" not in text
+    assert "arc-aware image RMS arcsec" not in text
+    assert "arc-aware recovered images" not in text
+    assert "arc-aware red1" not in text
+    assert "N_arc_supported" not in text
+    assert "arc-aware recovery gate" not in text
+
+
+def test_format_sequential_run_summary_text_gates_arc_aware_columns() -> None:
+    source_only = plotting._format_sequential_run_summary_text(
+        [
+            {
+                "stage": "stage3",
+                "sample_likelihood_mode": "source",
+                "headline_chi_square": 5.0,
+                "point_image_rms_arcsec": 0.6,
+                "point_recovered_image_count": 3,
+                "arc_aware_chi_square": 1.0,
+                "arc_aware_image_rms_arcsec": 0.2,
+            }
+        ],
+        run_name="mock",
+        root_dir="results/mock",
+    )
+
+    assert "point_RMS" in source_only
+    assert "arc_RMS" not in source_only
+    assert "arc_chi2" not in source_only
+    assert "0.2" not in source_only
+
+    mixed = plotting._format_sequential_run_summary_text(
+        [
+            {
+                "stage": "stage3",
+                "sample_likelihood_mode": "source",
+                "headline_chi_square": 5.0,
+                "point_image_rms_arcsec": 0.6,
+                "point_recovered_image_count": 3,
+                "arc_aware_chi_square": 99.0,
+                "arc_aware_image_rms_arcsec": 9.9,
+            },
+            {
+                "stage": "stage4",
+                "sample_likelihood_mode": "critical-arc-mixture-image-plane",
+                "headline_chi_square": 4.0,
+                "point_image_rms_arcsec": 0.5,
+                "point_recovered_image_count": 2,
+                "arc_aware_chi_square": 3.0,
+                "arc_aware_dof": 2,
+                "arc_aware_reduced_chi_square": 1.5,
+                "arc_aware_arc_supported_image_count": 1,
+                "arc_aware_recovered_image_count": 3,
+                "arc_aware_missing_image_count": 0,
+                "arc_aware_image_rms_arcsec": 0.3,
+            },
+        ],
+        run_name="mock",
+        root_dir="results/mock",
+    )
+
+    assert "arc_RMS" in mixed
+    assert "0.3" in mixed
+    assert "9.9" not in mixed
+    assert "99" not in mixed
 
 
 def test_parse_args_caustic_source_redshift_default_and_explicit(monkeypatch: Any) -> None:
@@ -2516,6 +2866,9 @@ def test_parse_args_caustic_source_redshift_default_and_explicit(monkeypatch: An
     assert args.caustic_source_redshift == pytest.approx(9.0)
     assert args.caustic_plot_grid_scale_arcsec == pytest.approx(0.2)
     assert args.kappa_true_fits is None
+    assert args.gammax_true_fits is None
+    assert args.gammay_true_fits is None
+    assert not hasattr(args, "plot_caustics")
     assert not hasattr(args, "caustic_num_pix")
     assert not hasattr(args, "validate_top_k_families")
     assert not hasattr(args, "validation_approx")
@@ -2529,11 +2882,17 @@ def test_parse_args_caustic_source_redshift_default_and_explicit(monkeypatch: An
             "9.5",
             "--kappa-true-fits",
             "data/ff_sims/hera/kappa_z9_0.fits",
+            "--gammax-true-fits",
+            "data/ff_sims/hera/gammax_z9_0.fits",
+            "--gammay-true-fits",
+            "data/ff_sims/hera/gammay_z9_0.fits",
         ],
     )
     args = cluster_solver._parse_args()
     assert args.caustic_source_redshift == pytest.approx(9.5)
     assert args.kappa_true_fits == "data/ff_sims/hera/kappa_z9_0.fits"
+    assert args.gammax_true_fits == "data/ff_sims/hera/gammax_z9_0.fits"
+    assert args.gammay_true_fits == "data/ff_sims/hera/gammay_z9_0.fits"
 
 
 def test_parse_args_image_catalog_rgb_display_controls(monkeypatch: Any) -> None:
@@ -2547,6 +2906,10 @@ def test_parse_args_image_catalog_rgb_display_controls(monkeypatch: Any) -> None
     assert args.image_catalog_family_cutout_rgb_red_gain is None
     assert args.image_catalog_family_cutout_rgb_green_gain is None
     assert args.image_catalog_family_cutout_rgb_blue_gain is None
+    assert args.image_catalog_family_cutout_mode == "full"
+    assert args.image_catalog_family_cutout_dpi is None
+    assert args.image_catalog_family_cutout_max_side_pixels is None
+    assert args.image_catalog_family_cutout_critical_lines == "auto"
 
     monkeypatch.setattr(
         sys,
@@ -2565,6 +2928,14 @@ def test_parse_args_image_catalog_rgb_display_controls(monkeypatch: Any) -> None
             "0.75",
             "--image-catalog-family-cutout-rgb-blue-gain",
             "3.5",
+            "--image-catalog-family-cutout-mode",
+            "fast",
+            "--image-catalog-family-cutout-dpi",
+            "120",
+            "--image-catalog-family-cutout-max-side-pixels",
+            "256",
+            "--image-catalog-family-cutout-critical-lines",
+            "off",
         ],
     )
     args = cluster_solver._parse_args()
@@ -2574,12 +2945,24 @@ def test_parse_args_image_catalog_rgb_display_controls(monkeypatch: Any) -> None
     assert args.image_catalog_family_cutout_rgb_red_gain == pytest.approx(0.68)
     assert args.image_catalog_family_cutout_rgb_green_gain == pytest.approx(0.75)
     assert args.image_catalog_family_cutout_rgb_blue_gain == pytest.approx(3.5)
+    assert args.image_catalog_family_cutout_mode == "fast"
+    assert args.image_catalog_family_cutout_dpi == 120
+    assert args.image_catalog_family_cutout_max_side_pixels == 256
+    assert args.image_catalog_family_cutout_critical_lines == "off"
 
     monkeypatch.setattr(sys, "argv", ["cluster_solver", "--image-catalog-family-cutout-rgb-q", "0"])
     with pytest.raises(SystemExit):
         cluster_solver._parse_args()
 
     monkeypatch.setattr(sys, "argv", ["cluster_solver", "--image-catalog-family-cutout-rgb-minimum", "nan"])
+    with pytest.raises(SystemExit):
+        cluster_solver._parse_args()
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--image-catalog-family-cutout-dpi", "0"])
+    with pytest.raises(SystemExit):
+        cluster_solver._parse_args()
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--image-catalog-family-cutout-max-side-pixels", "-1"])
     with pytest.raises(SystemExit):
         cluster_solver._parse_args()
 
@@ -2596,6 +2979,10 @@ def test_parse_args_caustic_plot_grid_scale_and_removed_num_pix(monkeypatch: Any
         cluster_solver._parse_args()
 
     monkeypatch.setattr(sys, "argv", ["cluster_solver", "--caustic-num-pix", "250"])
+    with pytest.raises(SystemExit):
+        cluster_solver._parse_args()
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--plot-caustics"])
     with pytest.raises(SystemExit):
         cluster_solver._parse_args()
 
@@ -4018,7 +4405,12 @@ def test_image_recovery_uses_status_colors_and_small_points(monkeypatch: Any, tm
         }
     )
 
-    plotting._plot_image_recovery_fit_quality(image_df, tmp_path / "image_recovery.pdf", extra_df)
+    plotting._plot_image_recovery_fit_quality(
+        image_df,
+        tmp_path / "image_recovery.pdf",
+        extra_df,
+        use_arc_aware_diagnostics=True,
+    )
 
     assert (tmp_path / "image_recovery.pdf").exists()
     assert image_axis.scatters[0][2]["marker"] == "x"
@@ -4091,7 +4483,7 @@ def test_fit_quality_diagnostic_plots_write_pdfs_and_merge_tables(tmp_path: Path
         assert path.stat().st_size > 0
 
 
-def test_plot_image_residual_histogram_prefers_q50_and_writes_pdf(
+def test_plot_image_residual_histogram_reports_point_and_arc_aware_rms(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4102,8 +4494,10 @@ def test_plot_image_residual_histogram_prefers_q50_and_writes_pdf(
             "arc_supported": [False, True, False, False],
             "image_residual_arcsec": [9.0, 9.0, 0.30, 9.0],
             "image_residual_q50": [0.04, np.nan, 0.08, np.inf],
-            "arc_aware_image_residual_arcsec": [0.04, 0.20, np.nan, 9.0],
+            "point_image_residual_arcsec": [0.04, np.nan, np.nan, 9.0],
+            "arc_aware_image_residual_arcsec": [0.04, np.nan, np.nan, 9.0],
             "arc_aware_image_residual_q50": [0.04, 0.18, np.nan, np.inf],
+            "arc_curve_distance_arcsec": [np.nan, 0.20, 0.07, np.nan],
         }
     )
     path = tmp_path / "image_residual_histogram.pdf"
@@ -4141,20 +4535,81 @@ def test_plot_image_residual_histogram_prefers_q50_and_writes_pdf(
 
     monkeypatch.setattr(plotting.plt, "subplots", spy_subplots)
 
-    plotting._plot_image_residual_histogram(image_df, path)
+    plotting._plot_image_residual_histogram(image_df, path, use_arc_aware_diagnostics=True)
 
     assert path.exists()
     assert path.stat().st_size > 0
-    assert len(captured["histograms"]) == 3
+    assert len(captured["histograms"]) == 2
     np.testing.assert_allclose(captured["histograms"][0]["values"], np.asarray([0.04, 9.0]))
-    np.testing.assert_allclose(captured["histograms"][1]["values"], np.asarray([0.18]))
-    np.testing.assert_allclose(captured["histograms"][2]["values"], np.asarray([0.04, 9.0, 0.18]))
+    np.testing.assert_allclose(captured["histograms"][1]["values"], np.asarray([0.04, 0.20, 9.0]))
     assert captured["histograms"][1]["kwargs"]["color"] == plotting._image_catalog_status_color("ARC_RECOVERED")
-    assert captured["histograms"][2]["kwargs"]["histtype"] == "step"
-    assert captured["histograms"][2]["kwargs"]["linestyle"] != "-"
-    expected_best_rms = float(np.sqrt(np.mean(np.square(np.asarray([0.04, 9.0, 0.18])))))
-    assert captured["vertical_lines"][-1][0] == pytest.approx(expected_best_rms)
-    assert any("RMS by recovery mode" in text and "missed by both: 1" in text for text in captured["texts"])
+    expected_point_rms = float(np.sqrt(np.mean(np.square(np.asarray([0.04, 9.0])))))
+    expected_arc_rms = float(np.sqrt(np.mean(np.square(np.asarray([0.04, 0.20, 9.0])))))
+    assert captured["vertical_lines"][0][0] == pytest.approx(expected_point_rms)
+    assert captured["vertical_lines"][1][0] == pytest.approx(expected_arc_rms)
+    assert any(
+        "Image RMS" in text
+        and "point:" in text
+        and "(2/4)" in text
+        and "arc-aware:" in text
+        and "(3/4)" in text
+        and "arc-supported: 1/4" in text
+        and "missed: 1/4" in text
+        for text in captured["texts"]
+    )
+
+
+def test_plot_image_residual_histogram_ignores_arc_aware_values_when_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_df = pd.DataFrame(
+        {
+            "image_recovery_status": ["recovered", "not_recovered", "recovered"],
+            "arc_recovery_status": ["point_recovered", "arc_supported", "point_recovered"],
+            "arc_supported": [False, True, False],
+            "image_residual_arcsec": [0.1, 9.0, 0.3],
+            "point_image_residual_arcsec": [0.1, np.nan, 0.3],
+            "arc_aware_image_residual_arcsec": [0.1, 0.2, 0.3],
+        }
+    )
+    path = tmp_path / "image_residual_histogram.pdf"
+    captured: dict[str, Any] = {"histograms": [], "texts": [], "titles": []}
+    original_subplots = plotting.plt.subplots
+
+    def spy_subplots(*args: Any, **kwargs: Any) -> Any:
+        fig, ax = original_subplots(*args, **kwargs)
+        original_hist = ax.hist
+        original_text = ax.text
+        original_set_title = ax.set_title
+
+        def spy_hist(values: Any, *hist_args: Any, **hist_kwargs: Any) -> Any:
+            captured["histograms"].append(np.asarray(values, dtype=float).copy())
+            return original_hist(values, *hist_args, **hist_kwargs)
+
+        def spy_text(*text_args: Any, **text_kwargs: Any) -> Any:
+            if len(text_args) >= 3:
+                captured["texts"].append(str(text_args[2]))
+            return original_text(*text_args, **text_kwargs)
+
+        def spy_set_title(label: str, *title_args: Any, **title_kwargs: Any) -> Any:
+            captured["titles"].append(str(label))
+            return original_set_title(label, *title_args, **title_kwargs)
+
+        ax.hist = spy_hist
+        ax.text = spy_text
+        ax.set_title = spy_set_title
+        return fig, ax
+
+    monkeypatch.setattr(plotting.plt, "subplots", spy_subplots)
+
+    plotting._plot_image_residual_histogram(image_df, path)
+
+    assert path.exists()
+    assert len(captured["histograms"]) == 1
+    np.testing.assert_allclose(captured["histograms"][0], np.asarray([0.1, 0.3]))
+    assert captured["titles"] == ["Image Residuals: Point Recovery"]
+    assert any("arc-aware" not in text and "arc-supported" not in text for text in captured["texts"])
 
 
 def test_plot_image_residual_histogram_writes_placeholder_without_finite_values(tmp_path: Path) -> None:

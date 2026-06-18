@@ -105,6 +105,9 @@ from .plotting import (
     _plot_critical_arc_recovery_by_family as _shared_plot_critical_arc_recovery_by_family,
     _plot_critical_arc_support_histogram as _shared_plot_critical_arc_support_histogram,
     _plot_critical_arc_support_phase_space as _shared_plot_critical_arc_support_phase_space,
+    _image_catalog_arc_recovered,
+    _image_catalog_effective_recovery_statuses,
+    _image_catalog_point_recovered,
     _plot_potfile_corner,
     _scaling_parameter_subset,
 )
@@ -124,12 +127,18 @@ FIT_METHOD_SVI_NUTS = "svi+nuts"
 FIT_METHOD_NUTS = "nuts"
 FIT_METHOD_NS = "ns"
 FIT_METHOD_SMC = "smc"
+FIT_METHOD_MCHMC = "mchmc"
+FIT_METHOD_MCLMC = "mclmc"
+MICROCANONICAL_FIT_METHODS = (FIT_METHOD_MCHMC, FIT_METHOD_MCLMC)
 SOLVER_FIT_MODE_SEQUENTIAL = "sequential"
 SOLVER_FIT_MODE_EVIDENCE_NS = "evidence-ns"
 RESUME_MODE_ALL = "all"
 RESUME_MODE_FAST = "fast"
 RESUME_MODES = (RESUME_MODE_ALL, RESUME_MODE_FAST)
 DEFAULT_MATCH_TOLERANCE = 1.5
+DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC = 0.2
+DEFAULT_EXACT_IMAGE_PRECISION_LIMIT = 1.0e-8
+DEFAULT_EXACT_IMAGE_NUM_ITER_MAX = 200
 JAX_DEVICE_AUTO = "auto"
 JAX_DEVICE_CPU = "cpu"
 JAX_DEVICE_GPU = "gpu"
@@ -156,6 +165,22 @@ DEFAULT_SMC_TARGET_ESS_FRAC = 0.8
 DEFAULT_SMC_MAX_TEMPERATURE_STEPS = 256
 DEFAULT_SMC_RMH_SCALE = 1.0
 DEFAULT_SMC_MALA_STEP_SIZE = 0.05
+DEFAULT_MICROCANONICAL_TUNE_FRAC1 = 0.1
+DEFAULT_MICROCANONICAL_TUNE_FRAC2 = 0.1
+DEFAULT_MICROCANONICAL_TUNE_FRAC3 = 0.1
+DEFAULT_MICROCANONICAL_DIAGONAL_PRECONDITIONING = True
+DEFAULT_MCLMC_DESIRED_ENERGY_VAR = 5.0e-4
+DEFAULT_MCLMC_TRUST_IN_ESTIMATE = 1.5
+DEFAULT_MCLMC_NUM_EFFECTIVE_SAMPLES = 150
+DEFAULT_MCLMC_LFACTOR = 0.4
+DEFAULT_MCHMC_TARGET_ACCEPT = 0.9
+DEFAULT_MCHMC_RANDOM_TRAJECTORY_LENGTH = True
+DEFAULT_MCHMC_L_PROPOSAL_FACTOR = float("inf")
+DEFAULT_MCHMC_DIVERGENCE_THRESHOLD = 1000.0
+DEFAULT_MCHMC_NUM_WINDOWS = 1
+DEFAULT_MCHMC_TUNING_FACTOR = 1.3
+MCHMC_L_ESTIMATORS = ("avg", "max")
+DEFAULT_MCHMC_L_ESTIMATOR = "avg"
 DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC = 2.0
 DEFAULT_IMAGE_SIGMA_INT_LOWER_ARCSEC = 1.0e-3
 DEFAULT_IMAGE_SIGMA_INT_UPPER_ARCSEC = 2.0
@@ -186,10 +211,18 @@ DEFAULT_CRITICAL_ARC_BASE_PROB = 0.10
 DEFAULT_CRITICAL_ARC_MAX_PROB = 0.80
 DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD = 0.20
 DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS = 0.05
+DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_MEDIAN = 0.15
+DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_LOG_SIGMA = 0.5
+DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_LOWER = 0.03
+DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_UPPER = 0.40
+DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_MEDIAN = 0.05
+DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_LOG_SIGMA = 0.5
+DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_LOWER = 0.005
+DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER = 0.20
 DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE = 1.0e-3
 DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE = 1.0e-6
 DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC = 20.0
-DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC = DEFAULT_MATCH_TOLERANCE
+DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD = 0.5
 DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC = 5.0
 DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC = 0.1
 DEFAULT_FOLD_CURVATURE_ARCSEC_INV = 1.0
@@ -700,20 +733,6 @@ def _artifact_arg(artifact_args: dict[str, Any] | None, name: str, default: Any)
     return default if value is None else value
 
 
-def _resolve_arc_aware_noncritical_support_radius_arcsec(
-    value: Any,
-    match_tolerance_arcsec: Any = DEFAULT_MATCH_TOLERANCE,
-) -> float:
-    if value is None:
-        value = match_tolerance_arcsec
-    if value is None:
-        value = DEFAULT_MATCH_TOLERANCE
-    radius = float(value)
-    if not np.isfinite(radius) or radius <= 0.0:
-        raise ValueError("arc_aware_noncritical_support_radius_arcsec must be finite and positive.")
-    return radius
-
-
 def _recovered_model_tables(
     state: Any,
     best_fit_physical: np.ndarray,
@@ -741,6 +760,9 @@ def _recovered_model_tables(
         DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
         DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
         DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+        DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC,
+        DEFAULT_EXACT_IMAGE_NUM_ITER_MAX,
+        DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
         DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
         DEFAULT_MATCH_TOLERANCE,
         DEFAULT_REFRESH_EVERY,
@@ -755,6 +777,15 @@ def _recovered_model_tables(
     evaluator = ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=match_tolerance_arcsec,
+        exact_image_min_distance_arcsec=float(
+            _artifact_arg(artifact_args, "exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)
+        ),
+        exact_image_precision_limit=float(
+            _artifact_arg(artifact_args, "exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)
+        ),
+        exact_image_num_iter_max=int(
+            _artifact_arg(artifact_args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)
+        ),
         sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full")),
         active_scaling_galaxies=_artifact_arg(artifact_args, "active_scaling_galaxies", DEFAULT_ACTIVE_SCALING_GALAXIES),
         active_scaling_selection=str(_artifact_arg(artifact_args, "active_scaling_selection", "adaptive")),
@@ -802,8 +833,54 @@ def _recovered_model_tables(
         critical_arc_singular_threshold=float(
             _artifact_arg(artifact_args, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)
         ),
+        sample_critical_arc_singular_threshold=bool(
+            _artifact_arg(artifact_args, "sample_critical_arc_singular_threshold", False)
+        ),
+        critical_arc_singular_threshold_prior_median=float(
+            _artifact_arg(
+                artifact_args,
+                "critical_arc_singular_threshold_prior_median",
+                DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_MEDIAN,
+            )
+        ),
+        critical_arc_singular_threshold_prior_log_sigma=float(
+            _artifact_arg(
+                artifact_args,
+                "critical_arc_singular_threshold_prior_log_sigma",
+                DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_LOG_SIGMA,
+            )
+        ),
+        critical_arc_singular_threshold_lower=float(
+            _artifact_arg(artifact_args, "critical_arc_singular_threshold_lower", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_LOWER)
+        ),
+        critical_arc_singular_threshold_upper=float(
+            _artifact_arg(artifact_args, "critical_arc_singular_threshold_upper", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_UPPER)
+        ),
         critical_arc_singular_softness=float(
             _artifact_arg(artifact_args, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
+        ),
+        sample_critical_arc_singular_softness=bool(
+            _artifact_arg(artifact_args, "sample_critical_arc_singular_softness", False)
+        ),
+        critical_arc_singular_softness_prior_median=float(
+            _artifact_arg(
+                artifact_args,
+                "critical_arc_singular_softness_prior_median",
+                DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_MEDIAN,
+            )
+        ),
+        critical_arc_singular_softness_prior_log_sigma=float(
+            _artifact_arg(
+                artifact_args,
+                "critical_arc_singular_softness_prior_log_sigma",
+                DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_LOG_SIGMA,
+            )
+        ),
+        critical_arc_singular_softness_lower=float(
+            _artifact_arg(artifact_args, "critical_arc_singular_softness_lower", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_LOWER)
+        ),
+        critical_arc_singular_softness_upper=float(
+            _artifact_arg(artifact_args, "critical_arc_singular_softness_upper", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER)
         ),
         critical_arc_lm_damping_relative=float(
             _artifact_arg(artifact_args, "critical_arc_lm_damping_relative", DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE)
@@ -814,9 +891,8 @@ def _recovered_model_tables(
         critical_arc_lm_trust_radius_arcsec=float(
             _artifact_arg(artifact_args, "critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
         ),
-        arc_aware_noncritical_support_radius_arcsec=_resolve_arc_aware_noncritical_support_radius_arcsec(
-            _artifact_arg(artifact_args, "arc_aware_noncritical_support_radius_arcsec", None),
-            match_tolerance_arcsec,
+        arc_recovery_p_arc_threshold=float(
+            _artifact_arg(artifact_args, "arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
         ),
         arc_aware_max_arclength_arcsec=float(
             _artifact_arg(artifact_args, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
@@ -1299,6 +1375,9 @@ def _posterior_prediction_uncertainty_tables(
         DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
         DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
         DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+        DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC,
+        DEFAULT_EXACT_IMAGE_NUM_ITER_MAX,
+        DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
         DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
         DEFAULT_MATCH_TOLERANCE,
         DEFAULT_REFRESH_EVERY,
@@ -1330,6 +1409,15 @@ def _posterior_prediction_uncertainty_tables(
         return ClusterJAXEvaluator(
             state=state,
             match_tolerance_arcsec=match_tolerance_arcsec,
+            exact_image_min_distance_arcsec=float(
+                _artifact_arg(artifact_args, "exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)
+            ),
+            exact_image_precision_limit=float(
+                _artifact_arg(artifact_args, "exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)
+            ),
+            exact_image_num_iter_max=int(
+                _artifact_arg(artifact_args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)
+            ),
             sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full")),
             active_scaling_galaxies=_artifact_arg(artifact_args, "active_scaling_galaxies", DEFAULT_ACTIVE_SCALING_GALAXIES),
             active_scaling_selection=str(_artifact_arg(artifact_args, "active_scaling_selection", "adaptive")),
@@ -1377,8 +1465,54 @@ def _posterior_prediction_uncertainty_tables(
             critical_arc_singular_threshold=float(
                 _artifact_arg(artifact_args, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)
             ),
+            sample_critical_arc_singular_threshold=bool(
+                _artifact_arg(artifact_args, "sample_critical_arc_singular_threshold", False)
+            ),
+            critical_arc_singular_threshold_prior_median=float(
+                _artifact_arg(
+                    artifact_args,
+                    "critical_arc_singular_threshold_prior_median",
+                    DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_MEDIAN,
+                )
+            ),
+            critical_arc_singular_threshold_prior_log_sigma=float(
+                _artifact_arg(
+                    artifact_args,
+                    "critical_arc_singular_threshold_prior_log_sigma",
+                    DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_LOG_SIGMA,
+                )
+            ),
+            critical_arc_singular_threshold_lower=float(
+                _artifact_arg(artifact_args, "critical_arc_singular_threshold_lower", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_LOWER)
+            ),
+            critical_arc_singular_threshold_upper=float(
+                _artifact_arg(artifact_args, "critical_arc_singular_threshold_upper", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_UPPER)
+            ),
             critical_arc_singular_softness=float(
                 _artifact_arg(artifact_args, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
+            ),
+            sample_critical_arc_singular_softness=bool(
+                _artifact_arg(artifact_args, "sample_critical_arc_singular_softness", False)
+            ),
+            critical_arc_singular_softness_prior_median=float(
+                _artifact_arg(
+                    artifact_args,
+                    "critical_arc_singular_softness_prior_median",
+                    DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_MEDIAN,
+                )
+            ),
+            critical_arc_singular_softness_prior_log_sigma=float(
+                _artifact_arg(
+                    artifact_args,
+                    "critical_arc_singular_softness_prior_log_sigma",
+                    DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_LOG_SIGMA,
+                )
+            ),
+            critical_arc_singular_softness_lower=float(
+                _artifact_arg(artifact_args, "critical_arc_singular_softness_lower", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_LOWER)
+            ),
+            critical_arc_singular_softness_upper=float(
+                _artifact_arg(artifact_args, "critical_arc_singular_softness_upper", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER)
             ),
             critical_arc_lm_damping_relative=float(
                 _artifact_arg(artifact_args, "critical_arc_lm_damping_relative", DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE)
@@ -1389,9 +1523,8 @@ def _posterior_prediction_uncertainty_tables(
             critical_arc_lm_trust_radius_arcsec=float(
                 _artifact_arg(artifact_args, "critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
             ),
-            arc_aware_noncritical_support_radius_arcsec=_resolve_arc_aware_noncritical_support_radius_arcsec(
-                _artifact_arg(artifact_args, "arc_aware_noncritical_support_radius_arcsec", None),
-                match_tolerance_arcsec,
+            arc_recovery_p_arc_threshold=float(
+                _artifact_arg(artifact_args, "arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
             ),
             arc_aware_max_arclength_arcsec=float(
                 _artifact_arg(artifact_args, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
@@ -2831,6 +2964,7 @@ def write_recovery_outputs(
             lambda: _plot_critical_arc_support_phase_space(
                 image_df,
                 paths["critical_arc_support_phase_space_plot"],
+                artifact_args=_saved_args,
             ),
         )
         run_recovery_phase(
@@ -3715,14 +3849,27 @@ def _plot_image_recovery(image_df: pd.DataFrame, path: Path) -> None:
 
 
 def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
-    residual = _plot_value_with_fallback(image_df, "image_residual_q50", "image_residual_arcsec")
-    residual = residual[np.isfinite(residual)]
-    arc_residual = _plot_value_with_fallback(
+    point_residual_all = _plot_value_with_fallback(image_df, "point_image_residual_arcsec", "image_residual_arcsec")
+    if any(column in image_df.columns for column in ("image_recovery_status", "arc_recovery_status", "exact_image_prediction_failed")):
+        status = _image_catalog_effective_recovery_statuses(image_df)
+        point_mask = np.asarray([_image_catalog_point_recovered(row) for _, row in image_df.iterrows()], dtype=bool)
+        arc_mask = np.asarray([_image_catalog_arc_recovered(row) for _, row in image_df.iterrows()], dtype=bool)
+    else:
+        status = np.where(np.isfinite(point_residual_all), "POINT_RECOVERED", "MISSED")
+        point_mask = status == "POINT_RECOVERED"
+        arc_mask = np.zeros(len(image_df), dtype=bool)
+    arc_candidate_residual_all = _plot_value_with_fallback(
         image_df,
-        "arc_aware_image_residual_q50",
+        "arc_candidate_image_residual_arcsec",
         "arc_aware_image_residual_arcsec",
     )
-    arc_residual = arc_residual[np.isfinite(arc_residual)]
+    if "arc_curve_distance_arcsec" in image_df.columns:
+        curve_distance = _plot_value_with_fallback(image_df, "arc_curve_distance_arcsec")
+        arc_candidate_residual_all = np.where(np.isfinite(arc_candidate_residual_all), arc_candidate_residual_all, curve_distance)
+    arc_aware_mask = arc_mask | (point_mask & ~arc_mask)
+    arc_residual_all = np.where(arc_mask, arc_candidate_residual_all, np.where(point_mask, point_residual_all, np.nan))
+    residual = point_residual_all[point_mask & np.isfinite(point_residual_all)]
+    arc_residual = arc_residual_all[arc_aware_mask & np.isfinite(arc_residual_all)]
     if residual.size == 0 and arc_residual.size == 0:
         _write_placeholder_plot(
             path,
@@ -3733,26 +3880,35 @@ def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
 
     fig, ax = plt.subplots(figsize=(6.2, 4.2))
     bin_count = 30
+    total_count = int(len(image_df))
     total_rms = float(np.sqrt(np.mean(np.square(residual)))) if residual.size else np.nan
     arc_total_rms = float(np.sqrt(np.mean(np.square(arc_residual)))) if arc_residual.size else np.nan
     if residual.size:
-        ax.hist(residual, bins=bin_count, color="tab:blue", alpha=0.55, label="strict")
-        ax.axvline(
-            float(np.nanmedian(residual)),
+        ax.hist(
+            residual,
+            bins=bin_count,
             color="tab:blue",
-            linestyle="--",
-            linewidth=1.2,
-            label="strict median",
+            alpha=0.5,
+            edgecolor="#1d4ed8",
+            linewidth=0.85,
+            label=f"point recovery {residual.size}/{total_count}",
         )
         ax.axvline(
             total_rms,
             color="tab:red",
             linestyle="-.",
             linewidth=1.2,
-            label="strict RMS",
+            label="point RMS",
         )
     if arc_residual.size:
-        ax.hist(arc_residual, bins=bin_count, color="tab:olive", alpha=0.45, label="arc-aware")
+        ax.hist(
+            arc_residual,
+            bins=bin_count,
+            histtype="step",
+            color="#ffd54f",
+            linewidth=2.0,
+            label=f"arc-aware {arc_residual.size}/{total_count}",
+        )
         ax.axvline(
             arc_total_rms,
             color="tab:green",
@@ -3760,9 +3916,15 @@ def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
             linewidth=1.2,
             label="arc-aware RMS",
         )
-    rms_annotation = (
-        f"Strict RMS = {total_rms:.3g} arcsec, N = {residual.size}\n"
-        f"Arc-aware RMS = {arc_total_rms:.3g} arcsec, N = {arc_residual.size}"
+    arc_supported_count = int(np.sum(arc_mask))
+    missed_count = int(np.sum(status == "MISSED"))
+    rms_annotation = "\n".join(
+        [
+            f"Point RMS = {total_rms:.3g} arcsec ({residual.size}/{total_count})",
+            f"Arc-aware RMS = {arc_total_rms:.3g} arcsec ({arc_residual.size}/{total_count})",
+            f"arc-supported = {arc_supported_count}/{total_count}",
+            f"missed = {missed_count}/{total_count}",
+        ]
     )
     ax.text(
         0.98,
@@ -3796,7 +3958,9 @@ def _plot_critical_arc_support_histogram(
     _shared_plot_critical_arc_support_histogram(
         image_df,
         path,
-        curve_support_radius_arcsec=0.5,
+        arc_recovery_p_arc_threshold=float(
+            _artifact_arg(artifact_args, "arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
+        ),
         critical_arc_base_prob=float(_artifact_arg(artifact_args, "critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)),
         critical_arc_max_prob=float(_artifact_arg(artifact_args, "critical_arc_max_prob", DEFAULT_CRITICAL_ARC_MAX_PROB)),
         singular_threshold=float(
@@ -3808,12 +3972,26 @@ def _plot_critical_arc_support_histogram(
     )
 
 
-def _plot_critical_arc_support_phase_space(image_df: pd.DataFrame, path: Path) -> None:
+def _plot_critical_arc_support_phase_space(
+    image_df: pd.DataFrame,
+    path: Path,
+    *,
+    artifact_args: dict[str, Any] | None = None,
+) -> None:
     _shared_plot_critical_arc_support_phase_space(
         image_df,
         path,
-        curve_support_radius_arcsec=0.5,
-        singular_threshold=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+        arc_recovery_p_arc_threshold=float(
+            _artifact_arg(artifact_args, "arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
+        ),
+        critical_arc_base_prob=float(_artifact_arg(artifact_args, "critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)),
+        critical_arc_max_prob=float(_artifact_arg(artifact_args, "critical_arc_max_prob", DEFAULT_CRITICAL_ARC_MAX_PROB)),
+        singular_threshold=float(
+            _artifact_arg(artifact_args, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)
+        ),
+        singular_softness=float(
+            _artifact_arg(artifact_args, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
+        ),
     )
 
 
@@ -4859,6 +5037,42 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         or float(getattr(args, "smc_mala_step_size", DEFAULT_SMC_MALA_STEP_SIZE)) <= 0.0
     ):
         raise SystemExit("--smc-mala-step-size must be positive.")
+    tune_fracs = [
+        float(getattr(args, "microcanonical_tune_frac1", DEFAULT_MICROCANONICAL_TUNE_FRAC1)),
+        float(getattr(args, "microcanonical_tune_frac2", DEFAULT_MICROCANONICAL_TUNE_FRAC2)),
+        float(getattr(args, "microcanonical_tune_frac3", DEFAULT_MICROCANONICAL_TUNE_FRAC3)),
+    ]
+    if any(not np.isfinite(value) or value < 0.0 or value > 1.0 for value in tune_fracs):
+        raise SystemExit("--microcanonical-tune-frac1/2/3 values must be finite and in [0, 1].")
+    if sum(tune_fracs) > 1.0 + 1.0e-12:
+        raise SystemExit("--microcanonical-tune-frac1/2/3 values must sum to <= 1.")
+    desired_energy_var = float(getattr(args, "mclmc_desired_energy_var", DEFAULT_MCLMC_DESIRED_ENERGY_VAR))
+    if not np.isfinite(desired_energy_var) or desired_energy_var <= 0.0:
+        raise SystemExit("--mclmc-desired-energy-var must be finite and positive.")
+    trust_in_estimate = float(getattr(args, "mclmc_trust_in_estimate", DEFAULT_MCLMC_TRUST_IN_ESTIMATE))
+    if not np.isfinite(trust_in_estimate) or trust_in_estimate <= 0.0:
+        raise SystemExit("--mclmc-trust-in-estimate must be finite and positive.")
+    if int(getattr(args, "mclmc_num_effective_samples", DEFAULT_MCLMC_NUM_EFFECTIVE_SAMPLES)) <= 0:
+        raise SystemExit("--mclmc-num-effective-samples must be positive.")
+    lfactor = float(getattr(args, "mclmc_lfactor", DEFAULT_MCLMC_LFACTOR))
+    if not np.isfinite(lfactor) or lfactor <= 0.0:
+        raise SystemExit("--mclmc-lfactor must be finite and positive.")
+    target_accept = float(getattr(args, "mchmc_target_accept", DEFAULT_MCHMC_TARGET_ACCEPT))
+    if not np.isfinite(target_accept) or target_accept <= 0.0 or target_accept >= 1.0:
+        raise SystemExit("--mchmc-target-accept must be finite and in (0, 1).")
+    l_proposal_factor = float(getattr(args, "mchmc_l_proposal_factor", DEFAULT_MCHMC_L_PROPOSAL_FACTOR))
+    if not (np.isposinf(l_proposal_factor) or (np.isfinite(l_proposal_factor) and l_proposal_factor > 0.0)):
+        raise SystemExit("--mchmc-l-proposal-factor must be positive or inf.")
+    divergence_threshold = float(getattr(args, "mchmc_divergence_threshold", DEFAULT_MCHMC_DIVERGENCE_THRESHOLD))
+    if not np.isfinite(divergence_threshold) or divergence_threshold <= 0.0:
+        raise SystemExit("--mchmc-divergence-threshold must be finite and positive.")
+    if int(getattr(args, "mchmc_num_windows", DEFAULT_MCHMC_NUM_WINDOWS)) <= 0:
+        raise SystemExit("--mchmc-num-windows must be positive.")
+    tuning_factor = float(getattr(args, "mchmc_tuning_factor", DEFAULT_MCHMC_TUNING_FACTOR))
+    if not np.isfinite(tuning_factor) or tuning_factor <= 0.0:
+        raise SystemExit("--mchmc-tuning-factor must be finite and positive.")
+    if str(getattr(args, "mchmc_l_estimator", DEFAULT_MCHMC_L_ESTIMATOR)) not in MCHMC_L_ESTIMATORS:
+        raise SystemExit(f"--mchmc-l-estimator must be one of {', '.join(MCHMC_L_ESTIMATORS)}.")
 
     evidence_prior_sigma = getattr(args, "evidence_source_prior_sigma_arcsec", None)
     if evidence_prior_sigma is not None and float(evidence_prior_sigma) <= 0.0:
@@ -5006,11 +5220,111 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     )
     if not np.isfinite(critical_arc_singular_threshold) or critical_arc_singular_threshold <= 0.0:
         raise SystemExit("--critical-arc-singular-threshold must be finite and positive.")
+    critical_arc_threshold_lower = float(
+        getattr(
+            args,
+            "critical_arc_singular_threshold_lower",
+            DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_LOWER,
+        )
+    )
+    critical_arc_threshold_upper = float(
+        getattr(
+            args,
+            "critical_arc_singular_threshold_upper",
+            DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_UPPER,
+        )
+    )
+    critical_arc_threshold_prior_median = float(
+        getattr(
+            args,
+            "critical_arc_singular_threshold_prior_median",
+            DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_MEDIAN,
+        )
+    )
+    critical_arc_threshold_prior_log_sigma = float(
+        getattr(
+            args,
+            "critical_arc_singular_threshold_prior_log_sigma",
+            DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_LOG_SIGMA,
+        )
+    )
+    if (
+        not np.isfinite(critical_arc_threshold_lower)
+        or not np.isfinite(critical_arc_threshold_upper)
+        or critical_arc_threshold_lower <= 0.0
+        or critical_arc_threshold_lower >= critical_arc_threshold_upper
+    ):
+        raise SystemExit("--critical-arc-singular-threshold-lower/upper must be finite, positive, and ordered.")
+    if (
+        not np.isfinite(critical_arc_threshold_prior_median)
+        or not (critical_arc_threshold_lower < critical_arc_threshold_prior_median < critical_arc_threshold_upper)
+    ):
+        raise SystemExit("--critical-arc-singular-threshold-prior-median must lie between the sampled threshold bounds.")
+    if not np.isfinite(critical_arc_threshold_prior_log_sigma) or critical_arc_threshold_prior_log_sigma <= 0.0:
+        raise SystemExit("--critical-arc-singular-threshold-prior-log-sigma must be finite and positive.")
+    if (
+        bool(getattr(args, "sample_critical_arc_singular_threshold", False))
+        and str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) != IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
+    ):
+        raise SystemExit(
+            "--sample-critical-arc-singular-threshold is only valid with "
+            "--image-plane-mode critical-arc-mixture-image-plane."
+        )
     critical_arc_singular_softness = float(
         getattr(args, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
     )
     if not np.isfinite(critical_arc_singular_softness) or critical_arc_singular_softness <= 0.0:
         raise SystemExit("--critical-arc-singular-softness must be finite and positive.")
+    critical_arc_softness_lower = float(
+        getattr(
+            args,
+            "critical_arc_singular_softness_lower",
+            DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_LOWER,
+        )
+    )
+    critical_arc_softness_upper = float(
+        getattr(
+            args,
+            "critical_arc_singular_softness_upper",
+            DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER,
+        )
+    )
+    critical_arc_softness_prior_median = float(
+        getattr(
+            args,
+            "critical_arc_singular_softness_prior_median",
+            DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_MEDIAN,
+        )
+    )
+    critical_arc_softness_prior_log_sigma = float(
+        getattr(
+            args,
+            "critical_arc_singular_softness_prior_log_sigma",
+            DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_LOG_SIGMA,
+        )
+    )
+    if (
+        not np.isfinite(critical_arc_softness_lower)
+        or not np.isfinite(critical_arc_softness_upper)
+        or critical_arc_softness_lower <= 0.0
+        or critical_arc_softness_lower >= critical_arc_softness_upper
+    ):
+        raise SystemExit("--critical-arc-singular-softness-lower/upper must be finite, positive, and ordered.")
+    if (
+        not np.isfinite(critical_arc_softness_prior_median)
+        or not (critical_arc_softness_lower < critical_arc_softness_prior_median < critical_arc_softness_upper)
+    ):
+        raise SystemExit("--critical-arc-singular-softness-prior-median must lie between the sampled softness bounds.")
+    if not np.isfinite(critical_arc_softness_prior_log_sigma) or critical_arc_softness_prior_log_sigma <= 0.0:
+        raise SystemExit("--critical-arc-singular-softness-prior-log-sigma must be finite and positive.")
+    if (
+        bool(getattr(args, "sample_critical_arc_singular_softness", False))
+        and str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) != IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
+    ):
+        raise SystemExit(
+            "--sample-critical-arc-singular-softness is only valid with "
+            "--image-plane-mode critical-arc-mixture-image-plane."
+        )
     critical_arc_lm_relative = float(
         getattr(args, "critical_arc_lm_damping_relative", DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE)
     )
@@ -5026,15 +5340,15 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     )
     if not np.isfinite(critical_arc_lm_trust_radius) or critical_arc_lm_trust_radius <= 0.0:
         raise SystemExit("--critical-arc-lm-trust-radius-arcsec must be finite and positive.")
-    try:
-        arc_aware_noncritical_support_radius = _resolve_arc_aware_noncritical_support_radius_arcsec(
-            getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
-            DEFAULT_MATCH_TOLERANCE,
-        )
-    except ValueError as exc:
-        raise SystemExit("--arc-aware-noncritical-support-radius-arcsec must be finite and positive.") from exc
-    if not np.isfinite(arc_aware_noncritical_support_radius) or arc_aware_noncritical_support_radius <= 0.0:
-        raise SystemExit("--arc-aware-noncritical-support-radius-arcsec must be finite and positive.")
+    arc_recovery_p_arc_threshold = float(
+        getattr(args, "arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
+    )
+    if (
+        not np.isfinite(arc_recovery_p_arc_threshold)
+        or arc_recovery_p_arc_threshold < 0.0
+        or arc_recovery_p_arc_threshold > 1.0
+    ):
+        raise SystemExit("--arc-recovery-p-arc-threshold must be finite and in [0, 1].")
     arc_aware_max_arclength = float(
         getattr(args, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
     )
@@ -5090,11 +5404,11 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         if bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)):
             raise SystemExit("--skip-stage3-image-plane-local-jacobian is not valid with --solver-fit-mode evidence-ns.")
         if (
-            str(getattr(args, "sampling_engine", "full")) == "refreshing_surrogate"
+            str(getattr(args, "sampling_engine", "full")) in {"refreshing_surrogate", "refreshing_surrogate_flat"}
             and int(getattr(args, "image_plane_newton_steps", 0)) > 0
         ):
             raise SystemExit(
-                "--sampling-engine refreshing_surrogate with linearized-forward-beta-image-plane "
+                "--sampling-engine refreshing_surrogate or refreshing_surrogate_flat with linearized-forward-beta-image-plane "
                 "requires --image-plane-newton-steps 0."
             )
         controls = {
@@ -5126,7 +5440,6 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     if mode in {
         IMAGE_PLANE_MODE_FORWARD_METRIC,
         IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
-        IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
         IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
     }:
@@ -5139,11 +5452,11 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             )
     if (
         mode == IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA
-        and str(getattr(args, "sampling_engine", "full")) == "refreshing_surrogate"
+        and str(getattr(args, "sampling_engine", "full")) in {"refreshing_surrogate", "refreshing_surrogate_flat"}
         and anchored_solve_steps > 0
     ):
         raise SystemExit(
-            "--sampling-engine refreshing_surrogate is not supported with "
+            "--sampling-engine refreshing_surrogate or refreshing_surrogate_flat is not supported with "
             "--image-plane-mode anchored-solved-forward-beta-image-plane unless "
             "--anchored-image-plane-solve-steps is 0."
         )
@@ -5178,7 +5491,17 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     ]
 
     invalid_fit_methods = sorted(
-        set(fit_methods).difference({FIT_METHOD_SVI, FIT_METHOD_SVI_NUTS, FIT_METHOD_NUTS, FIT_METHOD_NS, FIT_METHOD_SMC})
+        set(fit_methods).difference(
+            {
+                FIT_METHOD_SVI,
+                FIT_METHOD_SVI_NUTS,
+                FIT_METHOD_NUTS,
+                FIT_METHOD_NS,
+                FIT_METHOD_SMC,
+                FIT_METHOD_MCHMC,
+                FIT_METHOD_MCLMC,
+            }
+        )
     )
     if invalid_fit_methods:
         raise SystemExit(f"--fit-method has unsupported value(s): {', '.join(invalid_fit_methods)}")
@@ -5227,11 +5550,11 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         )
     if (
         _validation_linearized_stage_enabled(args)
-        and str(getattr(args, "sampling_engine", "full")) == "refreshing_surrogate"
+        and str(getattr(args, "sampling_engine", "full")) in {"refreshing_surrogate", "refreshing_surrogate_flat"}
         and int(getattr(args, "image_plane_newton_steps", 0)) > 0
     ):
         raise SystemExit(
-            "--sampling-engine refreshing_surrogate with linearized-forward-beta-image-plane "
+            "--sampling-engine refreshing_surrogate or refreshing_surrogate_flat with linearized-forward-beta-image-plane "
             "requires --image-plane-newton-steps 0."
         )
     if has_stage_specific_values and not has_stage3_or_stage4:
@@ -5303,6 +5626,13 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         nuts_stages.append("stage3")
     if has_stage4 and controls["stage4"].fit_method == FIT_METHOD_NUTS:
         nuts_stages.append("stage4")
+    microcanonical_stages: list[str] = []
+    if controls["stage2"].fit_method in MICROCANONICAL_FIT_METHODS:
+        microcanonical_stages.append("stage2")
+    if stage3_active and controls["stage3"].fit_method in MICROCANONICAL_FIT_METHODS:
+        microcanonical_stages.append("stage3")
+    if has_stage4 and controls["stage4"].fit_method in MICROCANONICAL_FIT_METHODS:
+        microcanonical_stages.append("stage4")
     if _validation_blocked_linearized_stage_enabled(args) and controls["stage4"].fit_method != FIT_METHOD_SVI_NUTS:
         raise SystemExit(
             "--image-plane-mode linearized-forward-beta-blocked-image-plane requires "
@@ -5319,6 +5649,11 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             raise SystemExit("--potfile-mass-size-reparam is not supported with blocked linearized stage 4 NUTS.")
         if smc_stages:
             raise SystemExit("--potfile-mass-size-reparam is only supported with NumPyro SVI/NUTS samplers, not --fit-method smc.")
+        if microcanonical_stages:
+            raise SystemExit(
+                "--potfile-mass-size-reparam is only supported with NumPyro SVI/NUTS samplers, "
+                "not --fit-method mchmc or mclmc."
+            )
     return controls
 
 
@@ -5656,6 +5991,8 @@ def _validation_configured_approximation_items(args: argparse.Namespace) -> list
     sampling_engine = str(getattr(args, "sampling_engine", "full"))
     if sampling_engine == "refreshing_surrogate":
         items.append("refreshing_surrogate=configured first-order inactive-deflection surrogate")
+    elif sampling_engine == "refreshing_surrogate_flat":
+        items.append("refreshing_surrogate_flat=configured flattened inactive-deflection surrogate")
     elif sampling_engine == "active_subset":
         items.append("active_subset=configured inactive scaling potentials omitted during solver fitting")
     try:
@@ -5859,6 +6196,18 @@ def _validate_validation_args(args: argparse.Namespace) -> None:
             raise SystemExit("--write-stage3-recovery requires stage 3; remove --skip-stage3-image-plane-local-jacobian.")
     if bool(getattr(args, "quick_diagnostics", False)) and bool(getattr(args, "exact_image_diagnostics_stage3", False)):
         raise SystemExit("--exact-image-diagnostics-stage3 cannot be combined with --quick-diagnostics.")
+    exact_image_min_distance_arcsec = float(
+        getattr(args, "exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)
+    )
+    if not np.isfinite(exact_image_min_distance_arcsec) or exact_image_min_distance_arcsec <= 0.0:
+        raise SystemExit("--exact-image-min-distance-arcsec must be finite and positive.")
+    exact_image_precision_limit = float(
+        getattr(args, "exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)
+    )
+    if not np.isfinite(exact_image_precision_limit) or exact_image_precision_limit <= 0.0:
+        raise SystemExit("--exact-image-precision-limit must be finite and positive.")
+    if int(getattr(args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)) <= 0:
+        raise SystemExit("--exact-image-num-iter-max must be positive.")
     fixed_image_sigma_int = getattr(args, "fix_image_sigma_int_arcsec", None)
     if fixed_image_sigma_int is not None and (
         not np.isfinite(float(fixed_image_sigma_int)) or float(fixed_image_sigma_int) < 0.0
@@ -5869,10 +6218,6 @@ def _validate_validation_args(args: argparse.Namespace) -> None:
 def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: argparse.Namespace) -> Path:
     controls = _normalize_validation_stage_fit_controls(args)
     solver_fit_mode = str(getattr(args, "solver_fit_mode", SOLVER_FIT_MODE_SEQUENTIAL))
-    arc_aware_noncritical_support_radius_arcsec = _resolve_arc_aware_noncritical_support_radius_arcsec(
-        getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
-        DEFAULT_MATCH_TOLERANCE,
-    )
     cmd = [
         sys.executable,
         "-m",
@@ -5925,6 +6270,12 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(args.source_plane_covariance_floor),
         "--z-bin-efficiency-tol",
         str(args.z_bin_efficiency_tol),
+        "--exact-image-min-distance-arcsec",
+        str(getattr(args, "exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)),
+        "--exact-image-precision-limit",
+        str(getattr(args, "exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)),
+        "--exact-image-num-iter-max",
+        str(getattr(args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)),
         "--active-scaling-selection",
         str(args.active_scaling_selection),
         "--active-scaling-cumulative-fraction",
@@ -5937,7 +6288,8 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(args.seed),
         "--target-accept",
         str(args.target_accept),
-        "--dense-mass" if bool(getattr(args, "dense_mass", True)) else "--no-dense-mass",
+        "--dense-mass",
+        str(getattr(args, "dense_mass", "structured")),
         "--jax-default-device",
         str(getattr(args, "jax_default_device", JAX_DEVICE_AUTO)),
         "--smc-device",
@@ -5956,7 +6308,41 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(getattr(args, "smc_rmh_scale", DEFAULT_SMC_RMH_SCALE)),
         "--smc-mala-step-size",
         str(getattr(args, "smc_mala_step_size", DEFAULT_SMC_MALA_STEP_SIZE)),
+        "--microcanonical-tune-frac1",
+        str(getattr(args, "microcanonical_tune_frac1", DEFAULT_MICROCANONICAL_TUNE_FRAC1)),
+        "--microcanonical-tune-frac2",
+        str(getattr(args, "microcanonical_tune_frac2", DEFAULT_MICROCANONICAL_TUNE_FRAC2)),
+        "--microcanonical-tune-frac3",
+        str(getattr(args, "microcanonical_tune_frac3", DEFAULT_MICROCANONICAL_TUNE_FRAC3)),
+        "--mclmc-desired-energy-var",
+        str(getattr(args, "mclmc_desired_energy_var", DEFAULT_MCLMC_DESIRED_ENERGY_VAR)),
+        "--mclmc-trust-in-estimate",
+        str(getattr(args, "mclmc_trust_in_estimate", DEFAULT_MCLMC_TRUST_IN_ESTIMATE)),
+        "--mclmc-num-effective-samples",
+        str(getattr(args, "mclmc_num_effective_samples", DEFAULT_MCLMC_NUM_EFFECTIVE_SAMPLES)),
+        "--mclmc-lfactor",
+        str(getattr(args, "mclmc_lfactor", DEFAULT_MCLMC_LFACTOR)),
+        "--mchmc-target-accept",
+        str(getattr(args, "mchmc_target_accept", DEFAULT_MCHMC_TARGET_ACCEPT)),
+        "--mchmc-l-proposal-factor",
+        str(getattr(args, "mchmc_l_proposal_factor", DEFAULT_MCHMC_L_PROPOSAL_FACTOR)),
+        "--mchmc-divergence-threshold",
+        str(getattr(args, "mchmc_divergence_threshold", DEFAULT_MCHMC_DIVERGENCE_THRESHOLD)),
+        "--mchmc-num-windows",
+        str(getattr(args, "mchmc_num_windows", DEFAULT_MCHMC_NUM_WINDOWS)),
+        "--mchmc-tuning-factor",
+        str(getattr(args, "mchmc_tuning_factor", DEFAULT_MCHMC_TUNING_FACTOR)),
+        "--mchmc-l-estimator",
+        str(getattr(args, "mchmc_l_estimator", DEFAULT_MCHMC_L_ESTIMATOR)),
     ]
+    if bool(getattr(args, "microcanonical_diagonal_preconditioning", DEFAULT_MICROCANONICAL_DIAGONAL_PRECONDITIONING)):
+        cmd.append("--microcanonical-diagonal-preconditioning")
+    else:
+        cmd.append("--no-microcanonical-diagonal-preconditioning")
+    if bool(getattr(args, "mchmc_random_trajectory_length", DEFAULT_MCHMC_RANDOM_TRAJECTORY_LENGTH)):
+        cmd.append("--mchmc-random-trajectory-length")
+    else:
+        cmd.append("--no-mchmc-random-trajectory-length")
     _append_stage_option(cmd, "--svi-steps", args.svi_steps)
     _append_stage_option(cmd, "--max-tree-depth", args.max_tree_depth)
     if bool(getattr(args, "potfile_mass_size_reparam", False)):
@@ -6021,12 +6407,86 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
                         DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
                     )
                 ),
+                *(
+                    ["--sample-critical-arc-singular-threshold"]
+                    if bool(getattr(args, "sample_critical_arc_singular_threshold", False))
+                    else []
+                ),
+                "--critical-arc-singular-threshold-prior-median",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_singular_threshold_prior_median",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_MEDIAN,
+                    )
+                ),
+                "--critical-arc-singular-threshold-prior-log-sigma",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_singular_threshold_prior_log_sigma",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_LOG_SIGMA,
+                    )
+                ),
+                "--critical-arc-singular-threshold-lower",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_singular_threshold_lower",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_LOWER,
+                    )
+                ),
+                "--critical-arc-singular-threshold-upper",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_singular_threshold_upper",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_UPPER,
+                    )
+                ),
                 "--critical-arc-singular-softness",
                 str(
                     getattr(
                         args,
                         "critical_arc_singular_softness",
                         DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
+                    )
+                ),
+                *(
+                    ["--sample-critical-arc-singular-softness"]
+                    if bool(getattr(args, "sample_critical_arc_singular_softness", False))
+                    else []
+                ),
+                "--critical-arc-singular-softness-prior-median",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_singular_softness_prior_median",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_MEDIAN,
+                    )
+                ),
+                "--critical-arc-singular-softness-prior-log-sigma",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_singular_softness_prior_log_sigma",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_LOG_SIGMA,
+                    )
+                ),
+                "--critical-arc-singular-softness-lower",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_singular_softness_lower",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_LOWER,
+                    )
+                ),
+                "--critical-arc-singular-softness-upper",
+                str(
+                    getattr(
+                        args,
+                        "critical_arc_singular_softness_upper",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER,
                     )
                 ),
                 "--critical-arc-lm-damping-relative",
@@ -6053,8 +6513,8 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
                         DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC,
                     )
                 ),
-                "--arc-aware-noncritical-support-radius-arcsec",
-                str(arc_aware_noncritical_support_radius_arcsec),
+                "--arc-recovery-p-arc-threshold",
+                str(getattr(args, "arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)),
                 "--arc-aware-max-arclength-arcsec",
                 str(
                     getattr(
@@ -6551,13 +7011,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fit-method",
         nargs="+",
-        choices=(FIT_METHOD_SVI, FIT_METHOD_SVI_NUTS, FIT_METHOD_NUTS, FIT_METHOD_NS, FIT_METHOD_SMC),
+        choices=(
+            FIT_METHOD_SVI,
+            FIT_METHOD_SVI_NUTS,
+            FIT_METHOD_NUTS,
+            FIT_METHOD_NS,
+            FIT_METHOD_SMC,
+            FIT_METHOD_MCHMC,
+            FIT_METHOD_MCLMC,
+        ),
         default=[FIT_METHOD_SVI_NUTS],
-        metavar="{svi,svi+nuts,nuts,ns,smc}",
+        metavar="{svi,svi+nuts,nuts,ns,smc,mchmc,mclmc}",
         help=(
             "Sequential solver fit method. Pass one value for all sampled stages, two values for "
             "stage2_joint and stage3_image_plane, or three values when stage 4 is enabled. "
-            "NUTS-only and SMC are accepted only for non-blocked stage 4 image-plane modes. "
+            "NUTS-only and SMC are accepted only for non-blocked stage 4 image-plane modes; "
+            "MCHMC and MCLMC are accepted for sampled stages. "
             "Ignored for --solver-fit-mode evidence-ns, which always uses nested sampling internally."
         ),
     )
@@ -6651,10 +7120,74 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Smallest-singular-value threshold where the critical-arc branch prior starts increasing.",
     )
     parser.add_argument(
+        "--sample-critical-arc-singular-threshold",
+        action="store_true",
+        help=(
+            "Sample the critical-arc smallest-singular-value threshold as a global hyperparameter. "
+            "Only valid for critical-arc-mixture image-plane stage 4."
+        ),
+    )
+    parser.add_argument(
+        "--critical-arc-singular-threshold-prior-median",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_MEDIAN,
+        help="Median of the truncated log-normal prior for sampled critical_arc_singular_threshold.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-threshold-prior-log-sigma",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_LOG_SIGMA,
+        help="Log-space standard deviation for the sampled critical_arc_singular_threshold prior.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-threshold-lower",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_LOWER,
+        help="Physical lower bound for sampled critical_arc_singular_threshold.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-threshold-upper",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_UPPER,
+        help="Physical upper bound for sampled critical_arc_singular_threshold.",
+    )
+    parser.add_argument(
         "--critical-arc-singular-softness",
         type=float,
         default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
         help="Softness for the critical-arc prior transition as the smallest singular value approaches zero.",
+    )
+    parser.add_argument(
+        "--sample-critical-arc-singular-softness",
+        action="store_true",
+        help=(
+            "Sample the critical-arc smallest-singular-value transition softness as a global hyperparameter. "
+            "Only valid for critical-arc-mixture image-plane stage 4."
+        ),
+    )
+    parser.add_argument(
+        "--critical-arc-singular-softness-prior-median",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_MEDIAN,
+        help="Median of the truncated log-normal prior for sampled critical_arc_singular_softness.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-softness-prior-log-sigma",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_LOG_SIGMA,
+        help="Log-space standard deviation for the sampled critical_arc_singular_softness prior.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-softness-lower",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_LOWER,
+        help="Physical lower bound for sampled critical_arc_singular_softness.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-softness-upper",
+        type=float,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER,
+        help="Physical upper bound for sampled critical_arc_singular_softness.",
     )
     parser.add_argument(
         "--critical-arc-lm-damping-relative",
@@ -6675,12 +7208,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Large smooth finite guard radius for critical-arc mixture LM image-plane displacements.",
     )
     parser.add_argument(
-        "--arc-aware-noncritical-support-radius-arcsec",
+        "--arc-recovery-p-arc-threshold",
         type=float,
-        default=None,
+        default=DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD,
         help=(
-            "Maximum support-curve distance for arc-aware image recovery validation. "
-            "Defaults to the solver match tolerance."
+            "Minimum critical-arc mixture arc-vs-point inlier responsibility required for "
+            "arc-supported image recovery."
         ),
     )
     parser.add_argument(
@@ -6874,8 +7407,31 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--smc-rmh-scale", type=float, default=DEFAULT_SMC_RMH_SCALE)
     parser.add_argument("--smc-mala-step-size", type=float, default=DEFAULT_SMC_MALA_STEP_SIZE)
     parser.add_argument(
+        "--microcanonical-diagonal-preconditioning",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_MICROCANONICAL_DIAGONAL_PRECONDITIONING,
+    )
+    parser.add_argument("--microcanonical-tune-frac1", type=float, default=DEFAULT_MICROCANONICAL_TUNE_FRAC1)
+    parser.add_argument("--microcanonical-tune-frac2", type=float, default=DEFAULT_MICROCANONICAL_TUNE_FRAC2)
+    parser.add_argument("--microcanonical-tune-frac3", type=float, default=DEFAULT_MICROCANONICAL_TUNE_FRAC3)
+    parser.add_argument("--mclmc-desired-energy-var", type=float, default=DEFAULT_MCLMC_DESIRED_ENERGY_VAR)
+    parser.add_argument("--mclmc-trust-in-estimate", type=float, default=DEFAULT_MCLMC_TRUST_IN_ESTIMATE)
+    parser.add_argument("--mclmc-num-effective-samples", type=int, default=DEFAULT_MCLMC_NUM_EFFECTIVE_SAMPLES)
+    parser.add_argument("--mclmc-lfactor", type=float, default=DEFAULT_MCLMC_LFACTOR)
+    parser.add_argument("--mchmc-target-accept", type=float, default=DEFAULT_MCHMC_TARGET_ACCEPT)
+    parser.add_argument(
+        "--mchmc-random-trajectory-length",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_MCHMC_RANDOM_TRAJECTORY_LENGTH,
+    )
+    parser.add_argument("--mchmc-l-proposal-factor", type=float, default=DEFAULT_MCHMC_L_PROPOSAL_FACTOR)
+    parser.add_argument("--mchmc-divergence-threshold", type=float, default=DEFAULT_MCHMC_DIVERGENCE_THRESHOLD)
+    parser.add_argument("--mchmc-num-windows", type=int, default=DEFAULT_MCHMC_NUM_WINDOWS)
+    parser.add_argument("--mchmc-tuning-factor", type=float, default=DEFAULT_MCHMC_TUNING_FACTOR)
+    parser.add_argument("--mchmc-l-estimator", choices=MCHMC_L_ESTIMATORS, default=DEFAULT_MCHMC_L_ESTIMATOR)
+    parser.add_argument(
         "--sampling-engine",
-        choices=("full", "refreshing_surrogate", "active_subset"),
+        choices=("full", "full_flat", "refreshing_surrogate", "refreshing_surrogate_flat", "active_subset"),
         default="refreshing_surrogate",
     )
     parser.add_argument("--source-plane-covariance-floor", type=float, default=1.0e-6)
@@ -6950,12 +7506,36 @@ def _build_parser() -> argparse.ArgumentParser:
             "stage3_image_plane even when a stage 4 image-plane stage is enabled."
         ),
     )
+    parser.add_argument(
+        "--exact-image-min-distance-arcsec",
+        type=float,
+        default=DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC,
+        help=(
+            "Pass-through Lenstronomy exact image search grid spacing in arcsec for solver diagnostics. "
+            "Larger values reduce grid size and speed up exact fit-quality plots."
+        ),
+    )
+    parser.add_argument(
+        "--exact-image-precision-limit",
+        type=float,
+        default=DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
+        help="Pass-through Lenstronomy exact image solver precision limit.",
+    )
+    parser.add_argument(
+        "--exact-image-num-iter-max",
+        type=int,
+        default=DEFAULT_EXACT_IMAGE_NUM_ITER_MAX,
+        help="Pass-through Lenstronomy exact image solver iteration cap.",
+    )
     parser.add_argument("--target-accept", type=float, default=0.85)
     parser.add_argument(
         "--dense-mass",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use dense mass-matrix adaptation for solver NumPyro NUTS. Pass --no-dense-mass for diagonal mass.",
+        choices=("structured", "full", "diagonal"),
+        default="structured",
+        help=(
+            "Solver NumPyro NUTS mass-matrix adaptation: structured dense blocks, one full dense matrix, "
+            "or diagonal mass."
+        ),
     )
     parser.add_argument(
         "--potfile-mass-size-reparam",

@@ -262,6 +262,8 @@ def family_image_recovery_rows(
     arc_s_max = np.full(n_images, np.nan, dtype=float)
     arc_detA = np.full(n_images, np.nan, dtype=float)
     arc_prior_probability = np.full(n_images, np.nan, dtype=float)
+    p_arc = np.full(n_images, np.nan, dtype=float)
+    arc_log_odds = np.full(n_images, np.nan, dtype=float)
     arc_curve_distance = np.full(n_images, np.nan, dtype=float)
     arc_curve_arclength = np.full(n_images, np.nan, dtype=float)
     arc_curve_finite = np.zeros(n_images, dtype=bool)
@@ -345,6 +347,12 @@ def family_image_recovery_rows(
         arc_array = diagnostic_detail_array(exact_details, "arc_prior_probability", n_images, float)
         if arc_array is not None:
             arc_prior_probability = arc_array
+        arc_array = diagnostic_detail_array(exact_details, "p_arc", n_images, float)
+        if arc_array is not None:
+            p_arc = arc_array
+        arc_array = diagnostic_detail_array(exact_details, "arc_log_odds", n_images, float)
+        if arc_array is not None:
+            arc_log_odds = arc_array
         arc_array = diagnostic_detail_array(exact_details, "arc_curve_distance_arcsec", n_images, float)
         if arc_array is not None:
             arc_curve_distance = arc_array
@@ -406,6 +414,8 @@ def family_image_recovery_rows(
         s_max,
         det_a,
         arc_prior,
+        arc_p,
+        arc_margin,
         curve_distance,
         curve_arclength,
         curve_finite,
@@ -436,6 +446,8 @@ def family_image_recovery_rows(
         arc_s_max,
         arc_detA,
         arc_prior_probability,
+        p_arc,
+        arc_log_odds,
         arc_curve_distance,
         arc_curve_arclength,
         arc_curve_finite,
@@ -506,6 +518,8 @@ def family_image_recovery_rows(
                 "arc_s_max": float(s_max),
                 "arc_detA": float(det_a),
                 "arc_prior_probability": float(arc_prior),
+                "p_arc": float(arc_p),
+                "arc_log_odds": float(arc_margin),
                 "arc_curve_distance_arcsec": float(curve_distance),
                 "arc_curve_arclength_arcsec": float(curve_arclength),
                 "arc_curve_finite": bool(curve_finite),

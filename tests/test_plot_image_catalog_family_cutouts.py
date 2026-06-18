@@ -161,6 +161,38 @@ def test_missing_rgb_images_fail_with_download_hint(tmp_path: Path) -> None:
     assert "/home/dutra/.conda/envs/lenstronomy/bin/python download_catalogs.py --catalog buffalo-images" in message
 
 
+def test_parse_args_family_cutout_render_controls(tmp_path: Path) -> None:
+    args = plotter.parse_args(["a370", str(tmp_path / "obs.cat")])
+    assert args.image_catalog_family_cutout_mode == "full"
+    assert args.image_catalog_family_cutout_dpi is None
+    assert args.image_catalog_family_cutout_max_side_pixels is None
+    assert args.image_catalog_family_cutout_critical_lines == "auto"
+
+    args = plotter.parse_args(
+        [
+            "a370",
+            str(tmp_path / "obs.cat"),
+            "--image-catalog-family-cutout-mode",
+            "fast",
+            "--image-catalog-family-cutout-dpi",
+            "120",
+            "--image-catalog-family-cutout-max-side-pixels",
+            "256",
+            "--image-catalog-family-cutout-critical-lines",
+            "off",
+        ]
+    )
+    assert args.image_catalog_family_cutout_mode == "fast"
+    assert args.image_catalog_family_cutout_dpi == 120
+    assert args.image_catalog_family_cutout_max_side_pixels == 256
+    assert args.image_catalog_family_cutout_critical_lines == "off"
+
+    with pytest.raises(SystemExit):
+        plotter.parse_args(["a370", str(tmp_path / "obs.cat"), "--image-catalog-family-cutout-dpi", "0"])
+    with pytest.raises(SystemExit):
+        plotter.parse_args(["a370", str(tmp_path / "obs.cat"), "--image-catalog-family-cutout-max-side-pixels", "-1"])
+
+
 def test_solver_cutout_overlay_positions_use_clamped_edge_window(tmp_path: Path) -> None:
     path = _write_band_image(tmp_path / "images", "F814W", crpix=(2.0, 2.0))
     image = plotter.load_rgb_metadata({"F814W": path}, bands=("F814W",))["F814W"]
@@ -269,10 +301,12 @@ def test_image_catalog_family_cutout_compact_labels_and_legend_handles() -> None
             "image_recovery_status": ["recovered", "not_recovered", "not_recovered"],
             "arc_recovery_status": ["point_recovered", "arc_supported", "not_recovered"],
             "arc_aware_image_residual_arcsec": [0.1, 0.2, np.nan],
+            "p_arc": [0.2, 0.7, 0.1],
             "x_model_arcsec": [0.1, np.nan, np.nan],
             "y_model_arcsec": [0.0, np.nan, np.nan],
             "arc_support_anchor_x_arcsec": [9.0, 2.5, 7.0],
             "arc_support_anchor_y_arcsec": [9.5, -1.5, 7.5],
+            "arc_supported": [False, True, False],
         }
     )
     block = {
@@ -317,6 +351,7 @@ def test_image_catalog_family_cutout_compact_labels_and_legend_handles() -> None
                 "arc_aware_image_residual_arcsec": 0.054,
                 "arc_curve_distance_arcsec": 0.0456,
                 "arc_prior_probability": 0.75,
+                "p_arc": 0.62,
                 "arc_noncritical_direction_residual_arcsec": 0.02,
                 "arc_critical_direction_residual_arcsec": 4.0,
                 "arc_s_min": 0.04,
@@ -326,9 +361,9 @@ def test_image_catalog_family_cutout_compact_labels_and_legend_handles() -> None
         )
     )
     assert detail_label == (
-        "4.1  point recovered (arc supported)\n"
+        "4.1  arc recovered\n"
         "point=recovered  r_point=0.054\n"
-        "arc=supported  r_arc=0.046  p_arc=0.75\n"
+        "arc=recovered  r_arc=0.046  p_arc=0.62\n"
         "d_curve=0.046  N=0.02  T=4\n"
         "s=0.04/1.1  detA=0.044"
     )
@@ -344,6 +379,7 @@ def test_image_catalog_family_cutout_compact_labels_and_legend_handles() -> None
                 "image_residual_arcsec": np.nan,
                 "arc_curve_distance_arcsec": 0.041,
                 "arc_prior_probability": 0.8,
+                "p_arc": 0.91,
                 "arc_noncritical_direction_residual_arcsec": 0.02,
                 "arc_critical_direction_residual_arcsec": 3.0,
                 "arc_s_min": 0.01,
@@ -355,7 +391,7 @@ def test_image_catalog_family_cutout_compact_labels_and_legend_handles() -> None
     assert arc_detail_label == (
         "4.2  arc recovered\n"
         "point=arc recovered  r_point=na\n"
-        "arc=recovered  r_arc=0.041  p_arc=0.8\n"
+        "arc=recovered  r_arc=0.041  p_arc=0.91\n"
         "d_curve=0.041  N=0.02  T=3\n"
         "s=0.01/0.9  detA=0.05"
     )
@@ -447,6 +483,7 @@ def _arc_anchor_overlay_row(**overrides: object) -> pd.Series:
     data: dict[str, object] = {
         "image_recovery_status": "not_recovered",
         "arc_recovery_status": "arc_supported",
+        "p_arc": 0.8,
         "x_obs_arcsec": 1.5,
         "y_obs_arcsec": 1.0,
         "x_model_arcsec": np.nan,
@@ -463,7 +500,30 @@ def _arc_anchor_overlay_row(**overrides: object) -> pd.Series:
     return pd.Series(data)
 
 
-def test_image_catalog_arc_anchor_overlays_skip_point_recovered_rows(
+def test_image_catalog_arc_status_and_curve_use_p_arc_threshold() -> None:
+    row = _arc_anchor_overlay_row(
+        preferred_recovery_status="arc_supported",
+        arc_recovery_status="arc_supported",
+        arc_supported=False,
+        p_arc=0.7,
+    )
+
+    assert solver_plotting._image_catalog_observed_panel_status(row) == "ARC_RECOVERED"
+    assert solver_plotting._image_catalog_draw_arc_anchor_overlays(row)
+
+    strict_threshold_row = _arc_anchor_overlay_row(
+        preferred_recovery_status="arc_supported",
+        arc_recovery_status="arc_supported",
+        arc_supported=False,
+        p_arc=0.7,
+        arc_recovery_p_arc_threshold=0.75,
+    )
+
+    assert solver_plotting._image_catalog_observed_panel_status(strict_threshold_row) == "MISSED"
+    assert not solver_plotting._image_catalog_draw_arc_anchor_overlays(strict_threshold_row)
+
+
+def test_image_catalog_arc_anchor_overlays_skip_below_p_arc_threshold_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     row = _arc_anchor_overlay_row(
@@ -475,6 +535,7 @@ def test_image_catalog_arc_anchor_overlays_skip_point_recovered_rows(
         point_image_residual_arcsec=0.1,
         preferred_image_residual_arcsec=0.1,
         arc_supported=False,
+        p_arc=0.1,
     )
 
     def fail_if_drawn(*_args: object, **_kwargs: object) -> bool:
@@ -520,6 +581,7 @@ def test_image_catalog_arc_anchor_overlays_draw_for_point_recovered_arc_supporte
         preferred_image_residual_arcsec=0.1,
         arc_supported=False,
         arc_aware_image_residual_arcsec=0.1,
+        p_arc=0.6,
     )
     polyline_calls: list[dict[str, object]] = []
     segment_calls: list[dict[str, object]] = []
@@ -543,7 +605,7 @@ def test_image_catalog_arc_anchor_overlays_draw_for_point_recovered_arc_supporte
 
     center = SkyCoord(ra=10.0 * u.deg, dec=0.0 * u.deg, frame="icrs")
 
-    assert solver_plotting._image_catalog_observed_panel_status(row) == "POINT_RECOVERED"
+    assert solver_plotting._image_catalog_observed_panel_status(row) == "ARC_RECOVERED"
     assert solver_plotting._image_catalog_draw_arc_anchor_overlays(row)
     assert solver_plotting._draw_image_catalog_arc_support_curve(
         object(),
@@ -568,6 +630,200 @@ def test_image_catalog_arc_anchor_overlays_draw_for_point_recovered_arc_supporte
     assert len(marker_calls) == 1
 
 
+def test_image_catalog_observed_overlay_suppresses_point_model_for_arc_recovered_point_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _arc_anchor_overlay_row(
+        image_recovery_status="recovered",
+        arc_recovery_status="point_recovered",
+        x_model_arcsec=1.6,
+        y_model_arcsec=1.0,
+        point_image_residual_arcsec=0.1,
+        arc_candidate_supported=True,
+        arc_candidate_image_residual_arcsec=0.08,
+        arc_supported=False,
+        p_arc=0.6,
+    )
+    observed_statuses: list[str] = []
+    model_marker_count = 0
+    segment_count = 0
+    arc_curve_count = 0
+    arc_component_count = 0
+
+    def fake_observed_marker(*_args: object, status: str, **_kwargs: object) -> None:
+        observed_statuses.append(status)
+
+    def fake_model_marker(*_args: object, **_kwargs: object) -> None:
+        nonlocal model_marker_count
+        model_marker_count += 1
+
+    def fake_segment(*_args: object, **_kwargs: object) -> tuple[float, float]:
+        nonlocal segment_count
+        segment_count += 1
+        return (0.0, 0.0)
+
+    def fake_arc_curve(*_args: object, **_kwargs: object) -> bool:
+        nonlocal arc_curve_count
+        arc_curve_count += 1
+        return True
+
+    def fake_arc_components(*_args: object, **_kwargs: object) -> bool:
+        nonlocal arc_component_count
+        arc_component_count += 1
+        return True
+
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_observed_marker", fake_observed_marker)
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_model_marker", fake_model_marker)
+    monkeypatch.setattr(solver_plotting, "_draw_cutout_segment", fake_segment)
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_arc_support_curve", fake_arc_curve)
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_arc_supported_components", fake_arc_components)
+
+    solver_plotting._draw_image_catalog_observed_row_overlays(
+        object(),
+        object(),
+        SkyCoord(ra=10.0 * u.deg, dec=0.0 * u.deg, frame="icrs"),
+        row,
+        (3, 10.0, 0.0),
+        cutout_size_arcsec=8.0,
+        rendered_shape=(100, 100),
+    )
+
+    assert observed_statuses == ["ARC_RECOVERED"]
+    assert arc_curve_count == 1
+    assert arc_component_count == 1
+    assert model_marker_count == 0
+    assert segment_count == 0
+
+
+def test_image_catalog_observed_overlay_draws_point_model_for_low_p_arc_point_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _arc_anchor_overlay_row(
+        image_recovery_status="recovered",
+        arc_recovery_status="point_recovered",
+        x_model_arcsec=1.6,
+        y_model_arcsec=1.0,
+        point_image_residual_arcsec=0.1,
+        arc_supported=False,
+        p_arc=0.1,
+    )
+    observed_statuses: list[str] = []
+    model_marker_count = 0
+    segment_count = 0
+    arc_curve_count = 0
+
+    def fake_observed_marker(*_args: object, status: str, **_kwargs: object) -> None:
+        observed_statuses.append(status)
+
+    def fake_model_marker(*_args: object, **_kwargs: object) -> None:
+        nonlocal model_marker_count
+        model_marker_count += 1
+
+    def fake_segment(*_args: object, **_kwargs: object) -> tuple[float, float]:
+        nonlocal segment_count
+        segment_count += 1
+        return (0.0, 0.0)
+
+    def fake_arc_curve(*_args: object, **_kwargs: object) -> bool:
+        nonlocal arc_curve_count
+        arc_curve_count += 1
+        return True
+
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_observed_marker", fake_observed_marker)
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_model_marker", fake_model_marker)
+    monkeypatch.setattr(solver_plotting, "_draw_cutout_segment", fake_segment)
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_arc_support_curve", fake_arc_curve)
+
+    solver_plotting._draw_image_catalog_observed_row_overlays(
+        object(),
+        object(),
+        SkyCoord(ra=10.0 * u.deg, dec=0.0 * u.deg, frame="icrs"),
+        row,
+        (3, 10.0, 0.0),
+        cutout_size_arcsec=8.0,
+        rendered_shape=(100, 100),
+    )
+
+    assert observed_statuses == ["POINT_RECOVERED"]
+    assert arc_curve_count == 0
+    assert model_marker_count == 1
+    assert segment_count == 1
+
+
+def test_image_catalog_detail_panel_suppresses_point_model_for_arc_recovered_point_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _arc_anchor_overlay_row(
+        panel_kind="observed",
+        panel_status="ARC_RECOVERED",
+        x_center_arcsec=1.5,
+        y_center_arcsec=1.0,
+        cutout_size_arcsec=8.0,
+        image_recovery_status="recovered",
+        arc_recovery_status="point_recovered",
+        x_model_arcsec=1.6,
+        y_model_arcsec=1.0,
+        point_image_residual_arcsec=0.1,
+        arc_candidate_supported=True,
+        arc_candidate_image_residual_arcsec=0.08,
+        arc_supported=False,
+        p_arc=0.6,
+    )
+    model_marker_count = 0
+    segment_count = 0
+    arc_curve_count = 0
+    arc_component_count = 0
+
+    def fake_rgb(*_args: object, **_kwargs: object) -> np.ndarray:
+        return np.zeros((100, 100, 3), dtype=np.uint8)
+
+    def fake_model_marker(*_args: object, **_kwargs: object) -> None:
+        nonlocal model_marker_count
+        model_marker_count += 1
+
+    def fake_segment(*_args: object, **_kwargs: object) -> tuple[float, float]:
+        nonlocal segment_count
+        segment_count += 1
+        return (0.0, 0.0)
+
+    def fake_arc_curve(*_args: object, **_kwargs: object) -> bool:
+        nonlocal arc_curve_count
+        arc_curve_count += 1
+        return True
+
+    def fake_arc_components(*_args: object, **_kwargs: object) -> bool:
+        nonlocal arc_component_count
+        arc_component_count += 1
+        return True
+
+    monkeypatch.setattr(solver_plotting, "_image_catalog_draw_rgb_cutout", fake_rgb)
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_model_marker", fake_model_marker)
+    monkeypatch.setattr(solver_plotting, "_draw_cutout_segment", fake_segment)
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_arc_support_curve", fake_arc_curve)
+    monkeypatch.setattr(solver_plotting, "_draw_image_catalog_arc_supported_components", fake_arc_components)
+
+    fig, ax = plt.subplots()
+    try:
+        solver_plotting._draw_image_catalog_detail_panel(
+            ax,
+            object(),
+            {},
+            ("F435W", "F606W", "F814W"),
+            object(),
+            object(),
+            row,
+            (3, 10.0, 0.0),
+            None,
+        )
+    finally:
+        plt.close(fig)
+
+    assert arc_curve_count == 1
+    assert arc_component_count == 1
+    assert model_marker_count == 0
+    assert segment_count == 0
+
+
 def test_image_catalog_overview_geometry_gates_arc_anchor_bounds() -> None:
     point_row = _arc_anchor_overlay_row(
         image_recovery_status="recovered",
@@ -579,6 +835,7 @@ def test_image_catalog_overview_geometry_gates_arc_anchor_bounds() -> None:
         arc_support_anchor_x_arcsec=100.0,
         arc_support_anchor_y_arcsec=0.0,
         arc_supported=False,
+        p_arc=0.1,
     )
     point_center_x, point_center_y, point_size = solver_plotting._image_catalog_overview_geometry(
         pd.DataFrame([point_row.to_dict()]),
@@ -618,6 +875,31 @@ def test_image_catalog_overview_geometry_gates_arc_anchor_bounds() -> None:
     assert arc_center_y == pytest.approx(1.0)
     assert arc_size == pytest.approx(130.0)
 
+    point_arc_row = _arc_anchor_overlay_row(
+        image_recovery_status="recovered",
+        arc_recovery_status="point_recovered",
+        x_obs_arcsec=0.0,
+        y_obs_arcsec=0.0,
+        x_model_arcsec=1000.0,
+        y_model_arcsec=0.0,
+        arc_candidate_supported=True,
+        arc_candidate_image_residual_arcsec=0.08,
+        arc_support_anchor_x_arcsec=100.0,
+        arc_support_anchor_y_arcsec=0.0,
+        arc_supported=False,
+        p_arc=0.6,
+    )
+    point_arc_center_x, point_arc_center_y, point_arc_size = solver_plotting._image_catalog_overview_geometry(
+        pd.DataFrame([point_arc_row.to_dict()]),
+        pd.DataFrame(),
+        10.0,
+    )
+
+    assert solver_plotting._image_catalog_arc_recovered(point_arc_row)
+    assert point_arc_center_x == pytest.approx(50.0)
+    assert point_arc_center_y == pytest.approx(1.0)
+    assert point_arc_size == pytest.approx(130.0)
+
 
 def test_image_catalog_cluster_overview_includes_model_extra_and_arc_geometry(
     monkeypatch: pytest.MonkeyPatch,
@@ -631,6 +913,7 @@ def test_image_catalog_cluster_overview_includes_model_extra_and_arc_geometry(
             "y_model_arcsec": [0.0, np.nan],
             "image_recovery_status": ["recovered", "not_recovered"],
             "arc_recovery_status": ["point_recovered", "arc_supported"],
+            "p_arc": [0.1, 0.8],
             "arc_candidate_supported": [False, True],
             "arc_candidate_image_residual_arcsec": [np.nan, 0.25],
             "arc_support_anchor_x_arcsec": [np.nan, 100.0],
@@ -754,6 +1037,81 @@ def test_main_returns_2_for_missing_catalog_path(tmp_path: Path, capsys: pytest.
     assert "error: Missing image catalog" in captured.err
 
 
+def test_render_rgb_cutout_downsamples_payload_and_preserves_native_axes() -> None:
+    helpers = solver_plotting._load_image_catalog_cutout_helpers()
+    rgb = np.zeros((800, 400, 3), dtype=np.float32)
+    config = helpers.build_family_cutout_render_config(
+        mode="fast",
+        dpi=None,
+        max_side_pixels=200,
+        critical_lines="auto",
+    )
+    fig, ax = plt.subplots()
+    try:
+        display_rgb = helpers.render_rgb_cutout_on_axis(ax, rgb, render_config=config)
+        assert display_rgb.shape == (200, 100, 3)
+        assert ax.images[0].get_array().shape == (200, 100, 3)
+        assert ax.get_xlim() == pytest.approx((-0.5, 399.5))
+        assert ax.get_ylim() == pytest.approx((-0.5, 799.5))
+    finally:
+        plt.close(fig)
+
+
+def test_stage_image_catalog_family_cutouts_fast_mode_skips_critical_lines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_rgb_images(tmp_path / "images")
+    run_dir = tmp_path / "stage4_critical_arc_mixture_image_plane"
+    family = SimpleNamespace(
+        family_id="1",
+        z_source=2.3,
+        effective_z_source=2.0,
+        image_labels=["1.1"],
+        x_obs=np.asarray([0.0], dtype=float),
+        y_obs=np.asarray([0.0], dtype=float),
+    )
+    state = SimpleNamespace(
+        run_name="a370_test",
+        par_path="data/a370_niemiec/a_sl_normal.par",
+        reference=(3, 10.0, 0.0),
+        parameter_specs=[],
+        family_data=[family],
+    )
+
+    class FastEvaluator:
+        arc_recovery_p_arc_threshold = 0.5
+
+        def reported_physical_to_latent_parameter_vector(self, theta):
+            raise AssertionError("fast mode should not convert best-fit parameters for critical lines")
+
+    def fail_critical_curve_caustics(*args: object, **kwargs: object) -> list[dict[str, np.ndarray]]:
+        raise AssertionError("fast mode should not draw critical-line contours")
+
+    monkeypatch.setattr(solver_plotting, "_critical_curve_caustics", fail_critical_curve_caustics)
+
+    solver_plotting._plot_image_catalog_family_cutouts(
+        run_dir,
+        state,
+        FastEvaluator(),
+        np.asarray([4.0], dtype=float),
+        pd.DataFrame(),
+        None,
+        SimpleNamespace(
+            image_catalog_family_cutout_image_dir=tmp_path / "images",
+            image_catalog_family_cutout_image_scale="60mas",
+            image_catalog_family_cutout_mode="fast",
+        ),
+    )
+
+    output = run_dir / "image_catalog_family_cutouts.pdf"
+    cluster_output = run_dir / "image_catalog_family_cluster.pdf"
+    assert output.exists()
+    assert output.stat().st_size > 0
+    assert cluster_output.exists()
+    assert cluster_output.stat().st_size > 0
+
+
 def test_stage_image_catalog_family_cutouts_include_solver_diagnostics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -795,6 +1153,7 @@ def test_stage_image_catalog_family_cutouts_include_solver_diagnostics(
             "arc_s_max": [1.0, 1.1],
             "arc_detA": [0.2, 0.044],
             "arc_prior_probability": [0.4, 0.75],
+            "p_arc": [0.2, 0.6],
             "arc_curve_distance_arcsec": [np.nan, 0.03],
             "arc_curve_arclength_arcsec": [np.nan, 3.8],
             "arc_curve_finite": [False, True],
@@ -918,7 +1277,7 @@ def test_stage_image_catalog_family_cutouts_include_solver_diagnostics(
     assert all(call["include_tangential"] is True for call in critical_calls)
     assert all(call["include_radial"] is True for call in critical_calls)
     centers = [call["center"] for call in critical_calls]
-    for expected_center in ((0.0, 0.25), (0.0, 0.0), (1.0, 0.0), (-1.0, 0.5)):
+    for expected_center in ((1.9, 0.25), (0.0, 0.0), (1.0, 0.0), (-1.0, 0.5)):
         assert any(np.allclose(center, expected_center) for center in centers)
     assert build_rgb_calls
     assert build_rgb_calls[0]["q"] == 6.5

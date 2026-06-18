@@ -3,17 +3,25 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
+import hashlib
+import importlib
 import json
 import math
+import multiprocessing
 import os
+import queue
 import re
+import shutil
 import sys
 import time
+import traceback
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from threading import Lock
+from typing import Any, Callable, Iterable, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -32,8 +40,21 @@ from numpyro.infer.autoguide import AutoNormal
 from numpyro.infer.initialization import init_to_value
 from numpyro.infer.util import unconstrain_fn
 try:
-    from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
 except ModuleNotFoundError:  # pragma: no cover - exercised only in minimal test environments
+    class BarColumn:
+        pass
+
+    class MofNCompleteColumn:
+        pass
+
     class Progress:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
@@ -46,6 +67,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only in minimal test
 
         def add_task(self, description: str, total: int | None = None) -> int:
             return 0
+
+        def advance(self, task_id: int, advance: int = 1) -> None:
+            pass
 
     class SpinnerColumn:
         pass
@@ -135,6 +159,7 @@ from .utils import (
     make_run_name as _make_run_name,
     parse_bool_env as _parse_bool_env,
     run_logged_phase as _run_logged_phase,
+    Table as _RichTable,
 )
 
 
@@ -142,6 +167,9 @@ SUPPORTED_PROFILES = {81, 14}
 DP_IE_PROFILE = 81
 SHEAR_PROFILE = 14
 DEFAULT_MATCH_TOLERANCE = 1.5
+DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC = 0.2
+DEFAULT_EXACT_IMAGE_PRECISION_LIMIT = 1.0e-8
+DEFAULT_EXACT_IMAGE_NUM_ITER_MAX = 200
 DEFAULT_SEARCH_PADDING = 8.0
 DEFAULT_Z_BIN_EFFICIENCY_TOL = 0.01
 DEFAULT_WARMUP = 300
@@ -154,6 +182,19 @@ DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION = 0.995
 DEFAULT_ACTIVE_SCALING_MIN = 4
 DEFAULT_REFRESH_EVERY = 250
 DEFAULT_REFRESH_PARAM_DRIFT_FRAC = 0.25
+DEFAULT_JAX_CLEAR_CACHES_AFTER_SVI_REFRESH = True
+DEFAULT_NUMPYRO_PRINT_SUMMARY = False
+DEFAULT_NUTS_CHAIN_METHOD = "parallel"
+NUTS_CHAIN_METHOD_CHOICES = ("parallel", "sequential")
+NUTS_DENSE_MASS_STRUCTURED = "structured"
+NUTS_DENSE_MASS_FULL = "full"
+NUTS_DENSE_MASS_DIAGONAL = "diagonal"
+NUTS_DENSE_MASS_CHOICES = (
+    NUTS_DENSE_MASS_STRUCTURED,
+    NUTS_DENSE_MASS_FULL,
+    NUTS_DENSE_MASS_DIAGONAL,
+)
+DEFAULT_NUTS_DENSE_MASS = NUTS_DENSE_MASS_STRUCTURED
 DEFAULT_NUTS_INIT_BOUNDARY_FRAC = 0.02
 DEFAULT_NUTS_INIT_JITTER_FRAC = 0.02
 DEFAULT_SVI_STEPS = 2000
@@ -174,14 +215,36 @@ DEFAULT_SMC_MAX_TEMPERATURE_STEPS = 256
 DEFAULT_SMC_RMH_SCALE = 1.0
 DEFAULT_SMC_MALA_STEP_SIZE = 0.05
 SMC_FINAL_TEMPERATURE_TOL = 1.0e-6
+DEFAULT_MICROCANONICAL_TUNE_FRAC1 = 0.1
+DEFAULT_MICROCANONICAL_TUNE_FRAC2 = 0.1
+DEFAULT_MICROCANONICAL_TUNE_FRAC3 = 0.1
+DEFAULT_MICROCANONICAL_DIAGONAL_PRECONDITIONING = True
+DEFAULT_MCLMC_DESIRED_ENERGY_VAR = 5.0e-4
+DEFAULT_MCLMC_TRUST_IN_ESTIMATE = 1.5
+DEFAULT_MCLMC_NUM_EFFECTIVE_SAMPLES = 150
+DEFAULT_MCLMC_LFACTOR = 0.4
+DEFAULT_MCHMC_TARGET_ACCEPT = 0.9
+DEFAULT_MCHMC_RANDOM_TRAJECTORY_LENGTH = True
+DEFAULT_MCHMC_L_PROPOSAL_FACTOR = float("inf")
+DEFAULT_MCHMC_DIVERGENCE_THRESHOLD = 1000.0
+DEFAULT_MCHMC_NUM_WINDOWS = 1
+DEFAULT_MCHMC_TUNING_FACTOR = 1.3
+MCHMC_L_ESTIMATORS = ("avg", "max")
+DEFAULT_MCHMC_L_ESTIMATOR = "avg"
 SAMPLING_ENGINE_FULL = "full"
+SAMPLING_ENGINE_FULL_FLAT = "full_flat"
 SAMPLING_ENGINE_REFRESHING_SURROGATE = "refreshing_surrogate"
+SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT = "refreshing_surrogate_flat"
 SAMPLING_ENGINE_ACTIVE_SUBSET = "active_subset"
 SAMPLING_ENGINES = (
     SAMPLING_ENGINE_FULL,
+    SAMPLING_ENGINE_FULL_FLAT,
     SAMPLING_ENGINE_REFRESHING_SURROGATE,
+    SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
     SAMPLING_ENGINE_ACTIVE_SUBSET,
 )
+STAGE4_SAMPLING_ENGINE_INHERIT = "inherit"
+STAGE4_SAMPLING_ENGINE_CHOICES = (STAGE4_SAMPLING_ENGINE_INHERIT, *SAMPLING_ENGINES)
 DEFAULT_SAMPLER = "numpyro_nuts"
 DEFAULT_SOURCE_SIGMA_INT_LOWER_ARCSEC = 1.0e-3
 DEFAULT_SOURCE_SIGMA_INT_UPPER_ARCSEC = 2.0
@@ -220,9 +283,21 @@ DEFAULT_CRITICAL_ARC_MAX_PROB = 0.80
 # real critical curves (singular_min < ~0.05); point images away from caustics keep full precision.
 DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD = 0.05
 DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS = 0.02
+CRITICAL_ARC_SINGULAR_THRESHOLD_SAMPLE_NAME = "critical_arc_singular_threshold"
+CRITICAL_ARC_SINGULAR_SOFTNESS_SAMPLE_NAME = "critical_arc_singular_softness"
+CRITICAL_ARC_HYPERPARAMETER_COMPONENT_FAMILY = "critical_arc_hyperparameter"
+DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_MEDIAN = 0.15
+DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_LOG_SIGMA = 0.5
+DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_LOWER = 0.03
+DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_UPPER = 0.40
+DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_MEDIAN = 0.05
+DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_LOG_SIGMA = 0.5
+DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_LOWER = 0.005
+DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER = 0.20
 DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE = 1.0e-3
 DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE = 1.0e-6
 DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC = 20.0
+DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD = 0.5
 CRITICAL_ARC_EIGENGAP_RELATIVE_SOFTENING = 1.0e-3
 CRITICAL_ARC_EIGENGAP_VALUE_ABSOLUTE_SOFTENING = 1.0e-18
 # Always-on magnification-fold of the base covariance along the critical direction:
@@ -266,7 +341,6 @@ CAB_FRAME_PHYSICAL_AMBIGUITY_FRACTION = 1.0e-1
 # curvature dimension of the CAB outlier density so the inlier/outlier handoff does
 # not depend on the absolute unit scale of the per-row curvature sigma.
 CAB_OUTLIER_CURVATURE_SIGMA_ARCSEC_INV = 0.1
-DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC = DEFAULT_MATCH_TOLERANCE
 DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC = 5.0
 DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC = 0.1
 DEFAULT_COVARIANCE_DIAGONAL_JITTER_RELATIVE = 1.0e-8
@@ -323,6 +397,7 @@ SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE = "linearized-forward-beta
 SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE = "forward-metric-image-plane"
 SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE = "anchored-solved-forward-beta-image-plane"
 SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE = "critical-arc-mixture-image-plane"
+SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE = "critical-arc-mixture-centroid-image-plane"
 SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE = "fold-regularized-forward-beta-image-plane"
 SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE = "catastrophe-normal-form-image-plane"
 EVIDENCE_LIKELIHOOD_MODES = (
@@ -346,6 +421,16 @@ IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA = "anchored-solved-forward-beta-im
 IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE = "critical-arc-mixture-image-plane"
 IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA = "fold-regularized-forward-beta-image-plane"
 IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM = "catastrophe-normal-form-image-plane"
+STAGE3_IMAGE_PLANE_MODE_AUTO = "auto"
+STAGE3_IMAGE_PLANE_MODE_NONE = "none"
+STAGE3_IMAGE_PLANE_MODE_LOCAL_JACOBIAN = IMAGE_PLANE_MODE_LOCAL_JACOBIAN
+STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE = IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
+STAGE3_IMAGE_PLANE_MODES = (
+    STAGE3_IMAGE_PLANE_MODE_AUTO,
+    STAGE3_IMAGE_PLANE_MODE_NONE,
+    STAGE3_IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+    STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+)
 FIT_MODE_SEQUENTIAL = "sequential"
 FIT_MODE_LARGE_ONLY = "large-only"
 FIT_MODE_JOINT = "joint"
@@ -355,6 +440,9 @@ FIT_METHOD_SVI_NUTS = "svi+nuts"
 FIT_METHOD_NUTS = "nuts"
 FIT_METHOD_NS = "ns"
 FIT_METHOD_SMC = "smc"
+FIT_METHOD_MCHMC = "mchmc"
+FIT_METHOD_MCLMC = "mclmc"
+MICROCANONICAL_FIT_METHODS = (FIT_METHOD_MCHMC, FIT_METHOD_MCLMC)
 JAX_DEVICE_AUTO = "auto"
 JAX_DEVICE_CPU = "cpu"
 JAX_DEVICE_GPU = "gpu"
@@ -460,6 +548,57 @@ class TracedBinData:
     image_has_constraint: jnp.ndarray
     effective_z_index: int = -1
     constrained_image_indices: jnp.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class FlatCriticalArcData:
+    family_ids: tuple[str, ...]
+    n_families: int
+    x_obs: jnp.ndarray
+    y_obs: jnp.ndarray
+    sigma_per_image: jnp.ndarray
+    reliability_per_image: jnp.ndarray
+    image_has_constraint: jnp.ndarray
+    effective_z_index_per_image: jnp.ndarray
+    global_family_index_per_image: jnp.ndarray
+    global_family_source_x_param_index: jnp.ndarray
+    global_family_source_y_param_index: jnp.ndarray
+    global_family_prior_x: jnp.ndarray
+    global_family_prior_y: jnp.ndarray
+    global_family_prior_sigma: jnp.ndarray
+    bin_index_per_image: jnp.ndarray
+    local_image_index_per_image: jnp.ndarray
+    sigma_scatter_x: jnp.ndarray
+    sigma_scatter_y: jnp.ndarray
+    core_scatter_x: jnp.ndarray
+    core_scatter_y: jnp.ndarray
+    cut_scatter_x: jnp.ndarray
+    cut_scatter_y: jnp.ndarray
+
+
+@dataclass(frozen=True)
+class FlatSurrogateCache:
+    inactive_alpha_x: jnp.ndarray
+    inactive_alpha_y: jnp.ndarray
+    inactive_alpha_dx_dparams: jnp.ndarray
+    inactive_alpha_dy_dparams: jnp.ndarray
+    inactive_jacobian_delta_a00: jnp.ndarray | None = None
+    inactive_jacobian_delta_a01: jnp.ndarray | None = None
+    inactive_jacobian_delta_a10: jnp.ndarray | None = None
+    inactive_jacobian_delta_a11: jnp.ndarray | None = None
+    inactive_jacobian_delta_da00_dparams: jnp.ndarray | None = None
+    inactive_jacobian_delta_da01_dparams: jnp.ndarray | None = None
+    inactive_jacobian_delta_da10_dparams: jnp.ndarray | None = None
+    inactive_jacobian_delta_da11_dparams: jnp.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class FlatSourceMetricCache:
+    inv_abs_mu: jnp.ndarray
+    jac_a00: jnp.ndarray
+    jac_a01: jnp.ndarray
+    jac_a10: jnp.ndarray
+    jac_a11: jnp.ndarray
 
 
 @dataclass(frozen=True)
@@ -743,6 +882,16 @@ def _positive_float_arg(value: str) -> float:
     return parsed
 
 
+def _positive_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _nonnegative_float_arg(value: str) -> float:
     try:
         parsed = float(value)
@@ -763,18 +912,14 @@ def _finite_float_arg(value: str) -> float:
     return parsed
 
 
-def _resolve_arc_aware_noncritical_support_radius_arcsec(
-    value: Any,
-    match_tolerance_arcsec: Any = DEFAULT_MATCH_TOLERANCE,
-) -> float:
-    if value is None:
-        value = match_tolerance_arcsec
-    if value is None:
-        value = DEFAULT_MATCH_TOLERANCE
-    radius = float(value)
-    if not np.isfinite(radius) or radius <= 0.0:
-        raise ValueError("arc_aware_noncritical_support_radius_arcsec must be finite and positive.")
-    return radius
+def _probability_float_arg(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite float in [0, 1]") from exc
+    if not np.isfinite(parsed) or parsed < 0.0 or parsed > 1.0:
+        raise argparse.ArgumentTypeError("must be a finite float in [0, 1]")
+    return parsed
 
 
 def _resume_mode(args: argparse.Namespace) -> str | None:
@@ -831,6 +976,30 @@ def _parse_args() -> argparse.Namespace:
             "Values are order-insensitive."
         ),
     )
+    parser.add_argument(
+        "--potfile-member-brightest-n",
+        type=_positive_int_arg,
+        nargs="+",
+        default=None,
+        metavar="N",
+        help=(
+            "At ingestion, keep only the N brightest rows from each potfile member catalog before "
+            "building scaling components and active-scaling ranks. Pass one value for all potfiles "
+            "or one value per potfile. Brightest means smallest catalog magnitude."
+        ),
+    )
+    parser.add_argument(
+        "--potfile-member-mag-max",
+        type=_finite_float_arg,
+        nargs="+",
+        default=None,
+        metavar="MAG",
+        help=(
+            "At ingestion, keep only potfile member catalog rows with catalog_mag <= MAG before "
+            "building scaling components and active-scaling ranks. Pass one value for all potfiles "
+            "or one value per potfile."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--jax-default-device",
@@ -858,6 +1027,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--stage4-fresh-process",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Sequential stage-4 memory guard. By default, stage 4 runs in a spawned fresh Python/JAX "
+            "process after earlier stages complete, so it does not inherit stage-3 XLA memory. "
+            "Pass --no-stage4-fresh-process to keep the legacy in-process handoff."
+        ),
+    )
+    parser.add_argument(
         "--skip-validation",
         action="store_true",
         help="Debug mode: skip the post-fit source-plane validation summary after sampling.",
@@ -871,8 +1050,8 @@ def _parse_args() -> argparse.Namespace:
         "--quick-diagnostics",
         action="store_true",
         help=(
-            "Fast post-fit diagnostics: skip exact image-position fit-quality diagnostics, caustic overlay, "
-            "and exact image-position fit-quality draws while keeping source-plane and magnification summaries."
+            "Fast post-fit diagnostics: skip exact image-position fit-quality diagnostics and "
+            "exact image-position fit-quality draws while still writing recovery plots."
         ),
     )
     parser.add_argument(
@@ -922,12 +1101,51 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--image-catalog-family-cutout-rgb-green-gain", type=_positive_float_arg, default=None)
     parser.add_argument("--image-catalog-family-cutout-rgb-blue-gain", type=_positive_float_arg, default=None)
     parser.add_argument(
+        "--image-catalog-family-cutout-mode",
+        choices=("full", "fast"),
+        default="full",
+        help=(
+            "Rendering mode for image-catalog family cutout diagnostics. "
+            "'full' preserves publication-quality output; 'fast' lowers DPI, downsamples embedded cutouts, "
+            "and skips critical-line overlays unless overridden."
+        ),
+    )
+    parser.add_argument(
+        "--image-catalog-family-cutout-dpi",
+        type=_positive_int_arg,
+        default=None,
+        help="Optional DPI override for image-catalog family cutout diagnostics.",
+    )
+    parser.add_argument(
+        "--image-catalog-family-cutout-max-side-pixels",
+        type=_positive_int_arg,
+        default=None,
+        help="Optional cap on embedded RGB cutout image side length for image-catalog family cutout diagnostics.",
+    )
+    parser.add_argument(
+        "--image-catalog-family-cutout-critical-lines",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Critical-line overlay policy for image-catalog family cutouts. 'auto' means on in full mode and off in fast mode.",
+    )
+    parser.add_argument(
         "--kappa-true-fits",
         default=None,
         help=(
-            "Optional true convergence FITS image. When set, write kappa_comparison.pdf "
-            "and kappa_recovery.pdf at --caustic-source-redshift."
+            "Optional true convergence FITS image. When set, write kappa truth diagnostics at "
+            "--caustic-source-redshift. Combine with --gammax-true-fits and --gammay-true-fits "
+            "to also write absolute-magnification truth recovery plots."
         ),
+    )
+    parser.add_argument(
+        "--gammax-true-fits",
+        default=None,
+        help="Optional true gamma1/shear-x FITS image paired with --gammay-true-fits for mu truth recovery.",
+    )
+    parser.add_argument(
+        "--gammay-true-fits",
+        default=None,
+        help="Optional true gamma2/shear-y FITS image paired with --gammax-true-fits for mu truth recovery.",
     )
     parser.add_argument(
         "--corner-overlay-bayes-dat",
@@ -955,6 +1173,27 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--exact-image-min-distance-arcsec",
+        type=_positive_float_arg,
+        default=DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC,
+        help=(
+            "Lenstronomy exact image search grid spacing in arcsec for post-fit diagnostics. "
+            "Larger values reduce grid size and speed up exact fit-quality plots."
+        ),
+    )
+    parser.add_argument(
+        "--exact-image-precision-limit",
+        type=_positive_float_arg,
+        default=DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
+        help="Lenstronomy exact image solver precision limit for post-fit diagnostics.",
+    )
+    parser.add_argument(
+        "--exact-image-num-iter-max",
+        type=int,
+        default=DEFAULT_EXACT_IMAGE_NUM_ITER_MAX,
+        help="Maximum Lenstronomy exact image solver iterations for post-fit diagnostics.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress stage logs and NS progress output; NumPyro SVI/NUTS progress bars may still render.",
@@ -966,6 +1205,15 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Use the exact full likelihood, a first-order inactive-scaling surrogate, "
             "or an exact active-scaling subset that omits inactive scaling galaxies during fitting."
+        ),
+    )
+    parser.add_argument(
+        "--stage4-sampling-engine",
+        choices=STAGE4_SAMPLING_ENGINE_CHOICES,
+        default=STAGE4_SAMPLING_ENGINE_INHERIT,
+        help=(
+            "Sequential stage-4 sampling engine override. 'inherit' uses --sampling-engine; "
+            "'full' is the exact lower-memory fallback for critical-arc stage 4."
         ),
     )
     parser.add_argument(
@@ -1034,15 +1282,34 @@ def _parse_args() -> argparse.Namespace:
         help="Fraction of the prior width used for surrogate finite-difference steps and drift thresholds.",
     )
     parser.add_argument(
+        "--jax-clear-caches-after-svi-refresh",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_JAX_CLEAR_CACHES_AFTER_SVI_REFRESH,
+        help=(
+            "Clear JAX's in-process compilation caches after the initial evaluator refresh and each blocked SVI cache refresh. "
+            "Enabled by default to reduce peak memory in refreshing-surrogate stage-4 runs; "
+            "pass --no-jax-clear-caches-after-svi-refresh to favor compile reuse."
+        ),
+    )
+    parser.add_argument(
         "--fit-method",
         nargs="+",
-        choices=(FIT_METHOD_SVI, FIT_METHOD_SVI_NUTS, FIT_METHOD_NUTS, FIT_METHOD_NS, FIT_METHOD_SMC),
+        choices=(
+            FIT_METHOD_SVI,
+            FIT_METHOD_SVI_NUTS,
+            FIT_METHOD_NUTS,
+            FIT_METHOD_NS,
+            FIT_METHOD_SMC,
+            FIT_METHOD_MCHMC,
+            FIT_METHOD_MCLMC,
+        ),
         default=[FIT_METHOD_SVI_NUTS],
-        metavar="{svi,svi+nuts,nuts,ns,smc}",
+        metavar="{svi,svi+nuts,nuts,ns,smc,mchmc,mclmc}",
         help=(
-            "Use SVI only or use SVI to initialize optional NUTS sampling. "
+            "Use SVI only, SVI initialized NUTS, or a direct sampler. "
             "The ns value is accepted only for backwards-compatible parsing and is reserved for --fit-mode evidence-ns; "
             "nuts and smc are accepted only for non-blocked sequential stage 4 image-plane modes. "
+            "mchmc and mclmc are direct BlackJAX microcanonical samplers for sampled stages. "
             "In sequential image-plane runs, pass one value for all sampled stages, two values for stage 2 and "
             "stage 3, or three values when a final stage 4 image-plane mode is enabled."
         ),
@@ -1081,6 +1348,17 @@ def _parse_args() -> argparse.Namespace:
         "--skip-stage3-image-plane-local-jacobian",
         action="store_true",
         help="Skip the local-Jacobian stage 3 before a final stage 4 image-plane mode.",
+    )
+    parser.add_argument(
+        "--stage3-image-plane-mode",
+        choices=STAGE3_IMAGE_PLANE_MODES,
+        default=STAGE3_IMAGE_PLANE_MODE_AUTO,
+        help=(
+            "Sequential stage-3 image-plane likelihood. auto preserves the existing workflow: "
+            "local-jacobian for --image-plane-mode local-jacobian and before stage 4 unless skipped. "
+            "critical-arc-mixture-image-plane runs a stage-3 critical-arc target with current centroid "
+            "source positions instead of sampled explicit source coordinates."
+        ),
     )
     parser.add_argument(
         "--critical-det-diagnostic-threshold",
@@ -1163,10 +1441,74 @@ def _parse_args() -> argparse.Namespace:
         help="Smallest-singular-value threshold where the critical-arc branch prior starts increasing.",
     )
     parser.add_argument(
+        "--sample-critical-arc-singular-threshold",
+        action="store_true",
+        help=(
+            "Sample the critical-arc smallest-singular-value threshold as a global hyperparameter. "
+            "Only valid for critical-arc-mixture image-plane stage 4."
+        ),
+    )
+    parser.add_argument(
+        "--critical-arc-singular-threshold-prior-median",
+        type=_positive_float_arg,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_MEDIAN,
+        help="Median of the truncated log-normal prior for sampled critical_arc_singular_threshold.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-threshold-prior-log-sigma",
+        type=_positive_float_arg,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_LOG_SIGMA,
+        help="Log-space standard deviation for the sampled critical_arc_singular_threshold prior.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-threshold-lower",
+        type=_positive_float_arg,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_LOWER,
+        help="Physical lower bound for sampled critical_arc_singular_threshold.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-threshold-upper",
+        type=_positive_float_arg,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_UPPER,
+        help="Physical upper bound for sampled critical_arc_singular_threshold.",
+    )
+    parser.add_argument(
         "--critical-arc-singular-softness",
         type=_positive_float_arg,
         default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
         help="Softness for the critical-arc prior transition as the smallest singular value approaches zero.",
+    )
+    parser.add_argument(
+        "--sample-critical-arc-singular-softness",
+        action="store_true",
+        help=(
+            "Sample the critical-arc smallest-singular-value transition softness as a global hyperparameter. "
+            "Only valid for critical-arc-mixture image-plane stage 4."
+        ),
+    )
+    parser.add_argument(
+        "--critical-arc-singular-softness-prior-median",
+        type=_positive_float_arg,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_MEDIAN,
+        help="Median of the truncated log-normal prior for sampled critical_arc_singular_softness.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-softness-prior-log-sigma",
+        type=_positive_float_arg,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_LOG_SIGMA,
+        help="Log-space standard deviation for the sampled critical_arc_singular_softness prior.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-softness-lower",
+        type=_positive_float_arg,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_LOWER,
+        help="Physical lower bound for sampled critical_arc_singular_softness.",
+    )
+    parser.add_argument(
+        "--critical-arc-singular-softness-upper",
+        type=_positive_float_arg,
+        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER,
+        help="Physical upper bound for sampled critical_arc_singular_softness.",
     )
     parser.add_argument(
         "--critical-arc-lm-damping-relative",
@@ -1187,12 +1529,12 @@ def _parse_args() -> argparse.Namespace:
         help="Large smooth finite guard radius for critical-arc mixture LM image-plane displacements.",
     )
     parser.add_argument(
-        "--arc-aware-noncritical-support-radius-arcsec",
-        type=_positive_float_arg,
-        default=None,
+        "--arc-recovery-p-arc-threshold",
+        type=_probability_float_arg,
+        default=DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD,
         help=(
-            "Maximum support-curve distance for arc-aware image recovery validation. "
-            "Defaults to --match-tolerance-arcsec."
+            "Minimum critical-arc mixture arc-vs-point inlier responsibility required for "
+            "arc-supported image recovery."
         ),
     )
     parser.add_argument(
@@ -1527,9 +1869,32 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dense-mass",
+        choices=NUTS_DENSE_MASS_CHOICES,
+        default=DEFAULT_NUTS_DENSE_MASS,
+        help=(
+            "NumPyro NUTS mass-matrix adaptation: 'structured' uses dense blocks for explicit "
+            "source-position stages, 'full' uses one full dense matrix, and 'diagonal' disables dense mass."
+        ),
+    )
+    parser.add_argument(
+        "--numpyro-print-summary",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use dense mass-matrix adaptation for NumPyro NUTS. Pass --no-dense-mass for diagonal mass.",
+        default=DEFAULT_NUMPYRO_PRINT_SUMMARY,
+        help=(
+            "Print NumPyro's textual MCMC summary after NUTS. Disabled by default because the summary "
+            "can be slow and memory-expensive for large parallel stage-4 runs; saved diagnostics still include "
+            "acceptance, divergence, step-count, and log-probability summaries."
+        ),
+    )
+    parser.add_argument(
+        "--nuts-chain-method",
+        choices=NUTS_CHAIN_METHOD_CHOICES,
+        default=DEFAULT_NUTS_CHAIN_METHOD,
+        help=(
+            "NumPyro MCMC chain method. The default 'parallel' requires at least one visible JAX device "
+            "per chain and raises if that is not available. Use 'sequential' only for explicit low-device "
+            "or lower-memory runs."
+        ),
     )
     parser.add_argument(
         "--potfile-mass-size-reparam",
@@ -1649,6 +2014,96 @@ def _parse_args() -> argparse.Namespace:
         help="Normalized-space MALA step size for the SMC mutation kernel.",
     )
     parser.add_argument(
+        "--microcanonical-diagonal-preconditioning",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_MICROCANONICAL_DIAGONAL_PRECONDITIONING,
+        help="Enable diagonal mass preconditioning during BlackJAX MCHMC/MCLMC tuning.",
+    )
+    parser.add_argument(
+        "--microcanonical-tune-frac1",
+        type=float,
+        default=DEFAULT_MICROCANONICAL_TUNE_FRAC1,
+        help="First adaptation fraction for BlackJAX MCHMC/MCLMC tuning.",
+    )
+    parser.add_argument(
+        "--microcanonical-tune-frac2",
+        type=float,
+        default=DEFAULT_MICROCANONICAL_TUNE_FRAC2,
+        help="Second adaptation fraction for BlackJAX MCHMC/MCLMC tuning.",
+    )
+    parser.add_argument(
+        "--microcanonical-tune-frac3",
+        type=float,
+        default=DEFAULT_MICROCANONICAL_TUNE_FRAC3,
+        help="Third adaptation fraction for BlackJAX MCHMC/MCLMC tuning.",
+    )
+    parser.add_argument(
+        "--mclmc-desired-energy-var",
+        type=float,
+        default=DEFAULT_MCLMC_DESIRED_ENERGY_VAR,
+        help="Desired per-step energy variance target used by BlackJAX MCLMC tuning.",
+    )
+    parser.add_argument(
+        "--mclmc-trust-in-estimate",
+        type=float,
+        default=DEFAULT_MCLMC_TRUST_IN_ESTIMATE,
+        help="Trust factor for BlackJAX MCLMC step-size estimation.",
+    )
+    parser.add_argument(
+        "--mclmc-num-effective-samples",
+        type=int,
+        default=DEFAULT_MCLMC_NUM_EFFECTIVE_SAMPLES,
+        help="Effective-sample target used by BlackJAX MCLMC adaptation.",
+    )
+    parser.add_argument(
+        "--mclmc-lfactor",
+        type=float,
+        default=DEFAULT_MCLMC_LFACTOR,
+        help="Momentum decoherence length scaling factor used by BlackJAX MCLMC L adaptation.",
+    )
+    parser.add_argument(
+        "--mchmc-target-accept",
+        type=float,
+        default=DEFAULT_MCHMC_TARGET_ACCEPT,
+        help="Target Metropolis acceptance probability for adjusted dynamic MCHMC tuning.",
+    )
+    parser.add_argument(
+        "--mchmc-random-trajectory-length",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_MCHMC_RANDOM_TRAJECTORY_LENGTH,
+        help="Randomize adjusted dynamic MCHMC trajectory length from the tuned L/step-size ratio.",
+    )
+    parser.add_argument(
+        "--mchmc-l-proposal-factor",
+        type=float,
+        default=DEFAULT_MCHMC_L_PROPOSAL_FACTOR,
+        help="Adjusted dynamic MCHMC proposal refresh factor; use inf for the BlackJAX recommended default.",
+    )
+    parser.add_argument(
+        "--mchmc-divergence-threshold",
+        type=float,
+        default=DEFAULT_MCHMC_DIVERGENCE_THRESHOLD,
+        help="Energy-error threshold for adjusted dynamic MCHMC divergence diagnostics.",
+    )
+    parser.add_argument(
+        "--mchmc-num-windows",
+        type=int,
+        default=DEFAULT_MCHMC_NUM_WINDOWS,
+        help="Number of BlackJAX adjusted MCHMC adaptation windows.",
+    )
+    parser.add_argument(
+        "--mchmc-tuning-factor",
+        type=float,
+        default=DEFAULT_MCHMC_TUNING_FACTOR,
+        help="Multiplicative L tuning factor for adjusted dynamic MCHMC adaptation.",
+    )
+    parser.add_argument(
+        "--mchmc-l-estimator",
+        choices=MCHMC_L_ESTIMATORS,
+        default=DEFAULT_MCHMC_L_ESTIMATOR,
+        help="Eigenvalue estimator used by BlackJAX adjusted MCHMC L adaptation.",
+    )
+    parser.add_argument(
         "--caustic-plot-grid-scale-arcsec",
         type=_positive_float_arg,
         default=CAUSTIC_PLOT_GRID_SCALE_ARCSEC,
@@ -1662,11 +2117,6 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=9.0,
         help="Source redshift used for critical-line and caustic overlay diagnostics.",
-    )
-    parser.add_argument(
-        "--plot-caustics",
-        action="store_true",
-        help="Generate the expensive caustic overlay plot for the joint stage too.",
     )
     parser.add_argument(
         "--truth",
@@ -1724,10 +2174,6 @@ def _log_runtime_summary(args: argparse.Namespace) -> None:
     except Exception as exc:  # pragma: no cover - defensive around runtime initialization
         jax_devices = "unknown"
         jax_backend = f"unknown:{type(exc).__name__}"
-    arc_aware_noncritical_support_radius_arcsec = _resolve_arc_aware_noncritical_support_radius_arcsec(
-        getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
-        getattr(args, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE),
-    )
     _log(
         args,
         (
@@ -1749,7 +2195,7 @@ def _log_runtime_summary(args: argparse.Namespace) -> None:
             f"critical_arc_critical_direction_sigma_arcsec={getattr(args, 'critical_arc_critical_direction_sigma_arcsec', DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)} "
             f"critical_arc_prob=({getattr(args, 'critical_arc_base_prob', DEFAULT_CRITICAL_ARC_BASE_PROB)},"
             f"{getattr(args, 'critical_arc_max_prob', DEFAULT_CRITICAL_ARC_MAX_PROB)}) "
-            f"arc_aware_noncritical_support_radius_arcsec={arc_aware_noncritical_support_radius_arcsec} "
+            f"arc_recovery_p_arc_threshold={getattr(args, 'arc_recovery_p_arc_threshold', DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)} "
             f"arc_aware_max_arclength_arcsec={getattr(args, 'arc_aware_max_arclength_arcsec', DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)} "
             f"arc_aware_curve_step_arcsec={getattr(args, 'arc_aware_curve_step_arcsec', DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)} "
             f"fold_curvature_arcsec_inv={getattr(args, 'fold_curvature_arcsec_inv', DEFAULT_FOLD_CURVATURE_ARCSEC_INV)} "
@@ -1758,6 +2204,9 @@ def _log_runtime_summary(args: argparse.Namespace) -> None:
             f"evidence_source_prior_sigma_arcsec={getattr(args, 'evidence_source_prior_sigma_arcsec', None)} "
             f"evidence_source_prior_mean=({getattr(args, 'evidence_source_prior_mean_x_arcsec', 0.0)},"
             f"{getattr(args, 'evidence_source_prior_mean_y_arcsec', 0.0)}) "
+            f"exact_image_min_distance_arcsec={getattr(args, 'exact_image_min_distance_arcsec', DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)} "
+            f"exact_image_precision_limit={getattr(args, 'exact_image_precision_limit', DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)} "
+            f"exact_image_num_iter_max={getattr(args, 'exact_image_num_iter_max', DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)} "
             f"fit_cosmology_flat_wcdm={bool(getattr(args, 'fit_cosmology_flat_wcdm', False))} "
             f"potfile_mass_size_reparam={bool(getattr(args, 'potfile_mass_size_reparam', False))} "
             f"chains={args.chains} thin={args.thin} skip_validation={args.skip_validation} "
@@ -1777,6 +2226,11 @@ def _log_runtime_summary(args: argparse.Namespace) -> None:
             f"likelihood_stabilizer_max_residual_arcsec={getattr(args, 'likelihood_stabilizer_max_residual_arcsec', DEFAULT_LIKELIHOOD_STABILIZER_MAX_RESIDUAL_ARCSEC)} "
             f"likelihood_stabilizer_residual_loss={getattr(args, 'likelihood_stabilizer_residual_loss', DEFAULT_LIKELIHOOD_STABILIZER_RESIDUAL_LOSS)} "
             f"likelihood_stabilizer_student_t_nu={getattr(args, 'likelihood_stabilizer_student_t_nu', DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU)} "
+            f"numpyro_print_summary={bool(getattr(args, 'numpyro_print_summary', DEFAULT_NUMPYRO_PRINT_SUMMARY))} "
+            f"nuts_chain_method={getattr(args, 'nuts_chain_method', DEFAULT_NUTS_CHAIN_METHOD)} "
+            f"jax_clear_caches_after_svi_refresh={bool(getattr(args, 'jax_clear_caches_after_svi_refresh', DEFAULT_JAX_CLEAR_CACHES_AFTER_SVI_REFRESH))} "
+            f"stage4_fresh_process={bool(getattr(args, 'stage4_fresh_process', True))} "
+            f"stage4_sampling_engine={getattr(args, 'stage4_sampling_engine', STAGE4_SAMPLING_ENGINE_INHERIT)} "
             f"skip_plots={args.skip_plots} quick_diagnostics={bool(getattr(args, 'quick_diagnostics', False))} "
             f"plots_only={args.plots_only}"
         ),
@@ -1819,6 +2273,45 @@ def _validate_jax_device_controls(args: argparse.Namespace) -> None:
             _resolve_jax_device_for_args(args, attr_name, flag_name=flag_name)
         except ValueError as exc:
             _fail(str(exc))
+
+
+def _validate_microcanonical_controls(args: argparse.Namespace) -> None:
+    tune_fracs = [
+        float(getattr(args, "microcanonical_tune_frac1", DEFAULT_MICROCANONICAL_TUNE_FRAC1)),
+        float(getattr(args, "microcanonical_tune_frac2", DEFAULT_MICROCANONICAL_TUNE_FRAC2)),
+        float(getattr(args, "microcanonical_tune_frac3", DEFAULT_MICROCANONICAL_TUNE_FRAC3)),
+    ]
+    if any(not np.isfinite(value) or value < 0.0 or value > 1.0 for value in tune_fracs):
+        _fail("--microcanonical-tune-frac1/2/3 values must be finite and in [0, 1].")
+    if sum(tune_fracs) > 1.0 + 1.0e-12:
+        _fail("--microcanonical-tune-frac1/2/3 values must sum to <= 1.")
+    desired_energy_var = float(getattr(args, "mclmc_desired_energy_var", DEFAULT_MCLMC_DESIRED_ENERGY_VAR))
+    if not np.isfinite(desired_energy_var) or desired_energy_var <= 0.0:
+        _fail("--mclmc-desired-energy-var must be finite and positive.")
+    trust_in_estimate = float(getattr(args, "mclmc_trust_in_estimate", DEFAULT_MCLMC_TRUST_IN_ESTIMATE))
+    if not np.isfinite(trust_in_estimate) or trust_in_estimate <= 0.0:
+        _fail("--mclmc-trust-in-estimate must be finite and positive.")
+    if int(getattr(args, "mclmc_num_effective_samples", DEFAULT_MCLMC_NUM_EFFECTIVE_SAMPLES)) <= 0:
+        _fail("--mclmc-num-effective-samples must be positive.")
+    lfactor = float(getattr(args, "mclmc_lfactor", DEFAULT_MCLMC_LFACTOR))
+    if not np.isfinite(lfactor) or lfactor <= 0.0:
+        _fail("--mclmc-lfactor must be finite and positive.")
+    target_accept = float(getattr(args, "mchmc_target_accept", DEFAULT_MCHMC_TARGET_ACCEPT))
+    if not np.isfinite(target_accept) or target_accept <= 0.0 or target_accept >= 1.0:
+        _fail("--mchmc-target-accept must be finite and in (0, 1).")
+    l_proposal_factor = float(getattr(args, "mchmc_l_proposal_factor", DEFAULT_MCHMC_L_PROPOSAL_FACTOR))
+    if not (np.isposinf(l_proposal_factor) or (np.isfinite(l_proposal_factor) and l_proposal_factor > 0.0)):
+        _fail("--mchmc-l-proposal-factor must be positive or inf.")
+    divergence_threshold = float(getattr(args, "mchmc_divergence_threshold", DEFAULT_MCHMC_DIVERGENCE_THRESHOLD))
+    if not np.isfinite(divergence_threshold) or divergence_threshold <= 0.0:
+        _fail("--mchmc-divergence-threshold must be finite and positive.")
+    if int(getattr(args, "mchmc_num_windows", DEFAULT_MCHMC_NUM_WINDOWS)) <= 0:
+        _fail("--mchmc-num-windows must be positive.")
+    tuning_factor = float(getattr(args, "mchmc_tuning_factor", DEFAULT_MCHMC_TUNING_FACTOR))
+    if not np.isfinite(tuning_factor) or tuning_factor <= 0.0:
+        _fail("--mchmc-tuning-factor must be finite and positive.")
+    if str(getattr(args, "mchmc_l_estimator", DEFAULT_MCHMC_L_ESTIMATOR)) not in MCHMC_L_ESTIMATORS:
+        _fail(f"--mchmc-l-estimator must be one of {', '.join(MCHMC_L_ESTIMATORS)}.")
 
 
 def _jax_device_context(device: Any | None):
@@ -1971,6 +2464,15 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
                 "active_subset=fit target omits inactive scaling potentials "
                 f"inactive_scaling={inactive}"
             )
+    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_FULL_FLAT:
+        if str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)) == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
+            items.append("sampling_engine=full_flat exact flattened local-metric likelihood")
+        else:
+            items.append("sampling_engine=full_flat exact flattened critical-arc likelihood")
+    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_REFRESHING_SURROGATE:
+        items.append("sampling_engine=refreshing_surrogate legacy per-bin surrogate")
+    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT:
+        items.append("sampling_engine=refreshing_surrogate_flat flattened surrogate")
     if family_count > 0 and bin_count < family_count:
         items.append(f"z_bins=active grouped_families={family_count} bins={bin_count}")
     if bool(getattr(evaluator, "quick_diagnostics", False)):
@@ -2002,17 +2504,18 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
         items.append(
             "sample_likelihood=critical-arc-mixture-image-plane "
             f"critical_direction_sigma_arcsec={float(getattr(evaluator, 'critical_arc_critical_direction_sigma_arcsec', DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)):.4g} "
-            f"arc_support_radius_arcsec={float(getattr(evaluator, 'arc_aware_noncritical_support_radius_arcsec', DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC)):.4g} "
+            f"arc_recovery_p_arc_threshold={float(getattr(evaluator, 'arc_recovery_p_arc_threshold', DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)):.4g} "
             f"arc_max_arclength_arcsec={float(getattr(evaluator, 'arc_aware_max_arclength_arcsec', DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)):.4g}"
         )
-    if sample_likelihood_mode in {
-        SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
-        SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
-        SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
-        SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-        SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
-        SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
-    }:
+    elif sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE:
+        items.append(
+            "sample_likelihood=critical-arc-mixture-centroid-image-plane "
+            "source_positions=current weighted centroids "
+            f"critical_direction_sigma_arcsec={float(getattr(evaluator, 'critical_arc_critical_direction_sigma_arcsec', DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)):.4g} "
+            f"arc_recovery_p_arc_threshold={float(getattr(evaluator, 'arc_recovery_p_arc_threshold', DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)):.4g} "
+            f"arc_max_arclength_arcsec={float(getattr(evaluator, 'arc_aware_max_arclength_arcsec', DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)):.4g}"
+        )
+    if _sample_likelihood_uses_image_plane_jacobian(sample_likelihood_mode):
         image_presence_weight = float(getattr(evaluator, "image_presence_penalty_weight", 0.0))
         if image_presence_weight > 0.0:
             items.append(f"image_presence_penalty=active weight={image_presence_weight:.4g}")
@@ -2075,6 +2578,293 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
     return items
 
 
+def _format_approximation_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return "na"
+        return f"{value:.6g}"
+    if isinstance(value, (np.floating,)):
+        value_f = float(value)
+        if not np.isfinite(value_f):
+            return "na"
+        return f"{value_f:.6g}"
+    if isinstance(value, (np.integer,)):
+        return str(int(value))
+    if value is None:
+        return "na"
+    return str(value)
+
+
+def _format_short_float_sequence(values: list[float], *, max_items: int = 12) -> str:
+    finite = [float(value) for value in values if np.isfinite(float(value))]
+    if not finite:
+        return "none"
+    shown = finite[:max_items]
+    text = ", ".join(f"{value:.6g}" for value in shown)
+    if len(finite) > max_items:
+        text += ", ..."
+    return text
+
+
+def _single_or_json(values: dict[str, Any]) -> str:
+    if not values:
+        return "na"
+    if len(values) == 1:
+        return _format_approximation_value(next(iter(values.values())))
+    formatted = {str(key): _format_approximation_value(value) for key, value in values.items()}
+    return json.dumps(formatted, sort_keys=True)
+
+
+def _active_scaling_fraction_status(value: Any) -> tuple[str, str]:
+    try:
+        fraction = float(value)
+    except (TypeError, ValueError):
+        return "unknown", "dim"
+    if not np.isfinite(fraction):
+        return "unknown", "dim"
+    if fraction >= 0.995:
+        return "excellent", "bold green"
+    if fraction >= 0.98:
+        return "good", "green"
+    if fraction >= 0.95:
+        return "watch", "bold yellow"
+    return "risky", "bold red"
+
+
+def _format_active_scaling_realized_fraction(value: Any) -> str:
+    label, _style = _active_scaling_fraction_status(value)
+    return f"{_format_approximation_value(value)} ({label})"
+
+
+def _single_or_json_active_scaling_fraction(values: dict[str, Any]) -> str:
+    if not values:
+        return "na (unknown)"
+    if len(values) == 1:
+        return _format_active_scaling_realized_fraction(next(iter(values.values())))
+    formatted = {str(key): _format_active_scaling_realized_fraction(value) for key, value in values.items()}
+    return json.dumps(formatted, sort_keys=True)
+
+
+def _active_scaling_realized_fraction_value_style(value: str) -> str:
+    if "(risky)" in value:
+        return "bold red"
+    if "(watch)" in value:
+        return "bold yellow"
+    if "(excellent)" in value:
+        return "bold green"
+    if "(good)" in value:
+        return "green"
+    if "(unknown)" in value:
+        return "dim"
+    return _APPROXIMATION_CATEGORY_STYLES["selection"]
+
+
+def _active_scaling_rank_summary(evaluator: Any) -> dict[str, str]:
+    scaling_rank_df = getattr(evaluator, "scaling_rank_df", None)
+    if scaling_rank_df is None or getattr(scaling_rank_df, "empty", True):
+        return {}
+    required_columns = {
+        "potfile_id",
+        "selected_active",
+        "requested_active_count",
+        "adaptive_cumulative_count",
+        "adaptive_knee_count",
+        "cumulative_importance_fraction",
+    }
+    if not required_columns.issubset(set(getattr(scaling_rank_df, "columns", []))):
+        return {}
+    requested: dict[str, Any] = {}
+    needed: dict[str, Any] = {}
+    knee: dict[str, Any] = {}
+    realized: dict[str, Any] = {}
+    for potfile_id, group in scaling_rank_df.groupby("potfile_id", sort=True):
+        potfile_key = str(potfile_id)
+        requested_values = pd.to_numeric(group["requested_active_count"], errors="coerce").dropna()
+        needed_values = pd.to_numeric(group["adaptive_cumulative_count"], errors="coerce").dropna()
+        knee_values = pd.to_numeric(group["adaptive_knee_count"], errors="coerce").dropna()
+        selected = group[group["selected_active"].astype(bool)]
+        realized_values = pd.to_numeric(selected["cumulative_importance_fraction"], errors="coerce").dropna()
+        if not requested_values.empty:
+            requested[potfile_key] = int(requested_values.iloc[0])
+        if not needed_values.empty:
+            needed[potfile_key] = int(needed_values.iloc[0])
+        if not knee_values.empty:
+            knee[potfile_key] = int(knee_values.iloc[0])
+        if not realized_values.empty:
+            realized[potfile_key] = float(realized_values.max())
+        else:
+            realized[potfile_key] = 0.0
+    rows: dict[str, str] = {}
+    if requested:
+        rows["active_scaling_requested_cap"] = _single_or_json(requested)
+    target = getattr(evaluator, "active_scaling_cumulative_fraction", None)
+    if target is not None:
+        rows["active_scaling_target_fraction"] = _format_approximation_value(float(target))
+    if needed:
+        rows["active_scaling_needed_for_target"] = _single_or_json(needed)
+    if knee:
+        rows["active_scaling_knee_count"] = _single_or_json(knee)
+    if realized:
+        rows["active_scaling_realized_fraction"] = _single_or_json_active_scaling_fraction(realized)
+    return rows
+
+
+def _z_bin_summary_rows(evaluator: Any) -> dict[str, str]:
+    state = getattr(evaluator, "state", None)
+    bin_data = list(getattr(state, "bin_data", []) or [])
+    family_data = list(getattr(state, "family_data", []) or [])
+    z_values: list[float] = []
+    for bin_item in bin_data:
+        z_value = getattr(bin_item, "effective_z_source", None)
+        if z_value is None:
+            z_value = getattr(bin_item, "z_source", None)
+        try:
+            z_values.append(float(z_value))
+        except (TypeError, ValueError):
+            continue
+    finite_z = [value for value in z_values if np.isfinite(value)]
+    rows = {
+        "z_bins": _format_approximation_value(len(bin_data)),
+        "families": _format_approximation_value(len(family_data)),
+    }
+    if finite_z:
+        rows["z_bin_range"] = f"{min(finite_z):.6g}-{max(finite_z):.6g}"
+        rows["z_bin_values"] = _format_short_float_sequence(sorted(finite_z))
+    else:
+        rows["z_bin_range"] = "none"
+        rows["z_bin_values"] = "none"
+    return rows
+
+
+ApproximationRow = tuple[str, str, str] | tuple[str, str, str, str]
+
+
+_APPROXIMATION_CATEGORY_STYLES: dict[str, str] = {
+    "engine": "bold yellow",
+    "surrogate": "yellow",
+    "active": "bold cyan",
+    "selection": "cyan",
+    "zbin": "bold blue",
+    "diagnostic": "bold magenta",
+    "likelihood": "bold green",
+    "source": "green",
+    "cache": "magenta",
+}
+
+
+def _active_approximation_rows(evaluator: Any) -> list[ApproximationRow]:
+    state = getattr(evaluator, "state", None)
+    active_scaling = _count_items(getattr(evaluator, "active_scaling_component_indices", []))
+    total_scaling = _count_items(getattr(evaluator, "scaling_component_indices", []))
+    rows: list[ApproximationRow] = [
+        ("sampling_engine", _format_approximation_value(getattr(evaluator, "sampling_engine", "unknown")), "engine"),
+        (
+            "surrogate_enabled",
+            _format_approximation_value(bool(getattr(evaluator, "surrogate_enabled", False))),
+            "surrogate",
+        ),
+        ("active_scaling", f"{active_scaling}/{total_scaling}", "active"),
+        (
+            "inactive_scaling",
+            _format_approximation_value(_count_items(getattr(evaluator, "inactive_scaling_component_indices", []))),
+            "active",
+        ),
+        (
+            "active_scaling_selection",
+            _format_approximation_value(getattr(evaluator, "active_scaling_selection", "na")),
+            "selection",
+        ),
+    ]
+    for name, value in _active_scaling_rank_summary(evaluator).items():
+        if name == "active_scaling_realized_fraction":
+            rows.append((name, value, "selection", _active_scaling_realized_fraction_value_style(value)))
+        else:
+            rows.append((name, value, "selection"))
+    rows.extend((name, value, "zbin") for name, value in _z_bin_summary_rows(evaluator).items())
+    rows.extend(
+        [
+            (
+                "quick_diagnostics",
+                _format_approximation_value(bool(getattr(evaluator, "quick_diagnostics", False))),
+                "diagnostic",
+            ),
+            (
+                "sample_likelihood",
+                _format_approximation_value(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)),
+                "likelihood",
+            ),
+        ]
+    )
+    source_position_count = sum(
+        str(getattr(spec, "component_family", "")) == "source_position"
+        for spec in getattr(state, "parameter_specs", [])
+    )
+    if source_position_count > 0:
+        rows.append(("source_position_parameters", _format_approximation_value(source_position_count), "source"))
+        rows.append(
+            (
+                "source_position_parameterization",
+                _format_approximation_value(
+                    getattr(evaluator, "source_position_parameterization", SOURCE_POSITION_PARAMETERIZATION_DIRECT)
+                ),
+                "source",
+            )
+        )
+    if _count_items(getattr(evaluator, "scaling_scatter_param_indices", [])) > 0:
+        rows.append(("scaling_scatter_cache", "linearized", "cache"))
+    if _count_items(getattr(evaluator, "source_metric_cache_by_z", {})) > 0:
+        rows.append(("source_metric_cache", "refreshed", "cache"))
+    return rows
+
+
+def _format_active_approximation_table_from_rows(rows: list[ApproximationRow]) -> str:
+    row_lines = ["[approximations]", "| name | value |"]
+    row_lines.extend(f"| {row[0]} | {row[1]} |" for row in rows)
+    return "\n".join(row_lines)
+
+
+def _format_active_approximation_table(evaluator: Any) -> str:
+    return _format_active_approximation_table_from_rows(_active_approximation_rows(evaluator))
+
+
+def _rich_escape(value: str) -> str:
+    return str(value).replace("[", "\\[").replace("]", "\\]")
+
+
+def _rich_style_cell(value: str, style: str) -> str:
+    return f"[{style}]{_rich_escape(value)}[/]"
+
+
+def _build_active_approximation_rich_table(rows: list[ApproximationRow]) -> Any:
+    table = _RichTable(
+        title="Active approximations",
+        title_style="bold yellow",
+        header_style="bold white",
+        border_style="yellow",
+        show_lines=False,
+        expand=False,
+    )
+    table.add_column("name", style="dim", no_wrap=True)
+    table.add_column("value", overflow="fold")
+    for row in rows:
+        name, value, category = row[:3]
+        style = _APPROXIMATION_CATEGORY_STYLES.get(category, "white")
+        value_style = row[3] if len(row) > 3 else style
+        table.add_row(_rich_style_cell(name, style), _rich_style_cell(value, value_style))
+    return table
+
+
+def _log_active_approximation_table(args: argparse.Namespace | None, evaluator: Any) -> None:
+    rows = _active_approximation_rows(evaluator)
+    _log(
+        args,
+        _format_active_approximation_table_from_rows(rows),
+        renderable=_build_active_approximation_rich_table(rows),
+    )
+
+
 def _log_solver_active_approximation_warning(args: argparse.Namespace | None, evaluator: Any) -> None:
     items = _solver_active_approximation_items(evaluator)
     if items:
@@ -2107,14 +2897,7 @@ def _log_evaluator_summary(args: argparse.Namespace, evaluator: Any) -> None:
     if (
         stabilizer_active
         or image_presence_weight > 0.0
-        or sample_likelihood_mode in {
-            SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
-            SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
-            SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
-            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-            SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
-            SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
-        }
+        or _sample_likelihood_uses_image_plane_jacobian(sample_likelihood_mode)
     ):
         _log(
             args,
@@ -2134,7 +2917,7 @@ def _log_evaluator_summary(args: argparse.Namespace, evaluator: Any) -> None:
                 f"anchored_steps={int(getattr(evaluator, 'anchored_image_plane_solve_steps', DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS))} "
                 f"anchored_trust_radius_arcsec={float(getattr(evaluator, 'anchored_image_plane_trust_radius_arcsec', DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC)):.4g} "
                 f"critical_arc_critical_direction_sigma_arcsec={float(getattr(evaluator, 'critical_arc_critical_direction_sigma_arcsec', DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)):.4g} "
-                f"arc_aware_noncritical_support_radius_arcsec={float(getattr(evaluator, 'arc_aware_noncritical_support_radius_arcsec', DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC)):.4g} "
+                f"arc_recovery_p_arc_threshold={float(getattr(evaluator, 'arc_recovery_p_arc_threshold', DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)):.4g} "
                 f"arc_aware_max_arclength_arcsec={float(getattr(evaluator, 'arc_aware_max_arclength_arcsec', DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)):.4g} "
                 f"arc_aware_curve_step_arcsec={float(getattr(evaluator, 'arc_aware_curve_step_arcsec', DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)):.4g} "
                 f"fold_curvature_arcsec_inv={float(getattr(evaluator, 'fold_curvature_arcsec_inv', DEFAULT_FOLD_CURVATURE_ARCSEC_INV)):.4g}"
@@ -2563,6 +3346,96 @@ def _write_nuts_integrator_debug_table(
     return df
 
 
+def _write_microcanonical_transition_debug_table(
+    path: Path,
+    posterior: PosteriorResults,
+    extra: dict[str, Any],
+    retained_indices: list[int],
+) -> pd.DataFrame:
+    grouped = np.asarray(posterior.grouped_samples, dtype=float) if posterior.grouped_samples is not None else np.asarray([])
+    n_chains = int(grouped.shape[0]) if grouped.ndim == 3 else int(posterior.num_chains)
+    n_draws = int(grouped.shape[1]) if grouped.ndim == 3 else int(posterior.sample_steps)
+    accept = _chain_draw_array(extra.get("accept_prob", posterior.accept_prob), n_chains, n_draws)
+    steps = _chain_draw_array(extra.get("num_steps", posterior.num_steps), n_chains, n_draws)
+    energy = _chain_draw_array(extra.get("energy"), n_chains, n_draws)
+    state_logdensity = _chain_draw_array(extra.get("state_logdensity"), n_chains, n_draws)
+    log_prob = _chain_draw_array(-np.asarray(extra.get("potential_energy"), dtype=float), n_chains, n_draws)
+    diverging = _chain_draw_array(extra.get("diverging", posterior.diverging), n_chains, n_draws)
+    accepted = _chain_draw_array(extra.get("is_accepted"), n_chains, n_draws)
+    nonans = _chain_draw_array(extra.get("nonans"), n_chains, n_draws)
+    step_size_values = np.asarray(extra.get("microcanonical_step_size", []), dtype=float).reshape(-1)
+    L_values = np.asarray(extra.get("microcanonical_L", []), dtype=float).reshape(-1)
+    inverse_mass_matrix = extra.get("microcanonical_inverse_mass_matrix")
+    rows: list[dict[str, Any]] = []
+    init_diag = posterior.init_diagnostics or {}
+    for chain_index in range(n_chains):
+        original_index = int(retained_indices[chain_index]) if chain_index < len(retained_indices) else chain_index
+        row: dict[str, Any] = {
+            "chain": chain_index + 1,
+            "chain_index": original_index,
+            "chain_label": _debug_chain_label(init_diag, original_index),
+            "n_draws": n_draws,
+            "requested_chains": int(init_diag.get("requested_chains", n_chains)),
+            "retained_finite_chains": int(init_diag.get("retained_finite_chains", n_chains)),
+            "dropped_nonfinite_chains": int(init_diag.get("dropped_nonfinite_chains", 0)),
+            "microcanonical_L": float(L_values[chain_index]) if chain_index < L_values.size else float("nan"),
+            "microcanonical_step_size": (
+                float(step_size_values[chain_index]) if chain_index < step_size_values.size else float("nan")
+            ),
+        }
+        if accept is not None:
+            stats = _finite_array_stats(accept[chain_index])
+            row.update({f"accept_prob_{key}": value for key, value in stats.items()})
+        if steps is not None:
+            stats = _finite_array_stats(steps[chain_index])
+            row.update({f"num_steps_{key}": value for key, value in stats.items()})
+        if log_prob is not None:
+            stats = _finite_array_stats(log_prob[chain_index])
+            row.update({f"log_prob_{key}": value for key, value in stats.items()})
+        if state_logdensity is not None:
+            stats = _finite_array_stats(state_logdensity[chain_index])
+            row.update({f"state_logdensity_{key}": value for key, value in stats.items()})
+        if energy is not None:
+            chain_energy = np.asarray(energy[chain_index], dtype=float).reshape(-1)
+            stats = _finite_array_stats(chain_energy)
+            row.update({f"energy_{key}": value for key, value in stats.items()})
+            finite_energy = chain_energy[np.isfinite(chain_energy)]
+            if finite_energy.size > 1:
+                row["energy_variance"] = float(np.var(finite_energy, ddof=1))
+                row["energy_diff_mean_square"] = float(np.mean(np.square(np.diff(finite_energy))))
+                row["energy_bfmi_like"] = (
+                    float(row["energy_diff_mean_square"] / row["energy_variance"])
+                    if row["energy_variance"] > 0.0
+                    else float("nan")
+                )
+        if diverging is not None:
+            chain_diverging = np.asarray(diverging[chain_index], dtype=bool).reshape(-1)
+            row["divergence_count"] = int(np.sum(chain_diverging))
+            row["divergence_fraction"] = float(np.mean(chain_diverging)) if chain_diverging.size else float("nan")
+        if accepted is not None:
+            chain_accepted = np.asarray(accepted[chain_index], dtype=bool).reshape(-1)
+            row["is_accepted_fraction"] = float(np.mean(chain_accepted)) if chain_accepted.size else float("nan")
+        if nonans is not None:
+            chain_nonans = np.asarray(nonans[chain_index], dtype=bool).reshape(-1)
+            row["nonans_fraction"] = float(np.mean(chain_nonans)) if chain_nonans.size else float("nan")
+            row["nonfinite_transition_fraction"] = (
+                float(np.mean(~chain_nonans)) if chain_nonans.size else float("nan")
+            )
+        if grouped.ndim == 3 and chain_index < grouped.shape[0]:
+            ranges = np.ptp(np.asarray(grouped[chain_index], dtype=float), axis=0)
+            finite_ranges = ranges[np.isfinite(ranges)]
+            row["parameter_range_min"] = float(np.min(finite_ranges)) if finite_ranges.size else float("nan")
+            row["parameter_range_median"] = float(np.median(finite_ranges)) if finite_ranges.size else float("nan")
+            row["stuck_parameter_count_range_lt_1e_9"] = int(np.sum(finite_ranges < 1.0e-9))
+            row["stuck_parameter_count_range_lt_1e_6"] = int(np.sum(finite_ranges < 1.0e-6))
+        row.update(_mass_matrix_chain_summary(inverse_mass_matrix, chain_index, n_chains))
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+    return df
+
+
 def _debug_prior_likelihood_gradient(
     state: BuildState,
     evaluator: Any,
@@ -2824,27 +3697,37 @@ def _write_sampler_debug_diagnostics(
     args: argparse.Namespace,
     state: BuildState,
     evaluator: Any,
-    nuts_init: NUTSInitialization,
+    sampler_init: NUTSInitialization,
     posterior: PosteriorResults,
     extra: dict[str, Any],
 ) -> dict[str, Any]:
     if not bool(getattr(args, "debug_sampler_diagnostics", False)):
         return {}
-    if str(posterior.sampler) != "numpyro_nuts":
+    sampler = str(posterior.sampler)
+    if sampler not in {"numpyro_nuts", *MICROCANONICAL_FIT_METHODS}:
         _log(args, f"[sampler-debug] skipped sampler={posterior.sampler}")
         return {}
     tables_dir = Path(args.output_dir) / state.run_name / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
     retained_indices = list((posterior.init_diagnostics or {}).get("retained_chain_indices", range(posterior.num_chains)))
     diagnostics: dict[str, Any] = {}
-    integrator_df = _write_nuts_integrator_debug_table(
-        tables_dir / "nuts_integrator_diagnostics.csv",
-        args,
-        posterior,
-        extra,
-        [int(index) for index in retained_indices],
-    )
-    diagnostics["nuts_integrator_diagnostics_rows"] = int(len(integrator_df))
+    if sampler == "numpyro_nuts":
+        integrator_df = _write_nuts_integrator_debug_table(
+            tables_dir / "nuts_integrator_diagnostics.csv",
+            args,
+            posterior,
+            extra,
+            [int(index) for index in retained_indices],
+        )
+        diagnostics["nuts_integrator_diagnostics_rows"] = int(len(integrator_df))
+    else:
+        transition_df = _write_microcanonical_transition_debug_table(
+            tables_dir / "microcanonical_transition_diagnostics.csv",
+            posterior,
+            extra,
+            [int(index) for index in retained_indices],
+        )
+        diagnostics["microcanonical_transition_diagnostics_rows"] = int(len(transition_df))
 
     posterior_value_grad_fn = jax.jit(
         jax.value_and_grad(
@@ -2853,7 +3736,7 @@ def _write_sampler_debug_diagnostics(
     )
     prior_fn = jax.jit(lambda current: _prior_log_prob(state.parameter_specs, current))
     likelihood_fn = jax.jit(lambda current: evaluator._source_loglike_fn(current))
-    debug_states = _sampler_debug_state_catalog(posterior, nuts_init, state.parameter_specs)
+    debug_states = _sampler_debug_state_catalog(posterior, sampler_init, state.parameter_specs)
     state_df, top_indices_by_state = _write_sampler_state_debug_table(
         tables_dir / "sampler_state_diagnostics.csv",
         state,
@@ -2874,7 +3757,7 @@ def _write_sampler_debug_diagnostics(
     )
     diagnostics["sampler_direction_scan_rows"] = int(len(scan_df))
 
-    if str(getattr(evaluator, "sample_likelihood_mode", "")) == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE:
+    if _sample_likelihood_uses_critical_arc_terms(str(getattr(evaluator, "sample_likelihood_mode", ""))):
         image_rows: list[dict[str, Any]] = []
         bin_rows: list[dict[str, Any]] = []
         for state_index, item in enumerate(debug_states):
@@ -4792,6 +5675,52 @@ def _critical_arc_geometry_from_jacobian(
     return singular_min, singular_max, critical_p00, critical_p01, critical_p11, finite
 
 
+def _critical_arc_lm_inverse_operator_from_jacobian(
+    jac_a00: jnp.ndarray,
+    jac_a01: jnp.ndarray,
+    jac_a10: jnp.ndarray,
+    jac_a11: jnp.ndarray,
+    *,
+    lm_damping_relative: float = DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE,
+    lm_damping_absolute: float = DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    finite_entries = (
+        jnp.isfinite(jac_a00)
+        & jnp.isfinite(jac_a01)
+        & jnp.isfinite(jac_a10)
+        & jnp.isfinite(jac_a11)
+    )
+    normal00, normal01, normal11, trace, *_unused = _critical_arc_normal_matrix_entries(
+        jac_a00,
+        jac_a01,
+        jac_a10,
+        jac_a11,
+    )
+    lam = (
+        jnp.asarray(float(lm_damping_absolute), dtype=jnp.float64)
+        + jnp.asarray(float(lm_damping_relative), dtype=jnp.float64) * trace
+    )
+    h00 = normal00 + lam
+    h11 = normal11 + lam
+    h01 = normal01
+    det_h = h00 * h11 - jnp.square(h01)
+    det_h_safe = jnp.maximum(det_h, jnp.asarray(MIN_JACOBIAN_NORMAL_DETERMINANT_GUARD, dtype=jnp.float64))
+    inv00 = (h11 * jac_a00 - h01 * jac_a01) / det_h_safe
+    inv01 = (h11 * jac_a10 - h01 * jac_a11) / det_h_safe
+    inv10 = (-h01 * jac_a00 + h00 * jac_a01) / det_h_safe
+    inv11 = (-h01 * jac_a10 + h00 * jac_a11) / det_h_safe
+    finite = (
+        finite_entries
+        & jnp.isfinite(lam)
+        & jnp.isfinite(det_h)
+        & jnp.isfinite(inv00)
+        & jnp.isfinite(inv01)
+        & jnp.isfinite(inv10)
+        & jnp.isfinite(inv11)
+    )
+    return inv00, inv01, inv10, inv11, finite
+
+
 def _critical_arc_lm_geometry_from_jacobian(
     f_x: jnp.ndarray,
     f_y: jnp.ndarray,
@@ -4834,24 +5763,20 @@ def _critical_arc_lm_geometry_from_jacobian(
         normal11,
         trace,
     )
-    lam = (
-        jnp.asarray(float(lm_damping_absolute), dtype=jnp.float64)
-        + jnp.asarray(float(lm_damping_relative), dtype=jnp.float64) * trace
+    inv00, inv01, inv10, inv11, inverse_finite = _critical_arc_lm_inverse_operator_from_jacobian(
+        jac_a00,
+        jac_a01,
+        jac_a10,
+        jac_a11,
+        lm_damping_relative=lm_damping_relative,
+        lm_damping_absolute=lm_damping_absolute,
     )
-    h00 = normal00 + lam
-    h11 = normal11 + lam
-    h01 = normal01
-    rhs0 = -(jac_a00 * f_x + jac_a10 * f_y)
-    rhs1 = -(jac_a01 * f_x + jac_a11 * f_y)
-    det_h = h00 * h11 - jnp.square(h01)
-    det_h_safe = jnp.maximum(det_h, jnp.asarray(MIN_JACOBIAN_NORMAL_DETERMINANT_GUARD, dtype=jnp.float64))
-    delta_x = (h11 * rhs0 - h01 * rhs1) / det_h_safe
-    delta_y = (-h01 * rhs0 + h00 * rhs1) / det_h_safe
+    delta_x = -(inv00 * f_x + inv01 * f_y)
+    delta_y = -(inv10 * f_x + inv11 * f_y)
     delta_x, delta_y = _smooth_residual_cap(delta_x, delta_y, trust_radius_arcsec)
     finite = (
         finite_entries
-        & jnp.isfinite(lam)
-        & jnp.isfinite(det_h)
+        & inverse_finite
         & jnp.isfinite(delta_x)
         & jnp.isfinite(delta_y)
         & jnp.isfinite(singular_min)
@@ -4956,11 +5881,11 @@ def _critical_arc_branch_probability(
     singular_threshold: float = DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
     singular_softness: float = DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
 ) -> jnp.ndarray:
-    base = jnp.asarray(float(base_prob), dtype=jnp.float64)
-    high = jnp.asarray(float(max_prob), dtype=jnp.float64)
+    base = jnp.asarray(base_prob, dtype=jnp.float64)
+    high = jnp.asarray(max_prob, dtype=jnp.float64)
     transition = jax.nn.sigmoid(
-        (jnp.asarray(float(singular_threshold), dtype=jnp.float64) - singular_min)
-        / jnp.asarray(float(singular_softness), dtype=jnp.float64)
+        (jnp.asarray(singular_threshold, dtype=jnp.float64) - singular_min)
+        / jnp.asarray(singular_softness, dtype=jnp.float64)
     )
     prob = base + (high - base) * transition
     return jnp.clip(prob, 1.0e-6, 1.0 - 1.0e-6)
@@ -4985,7 +5910,7 @@ class _CriticalArcMixtureResponsibilities(NamedTuple):
     inlier_log_weight: jnp.ndarray
     outlier_log_weight: jnp.ndarray
     point_inlier_responsibility: jnp.ndarray
-    arc_inlier_responsibility: jnp.ndarray
+    p_arc: jnp.ndarray
     point_mixture_responsibility: jnp.ndarray
     arc_mixture_responsibility: jnp.ndarray
     inlier_responsibility: jnp.ndarray
@@ -5001,20 +5926,28 @@ def _critical_arc_aniso_quad_logdet(
     critical_p01: jnp.ndarray,
     critical_p11: jnp.ndarray,
     projector_det: jnp.ndarray,
+    scatter_cov00: jnp.ndarray | None = None,
+    scatter_cov01: jnp.ndarray | None = None,
+    scatter_cov11: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Mahalanobis quadratic and log-det for Sigma = sigma2 I + extra_var P.
+    """Mahalanobis quadratic and log-det for Sigma = sigma2 I + C_scatter + extra_var P.
 
     P is the regularized critical-direction projector. With extra_var = 0 this reduces
     exactly to the isotropic (sigma2 I) form, so it leaves images away from caustics
     unchanged; with extra_var > 0 it inflates the covariance along the critical direction.
     """
-    s00 = sigma2 + extra_var * critical_p00
-    s01 = extra_var * critical_p01
-    s11 = sigma2 + extra_var * critical_p11
-    det = (
-        jnp.square(sigma2)
-        + sigma2 * extra_var * (critical_p00 + critical_p11)
-        + jnp.square(extra_var) * projector_det
+    if scatter_cov00 is None:
+        scatter_cov00 = jnp.zeros_like(sigma2)
+    if scatter_cov01 is None:
+        scatter_cov01 = jnp.zeros_like(sigma2)
+    if scatter_cov11 is None:
+        scatter_cov11 = jnp.zeros_like(sigma2)
+    s00 = sigma2 + scatter_cov00 + extra_var * critical_p00
+    s01 = scatter_cov01 + extra_var * critical_p01
+    s11 = sigma2 + scatter_cov11 + extra_var * critical_p11
+    det = jnp.maximum(
+        s00 * s11 - jnp.square(s01),
+        jnp.asarray(MIN_COVARIANCE_DETERMINANT_GUARD, dtype=jnp.float64),
     )
     quad = jnp.maximum(
         (
@@ -5046,6 +5979,9 @@ def _critical_arc_mixture_image_plane_terms(
     max_prob: float = DEFAULT_CRITICAL_ARC_MAX_PROB,
     singular_threshold: float = DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
     singular_softness: float = DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
+    scatter_cov00: jnp.ndarray | None = None,
+    scatter_cov01: jnp.ndarray | None = None,
+    scatter_cov11: jnp.ndarray | None = None,
 ) -> _CriticalArcMixtureTerms:
     sigma2 = _image_plane_effective_sigma2(
         sigma_per_image,
@@ -5107,6 +6043,9 @@ def _critical_arc_mixture_image_plane_terms(
         critical_p01,
         critical_p11,
         projector_det,
+        scatter_cov00=scatter_cov00,
+        scatter_cov01=scatter_cov01,
+        scatter_cov11=scatter_cov11,
     )
     # Covariance-side arc branch: Sigma = sigma2 I + (fold + sigma_arc^2) P. The fixed
     # morphological tolerance sigma_arc^2 sits on TOP of the magnification-folded base, so it
@@ -5123,6 +6062,9 @@ def _critical_arc_mixture_image_plane_terms(
         critical_p01,
         critical_p11,
         projector_det,
+        scatter_cov00=scatter_cov00,
+        scatter_cov01=scatter_cov01,
+        scatter_cov11=scatter_cov11,
     )
     arc_prob = _critical_arc_branch_probability(
         singular_min_gate,
@@ -5178,11 +6120,7 @@ def _critical_arc_mixture_image_plane_responsibilities(
         + terms.point_ll
         - terms.inlier_ll
     )
-    arc_inlier_responsibility = jnp.exp(
-        jnp.log(jnp.clip(terms.arc_prob, 1.0e-300, 1.0))
-        + terms.arc_ll
-        - terms.inlier_ll
-    )
+    p_arc = terms.arc_prob
     point_mixture_responsibility = jnp.exp(point_log_weight - terms.mixture_ll)
     arc_mixture_responsibility = jnp.exp(arc_log_weight - terms.mixture_ll)
     inlier_responsibility = jnp.exp(inlier_log_weight - terms.mixture_ll)
@@ -5193,7 +6131,7 @@ def _critical_arc_mixture_image_plane_responsibilities(
         inlier_log_weight=inlier_log_weight,
         outlier_log_weight=outlier_log_weight,
         point_inlier_responsibility=point_inlier_responsibility,
-        arc_inlier_responsibility=arc_inlier_responsibility,
+        p_arc=p_arc,
         point_mixture_responsibility=point_mixture_responsibility,
         arc_mixture_responsibility=arc_mixture_responsibility,
         inlier_responsibility=inlier_responsibility,
@@ -5367,6 +6305,24 @@ def _trace_arc_support_curve_from_anchor(
     return points[:, 0], points[:, 1], finite
 
 
+def _dynamic_arc_support_trace_arclength(
+    base_arclength_arcsec: float,
+    critical_direction_residual_arcsec: float,
+    curve_step_arcsec: float,
+) -> float:
+    base_arclength = float(base_arclength_arcsec)
+    if not np.isfinite(base_arclength) or base_arclength <= 0.0:
+        base_arclength = DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC
+    residual = abs(float(critical_direction_residual_arcsec))
+    if not np.isfinite(residual):
+        return base_arclength
+    step = float(curve_step_arcsec)
+    if not np.isfinite(step) or step <= 0.0:
+        step = DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC
+    margin = max(0.5, 2.0 * step, 0.05 * residual)
+    return max(base_arclength, residual + margin)
+
+
 def _polyline_distance_and_anchor_arclength(
     point_x: float,
     point_y: float,
@@ -5450,6 +6406,9 @@ def _critical_arc_mixture_image_plane_bin_loglike(
     singular_min_precomputed: jnp.ndarray | None = None,
     singular_max_precomputed: jnp.ndarray | None = None,
     critical_direction_projector_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray] | None = None,
+    scatter_cov00: jnp.ndarray | None = None,
+    scatter_cov01: jnp.ndarray | None = None,
+    scatter_cov11: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     if (
         singular_min_precomputed is None
@@ -5497,6 +6456,9 @@ def _critical_arc_mixture_image_plane_bin_loglike(
         max_prob=max_prob,
         singular_threshold=singular_threshold,
         singular_softness=singular_softness,
+        scatter_cov00=scatter_cov00,
+        scatter_cov01=scatter_cov01,
+        scatter_cov11=scatter_cov11,
     )
     bin_loglike = jnp.sum(jnp.where(image_has_constraint, terms.mixture_ll, 0.0))
     if (
@@ -5534,10 +6496,18 @@ def _critical_arc_mixture_image_plane_bin_loglike(
             count_softness=float(image_presence_count_softness),
             count_margin=float(image_presence_count_margin),
         )
+    scatter_finite = jnp.asarray(True)
+    if scatter_cov00 is not None:
+        scatter_finite = scatter_finite & jnp.all(jnp.isfinite(scatter_cov00))
+    if scatter_cov01 is not None:
+        scatter_finite = scatter_finite & jnp.all(jnp.isfinite(scatter_cov01))
+    if scatter_cov11 is not None:
+        scatter_finite = scatter_finite & jnp.all(jnp.isfinite(scatter_cov11))
     finite = (
         jnp.all(frame_finite)
         & jnp.all(jnp.isfinite(residual_x))
         & jnp.all(jnp.isfinite(residual_y))
+        & scatter_finite
         & jnp.all(jnp.isfinite(terms.sigma2))
         & jnp.all(jnp.isfinite(singular_min))
         & jnp.all(jnp.isfinite(singular_max))
@@ -5556,7 +6526,7 @@ def _critical_arc_debug_terms_for_state(
     chain: int,
     draw: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if str(getattr(evaluator, "sample_likelihood_mode", "")) != SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE:
+    if not _sample_likelihood_uses_critical_arc_terms(str(getattr(evaluator, "sample_likelihood_mode", ""))):
         return [], []
     params = jnp.asarray(theta, dtype=jnp.float64)
     physical_params = evaluator._physical_parameter_vector(params)
@@ -5628,15 +6598,23 @@ def _critical_arc_debug_terms_for_state(
                 y_obs,
                 packed_state,
             )
-        beta_family_x, beta_family_y, has_source_positions, source_transport_correction = evaluator._explicit_source_position_vectors_for_bin(
-            params,
-            physical_params,
-            bin_data,
-            beta_x,
-            beta_y,
-            image_sigma_int,
-            observed_jacobian_entries,
-        )
+        if str(getattr(evaluator, "sample_likelihood_mode", "")) == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE:
+            beta_family_x, beta_family_y, has_source_positions, source_transport_correction = evaluator._centroid_source_position_vectors_for_bin(
+                bin_data,
+                beta_x,
+                beta_y,
+                image_sigma_int,
+            )
+        else:
+            beta_family_x, beta_family_y, has_source_positions, source_transport_correction = evaluator._explicit_source_position_vectors_for_bin(
+                params,
+                physical_params,
+                bin_data,
+                beta_x,
+                beta_y,
+                image_sigma_int,
+                observed_jacobian_entries,
+            )
         (
             residual_x,
             residual_y,
@@ -5654,7 +6632,57 @@ def _critical_arc_debug_terms_for_state(
             lm_damping_relative=evaluator.critical_arc_lm_damping_relative,
             lm_damping_absolute=evaluator.critical_arc_lm_damping_absolute,
         )
-        invalid = invalid | (~has_source_positions) | (~jnp.all(residual_finite))
+        if hasattr(evaluator, "_scaling_scatter_image_covariance_from_inverse"):
+            (
+                critical_inv00,
+                critical_inv01,
+                critical_inv10,
+                critical_inv11,
+                critical_inverse_finite,
+            ) = _critical_arc_lm_inverse_operator_from_jacobian(
+                *observed_jacobian_entries,
+                lm_damping_relative=evaluator.critical_arc_lm_damping_relative,
+                lm_damping_absolute=evaluator.critical_arc_lm_damping_absolute,
+            )
+            scatter_cov00, scatter_cov01, scatter_cov11, scatter_cov_finite = (
+                evaluator._scaling_scatter_image_covariance_from_inverse(
+                    physical_params,
+                    bin_data,
+                    critical_inv00,
+                    critical_inv01,
+                    critical_inv10,
+                    critical_inv11,
+                    critical_inverse_finite,
+                )
+            )
+        else:
+            scatter_zeros = jnp.zeros_like(residual_x)
+            scatter_cov00 = scatter_zeros
+            scatter_cov01 = scatter_zeros
+            scatter_cov11 = scatter_zeros
+            scatter_cov_finite = jnp.ones_like(residual_x, dtype=bool)
+        invalid = (
+            invalid
+            | (~has_source_positions)
+            | (~jnp.all(residual_finite))
+            | (~jnp.all(scatter_cov_finite))
+        )
+        critical_arc_singular_threshold = (
+            evaluator._critical_arc_singular_threshold_from_physical(physical_params)
+            if hasattr(evaluator, "_critical_arc_singular_threshold_from_physical")
+            else jnp.asarray(
+                float(getattr(evaluator, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)),
+                dtype=jnp.float64,
+            )
+        )
+        critical_arc_singular_softness = (
+            evaluator._critical_arc_singular_softness_from_physical(physical_params)
+            if hasattr(evaluator, "_critical_arc_singular_softness_from_physical")
+            else jnp.asarray(
+                float(getattr(evaluator, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)),
+                dtype=jnp.float64,
+            )
+        )
         terms = _critical_arc_mixture_image_plane_terms(
             residual_x=residual_x,
             residual_y=residual_y,
@@ -5670,8 +6698,11 @@ def _critical_arc_debug_terms_for_state(
             critical_direction_sigma_arcsec=evaluator.critical_arc_critical_direction_sigma_arcsec,
             base_prob=evaluator.critical_arc_base_prob,
             max_prob=evaluator.critical_arc_max_prob,
-            singular_threshold=evaluator.critical_arc_singular_threshold,
-            singular_softness=evaluator.critical_arc_singular_softness,
+            singular_threshold=critical_arc_singular_threshold,
+            singular_softness=critical_arc_singular_softness,
+            scatter_cov00=scatter_cov00,
+            scatter_cov01=scatter_cov01,
+            scatter_cov11=scatter_cov11,
         )
         responsibilities = _critical_arc_mixture_image_plane_responsibilities(terms)
         image_contribution = jnp.where(bin_data.image_has_constraint, terms.mixture_ll, 0.0)
@@ -5701,11 +6732,14 @@ def _critical_arc_debug_terms_for_state(
             critical_direction_sigma_arcsec=evaluator.critical_arc_critical_direction_sigma_arcsec,
             base_prob=evaluator.critical_arc_base_prob,
             max_prob=evaluator.critical_arc_max_prob,
-            singular_threshold=evaluator.critical_arc_singular_threshold,
-            singular_softness=evaluator.critical_arc_singular_softness,
+            singular_threshold=critical_arc_singular_threshold,
+            singular_softness=critical_arc_singular_softness,
             singular_min_precomputed=singular_min,
             singular_max_precomputed=singular_max,
             critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+            scatter_cov00=scatter_cov00,
+            scatter_cov01=scatter_cov01,
+            scatter_cov11=scatter_cov11,
         )
         bin_total = bin_loglike_without_transport + source_transport_correction
         presence_penalty = bin_loglike_without_transport - mixture_sum
@@ -5749,6 +6783,8 @@ def _critical_arc_debug_terms_for_state(
                     "det_a": float(det_a_np[local_image_index]),
                     "singular_min": float(np1(singular_min)[local_image_index]),
                     "singular_max": float(np1(singular_max)[local_image_index]),
+                    "critical_arc_singular_threshold": float(np.asarray(critical_arc_singular_threshold, dtype=float)),
+                    "critical_arc_singular_softness": float(np.asarray(critical_arc_singular_softness, dtype=float)),
                     "arc_probability": float(np1(terms.arc_prob)[local_image_index]),
                     "critical_direction_residual": float(np.sqrt(np1(terms.critical_quad)[local_image_index])),
                     "noncritical_direction_residual": float(np.sqrt(np1(terms.noncritical_quad)[local_image_index])),
@@ -5760,7 +6796,7 @@ def _critical_arc_debug_terms_for_state(
                     "inlier_responsibility": float(np1(responsibilities.inlier_responsibility)[local_image_index]),
                     "outlier_responsibility": float(np1(responsibilities.outlier_responsibility)[local_image_index]),
                     "point_inlier_responsibility": float(np1(responsibilities.point_inlier_responsibility)[local_image_index]),
-                    "arc_inlier_responsibility": float(np1(responsibilities.arc_inlier_responsibility)[local_image_index]),
+                    "p_arc": float(np1(responsibilities.p_arc)[local_image_index]),
                     "point_mixture_responsibility": float(np1(responsibilities.point_mixture_responsibility)[local_image_index]),
                     "arc_mixture_responsibility": float(np1(responsibilities.arc_mixture_responsibility)[local_image_index]),
                     "inlier_log_weight": float(np1(responsibilities.inlier_log_weight)[local_image_index]),
@@ -5770,8 +6806,11 @@ def _critical_arc_debug_terms_for_state(
                     "outlier_margin_log_weight_minus_inlier": float(
                         np1(responsibilities.outlier_log_weight - responsibilities.inlier_log_weight)[local_image_index]
                     ),
-                    "arc_margin_log_weight_minus_point": float(
-                        np1(responsibilities.arc_log_weight - responsibilities.point_log_weight)[local_image_index]
+                    "arc_log_odds": float(
+                        np1(
+                            jnp.log(jnp.clip(responsibilities.p_arc, 1.0e-300, 1.0 - 1.0e-12))
+                            - jnp.log1p(-jnp.clip(responsibilities.p_arc, 1.0e-300, 1.0 - 1.0e-12))
+                        )[local_image_index]
                     ),
                     "final_image_mixture_contribution": float(np1(image_contribution)[local_image_index]),
                     "branch_margin_arc_minus_point": float(np1(terms.arc_ll - terms.point_ll)[local_image_index]),
@@ -5804,6 +6843,8 @@ def _critical_arc_debug_terms_for_state(
                 "all_residual_finite": bool(np.asarray(jnp.all(residual_finite), dtype=bool)),
                 "image_sigma_int": float(np.asarray(image_sigma_int, dtype=float)),
                 "image_sigma_int_sampled": bool(getattr(evaluator, "image_sigma_int_sampled", False)),
+                "critical_arc_singular_threshold": float(np.asarray(critical_arc_singular_threshold, dtype=float)),
+                "critical_arc_singular_softness": float(np.asarray(critical_arc_singular_softness, dtype=float)),
                 "fixed_image_sigma_int_arcsec": (
                     float(getattr(evaluator, "fixed_image_sigma_int_arcsec"))
                     if getattr(evaluator, "fixed_image_sigma_int_arcsec", None) is not None
@@ -5844,7 +6885,18 @@ def _arc_aware_image_support_from_local_linearization(
     jacobian_at: Callable[[np.ndarray, np.ndarray], tuple[Any, Any, Any, Any]] | None = None,
     point_recovered_mask: Any | None = None,
     point_residual_arcsec: Any | None = None,
-    noncritical_support_radius_arcsec: float = DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
+    arc_recovery_p_arc_threshold: float = DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD,
+    sigma_per_image: Any | None = None,
+    reliability_per_image: Any | None = None,
+    image_sigma_int: Any = 0.0,
+    covariance_floor: float = 0.0,
+    outlier_sigma_arcsec: float = DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
+    residual_loss: str = DEFAULT_LIKELIHOOD_STABILIZER_RESIDUAL_LOSS,
+    student_t_nu: float = DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU,
+    critical_direction_sigma_arcsec: float = DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+    scatter_cov00: Any | None = None,
+    scatter_cov01: Any | None = None,
+    scatter_cov11: Any | None = None,
     max_arclength_arcsec: float = DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC,
     curve_step_arcsec: float = DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC,
     trust_radius_arcsec: float = DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC,
@@ -5892,8 +6944,45 @@ def _arc_aware_image_support_from_local_linearization(
         obs_x = np.full(shape, np.nan, dtype=float)
     if obs_y.shape != shape:
         obs_y = np.full(shape, np.nan, dtype=float)
+    threshold = float(arc_recovery_p_arc_threshold)
+    if not np.isfinite(threshold) or threshold < 0.0 or threshold > 1.0:
+        raise ValueError("arc_recovery_p_arc_threshold must be finite and in [0, 1].")
 
-    delta_x, delta_y, step_finite = _critical_arc_lm_step_from_jacobian(
+    def _array_or_fill(values: Any | None, fill: float) -> jnp.ndarray:
+        if values is None:
+            return jnp.full(f_x.shape, float(fill), dtype=jnp.float64)
+        try:
+            array = np.asarray(values, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            array = np.full(shape, float(fill), dtype=float)
+        if array.shape != shape:
+            array = np.full(shape, float(fill), dtype=float)
+        return jnp.asarray(array.reshape(f_x.shape), dtype=jnp.float64)
+
+    sigma_values = _array_or_fill(sigma_per_image, 1.0)
+    reliability_values = _array_or_fill(reliability_per_image, 1.0 - 1.0e-6)
+
+    def _optional_scatter(values: Any | None) -> jnp.ndarray | None:
+        if values is None:
+            return None
+        try:
+            array = np.asarray(values, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+        if array.shape != shape:
+            return None
+        return jnp.asarray(array.reshape(f_x.shape), dtype=jnp.float64)
+
+    (
+        delta_x,
+        delta_y,
+        singular_min,
+        singular_max,
+        critical_p00,
+        critical_p01,
+        critical_p11,
+        step_finite,
+    ) = _critical_arc_lm_geometry_from_jacobian(
         f_x,
         f_y,
         a00,
@@ -5904,19 +6993,34 @@ def _arc_aware_image_support_from_local_linearization(
         lm_damping_relative=lm_damping_relative,
         lm_damping_absolute=lm_damping_absolute,
     )
-    critical_direction_x, critical_direction_y, noncritical_direction_x, noncritical_direction_y, singular_min, singular_max, frame_finite = _critical_arc_jacobian_frame(
+    critical_direction_x, critical_direction_y, noncritical_direction_x, noncritical_direction_y, _frame_s_min, _frame_s_max, frame_finite = _critical_arc_jacobian_frame(
         a00,
         a01,
         a10,
         a11,
     )
-    arc_prior = _critical_arc_branch_probability(
-        singular_min,
+    terms = _critical_arc_mixture_image_plane_terms(
+        residual_x=delta_x,
+        residual_y=delta_y,
+        sigma_per_image=sigma_values,
+        reliability_per_image=reliability_values,
+        image_sigma_int=jnp.asarray(image_sigma_int, dtype=jnp.float64),
+        covariance_floor=float(covariance_floor),
+        outlier_sigma_arcsec=float(outlier_sigma_arcsec),
+        singular_min=singular_min,
+        critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+        residual_loss=residual_loss,
+        student_t_nu=float(student_t_nu),
+        critical_direction_sigma_arcsec=float(critical_direction_sigma_arcsec),
         base_prob=base_prob,
         max_prob=max_prob,
         singular_threshold=singular_threshold,
         singular_softness=singular_softness,
+        scatter_cov00=_optional_scatter(scatter_cov00),
+        scatter_cov01=_optional_scatter(scatter_cov01),
+        scatter_cov11=_optional_scatter(scatter_cov11),
     )
+    responsibilities = _critical_arc_mixture_image_plane_responsibilities(terms)
     delta_critical_direction = delta_x * critical_direction_x + delta_y * critical_direction_y
     delta_noncritical_direction = delta_x * noncritical_direction_x + delta_y * noncritical_direction_y
     noncritical_direction_residual = np.abs(np.asarray(delta_noncritical_direction, dtype=float).reshape(-1))
@@ -5925,14 +7029,22 @@ def _arc_aware_image_support_from_local_linearization(
     critical_direction_y_np = np.asarray(critical_direction_y, dtype=float).reshape(-1)
     noncritical_direction_x_np = np.asarray(noncritical_direction_x, dtype=float).reshape(-1)
     noncritical_direction_y_np = np.asarray(noncritical_direction_y, dtype=float).reshape(-1)
+    delta_noncritical_direction_np = np.asarray(delta_noncritical_direction, dtype=float).reshape(-1)
     s_min = np.asarray(singular_min, dtype=float).reshape(-1)
     s_max = np.asarray(singular_max, dtype=float).reshape(-1)
     det_a = np.asarray(a00 * a11 - a01 * a10, dtype=float).reshape(-1)
-    arc_prior_np = np.asarray(arc_prior, dtype=float).reshape(-1)
+    arc_prior_np = np.asarray(terms.arc_prob, dtype=float).reshape(-1)
+    point_ll_np = np.asarray(terms.point_ll, dtype=float).reshape(-1)
+    arc_ll_np = np.asarray(terms.arc_ll, dtype=float).reshape(-1)
+    inlier_ll_np = np.asarray(terms.inlier_ll, dtype=float).reshape(-1)
+    p_arc = np.asarray(responsibilities.p_arc, dtype=float).reshape(-1)
+    p_arc_clipped = np.clip(p_arc, 1.0e-300, 1.0 - 1.0e-12)
+    arc_log_odds = np.log(p_arc_clipped) - np.log1p(-p_arc_clipped)
     finite = (
         np.asarray(step_finite & frame_finite, dtype=bool).reshape(-1)
         & np.isfinite(noncritical_direction_residual)
         & np.isfinite(critical_direction_residual)
+        & np.isfinite(delta_noncritical_direction_np)
         & np.isfinite(critical_direction_x_np)
         & np.isfinite(critical_direction_y_np)
         & np.isfinite(noncritical_direction_x_np)
@@ -5941,12 +7053,15 @@ def _arc_aware_image_support_from_local_linearization(
         & np.isfinite(s_max)
         & np.isfinite(det_a)
         & np.isfinite(arc_prior_np)
+        & np.isfinite(point_ll_np)
+        & np.isfinite(arc_ll_np)
+        & np.isfinite(inlier_ll_np)
+        & np.isfinite(p_arc)
+        & np.isfinite(arc_log_odds)
     )
-    critical_probability = 0.5 * (float(base_prob) + float(max_prob))
-    delta_x_np = np.asarray(delta_x, dtype=float).reshape(-1)
-    delta_y_np = np.asarray(delta_y, dtype=float).reshape(-1)
-    support_anchor_x = obs_x + delta_x_np
-    support_anchor_y = obs_y + delta_y_np
+    arc_candidate_supported = finite & (p_arc >= threshold)
+    support_anchor_x = obs_x + delta_noncritical_direction_np * noncritical_direction_x_np
+    support_anchor_y = obs_y + delta_noncritical_direction_np * noncritical_direction_y_np
     curve_distance = np.full(shape, np.nan, dtype=float)
     curve_arclength = np.full(shape, np.nan, dtype=float)
     curve_finite = np.zeros(shape, dtype=bool)
@@ -5954,19 +7069,29 @@ def _arc_aware_image_support_from_local_linearization(
     curve_y_json = np.asarray([_json_arcsec_array([]) for _ in range(int(np.prod(shape)))], dtype=object).reshape(shape)
     if jacobian_at is not None:
         for index in range(shape[0]):
+            # Scalar arc diagnostics are computed above for every image. Trace the support
+            # curve for any high-p_arc candidate, including images that also have a point
+            # recovery, because catalog overlays visualize arc recovery preferentially.
+            trace_needed = bool(arc_candidate_supported[index])
             if not (
-                finite[index]
+                trace_needed
+                and finite[index]
                 and np.isfinite(obs_x[index])
                 and np.isfinite(obs_y[index])
                 and np.isfinite(support_anchor_x[index])
                 and np.isfinite(support_anchor_y[index])
             ):
                 continue
+            trace_arclength = _dynamic_arc_support_trace_arclength(
+                max_arclength_arcsec,
+                critical_direction_residual[index],
+                curve_step_arcsec,
+            )
             curve_x, curve_y, trace_finite = _trace_arc_support_curve_from_anchor(
                 float(support_anchor_x[index]),
                 float(support_anchor_y[index]),
                 jacobian_at,
-                max_arclength_arcsec=max_arclength_arcsec,
+                max_arclength_arcsec=trace_arclength,
                 curve_step_arcsec=curve_step_arcsec,
             )
             distance, arclength, distance_finite = _polyline_distance_and_anchor_arclength(
@@ -5977,30 +7102,42 @@ def _arc_aware_image_support_from_local_linearization(
                 float(support_anchor_x[index]),
                 float(support_anchor_y[index]),
             )
-            curve_ok = bool(trace_finite and distance_finite and np.isfinite(distance) and np.isfinite(arclength))
+            try:
+                curve_sample_count = min(
+                    np.asarray(curve_x, dtype=float).reshape(-1).size,
+                    np.asarray(curve_y, dtype=float).reshape(-1).size,
+                )
+            except (TypeError, ValueError):
+                curve_sample_count = 0
+            # Keep finite partial traces for plotting; a branch can leave the finite region
+            # after it has already supplied a useful support curve segment.
+            curve_ok = bool(
+                (trace_finite or curve_sample_count >= 2)
+                and distance_finite
+                and np.isfinite(distance)
+                and np.isfinite(arclength)
+            )
             curve_finite[index] = curve_ok
             if curve_ok:
                 curve_distance[index] = float(distance)
                 curve_arclength[index] = float(arclength)
                 curve_x_json[index] = _json_arcsec_array(curve_x)
                 curve_y_json[index] = _json_arcsec_array(curve_y)
-    arc_candidate_supported = (
-        finite
-        & curve_finite
-        & (arc_prior_np >= critical_probability)
-        & (curve_distance <= float(noncritical_support_radius_arcsec))
+    arc_candidate_residual = np.where(
+        np.isfinite(curve_distance),
+        curve_distance,
+        np.where(np.isfinite(noncritical_direction_residual), noncritical_direction_residual, np.nan),
     )
-    arc_candidate_residual = np.where(arc_candidate_supported, curve_distance, np.nan)
-    arc_supported = (~point_valid) & arc_candidate_supported & np.isfinite(arc_candidate_residual)
+    arc_supported = arc_candidate_supported & np.isfinite(arc_candidate_residual)
     status = np.where(
-        point_valid,
-        "point_recovered",
-        np.where(arc_supported, "arc_supported", "not_recovered"),
+        arc_supported,
+        "arc_supported",
+        np.where(point_valid, "point_recovered", "not_recovered"),
     )
     arc_aware_residual = np.where(
-        point_valid,
-        point_residual,
-        np.where(arc_supported, arc_candidate_residual, np.nan),
+        arc_supported,
+        arc_candidate_residual,
+        np.where(point_valid, point_residual, np.nan),
     )
     supported_or_recovered = np.isfinite(arc_aware_residual)
     arc_aware_rms = (
@@ -6026,6 +7163,8 @@ def _arc_aware_image_support_from_local_linearization(
         "arc_s_max": s_max.astype(float),
         "arc_detA": det_a.astype(float),
         "arc_prior_probability": arc_prior_np.astype(float),
+        "p_arc": p_arc.astype(float),
+        "arc_log_odds": arc_log_odds.astype(float),
         "arc_curve_distance_arcsec": curve_distance.astype(float),
         "arc_curve_arclength_arcsec": curve_arclength.astype(float),
         "arc_curve_finite": curve_finite.astype(bool),
@@ -6884,6 +8023,865 @@ def _run_blackjax_smc_sampler(
     return posterior
 
 
+def _blackjax_microcanonical_components() -> tuple[Any, Any, Any, Any]:
+    try:
+        import blackjax
+
+        mclmc_module = importlib.import_module("blackjax.mcmc.mclmc")
+        adjusted_dynamic = importlib.import_module("blackjax.mcmc.adjusted_mclmc_dynamic")
+        integrators = importlib.import_module("blackjax.mcmc.integrators")
+    except ImportError as exc:
+        raise RuntimeError(
+            "BlackJAX MCHMC/MCLMC requires blackjax>=1.5 in the active lenstronomy environment."
+        ) from exc
+    version = getattr(blackjax, "__version__", None)
+    if version is not None:
+        try:
+            major, minor, *_rest = [int(part) for part in str(version).split(".")]
+        except ValueError:
+            major, minor = 1, 5
+        if (major, minor) < (1, 5):
+            raise RuntimeError(f"BlackJAX MCHMC/MCLMC requires blackjax>=1.5; found {version}.")
+    required = (
+        "mclmc",
+        "adjusted_mclmc_dynamic",
+        "mclmc_find_L_and_step_size",
+        "adjusted_mclmc_find_L_and_step_size",
+    )
+    missing = [name for name in required if not hasattr(blackjax, name)]
+    if missing:
+        raise RuntimeError(
+            "BlackJAX MCHMC/MCLMC requires missing blackjax API(s): "
+            + ", ".join(missing)
+        )
+    return blackjax, mclmc_module, adjusted_dynamic, integrators
+
+
+def _make_microcanonical_chain_seeds(
+    args: argparse.Namespace,
+    parameter_specs: list[ParameterSpec],
+    center_theta: np.ndarray,
+    method: str,
+) -> list[ChainSeed]:
+    offset = 3303 if method == FIT_METHOD_MCLMC else 4303
+    rng = np.random.default_rng(None if args.seed is None else int(args.seed) + offset)
+    chain_seeds: list[ChainSeed] = []
+    for chain_index in range(int(args.chains)):
+        seed_theta = _small_svi_nuts_perturbation(
+            center_theta,
+            parameter_specs,
+            rng,
+            jitter_frac=float(getattr(args, "nuts_init_jitter_frac", DEFAULT_NUTS_INIT_JITTER_FRAC)),
+            boundary_frac=float(getattr(args, "nuts_init_boundary_frac", DEFAULT_NUTS_INIT_BOUNDARY_FRAC)),
+        )
+        if not np.all(np.isfinite(seed_theta)):
+            raise ValueError(
+                f"Direct {method.upper()} initializer produced non-finite values for chain {chain_index + 1}."
+            )
+        chain_seeds.append(
+            ChainSeed(
+                values=np.asarray(seed_theta, dtype=float),
+                source_label=f"direct_{method}_chain_{chain_index + 1}",
+            )
+        )
+    return chain_seeds
+
+
+def _direct_blackjax_logdensity_fn(
+    parameter_specs: list[ParameterSpec],
+    evaluator: ClusterJAXEvaluator,
+) -> Callable[[jnp.ndarray], jnp.ndarray]:
+    def logdensity(theta: jnp.ndarray) -> jnp.ndarray:
+        theta_array = jnp.asarray(theta, dtype=jnp.float64)
+        return evaluator._source_loglike_fn(theta_array) + _prior_log_prob(parameter_specs, theta_array)
+
+    return logdensity
+
+
+def _microcanonical_default_parameters(method: str, dim: int) -> dict[str, jnp.ndarray]:
+    dim_value = jnp.asarray(max(int(dim), 1), dtype=jnp.float64)
+    if method == FIT_METHOD_MCLMC:
+        step_size = jnp.sqrt(dim_value) * jnp.asarray(0.25, dtype=jnp.float64)
+    else:
+        step_size = jnp.sqrt(dim_value) * jnp.asarray(0.2, dtype=jnp.float64)
+    return {
+        "L": jnp.sqrt(dim_value),
+        "step_size": step_size,
+        "inverse_mass_matrix": jnp.ones((int(dim),), dtype=jnp.float64),
+    }
+
+
+def _microcanonical_params_dict(params: Any, method: str, dim: int) -> dict[str, jnp.ndarray]:
+    if params is None:
+        return _microcanonical_default_parameters(method, dim)
+    return {
+        "L": jnp.asarray(getattr(params, "L"), dtype=jnp.float64),
+        "step_size": jnp.asarray(getattr(params, "step_size"), dtype=jnp.float64),
+        "inverse_mass_matrix": jnp.asarray(getattr(params, "inverse_mass_matrix"), dtype=jnp.float64),
+    }
+
+
+def _mchmc_integration_steps_fn(
+    adjusted_dynamic: Any,
+    avg_num_integration_steps: Any,
+    *,
+    randomize: bool,
+) -> Callable[[jax.Array], jnp.ndarray]:
+    avg_steps = jnp.maximum(jnp.asarray(avg_num_integration_steps, dtype=jnp.float64), 1.0)
+    if randomize:
+        scale = jnp.maximum(jnp.asarray(adjusted_dynamic.rescale(avg_steps), dtype=jnp.float64), 1.0)
+
+        def integration_steps_fn(key: jax.Array) -> jnp.ndarray:
+            return jnp.maximum(1, jnp.asarray(jnp.ceil(jax.random.uniform(key) * scale), dtype=jnp.int32))
+
+        return integration_steps_fn
+
+    fixed_steps = jnp.maximum(1, jnp.asarray(jnp.ceil(avg_steps), dtype=jnp.int32))
+
+    def integration_steps_fn(_key: jax.Array) -> jnp.ndarray:
+        return fixed_steps
+
+    return integration_steps_fn
+
+
+def _microcanonical_chain_quality(
+    grouped_samples: np.ndarray,
+    grouped_log_prob: np.ndarray,
+    method: str,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    requested_chains = int(grouped_samples.shape[0])
+    sample_finite = np.isfinite(grouped_samples).all(axis=(1, 2))
+    log_prob_finite = np.isfinite(grouped_log_prob).all(axis=1)
+    valid_chain_mask = sample_finite & log_prob_finite
+    retained_indices = np.where(valid_chain_mask)[0].astype(int).tolist()
+    dropped_indices = np.where(~valid_chain_mask)[0].astype(int).tolist()
+    if not retained_indices:
+        raise RuntimeError(
+            f"All {method.upper()} chains produced non-finite posterior samples or log probabilities; "
+            "no finite chains remain."
+        )
+    return valid_chain_mask, {
+        "requested_chains": requested_chains,
+        "retained_finite_chains": int(len(retained_indices)),
+        "dropped_nonfinite_chains": int(len(dropped_indices)),
+        "retained_chain_indices": retained_indices,
+        "dropped_chain_indices": dropped_indices,
+    }
+
+
+def _microcanonical_posterior_is_usable(posterior: PosteriorResults) -> tuple[bool, str]:
+    samples = np.asarray(posterior.samples, dtype=float)
+    if samples.ndim != 2 or samples.shape[0] < 2:
+        return False, "fewer than two retained samples"
+    if not np.isfinite(samples).all():
+        return False, "non-finite posterior samples"
+    diverging = np.asarray(posterior.diverging, dtype=bool)
+    divergence_fraction = float(np.mean(diverging)) if diverging.size else 0.0
+    if divergence_fraction > 0.95:
+        return False, f"divergence/non-finite fraction is {divergence_fraction:.3f}"
+    if samples.shape[1] > 0:
+        spans = np.nanmax(samples, axis=0) - np.nanmin(samples, axis=0)
+        dynamic_parameters = int(np.sum(np.isfinite(spans) & (spans > 1.0e-10)))
+        required_dynamic = 1 if samples.shape[1] == 1 else 2
+        if dynamic_parameters < required_dynamic:
+            return False, f"only {dynamic_parameters} parameters have dynamic range"
+    accept_prob = np.asarray(posterior.accept_prob, dtype=float)
+    if posterior.sampler == FIT_METHOD_MCHMC and accept_prob.size:
+        accept_mean = float(np.nanmean(accept_prob))
+        if not np.isfinite(accept_mean) or accept_mean < 1.0e-3:
+            return False, f"mean acceptance is {accept_mean:.3g}"
+    return True, "ok"
+
+
+class _MicrocanonicalProgressReporter:
+    def __init__(
+        self,
+        progress: Progress,
+        *,
+        overall_task: int,
+        chain_task: int,
+        chains: int,
+        warmup: int,
+        samples: int,
+    ) -> None:
+        self._progress = progress
+        self._overall_task = overall_task
+        self._chain_task = chain_task
+        self._warmup = max(0, int(warmup))
+        self._samples = max(0, int(samples))
+        self._lock = Lock()
+        self._warmup_completed = [0] * int(chains)
+        self._production_completed = [0] * int(chains)
+
+    def advance_warmup_to(self, chain_index: int, completed: Any) -> None:
+        if self._warmup <= 0:
+            return
+        completed_int = int(np.asarray(completed))
+        completed_int = min(max(completed_int, 0), self._warmup)
+        with self._lock:
+            previous = self._warmup_completed[chain_index]
+            delta = completed_int - previous
+            if delta <= 0:
+                return
+            self._warmup_completed[chain_index] = completed_int
+            self._progress.advance(self._overall_task, delta)
+
+    def advance_warmup(self, chain_index: int) -> None:
+        self.advance_warmup_to(chain_index, self._warmup)
+
+    def advance_production_to(self, chain_index: int, completed: Any) -> None:
+        completed_int = int(np.asarray(completed))
+        completed_int = min(max(completed_int, 0), self._samples)
+        with self._lock:
+            previous = self._production_completed[chain_index]
+            delta = completed_int - previous
+            if delta <= 0:
+                return
+            self._production_completed[chain_index] = completed_int
+            self._progress.advance(self._overall_task, delta)
+
+    def advance_chain_complete(self) -> None:
+        with self._lock:
+            self._progress.advance(self._chain_task, 1)
+
+
+def _mclmc_tuning_transition_estimate(args: argparse.Namespace, warmup: int) -> int:
+    tune_frac1 = float(getattr(args, "microcanonical_tune_frac1", DEFAULT_MICROCANONICAL_TUNE_FRAC1))
+    tune_frac2 = float(getattr(args, "microcanonical_tune_frac2", DEFAULT_MICROCANONICAL_TUNE_FRAC2))
+    tune_frac3 = float(getattr(args, "microcanonical_tune_frac3", DEFAULT_MICROCANONICAL_TUNE_FRAC3))
+    steps1 = round(warmup * tune_frac1)
+    steps2 = round(warmup * tune_frac2)
+    if bool(getattr(args, "microcanonical_diagonal_preconditioning", DEFAULT_MICROCANONICAL_DIAGONAL_PRECONDITIONING)):
+        steps2 += steps2 // 3
+    steps3 = round(warmup * tune_frac3)
+    return int(steps1 + steps2 + (steps3 if steps3 >= 2 else 0))
+
+
+def _mchmc_tuning_transition_estimate(args: argparse.Namespace, warmup: int) -> tuple[int, float]:
+    tune_frac1 = float(getattr(args, "microcanonical_tune_frac1", DEFAULT_MICROCANONICAL_TUNE_FRAC1))
+    tune_frac2 = float(getattr(args, "microcanonical_tune_frac2", DEFAULT_MICROCANONICAL_TUNE_FRAC2))
+    tune_frac3 = float(getattr(args, "microcanonical_tune_frac3", DEFAULT_MICROCANONICAL_TUNE_FRAC3))
+    num_windows = max(1, int(getattr(args, "mchmc_num_windows", DEFAULT_MCHMC_NUM_WINDOWS)))
+    window_frac1 = tune_frac1 / num_windows
+    window_frac2 = tune_frac2 / num_windows
+    effective_tune_frac3 = tune_frac3 if int(warmup * tune_frac3 / num_windows) > 0 else 0.0
+    window_frac3 = effective_tune_frac3 / num_windows
+    steps1 = int(warmup * window_frac1)
+    steps2 = int(warmup * window_frac2)
+    steps3 = int(warmup * window_frac3)
+    per_window = steps1 + steps2 + (steps1 if steps2 != 0 else 0)
+    if effective_tune_frac3 != 0.0:
+        per_window += steps3 + steps1
+    return int(num_windows * per_window), effective_tune_frac3
+
+
+def _microcanonical_warmup_progress_units(
+    completed_transitions: Any,
+    *,
+    estimated_transitions: int,
+    warmup: int,
+) -> int:
+    if warmup <= 0:
+        return 0
+    estimated = max(1, int(estimated_transitions))
+    completed = min(max(int(np.asarray(completed_transitions)), 0), estimated)
+    return int(math.ceil(completed * warmup / estimated))
+
+
+def _run_microcanonical_chain(
+    args: argparse.Namespace,
+    method: str,
+    chain_index: int,
+    chain_seed: ChainSeed,
+    logdensity_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    *,
+    blackjax: Any,
+    mclmc_module: Any,
+    adjusted_dynamic: Any,
+    integrators: Any,
+    progress_reporter: _MicrocanonicalProgressReporter | None = None,
+) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, Any]]:
+    dim = int(np.asarray(chain_seed.values).size)
+    warmup = int(getattr(args, "warmup", DEFAULT_WARMUP))
+    samples = int(getattr(args, "samples", DEFAULT_SAMPLES))
+    if samples <= 0:
+        raise ValueError("MCHMC/MCLMC sample count must be positive.")
+    tune_frac1 = float(getattr(args, "microcanonical_tune_frac1", DEFAULT_MICROCANONICAL_TUNE_FRAC1))
+    tune_frac2 = float(getattr(args, "microcanonical_tune_frac2", DEFAULT_MICROCANONICAL_TUNE_FRAC2))
+    tune_frac3 = float(getattr(args, "microcanonical_tune_frac3", DEFAULT_MICROCANONICAL_TUNE_FRAC3))
+    if method == FIT_METHOD_MCLMC:
+        tuning_step_count_estimate = _mclmc_tuning_transition_estimate(args, warmup)
+        effective_tune_frac3 = tune_frac3
+    else:
+        tuning_step_count_estimate, effective_tune_frac3 = _mchmc_tuning_transition_estimate(args, warmup)
+    should_tune = bool(warmup > 0 and tuning_step_count_estimate > 0)
+    warmup_progress_enabled = bool(progress_reporter is not None and should_tune)
+    warmup_progress_interval = max(1, tuning_step_count_estimate // 50)
+    warmup_progress_count = 0
+    warmup_progress_lock = Lock()
+
+    def report_warmup_transition(_value: Any) -> None:
+        nonlocal warmup_progress_count
+        with warmup_progress_lock:
+            warmup_progress_count += 1
+            completed_transitions = warmup_progress_count
+        if progress_reporter is None:
+            return
+        if completed_transitions % warmup_progress_interval == 0 or completed_transitions >= tuning_step_count_estimate:
+            progress_reporter.advance_warmup_to(
+                chain_index,
+                _microcanonical_warmup_progress_units(
+                    completed_transitions,
+                    estimated_transitions=tuning_step_count_estimate,
+                    warmup=warmup,
+                ),
+            )
+
+    rng_seed = 0 if args.seed is None else int(args.seed)
+    rng_key = jax.random.PRNGKey(rng_seed + 5303 + chain_index * 1009 + (0 if method == FIT_METHOD_MCLMC else 503))
+    init_key, tune_key, run_key = jax.random.split(rng_key, 3)
+    initial_position = jnp.asarray(chain_seed.values, dtype=jnp.float64)
+    tuning_skipped = not should_tune
+    tuning_steps = 0
+    tuning_start = time.time()
+    if method == FIT_METHOD_MCLMC:
+        initial_state = mclmc_module.init(initial_position, logdensity_fn, init_key)
+        params = _microcanonical_default_parameters(method, dim)
+        tuned_state = initial_state
+        if should_tune:
+            def kernel_factory(inverse_mass_matrix: Any) -> Callable[..., tuple[Any, Any]]:
+                base_kernel = mclmc_module.build_kernel(
+                    logdensity_fn=logdensity_fn,
+                    integrator=integrators.isokinetic_mclachlan,
+                    inverse_mass_matrix=inverse_mass_matrix,
+                    desired_energy_var=float(getattr(args, "mclmc_desired_energy_var", DEFAULT_MCLMC_DESIRED_ENERGY_VAR)),
+                )
+                if not warmup_progress_enabled:
+                    return base_kernel
+
+                def progress_kernel(
+                    rng_key: jax.Array,
+                    state: Any,
+                    L: Any,
+                    step_size: Any,
+                ) -> tuple[Any, Any]:
+                    jax.debug.callback(report_warmup_transition, jnp.asarray(0, dtype=jnp.int32), ordered=False)
+                    return base_kernel(rng_key, state, L, step_size)
+
+                return progress_kernel
+
+            tuned_state, tuned_params, tuning_steps_value = blackjax.mclmc_find_L_and_step_size(
+                mclmc_kernel=kernel_factory,
+                num_steps=warmup,
+                state=initial_state,
+                rng_key=tune_key,
+                frac_tune1=tune_frac1,
+                frac_tune2=tune_frac2,
+                frac_tune3=tune_frac3,
+                desired_energy_var=float(getattr(args, "mclmc_desired_energy_var", DEFAULT_MCLMC_DESIRED_ENERGY_VAR)),
+                trust_in_estimate=float(getattr(args, "mclmc_trust_in_estimate", DEFAULT_MCLMC_TRUST_IN_ESTIMATE)),
+                num_effective_samples=int(getattr(args, "mclmc_num_effective_samples", DEFAULT_MCLMC_NUM_EFFECTIVE_SAMPLES)),
+                diagonal_preconditioning=bool(
+                    getattr(
+                        args,
+                        "microcanonical_diagonal_preconditioning",
+                        DEFAULT_MICROCANONICAL_DIAGONAL_PRECONDITIONING,
+                    )
+                ),
+                Lfactor=float(getattr(args, "mclmc_lfactor", DEFAULT_MCLMC_LFACTOR)),
+            )
+            tuning_steps = int(np.asarray(tuning_steps_value))
+            params = _microcanonical_params_dict(tuned_params, method, dim)
+        algorithm = blackjax.mclmc(
+            logdensity_fn=logdensity_fn,
+            L=params["L"],
+            step_size=params["step_size"],
+            integrator=integrators.isokinetic_mclachlan,
+            inverse_mass_matrix=params["inverse_mass_matrix"],
+        )
+    else:
+        initial_state = adjusted_dynamic.init(initial_position, logdensity_fn, init_key)
+        params = _microcanonical_default_parameters(method, dim)
+        tuned_state = initial_state
+
+        def adjusted_kernel(
+            *,
+            rng_key: jax.Array,
+            state: Any,
+            avg_num_integration_steps: Any,
+            step_size: Any,
+            inverse_mass_matrix: Any,
+        ) -> tuple[Any, Any]:
+            if warmup_progress_enabled:
+                jax.debug.callback(report_warmup_transition, jnp.asarray(0, dtype=jnp.int32), ordered=False)
+            kernel = adjusted_dynamic.build_kernel(
+                integration_steps_fn=_mchmc_integration_steps_fn(
+                    adjusted_dynamic,
+                    avg_num_integration_steps,
+                    randomize=bool(getattr(args, "mchmc_random_trajectory_length", DEFAULT_MCHMC_RANDOM_TRAJECTORY_LENGTH)),
+                ),
+                integrator=integrators.isokinetic_mclachlan,
+                divergence_threshold=float(getattr(args, "mchmc_divergence_threshold", DEFAULT_MCHMC_DIVERGENCE_THRESHOLD)),
+                inverse_mass_matrix=inverse_mass_matrix,
+            )
+            return kernel(
+                rng_key,
+                state,
+                logdensity_fn,
+                step_size,
+                float(getattr(args, "mchmc_l_proposal_factor", DEFAULT_MCHMC_L_PROPOSAL_FACTOR)),
+            )
+
+        if should_tune:
+            tuned_state, tuned_params, tuning_steps_value = blackjax.adjusted_mclmc_find_L_and_step_size(
+                mclmc_kernel=adjusted_kernel,
+                num_steps=warmup,
+                state=initial_state,
+                rng_key=tune_key,
+                target=float(getattr(args, "mchmc_target_accept", DEFAULT_MCHMC_TARGET_ACCEPT)),
+                frac_tune1=tune_frac1,
+                frac_tune2=tune_frac2,
+                frac_tune3=effective_tune_frac3,
+                diagonal_preconditioning=bool(
+                    getattr(
+                        args,
+                        "microcanonical_diagonal_preconditioning",
+                        DEFAULT_MICROCANONICAL_DIAGONAL_PRECONDITIONING,
+                    )
+                ),
+                max=str(getattr(args, "mchmc_l_estimator", DEFAULT_MCHMC_L_ESTIMATOR)),
+                num_windows=int(getattr(args, "mchmc_num_windows", DEFAULT_MCHMC_NUM_WINDOWS)),
+                tuning_factor=float(getattr(args, "mchmc_tuning_factor", DEFAULT_MCHMC_TUNING_FACTOR)),
+            )
+            tuning_steps = int(np.asarray(tuning_steps_value))
+            params = _microcanonical_params_dict(tuned_params, method, dim)
+        avg_steps = params["L"] / jnp.maximum(params["step_size"], jnp.asarray(1.0e-300, dtype=jnp.float64))
+        algorithm = blackjax.adjusted_mclmc_dynamic(
+            logdensity_fn=logdensity_fn,
+            step_size=params["step_size"],
+            L_proposal_factor=float(getattr(args, "mchmc_l_proposal_factor", DEFAULT_MCHMC_L_PROPOSAL_FACTOR)),
+            inverse_mass_matrix=params["inverse_mass_matrix"],
+            divergence_threshold=float(getattr(args, "mchmc_divergence_threshold", DEFAULT_MCHMC_DIVERGENCE_THRESHOLD)),
+            integrator=integrators.isokinetic_mclachlan,
+            integration_steps_fn=_mchmc_integration_steps_fn(
+                adjusted_dynamic,
+                avg_steps,
+                randomize=bool(getattr(args, "mchmc_random_trajectory_length", DEFAULT_MCHMC_RANDOM_TRAJECTORY_LENGTH)),
+            ),
+        )
+    tuning_elapsed = time.time() - tuning_start
+    if progress_reporter is not None:
+        progress_reporter.advance_warmup(chain_index)
+    step = jax.jit(algorithm.step)
+    run_keys = jax.random.split(run_key, samples)
+    progress_interval = max(1, samples // 50)
+
+    def scan_step(carry: Any, xs: tuple[jax.Array, jax.Array]) -> tuple[Any, tuple[Any, ...]]:
+        sample_index, key = xs
+        new_state, info = step(key, carry)
+        if method == FIT_METHOD_MCLMC:
+            accept_prob = jnp.asarray(1.0, dtype=jnp.float64)
+            diverging = jnp.logical_not(jnp.asarray(info.nonans, dtype=bool))
+            num_steps = jnp.asarray(1.0, dtype=jnp.float64)
+            energy_value = jnp.asarray(info.energy_change, dtype=jnp.float64)
+            accepted = jnp.asarray(True, dtype=bool)
+            nonans = jnp.asarray(info.nonans, dtype=bool)
+        else:
+            accept_prob = jnp.asarray(info.acceptance_rate, dtype=jnp.float64)
+            diverging = jnp.asarray(info.is_divergent, dtype=bool)
+            num_steps = jnp.asarray(info.num_integration_steps, dtype=jnp.float64)
+            energy_value = jnp.asarray(info.energy, dtype=jnp.float64)
+            accepted = jnp.asarray(info.is_accepted, dtype=bool)
+            nonans = jnp.logical_not(diverging)
+        if progress_reporter is not None:
+            completed = sample_index + jnp.asarray(1, dtype=sample_index.dtype)
+
+            def report_progress(value: Any) -> None:
+                progress_reporter.advance_production_to(chain_index, value)
+
+            _ = jax.lax.cond(
+                ((completed % progress_interval) == 0) | (completed == samples),
+                lambda _: jax.debug.callback(report_progress, completed, ordered=False),
+                lambda _: None,
+                operand=None,
+            )
+        return new_state, (
+            jnp.asarray(new_state.position, dtype=jnp.float64),
+            jnp.asarray(new_state.logdensity, dtype=jnp.float64),
+            accept_prob,
+            diverging,
+            num_steps,
+            energy_value,
+            accepted,
+            nonans,
+        )
+
+    scan = jax.jit(lambda state, keys: jax.lax.scan(scan_step, state, (jnp.arange(samples), keys)))
+    run_start = time.time()
+    final_state, outputs = scan(tuned_state, run_keys)
+    jax.tree_util.tree_map(
+        lambda value: value.block_until_ready() if hasattr(value, "block_until_ready") else value,
+        final_state,
+    )
+    run_elapsed = time.time() - run_start
+    positions, state_logdensity, accept_prob, diverging, num_steps, energy, accepted, nonans = outputs
+    chain_samples = np.asarray(positions, dtype=float)
+    info = {
+        "state_logdensity": np.asarray(state_logdensity, dtype=float),
+        "accept_prob": np.asarray(accept_prob, dtype=float),
+        "diverging": np.asarray(diverging, dtype=bool),
+        "num_steps": np.asarray(num_steps, dtype=float),
+        "energy": np.asarray(energy, dtype=float),
+        "is_accepted": np.asarray(accepted, dtype=bool),
+        "nonans": np.asarray(nonans, dtype=bool),
+    }
+    diagnostics = {
+        "chain_index": int(chain_index),
+        "chain_seed_label": str(chain_seed.source_label),
+        "microcanonical_L": float(np.asarray(params["L"], dtype=float)),
+        "microcanonical_step_size": float(np.asarray(params["step_size"], dtype=float)),
+        "microcanonical_inverse_mass_matrix": np.asarray(params["inverse_mass_matrix"], dtype=float),
+        "microcanonical_tuning_steps": int(tuning_steps),
+        "microcanonical_tuning_skipped": bool(tuning_skipped),
+        "microcanonical_tuning_runtime_sec": float(tuning_elapsed),
+        "microcanonical_production_runtime_sec": float(run_elapsed),
+    }
+    return chain_samples, info, diagnostics
+
+
+def _run_blackjax_microcanonical_sampler(
+    args: argparse.Namespace,
+    state: BuildState,
+    evaluator: ClusterJAXEvaluator,
+    method: str,
+) -> PosteriorResults:
+    if method not in MICROCANONICAL_FIT_METHODS:
+        raise ValueError(f"Unsupported microcanonical sampler {method!r}.")
+    parameter_specs = state.parameter_specs
+    if not parameter_specs:
+        raise RuntimeError("BlackJAX MCHMC/MCLMC requires at least one free parameter.")
+    if len(parameter_specs) < 2:
+        raise RuntimeError("BlackJAX MCHMC/MCLMC requires at least two free parameters.")
+    _validate_microcanonical_controls(args)
+    warmup = int(getattr(args, "warmup", DEFAULT_WARMUP))
+    samples_requested = int(getattr(args, "samples", DEFAULT_SAMPLES))
+    chains_requested = int(getattr(args, "chains", 1))
+    if chains_requested <= 0:
+        raise ValueError("MCHMC/MCLMC chain count must be positive.")
+    if samples_requested <= 0:
+        raise ValueError("MCHMC/MCLMC sample count must be positive.")
+    default_device = _resolve_jax_device_for_args(args, "jax_default_device", flag_name="--jax-default-device")
+    blackjax, mclmc_module, adjusted_dynamic, integrators = _blackjax_microcanonical_components()
+    reference = _reference_theta_from_init_values(
+        parameter_specs,
+        getattr(state, "svi_init_values", None),
+        _default_theta(parameter_specs),
+    )
+    chain_seeds = _make_microcanonical_chain_seeds(args, parameter_specs, reference, method)
+    if warmup <= 0:
+        _log(args, f"[{method}] warmup=0; skipping BlackJAX tuning and using default L/step-size parameters")
+    _log(
+        args,
+        (
+            f"[{method}] preparing sampler chains={chains_requested} warmup={warmup} "
+            f"samples={samples_requested} thin={int(getattr(args, 'thin', 1))} "
+            f"diagonal_preconditioning={bool(getattr(args, 'microcanonical_diagonal_preconditioning', DEFAULT_MICROCANONICAL_DIAGONAL_PRECONDITIONING))} "
+            f"device={_jax_device_label(default_device)}"
+        ),
+    )
+    logdensity_fn = _direct_blackjax_logdensity_fn(parameter_specs, evaluator)
+    grouped_samples_list: list[np.ndarray | None] = [None] * chains_requested
+    grouped_state_logdensity_list: list[np.ndarray | None] = [None] * chains_requested
+    grouped_accept_list: list[np.ndarray | None] = [None] * chains_requested
+    grouped_diverging_list: list[np.ndarray | None] = [None] * chains_requested
+    grouped_num_steps_list: list[np.ndarray | None] = [None] * chains_requested
+    grouped_energy_list: list[np.ndarray | None] = [None] * chains_requested
+    grouped_accepted_list: list[np.ndarray | None] = [None] * chains_requested
+    grouped_nonans_list: list[np.ndarray | None] = [None] * chains_requested
+    per_chain_diag: list[dict[str, Any] | None] = [None] * chains_requested
+    sampler_start = time.time()
+    progress_reporter: _MicrocanonicalProgressReporter | None = None
+
+    def run_chain_worker(
+        chain_index: int,
+        chain_seed: ChainSeed,
+    ) -> tuple[int, np.ndarray, dict[str, np.ndarray], dict[str, Any]]:
+        with _jax_device_context(default_device):
+            chain_samples, chain_info, chain_diag = _run_microcanonical_chain(
+                args,
+                method,
+                chain_index,
+                chain_seed,
+                logdensity_fn,
+                blackjax=blackjax,
+                mclmc_module=mclmc_module,
+                adjusted_dynamic=adjusted_dynamic,
+                integrators=integrators,
+                progress_reporter=progress_reporter,
+            )
+        return chain_index, chain_samples, chain_info, chain_diag
+
+    _log(
+        args,
+        (
+            f"[{method}] launching parallel chains workers={chains_requested} "
+            f"warmup={warmup} samples={samples_requested} device={_jax_device_label(default_device)}"
+        ),
+    )
+    progress_cm = (
+        Progress(
+            TextColumn("{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            transient=True,
+        )
+        if not bool(getattr(args, "quiet", False))
+        else nullcontext(None)
+    )
+    with ThreadPoolExecutor(max_workers=chains_requested) as executor, progress_cm as progress:
+        if progress is not None:
+            overall_task = progress.add_task(
+                f"{method}: warmup+sampling",
+                total=chains_requested * (max(0, warmup) + samples_requested),
+            )
+            chain_task = progress.add_task(f"{method}: chains complete", total=chains_requested)
+            progress_reporter = _MicrocanonicalProgressReporter(
+                progress,
+                overall_task=overall_task,
+                chain_task=chain_task,
+                chains=chains_requested,
+                warmup=warmup,
+                samples=samples_requested,
+            )
+        futures = {}
+        for chain_index, chain_seed in enumerate(chain_seeds):
+            _log(args, f"[{method}] chain={chain_index + 1}/{chains_requested} tuning+sampling submitted")
+            future = executor.submit(run_chain_worker, chain_index, chain_seed)
+            futures[future] = chain_index
+        for future in as_completed(futures):
+            chain_index = futures[future]
+            try:
+                result_index, chain_samples, chain_info, chain_diag = future.result()
+            except Exception as exc:
+                for pending in futures:
+                    if pending is not future:
+                        pending.cancel()
+                raise RuntimeError(f"{method.upper()} chain {chain_index + 1}/{chains_requested} failed") from exc
+            grouped_samples_list[result_index] = chain_samples
+            grouped_state_logdensity_list[result_index] = chain_info["state_logdensity"]
+            grouped_accept_list[result_index] = chain_info["accept_prob"]
+            grouped_diverging_list[result_index] = chain_info["diverging"]
+            grouped_num_steps_list[result_index] = chain_info["num_steps"]
+            grouped_energy_list[result_index] = chain_info["energy"]
+            grouped_accepted_list[result_index] = chain_info["is_accepted"]
+            grouped_nonans_list[result_index] = chain_info["nonans"]
+            per_chain_diag[result_index] = chain_diag
+            _log(
+                args,
+                (
+                    f"[{method}] chain={result_index + 1}/{chains_requested} complete "
+                    f"L={chain_diag['microcanonical_L']:.4g} "
+                    f"step_size={chain_diag['microcanonical_step_size']:.4g} "
+                    f"tune_runtime={_fmt_seconds(chain_diag['microcanonical_tuning_runtime_sec'])} "
+                    f"production_runtime={_fmt_seconds(chain_diag['microcanonical_production_runtime_sec'])}"
+                ),
+            )
+            if progress_reporter is not None:
+                progress_reporter.advance_chain_complete()
+    if any(value is None for value in grouped_samples_list):
+        raise RuntimeError(f"{method.upper()} failed to return all requested chains.")
+    grouped_samples_unthinned = np.asarray(grouped_samples_list, dtype=float)
+    with _jax_device_context(default_device):
+        flat_unthinned = grouped_samples_unthinned.reshape(-1, grouped_samples_unthinned.shape[-1])
+        log_prob_unthinned = _posterior_logprob_matrix(parameter_specs, evaluator, flat_unthinned)
+    grouped_log_prob_unthinned = np.asarray(log_prob_unthinned, dtype=float).reshape(
+        grouped_samples_unthinned.shape[:2]
+    )
+    grouped_state_logdensity = np.asarray(grouped_state_logdensity_list, dtype=float)
+    grouped_accept = np.asarray(grouped_accept_list, dtype=float)
+    grouped_diverging = np.asarray(grouped_diverging_list, dtype=bool)
+    grouped_num_steps = np.asarray(grouped_num_steps_list, dtype=float)
+    grouped_energy = np.asarray(grouped_energy_list, dtype=float)
+    grouped_accepted = np.asarray(grouped_accepted_list, dtype=bool)
+    grouped_nonans = np.asarray(grouped_nonans_list, dtype=bool)
+    valid_chain_mask, chain_quality_diag = _microcanonical_chain_quality(
+        grouped_samples_unthinned,
+        grouped_log_prob_unthinned,
+        method,
+    )
+    grouped_samples_unthinned = grouped_samples_unthinned[valid_chain_mask]
+    grouped_log_prob_unthinned = grouped_log_prob_unthinned[valid_chain_mask]
+    grouped_state_logdensity = grouped_state_logdensity[valid_chain_mask]
+    grouped_accept = grouped_accept[valid_chain_mask]
+    grouped_diverging = grouped_diverging[valid_chain_mask]
+    grouped_num_steps = grouped_num_steps[valid_chain_mask]
+    grouped_energy = grouped_energy[valid_chain_mask]
+    grouped_accepted = grouped_accepted[valid_chain_mask]
+    grouped_nonans = grouped_nonans[valid_chain_mask]
+    retained_chain_diag = [diag for keep, diag in zip(valid_chain_mask.tolist(), per_chain_diag) if keep]
+    thin = max(1, int(getattr(args, "thin", 1)))
+    grouped_samples = grouped_samples_unthinned[:, ::thin, :]
+    grouped_log_prob = grouped_log_prob_unthinned[:, ::thin]
+    grouped_state_logdensity = grouped_state_logdensity[:, ::thin]
+    samples = grouped_samples.reshape(-1, grouped_samples.shape[-1])
+    log_prob = grouped_log_prob.reshape(-1)
+    accept_prob = grouped_accept[:, ::thin].reshape(-1)
+    diverging = grouped_diverging[:, ::thin].reshape(-1)
+    num_steps = grouped_num_steps[:, ::thin].reshape(-1)
+    energy = grouped_energy[:, ::thin].reshape(-1)
+    accepted = grouped_accepted[:, ::thin].reshape(-1)
+    nonans = grouped_nonans[:, ::thin].reshape(-1)
+    sampler_elapsed = time.time() - sampler_start
+    evaluator.timing_totals[f"{method}_runtime"] = evaluator.timing_totals.get(f"{method}_runtime", 0.0) + sampler_elapsed
+    L_values = np.asarray([diag["microcanonical_L"] for diag in retained_chain_diag], dtype=float)
+    step_values = np.asarray([diag["microcanonical_step_size"] for diag in retained_chain_diag], dtype=float)
+    inverse_mass_values = [
+        np.asarray(diag["microcanonical_inverse_mass_matrix"], dtype=float).reshape(-1)
+        for diag in retained_chain_diag
+    ]
+    inverse_mass = np.concatenate(inverse_mass_values) if inverse_mass_values else np.empty((0,), dtype=float)
+    diagnostics = {
+        "strategy_requested": method,
+        "strategy_used": method,
+        "svi_used": False,
+        "sampler": method,
+        "microcanonical_sampler": "blackjax_mclmc" if method == FIT_METHOD_MCLMC else "blackjax_adjusted_mclmc_dynamic",
+        "jax_default_device": _jax_device_label(default_device),
+        "microcanonical_warmup": int(warmup),
+        "microcanonical_samples": int(samples_requested),
+        "microcanonical_thin": int(thin),
+        "microcanonical_diagonal_preconditioning": bool(
+            getattr(args, "microcanonical_diagonal_preconditioning", DEFAULT_MICROCANONICAL_DIAGONAL_PRECONDITIONING)
+        ),
+        "microcanonical_tune_frac1": float(getattr(args, "microcanonical_tune_frac1", DEFAULT_MICROCANONICAL_TUNE_FRAC1)),
+        "microcanonical_tune_frac2": float(getattr(args, "microcanonical_tune_frac2", DEFAULT_MICROCANONICAL_TUNE_FRAC2)),
+        "microcanonical_tune_frac3": float(getattr(args, "microcanonical_tune_frac3", DEFAULT_MICROCANONICAL_TUNE_FRAC3)),
+        "microcanonical_tuning_steps": [int(diag["microcanonical_tuning_steps"]) for diag in retained_chain_diag],
+        "microcanonical_tuning_skipped": bool(
+            all(bool(diag["microcanonical_tuning_skipped"]) for diag in retained_chain_diag)
+        ),
+        "microcanonical_L_summary": _finite_array_stats(L_values),
+        "microcanonical_step_size_summary": _finite_array_stats(step_values),
+        "microcanonical_inverse_mass_summary": _finite_array_stats(inverse_mass),
+        "microcanonical_runtime_sec": float(sampler_elapsed),
+        "microcanonical_energy_summary": _finite_array_stats(energy),
+        "microcanonical_accept_mean": float(np.nanmean(accept_prob)) if accept_prob.size else float("nan"),
+        "microcanonical_divergence_count": int(np.sum(diverging)) if diverging.size else 0,
+        "microcanonical_divergence_fraction": float(np.mean(diverging)) if diverging.size else 0.0,
+        "microcanonical_num_steps_summary": _finite_array_stats(num_steps),
+        "microcanonical_is_accepted_fraction": float(np.mean(accepted)) if accepted.size else float("nan"),
+        "microcanonical_nonans_fraction": float(np.mean(nonans)) if nonans.size else float("nan"),
+        "microcanonical_per_chain": [
+            {
+                key: value
+                for key, value in diag.items()
+                if key != "microcanonical_inverse_mass_matrix"
+            }
+            for diag in retained_chain_diag
+        ],
+        "requested_chains": int(chains_requested),
+        "chain_seed_labels": [seed.source_label for seed in chain_seeds],
+        "distinct_chain_seeds": int(len({tuple(np.round(seed.values, 8)) for seed in chain_seeds})),
+        "invalid_state_rejection_count": int(getattr(evaluator, "invalid_state_rejection_count", 0)),
+        "invalid_state_reason_counts": {
+            key: int(value) for key, value in dict(getattr(evaluator, "invalid_state_reason_counts", {})).items()
+        },
+        "fixed_surrogate_drift": _smc_fixed_surrogate_drift_summary(evaluator, samples),
+        **chain_quality_diag,
+    }
+    if method == FIT_METHOD_MCLMC:
+        diagnostics.update(
+            {
+                "mclmc_desired_energy_var": float(getattr(args, "mclmc_desired_energy_var", DEFAULT_MCLMC_DESIRED_ENERGY_VAR)),
+                "mclmc_trust_in_estimate": float(getattr(args, "mclmc_trust_in_estimate", DEFAULT_MCLMC_TRUST_IN_ESTIMATE)),
+                "mclmc_num_effective_samples": int(getattr(args, "mclmc_num_effective_samples", DEFAULT_MCLMC_NUM_EFFECTIVE_SAMPLES)),
+                "mclmc_lfactor": float(getattr(args, "mclmc_lfactor", DEFAULT_MCLMC_LFACTOR)),
+                "mclmc_unadjusted_bias_warning": True,
+            }
+        )
+    else:
+        diagnostics.update(
+            {
+                "mchmc_target_accept": float(getattr(args, "mchmc_target_accept", DEFAULT_MCHMC_TARGET_ACCEPT)),
+                "mchmc_random_trajectory_length": bool(
+                    getattr(args, "mchmc_random_trajectory_length", DEFAULT_MCHMC_RANDOM_TRAJECTORY_LENGTH)
+                ),
+                "mchmc_l_proposal_factor": float(getattr(args, "mchmc_l_proposal_factor", DEFAULT_MCHMC_L_PROPOSAL_FACTOR)),
+                "mchmc_divergence_threshold": float(
+                    getattr(args, "mchmc_divergence_threshold", DEFAULT_MCHMC_DIVERGENCE_THRESHOLD)
+                ),
+                "mchmc_num_windows": int(getattr(args, "mchmc_num_windows", DEFAULT_MCHMC_NUM_WINDOWS)),
+                "mchmc_tuning_factor": float(getattr(args, "mchmc_tuning_factor", DEFAULT_MCHMC_TUNING_FACTOR)),
+                "mchmc_l_estimator": str(getattr(args, "mchmc_l_estimator", DEFAULT_MCHMC_L_ESTIMATOR)),
+            }
+        )
+    posterior = PosteriorResults(
+        samples=samples,
+        log_prob=log_prob,
+        accept_prob=accept_prob,
+        diverging=diverging,
+        num_steps=num_steps,
+        warmup_steps=warmup,
+        sample_steps=samples_requested,
+        num_chains=int(chain_quality_diag["retained_finite_chains"]),
+        init_diagnostics=diagnostics,
+        grouped_samples=grouped_samples,
+        grouped_log_prob=grouped_log_prob,
+        sampler=method,
+    )
+    if bool(getattr(args, "debug_sampler_diagnostics", False)):
+        try:
+            retained_inverse_mass_matrix = np.asarray(
+                [
+                    np.asarray(diag["microcanonical_inverse_mass_matrix"], dtype=float).reshape(-1)
+                    for diag in retained_chain_diag
+                ],
+                dtype=float,
+            )
+            debug_extra = {
+                "accept_prob": grouped_accept[:, ::thin],
+                "diverging": grouped_diverging[:, ::thin],
+                "num_steps": grouped_num_steps[:, ::thin],
+                "energy": grouped_energy[:, ::thin],
+                "state_logdensity": grouped_state_logdensity,
+                "is_accepted": grouped_accepted[:, ::thin],
+                "nonans": grouped_nonans[:, ::thin],
+                "potential_energy": -grouped_log_prob,
+                "microcanonical_step_size": step_values,
+                "microcanonical_L": L_values,
+                "microcanonical_inverse_mass_matrix": retained_inverse_mass_matrix[:, np.newaxis, :],
+            }
+            debug_init = NUTSInitialization(
+                init_params={},
+                chain_seeds=chain_seeds,
+                diagnostics=diagnostics,
+                reference_theta=np.asarray(reference, dtype=float),
+            )
+            debug_diag = _run_logged_phase(
+                args,
+                "sampler_debug.write_diagnostics",
+                lambda: _write_sampler_debug_diagnostics(args, state, evaluator, debug_init, posterior, debug_extra),
+            )
+            if debug_diag:
+                posterior.init_diagnostics["sampler_debug_diagnostics"] = dict(debug_diag)
+        except Exception as exc:  # pragma: no cover - diagnostics should not change sampler behavior
+            _log(args, f"[sampler-debug] failed to write diagnostics: {exc}")
+    _log_posterior_summary(args, method, posterior)
+    _log(
+        args,
+        (
+            f"[{method}] complete in {_fmt_seconds(sampler_elapsed)} "
+            f"accept_mean={diagnostics['microcanonical_accept_mean']:.3f} "
+            f"divergences={diagnostics['microcanonical_divergence_count']} "
+            f"mean_steps={diagnostics['microcanonical_num_steps_summary']['mean']:.3g} "
+            f"retained_samples={samples.shape[0]}"
+        ),
+    )
+    gc.collect()
+    return posterior
+
+
 def _prepare_svi_health_for_nuts(
     args: argparse.Namespace,
     parameter_specs: list[ParameterSpec],
@@ -6935,6 +8933,7 @@ class _SviRefreshCacheSnapshot:
     reference_params: np.ndarray | None
     shapes: dict[str, tuple[int, ...]]
     probes: dict[str, _SviRefreshArrayProbe]
+    total_nbytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -6942,6 +8941,8 @@ class _SviRefreshCacheDelta:
     enabled: bool
     before_arrays: int
     after_arrays: int
+    before_nbytes: int
+    after_nbytes: int
     compared_arrays: int
     compared_values: int
     added_arrays: int
@@ -6958,6 +8959,26 @@ class _SviRefreshParameterDelta:
     top_changes: str
 
 
+@dataclass(frozen=True)
+class _SviRefreshCacheStatus:
+    name: str
+    rms: str
+    max_abs: str
+    status: str
+    meaning: str
+    style: str
+    structural_change: bool = False
+
+
+@dataclass(frozen=True)
+class _NutsSviDeviationStatus:
+    metric: str
+    value: str
+    status: str
+    meaning: str
+    style: str
+
+
 def _svi_refresh_float(value: Any) -> str:
     try:
         scalar = float(value)
@@ -6968,6 +8989,16 @@ def _svi_refresh_float(value: Any) -> str:
     if scalar == 0.0:
         return "0"
     return f"{scalar:.3g}"
+
+
+def _format_mb_from_bytes(nbytes: int) -> str:
+    try:
+        value = float(nbytes) / (1024.0 * 1024.0)
+    except (TypeError, ValueError):
+        return "na"
+    if not np.isfinite(value):
+        return "na"
+    return f"{value:.3g}"
 
 
 def _svi_refresh_key(value: Any) -> str:
@@ -7013,6 +9044,13 @@ def _svi_refresh_numeric_array(value: Any) -> Any | None:
     ):
         return None
     return array
+
+
+def _svi_refresh_array_nbytes(array: Any) -> int:
+    try:
+        return int(array.size) * int(np.dtype(array.dtype).itemsize)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _svi_refresh_cache_entry_items(entry: Any) -> list[tuple[str, Any]]:
@@ -7061,9 +9099,10 @@ def _svi_refresh_cache_snapshot(
     max_values_per_array: int = _SVI_REFRESH_MAX_VALUES_PER_ARRAY,
 ) -> _SviRefreshCacheSnapshot:
     if not enabled:
-        return _SviRefreshCacheSnapshot(enabled=False, reference_params=None, shapes={}, probes={})
+        return _SviRefreshCacheSnapshot(enabled=False, reference_params=None, shapes={}, probes={}, total_nbytes=0)
     arrays = _svi_refresh_cache_arrays(cache_by_z)
     shapes = {key: tuple(int(dim) for dim in array.shape) for key, array in arrays}
+    total_nbytes = sum(_svi_refresh_array_nbytes(array) for _key, array in arrays)
     probes = {
         key: _svi_refresh_sample_array(array, max_values_per_array)
         for key, array in arrays[: max(0, int(max_arrays))]
@@ -7073,6 +9112,7 @@ def _svi_refresh_cache_snapshot(
         reference_params=_svi_refresh_reference(reference_params),
         shapes=shapes,
         probes=probes,
+        total_nbytes=int(total_nbytes),
     )
 
 
@@ -7094,6 +9134,59 @@ def _svi_refresh_evaluator_snapshot(evaluator: Any) -> dict[str, _SviRefreshCach
     }
 
 
+def _log_evaluator_memory_shape_diagnostics(
+    args: argparse.Namespace,
+    evaluator: Any,
+    *,
+    reason: str,
+) -> None:
+    bins = list(getattr(evaluator, "traced_bin_data", []) or [])
+    image_counts: list[int] = []
+    constrained_counts: list[int] = []
+    x_ndims: set[int] = set()
+    y_ndims: set[int] = set()
+    x_nbytes = 0
+    y_nbytes = 0
+    for bin_data in bins:
+        x_obs = np.asarray(getattr(bin_data, "x_obs", np.empty((0,), dtype=float)))
+        y_obs = np.asarray(getattr(bin_data, "y_obs", np.empty((0,), dtype=float)))
+        image_counts.append(int(x_obs.size))
+        x_ndims.add(int(x_obs.ndim))
+        y_ndims.add(int(y_obs.ndim))
+        x_nbytes += int(x_obs.nbytes)
+        y_nbytes += int(y_obs.nbytes)
+        image_has_constraint = np.asarray(
+            getattr(bin_data, "image_has_constraint", np.ones(int(x_obs.size), dtype=bool)),
+            dtype=bool,
+        )
+        constrained_counts.append(int(np.count_nonzero(image_has_constraint)))
+    cache_snapshot = _svi_refresh_evaluator_snapshot(evaluator)
+    cache_parts = [
+        f"{name}={_format_mb_from_bytes(snapshot.total_nbytes)}"
+        for name, snapshot in cache_snapshot.items()
+    ]
+    sample_likelihood_mode = str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))
+    _log(
+        args,
+        (
+            f"[memory] evaluator_shapes reason={reason} "
+            f"sampling_engine={getattr(evaluator, 'sampling_engine', '<unknown>')} "
+            f"sample_likelihood={sample_likelihood_mode} "
+            f"images={sum(image_counts)} z_bins={len(bins)} "
+            f"max_bin_images={(max(image_counts) if image_counts else 0)} "
+            f"constrained_images={sum(constrained_counts)} "
+            f"x_obs_ndim={','.join(str(value) for value in sorted(x_ndims)) if x_ndims else 'none'} "
+            f"y_obs_ndim={','.join(str(value) for value in sorted(y_ndims)) if y_ndims else 'none'} "
+            f"obs_nbytes={_format_mb_from_bytes(x_nbytes + y_nbytes)} "
+            f"surrogate_enabled={bool(getattr(evaluator, 'surrogate_enabled', False))} "
+            f"jacobian_surrogate={bool(getattr(evaluator, 'surrogate_enabled', False) and _sample_likelihood_uses_image_plane_jacobian(sample_likelihood_mode))} "
+            f"active_scaling={len(getattr(evaluator, 'active_scaling_component_indices', []))} "
+            f"inactive_scaling={len(getattr(evaluator, 'inactive_scaling_component_indices', []))} "
+            f"cache_mb={' '.join(cache_parts)}"
+        ),
+    )
+
+
 def _svi_refresh_cache_delta(
     before: _SviRefreshCacheSnapshot,
     after: _SviRefreshCacheSnapshot,
@@ -7103,6 +9196,8 @@ def _svi_refresh_cache_delta(
             enabled=False,
             before_arrays=0,
             after_arrays=0,
+            before_nbytes=0,
+            after_nbytes=0,
             compared_arrays=0,
             compared_values=0,
             added_arrays=0,
@@ -7142,6 +9237,8 @@ def _svi_refresh_cache_delta(
         enabled=True,
         before_arrays=len(before_keys),
         after_arrays=len(after_keys),
+        before_nbytes=int(before.total_nbytes),
+        after_nbytes=int(after.total_nbytes),
         compared_arrays=compared_arrays,
         compared_values=compared_values,
         added_arrays=len(after_keys - before_keys),
@@ -7156,15 +9253,193 @@ def _format_svi_refresh_cache_delta(label: str, delta: _SviRefreshCacheDelta) ->
     if not delta.enabled:
         return f"{label}=disabled"
     if delta.before_arrays == 0 and delta.after_arrays == 0:
-        return f"{label}=empty arrays=0"
+        return f"{label}=empty arrays=0 mb=0"
     return (
         f"{label}=max={_svi_refresh_float(delta.max_abs)} "
         f"rms={_svi_refresh_float(delta.rms)} "
         f"probes={delta.compared_values} "
         f"arrays={delta.compared_arrays}/{delta.after_arrays} "
+        f"mb={_format_mb_from_bytes(delta.after_nbytes)} "
+        f"dmb={_format_mb_from_bytes(delta.after_nbytes - delta.before_nbytes)} "
         f"added={delta.added_arrays} removed={delta.removed_arrays} "
         f"shape={delta.shape_changed_arrays}"
     )
+
+
+_SVI_REFRESH_STATUS_THRESHOLDS = {
+    "surrogate": {
+        "green": (0.05, 0.20),
+        "yellow": (0.12, 0.50),
+        "good": "local approximation stable",
+        "watch": "local approximation drifted mildly",
+        "stale": "local approximation drift is large",
+    },
+    "scaling": {
+        "green": (0.30, 1.00),
+        "yellow": (1.00, 3.00),
+        "good": "scatter linearization stable",
+        "watch": "scatter linearization drifted mildly",
+        "stale": "scatter linearization drift is large",
+    },
+    "source_metric": {
+        "green": (0.05, 0.20),
+        "yellow": (0.15, 0.75),
+        "good": "lensing metric stable",
+        "watch": "lensing metric changed mildly",
+        "stale": "lensing metric changed strongly",
+    },
+}
+
+
+def _svi_refresh_status_style(status: str) -> str:
+    if status == "good":
+        return "bold green"
+    if status == "watch":
+        return "bold yellow"
+    if status == "stale":
+        return "bold red"
+    return "dim"
+
+
+def _classify_svi_refresh_cache_delta(label: str, delta: _SviRefreshCacheDelta) -> _SviRefreshCacheStatus:
+    if not delta.enabled:
+        return _SviRefreshCacheStatus(
+            name=label,
+            rms="na",
+            max_abs="na",
+            status="disabled",
+            meaning="cache is not active for this run",
+            style=_svi_refresh_status_style("disabled"),
+        )
+    if delta.before_arrays == 0 and delta.after_arrays == 0:
+        return _SviRefreshCacheStatus(
+            name=label,
+            rms="na",
+            max_abs="na",
+            status="empty",
+            meaning="cache has no arrays to compare",
+            style=_svi_refresh_status_style("empty"),
+        )
+    thresholds = _SVI_REFRESH_STATUS_THRESHOLDS.get(label, _SVI_REFRESH_STATUS_THRESHOLDS["surrogate"])
+    rms = float(delta.rms)
+    max_abs = float(delta.max_abs)
+    if not np.isfinite(rms) or not np.isfinite(max_abs):
+        status = "stale"
+    else:
+        green_rms, green_max = thresholds["green"]
+        yellow_rms, yellow_max = thresholds["yellow"]
+        if rms < green_rms and max_abs < green_max:
+            status = "good"
+        elif rms < yellow_rms and max_abs < yellow_max:
+            status = "watch"
+        else:
+            status = "stale"
+    return _SviRefreshCacheStatus(
+        name=label,
+        rms=_svi_refresh_float(delta.rms),
+        max_abs=_svi_refresh_float(delta.max_abs),
+        status=status,
+        meaning=str(thresholds[status]),
+        style=_svi_refresh_status_style(status),
+        structural_change=bool(delta.added_arrays or delta.removed_arrays or delta.shape_changed_arrays),
+    )
+
+
+def _svi_refresh_cache_status_rows(
+    deltas: dict[str, _SviRefreshCacheDelta],
+) -> list[_SviRefreshCacheStatus]:
+    rows = [_classify_svi_refresh_cache_delta(label, deltas[label]) for label in ("surrogate", "scaling", "source_metric")]
+    for label in ("surrogate", "scaling", "source_metric"):
+        delta = deltas[label]
+        if delta.enabled and (delta.added_arrays or delta.removed_arrays or delta.shape_changed_arrays):
+            rows.append(
+                _SviRefreshCacheStatus(
+                    name=f"{label}_structure",
+                    rms="na",
+                    max_abs="na",
+                    status="stale",
+                    meaning="cache arrays added, removed, or reshaped",
+                    style=_svi_refresh_status_style("stale"),
+                    structural_change=True,
+                )
+            )
+    return rows
+
+
+def _format_svi_refresh_status_message(
+    *,
+    reason: str,
+    block_index: int,
+    remaining_steps: int,
+    center_shift: float,
+    parameter_delta: _SviRefreshParameterDelta,
+    rows: list[_SviRefreshCacheStatus],
+) -> str:
+    parts = [
+        f"[svi] refresh reason={reason}",
+        f"block={block_index}",
+        f"remaining_steps={remaining_steps}",
+        f"center_shift={_svi_refresh_float(center_shift)}",
+        f"theta_linf={_svi_refresh_float(parameter_delta.theta_linf)}",
+        f"top={parameter_delta.top_changes}",
+    ]
+    for row in rows:
+        if row.name.endswith("_structure"):
+            parts.append(f"{row.name}=changed")
+            continue
+        parts.extend(
+            [
+                f"{row.name}_status={row.status}",
+                f"{row.name}_rms={row.rms}",
+                f"{row.name}_max={row.max_abs}",
+            ]
+        )
+    return " ".join(parts)
+
+
+def _first_svi_refresh_top_change(top_changes: str) -> str:
+    if not top_changes or top_changes == "none":
+        return "none"
+    first = top_changes.split(",", 1)[0]
+    if ":" not in first:
+        return first
+    name, value = first.split(":", 1)
+    return f"{name}={value}"
+
+
+def _build_svi_refresh_status_rich_table(
+    *,
+    block_index: int,
+    remaining_steps: int,
+    center_shift: float,
+    parameter_delta: _SviRefreshParameterDelta,
+    rows: list[_SviRefreshCacheStatus],
+) -> Any:
+    table = _RichTable(
+        title=f"SVI refresh: block {block_index}, remaining {remaining_steps}",
+        caption=(
+            f"center shift: {_svi_refresh_float(center_shift)}   "
+            f"largest move: {_first_svi_refresh_top_change(parameter_delta.top_changes)}"
+        ),
+        show_header=True,
+        header_style="bold white",
+        expand=False,
+    )
+    table.add_column("cache", style="cyan", no_wrap=True)
+    table.add_column("rms", justify="right")
+    table.add_column("max", justify="right")
+    table.add_column("status", no_wrap=True)
+    table.add_column("meaning")
+    for row in rows:
+        table.add_row(
+            row.name,
+            row.rms,
+            row.max_abs,
+            row.status,
+            row.meaning,
+            style=row.style,
+        )
+    return table
 
 
 def _first_svi_refresh_reference(snapshots: dict[str, _SviRefreshCacheSnapshot]) -> np.ndarray | None:
@@ -7220,6 +9495,30 @@ def _svi_refresh_delta_message(
     before: dict[str, _SviRefreshCacheSnapshot],
     after: dict[str, _SviRefreshCacheSnapshot],
 ) -> str:
+    message, _renderable = _svi_refresh_status_log_payload(
+        state,
+        reason=reason,
+        block_index=block_index,
+        remaining_steps=remaining_steps,
+        center_shift=center_shift,
+        current_theta=current_theta,
+        before=before,
+        after=after,
+    )
+    return message
+
+
+def _svi_refresh_status_log_payload(
+    state: BuildState,
+    *,
+    reason: str,
+    block_index: int,
+    remaining_steps: int,
+    center_shift: float,
+    current_theta: np.ndarray,
+    before: dict[str, _SviRefreshCacheSnapshot],
+    after: dict[str, _SviRefreshCacheSnapshot],
+) -> tuple[str, Any]:
     before_reference = _first_svi_refresh_reference(before)
     after_reference = _first_svi_refresh_reference(after)
     parameter_delta = _svi_refresh_parameter_delta(
@@ -7227,22 +9526,291 @@ def _svi_refresh_delta_message(
         after_reference if after_reference is not None else np.asarray(current_theta, dtype=float),
         state.parameter_specs,
     )
-    cache_parts = [
-        _format_svi_refresh_cache_delta(label, _svi_refresh_cache_delta(before[label], after[label]))
+    deltas = {
+        label: _svi_refresh_cache_delta(before[label], after[label])
         for label in ("surrogate", "scaling", "source_metric")
-    ]
-    return " ".join(
-        [
-            f"[svi] refresh reason={reason}",
-            f"block={block_index}",
-            f"remaining_steps={remaining_steps}",
-            f"center_shift={_svi_refresh_float(center_shift)}",
-            f"theta_l2={_svi_refresh_float(parameter_delta.theta_l2)}",
-            f"theta_linf={_svi_refresh_float(parameter_delta.theta_linf)}",
-            f"top={parameter_delta.top_changes}",
-            *cache_parts,
-        ]
+    }
+    rows = _svi_refresh_cache_status_rows(deltas)
+    return (
+        _format_svi_refresh_status_message(
+            reason=reason,
+            block_index=block_index,
+            remaining_steps=remaining_steps,
+            center_shift=center_shift,
+            parameter_delta=parameter_delta,
+            rows=rows,
+        ),
+        _build_svi_refresh_status_rich_table(
+            block_index=block_index,
+            remaining_steps=remaining_steps,
+            center_shift=center_shift,
+            parameter_delta=parameter_delta,
+            rows=rows,
+        ),
     )
+
+
+def _nuts_svi_deviation_status_style(status: str) -> str:
+    if status == "good":
+        return "bold green"
+    if status == "watch":
+        return "bold yellow"
+    if status == "large":
+        return "bold red"
+    return "dim"
+
+
+def _classify_nuts_svi_deviation_metric(metric: str, value: float) -> tuple[str, str, str]:
+    if not np.isfinite(value):
+        status = "unknown"
+        return status, "value could not be computed", _nuts_svi_deviation_status_style(status)
+    if metric == "median_shift_linf":
+        if value < 0.25:
+            status = "good"
+            meaning = "posterior stayed near SVI fit"
+        elif value < 1.0:
+            status = "watch"
+            meaning = "largest parameter moved mildly"
+        else:
+            status = "large"
+            meaning = "largest parameter moved strongly"
+    elif metric == "median_shift_rms":
+        if value < 0.15:
+            status = "good"
+            meaning = "typical movement is small"
+        elif value < 0.50:
+            status = "watch"
+            meaning = "typical movement is moderate"
+        else:
+            status = "large"
+            meaning = "typical movement is large"
+    elif metric == "max_shift_over_posterior_sigma":
+        if value < 1.0:
+            status = "good"
+            meaning = "shift is within posterior spread"
+        elif value < 3.0:
+            status = "watch"
+            meaning = "one parameter moved beyond its spread"
+        else:
+            status = "large"
+            meaning = "one parameter moved far beyond its spread"
+    else:
+        status = "unknown"
+        meaning = "diagnostic status is unknown"
+    return status, meaning, _nuts_svi_deviation_status_style(status)
+
+
+def _overall_nuts_svi_deviation_status(rows: list[_NutsSviDeviationStatus]) -> str:
+    statuses = [row.status for row in rows if row.metric != "largest_moves"]
+    if not statuses:
+        return "unknown"
+    if any(status == "large" for status in statuses):
+        return "large"
+    if any(status == "watch" for status in statuses):
+        return "watch"
+    if any(status == "good" for status in statuses):
+        return "good"
+    return "unknown"
+
+
+def _top_nuts_svi_deviation_moves(
+    abs_diff: np.ndarray,
+    parameter_specs: list[ParameterSpec],
+    *,
+    count: int = 3,
+) -> str:
+    if abs_diff.ndim != 1 or abs_diff.size == 0:
+        return "none"
+    finite_diff = np.where(np.isfinite(abs_diff), abs_diff, 0.0)
+    top_indices = [
+        int(index)
+        for index in np.argsort(-finite_diff)[: max(0, int(count))]
+        if finite_diff[int(index)] > 0.0
+    ]
+    top_moves: list[str] = []
+    for index in top_indices:
+        if index < len(parameter_specs):
+            name = str(parameter_specs[index].sample_name)
+        else:
+            name = f"theta_{index}"
+        top_moves.append(f"{name}:{_svi_refresh_float(finite_diff[index])}")
+    return ",".join(top_moves) if top_moves else "none"
+
+
+def _nuts_svi_deviation_rows(
+    posterior: PosteriorResults,
+    reference_theta: Any,
+    parameter_specs: list[ParameterSpec],
+) -> tuple[list[_NutsSviDeviationStatus], str]:
+    try:
+        samples = np.asarray(posterior.samples, dtype=float)
+        reference = np.asarray(reference_theta, dtype=float)
+    except (TypeError, ValueError):
+        samples = np.empty((0, 0), dtype=float)
+        reference = np.empty((0,), dtype=float)
+    if samples.ndim != 2 or reference.ndim != 1 or samples.shape[0] == 0 or samples.shape[1] != reference.size:
+        rows = [
+            _NutsSviDeviationStatus(
+                metric="median_shift_linf",
+                value="na",
+                status="unknown",
+                meaning="NUTS samples and SVI reference are incompatible",
+                style=_nuts_svi_deviation_status_style("unknown"),
+            ),
+            _NutsSviDeviationStatus(
+                metric="median_shift_rms",
+                value="na",
+                status="unknown",
+                meaning="NUTS samples and SVI reference are incompatible",
+                style=_nuts_svi_deviation_status_style("unknown"),
+            ),
+            _NutsSviDeviationStatus(
+                metric="max_shift_over_posterior_sigma",
+                value="na",
+                status="unknown",
+                meaning="NUTS samples and SVI reference are incompatible",
+                style=_nuts_svi_deviation_status_style("unknown"),
+            ),
+        ]
+        rows.append(
+            _NutsSviDeviationStatus(
+                metric="largest_moves",
+                value="none",
+                status="unknown",
+                meaning="no comparable parameters",
+                style=_nuts_svi_deviation_status_style("unknown"),
+            )
+        )
+        return rows, "none"
+    finite_samples = np.where(np.isfinite(samples), samples, np.nan)
+    with np.errstate(all="ignore"):
+        posterior_median = np.nanmedian(finite_samples, axis=0)
+        posterior_sigma = np.nanstd(finite_samples, axis=0, ddof=0)
+    diff = posterior_median - reference
+    finite_diff = np.isfinite(diff)
+    if not finite_diff.any():
+        median_shift_linf = float("nan")
+        median_shift_rms = float("nan")
+    else:
+        finite_values = diff[finite_diff]
+        median_shift_linf = float(np.max(np.abs(finite_values)))
+        median_shift_rms = float(np.sqrt(np.mean(np.square(finite_values))))
+    finite_sigma = np.isfinite(posterior_sigma) & (posterior_sigma > 0.0) & np.isfinite(diff)
+    if finite_sigma.any():
+        max_shift_over_sigma = float(np.max(np.abs(diff[finite_sigma]) / posterior_sigma[finite_sigma]))
+    else:
+        max_shift_over_sigma = float("nan")
+    metrics = [
+        ("median_shift_linf", median_shift_linf),
+        ("median_shift_rms", median_shift_rms),
+        ("max_shift_over_posterior_sigma", max_shift_over_sigma),
+    ]
+    rows: list[_NutsSviDeviationStatus] = []
+    for metric, value in metrics:
+        status, meaning, style = _classify_nuts_svi_deviation_metric(metric, value)
+        rows.append(
+            _NutsSviDeviationStatus(
+                metric=metric,
+                value=_svi_refresh_float(value),
+                status=status,
+                meaning=meaning,
+                style=style,
+            )
+        )
+    top_moves = _top_nuts_svi_deviation_moves(np.abs(diff), parameter_specs)
+    top_status = _overall_nuts_svi_deviation_status(rows)
+    rows.append(
+        _NutsSviDeviationStatus(
+            metric="largest_moves",
+            value=top_moves,
+            status=top_status,
+            meaning="top posterior median shifts from SVI",
+            style=_nuts_svi_deviation_status_style(top_status),
+        )
+    )
+    return rows, top_moves
+
+
+def _format_nuts_svi_deviation_message(rows: list[_NutsSviDeviationStatus], top_moves: str) -> str:
+    values = {row.metric: row.value for row in rows}
+    return (
+        "[nuts] svi_deviation "
+        f"status={_overall_nuts_svi_deviation_status(rows)} "
+        f"median_shift_linf={values.get('median_shift_linf', 'na')} "
+        f"median_shift_rms={values.get('median_shift_rms', 'na')} "
+        f"max_shift_over_posterior_sigma={values.get('max_shift_over_posterior_sigma', 'na')} "
+        f"top={top_moves}"
+    )
+
+
+def _build_nuts_svi_deviation_rich_table(rows: list[_NutsSviDeviationStatus]) -> Any:
+    table = _RichTable(
+        title="NUTS deviation from SVI",
+        show_header=True,
+        header_style="bold white",
+        expand=False,
+    )
+    table.add_column("metric", style="cyan", no_wrap=True)
+    table.add_column("value", justify="right")
+    table.add_column("status", no_wrap=True)
+    table.add_column("meaning")
+    for row in rows:
+        table.add_row(
+            row.metric,
+            row.value,
+            row.status,
+            row.meaning,
+            style=row.style,
+        )
+    return table
+
+
+def _log_nuts_svi_deviation_table(
+    args: argparse.Namespace,
+    state: BuildState,
+    posterior: PosteriorResults,
+    nuts_init: NUTSInitialization,
+) -> None:
+    if not bool((nuts_init.diagnostics or {}).get("svi_used", False)):
+        return
+    rows, top_moves = _nuts_svi_deviation_rows(
+        posterior,
+        nuts_init.reference_theta,
+        state.parameter_specs,
+    )
+    _log(
+        args,
+        _format_nuts_svi_deviation_message(rows, top_moves),
+        renderable=_build_nuts_svi_deviation_rich_table(rows),
+    )
+
+
+def _maybe_clear_jax_caches(args: argparse.Namespace, reason: str) -> bool:
+    if not bool(
+        getattr(
+            args,
+            "jax_clear_caches_after_svi_refresh",
+            DEFAULT_JAX_CLEAR_CACHES_AFTER_SVI_REFRESH,
+        )
+    ):
+        return False
+    clear_caches = getattr(jax, "clear_caches", None)
+    if clear_caches is None:
+        _log(args, f"[memory] jax.clear_caches unavailable reason={reason}")
+        return False
+    gc.collect()
+    try:
+        clear_caches()
+    except Exception as exc:  # pragma: no cover - defensive around JAX internals
+        _log(args, f"[memory] jax.clear_caches failed reason={reason} error={type(exc).__name__}: {exc}")
+        return False
+    gc.collect()
+    _log(args, f"[memory] jax.clear_caches reason={reason} status=ok")
+    return True
+
+
+def _maybe_clear_jax_caches_after_svi_refresh(args: argparse.Namespace, reason: str) -> bool:
+    return _maybe_clear_jax_caches(args, reason)
 
 
 def _source_loglike_matrix(
@@ -7424,6 +9992,7 @@ def _run_svi_fit(
     block_center_shift: list[float] = []
     block_steps: list[int] = []
     block_refresh_count = 0
+    jax_cache_clear_count = 0
     init_values = dict(state.svi_init_values or {})
     guide = None
     svi = None
@@ -7471,20 +10040,29 @@ def _run_svi_fit(
             evaluator.refresh_scaling_scatter_cache(center_theta, reason=refresh_reason)
             evaluator.refresh_source_metric_cache(center_theta, reason=refresh_reason)
             after_refresh = _svi_refresh_evaluator_snapshot(evaluator)
+            refresh_message, refresh_renderable = _svi_refresh_status_log_payload(
+                state,
+                reason=refresh_reason,
+                block_index=block_index,
+                remaining_steps=remaining_steps,
+                center_shift=block_center_shift[-1] if block_center_shift else float("nan"),
+                current_theta=center_theta,
+                before=before_refresh,
+                after=after_refresh,
+            )
             _log(
                 args,
-                _svi_refresh_delta_message(
-                    state,
-                    reason=refresh_reason,
-                    block_index=block_index,
-                    remaining_steps=remaining_steps,
-                    center_shift=block_center_shift[-1] if block_center_shift else float("nan"),
-                    current_theta=center_theta,
-                    before=before_refresh,
-                    after=after_refresh,
-                ),
+                refresh_message,
+                renderable=refresh_renderable,
             )
             block_refresh_count += 1
+            if _maybe_clear_jax_caches_after_svi_refresh(args, refresh_reason):
+                jax_cache_clear_count += 1
+            guide = None
+            svi = None
+            svi_result = None
+            params = None
+            gc.collect()
     if guide is None or svi is None or svi_result is None or params is None or center_theta_previous is None:
         raise RuntimeError("SVI did not run any steps.")
     before_refresh = _svi_refresh_evaluator_snapshot(evaluator)
@@ -7493,19 +10071,23 @@ def _run_svi_fit(
     evaluator.refresh_scaling_scatter_cache(center_theta_previous, reason="svi_final")
     evaluator.refresh_source_metric_cache(center_theta_previous, reason="svi_final")
     after_refresh = _svi_refresh_evaluator_snapshot(evaluator)
+    refresh_message, refresh_renderable = _svi_refresh_status_log_payload(
+        state,
+        reason="svi_final",
+        block_index=block_index,
+        remaining_steps=0,
+        center_shift=block_center_shift[-1] if block_center_shift else float("nan"),
+        current_theta=center_theta_previous,
+        before=before_refresh,
+        after=after_refresh,
+    )
     _log(
         args,
-        _svi_refresh_delta_message(
-            state,
-            reason="svi_final",
-            block_index=block_index,
-            remaining_steps=0,
-            center_shift=block_center_shift[-1] if block_center_shift else float("nan"),
-            current_theta=center_theta_previous,
-            before=before_refresh,
-            after=after_refresh,
-        ),
+        refresh_message,
+        renderable=refresh_renderable,
     )
+    if _maybe_clear_jax_caches_after_svi_refresh(args, "svi_final"):
+        jax_cache_clear_count += 1
     svi_elapsed = time.time() - svi_start
     evaluator.timing_totals["svi_runtime"] = evaluator.timing_totals.get("svi_runtime", 0.0) + svi_elapsed
     losses = np.concatenate(block_losses) if block_losses else np.empty((0,), dtype=float)
@@ -7543,6 +10125,7 @@ def _run_svi_fit(
         "svi_block_count": int(len(block_steps)),
         "svi_block_steps": [int(value) for value in block_steps],
         "svi_cache_refresh_count": int(block_refresh_count),
+        "svi_jax_cache_clear_count": int(jax_cache_clear_count),
         "svi_block_center_shift": [float(value) for value in block_center_shift],
         "direct_evaluator_startup": True,
         "requested_chains": 0,
@@ -7595,7 +10178,8 @@ def _run_svi_fit(
         (
             f"[svi] complete in {_fmt_seconds(svi_elapsed)} final_elbo={diagnostics['svi_final_elbo_loss']:.4g} "
             f"guide_draws={total_draws} blocks={diagnostics['svi_block_count']} "
-            f"cache_refreshes={diagnostics['svi_cache_refresh_count']}"
+            f"cache_refreshes={diagnostics['svi_cache_refresh_count']} "
+            f"jax_cache_clears={diagnostics['svi_jax_cache_clear_count']}"
         ),
     )
     return np.asarray(center_theta, dtype=float), posterior, diagnostics
@@ -7619,11 +10203,28 @@ def _run_numpyro_nuts_sampler(
     sample_model,
     nuts_init: NUTSInitialization,
 ) -> PosteriorResults:
-    chain_method = "parallel" if jax.device_count() >= args.chains else "sequential"
+    requested_chain_method = str(getattr(args, "nuts_chain_method", DEFAULT_NUTS_CHAIN_METHOD))
+    chain_method = requested_chain_method
+    device_count = int(jax.device_count())
+    if chain_method == "parallel" and device_count < int(args.chains):
+        raise RuntimeError(
+            "--nuts-chain-method parallel requires at least one visible JAX device per chain; "
+            f"chains={int(args.chains)} jax_device_count={device_count}. "
+            "Set JAX_NUM_CPU_DEVICES to at least the chain count before starting the process, "
+            "or pass --nuts-chain-method sequential."
+        )
     max_tree_depth = _max_tree_depth_for_args(args)
-    dense_mass = bool(getattr(args, "dense_mass", True))
-    nuts_init.diagnostics["dense_mass"] = dense_mass
-    nuts_init.diagnostics["nuts_dense_mass"] = dense_mass
+    dense_mass = _nuts_dense_mass_argument(args, state)
+    dense_mass_structure = _resolved_nuts_dense_mass_structure(args, state)
+    print_summary = bool(getattr(args, "numpyro_print_summary", DEFAULT_NUMPYRO_PRINT_SUMMARY))
+    nuts_init.diagnostics["dense_mass"] = dense_mass is not False
+    nuts_init.diagnostics["nuts_dense_mass"] = _nuts_dense_mass_diagnostic_value(dense_mass)
+    nuts_init.diagnostics["nuts_dense_mass_structure"] = dense_mass_structure
+    if not isinstance(dense_mass, bool):
+        nuts_init.diagnostics["nuts_dense_mass_blocks"] = _nuts_dense_mass_diagnostic_value(dense_mass)
+    nuts_init.diagnostics["nuts_chain_method"] = chain_method
+    nuts_init.diagnostics["nuts_chain_method_requested"] = requested_chain_method
+    nuts_init.diagnostics["numpyro_print_summary"] = print_summary
     nuts_init.diagnostics["potfile_mass_size_reparam_enabled"] = bool(
         _potfile_mass_size_group_count(state.parameter_specs) > 0
     )
@@ -7647,7 +10248,8 @@ def _run_numpyro_nuts_sampler(
             f"[nuts] preparing sampler chains={args.chains} chain_method={chain_method} "
             f"warmup={args.warmup} samples={args.samples} thin={args.thin} "
             f"target_accept={args.target_accept:.2f} max_tree_depth={max_tree_depth} "
-            f"dense_mass={dense_mass} "
+            f"dense_mass={_format_nuts_dense_mass_for_log(dense_mass)} "
+            f"dense_mass_structure={dense_mass_structure} print_summary={print_summary} "
             f"potfile_mass_size_reparam_groups={_potfile_mass_size_group_count(state.parameter_specs)} "
             f"image_sigma_int_sampled={bool(getattr(evaluator, 'image_sigma_int_sampled', False))} "
             f"fixed_image_sigma_int_arcsec={getattr(evaluator, 'fixed_image_sigma_int_arcsec', None)} "
@@ -7686,11 +10288,16 @@ def _run_numpyro_nuts_sampler(
     nuts_elapsed = time.time() - nuts_start
     evaluator.timing_totals["nuts_runtime"] += nuts_elapsed
 
-    _run_logged_phase(
-        args,
-        "nuts.print_summary",
-        lambda: mcmc.print_summary(),
-    )
+    if print_summary:
+        _run_logged_phase(
+            args,
+            "nuts.print_summary",
+            lambda: mcmc.print_summary(),
+        )
+        nuts_init.diagnostics["nuts_print_summary_skipped"] = False
+    else:
+        nuts_init.diagnostics["nuts_print_summary_skipped"] = True
+        _log(args, "[nuts] print_summary skipped by --no-numpyro-print-summary; using saved diagnostics")
     samples_dict = _run_logged_phase(
         args,
         "nuts.get_samples",
@@ -7763,6 +10370,7 @@ def _run_numpyro_nuts_sampler(
             _log(args, f"[sampler-debug] failed to write diagnostics: {exc}")
     _apply_nuts_quality_gate(args, posterior, state.parameter_specs)
     _log_posterior_summary(args, "nuts", posterior)
+    _log_nuts_svi_deviation_table(args, state, posterior, nuts_init)
     _log(
         args,
         (
@@ -7889,7 +10497,7 @@ def _run_block_nuts_once(
     fixed_indices = tuple(idx for idx in range(len(parameter_specs)) if idx not in set(block.indices))
     block_model = _conditioned_posterior_model_for_block(parameter_specs, evaluator, fixed_indices, theta)
     init_params = _block_init_params(parameter_specs, block, block_model, theta)
-    dense_mass = bool(getattr(args, "dense_mass", True))
+    dense_mass = _blocked_nuts_dense_mass_argument(args)
     nuts = NUTS(
         block_model,
         target_accept_prob=float(args.target_accept),
@@ -7979,7 +10587,7 @@ def _run_blocked_numpyro_nuts_sampler(
             f"chains={args.chains} cycles={cycles} pilot_warmup={pilot_warmup} "
             f"thin={args.thin} target_accept={args.target_accept:.2f} "
             f"max_tree_depth={_max_tree_depth_for_args(args)} "
-            f"dense_mass={bool(getattr(args, 'dense_mass', True))} "
+            f"dense_mass={_blocked_nuts_dense_mass_argument(args)} "
             f"blocks={{non_source:{len(block_by_name['non_source'].indices)}, "
             f"source_position:{len(block_by_name['source_position'].indices)}}}"
         ),
@@ -8128,8 +10736,9 @@ def _run_blocked_numpyro_nuts_sampler(
         **nuts_init.diagnostics,
         "sampler": "numpyro_blocked_nuts",
         "blocked_nuts": True,
-        "dense_mass": bool(getattr(args, "dense_mass", True)),
-        "nuts_dense_mass": bool(getattr(args, "dense_mass", True)),
+        "dense_mass": _blocked_nuts_dense_mass_argument(args),
+        "nuts_dense_mass": _blocked_nuts_dense_mass_argument(args),
+        "nuts_dense_mass_structure": _resolved_nuts_dense_mass_structure(args),
         "blocked_nuts_cycles": int(cycles),
         "blocked_nuts_pilot_warmup": int(pilot_warmup),
         "blocked_nuts_blocks": {
@@ -8505,7 +11114,28 @@ def _sample_likelihood_uses_explicit_beta(sample_likelihood_mode: str) -> bool:
 
 
 def _sample_likelihood_uses_image_scatter(sample_likelihood_mode: str) -> bool:
-    return _sample_likelihood_uses_explicit_beta(sample_likelihood_mode)
+    return _sample_likelihood_uses_explicit_beta(sample_likelihood_mode) or str(
+        sample_likelihood_mode
+    ) == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE
+
+
+def _sample_likelihood_uses_critical_arc_terms(sample_likelihood_mode: str) -> bool:
+    return str(sample_likelihood_mode) in {
+        SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
+    }
+
+
+def _sample_likelihood_uses_image_plane_jacobian(sample_likelihood_mode: str) -> bool:
+    return str(sample_likelihood_mode) in {
+        SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
+    }
 
 
 def _effective_image_presence_penalty_weight(
@@ -8522,11 +11152,12 @@ def _effective_image_presence_penalty_weight(
         SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
     }:
         return 0.0
-    if str(sample_likelihood_mode) == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE:
+    if _sample_likelihood_uses_critical_arc_terms(str(sample_likelihood_mode)):
         return 0.0
     if str(fit_mode) == FIT_MODE_EVIDENCE_NS:
         return 0.0
@@ -8599,6 +11230,51 @@ def _stage4_run_directory_name(args: argparse.Namespace) -> str:
     if _catastrophe_normal_form_stage_enabled(args):
         return "stage4_catastrophe_normal_form_image_plane"
     return "stage4_linearized_image_plane"
+
+
+def _auto_local_jacobian_stage_enabled(args: argparse.Namespace) -> bool:
+    mode = str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE))
+    if mode == IMAGE_PLANE_MODE_LOCAL_JACOBIAN:
+        return True
+    if mode in {
+        IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
+        IMAGE_PLANE_MODE_FORWARD_METRIC,
+        IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
+        IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
+    }:
+        return not bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False))
+    return False
+
+
+def _stage3_image_plane_mode(args: argparse.Namespace) -> str:
+    requested = str(getattr(args, "stage3_image_plane_mode", STAGE3_IMAGE_PLANE_MODE_AUTO))
+    if requested == STAGE3_IMAGE_PLANE_MODE_AUTO:
+        return STAGE3_IMAGE_PLANE_MODE_LOCAL_JACOBIAN if _auto_local_jacobian_stage_enabled(args) else STAGE3_IMAGE_PLANE_MODE_NONE
+    return requested
+
+
+def _local_jacobian_stage_enabled(args: argparse.Namespace) -> bool:
+    return _stage3_image_plane_mode(args) == STAGE3_IMAGE_PLANE_MODE_LOCAL_JACOBIAN
+
+
+def _critical_arc_centroid_stage_enabled(args: argparse.Namespace) -> bool:
+    return _stage3_image_plane_mode(args) == STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
+
+
+def _stage3_image_plane_enabled(args: argparse.Namespace) -> bool:
+    return _stage3_image_plane_mode(args) != STAGE3_IMAGE_PLANE_MODE_NONE
+
+
+def _stage3_sample_likelihood_mode(args: argparse.Namespace) -> str | None:
+    mode = _stage3_image_plane_mode(args)
+    if mode == STAGE3_IMAGE_PLANE_MODE_LOCAL_JACOBIAN:
+        return SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
+    if mode == STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE:
+        return SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE
+    return None
 
 
 SEQUENTIAL_STAGE_NAMES = {
@@ -8699,27 +11375,28 @@ def _plots_only_exact_diagnostics_stage(run_dir: Path) -> str | None:
     return _final_available_sequential_stage(sibling_stage_dirs) or _sequential_stage_name(run_dir)
 
 
-def _local_jacobian_stage_enabled(args: argparse.Namespace) -> bool:
-    mode = str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE))
-    if mode == IMAGE_PLANE_MODE_LOCAL_JACOBIAN:
-        return True
-    if mode in {
-        IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
-        IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
-        IMAGE_PLANE_MODE_FORWARD_METRIC,
-        IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
-        IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
-        IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
-        IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
-    }:
-        return not bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False))
-    return False
-
-
 def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFitControls]:
     fit_mode = str(getattr(args, "fit_mode", FIT_MODE_SEQUENTIAL))
     mode = str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE))
     start_at_stage3 = bool(getattr(args, "start_at_stage3", False))
+    requested_stage3_mode = str(getattr(args, "stage3_image_plane_mode", STAGE3_IMAGE_PLANE_MODE_AUTO))
+    if requested_stage3_mode not in STAGE3_IMAGE_PLANE_MODES:
+        _fail(
+            "--stage3-image-plane-mode must be one of "
+            f"{', '.join(STAGE3_IMAGE_PLANE_MODES)}."
+        )
+    if (
+        bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False))
+        and requested_stage3_mode != STAGE3_IMAGE_PLANE_MODE_AUTO
+    ):
+        _fail("--skip-stage3-image-plane-local-jacobian can only be combined with --stage3-image-plane-mode auto.")
+    if requested_stage3_mode != STAGE3_IMAGE_PLANE_MODE_AUTO and fit_mode != FIT_MODE_SEQUENTIAL:
+        _fail("--stage3-image-plane-mode is only valid with --fit-mode sequential.")
+    stage4_sampling_engine = str(getattr(args, "stage4_sampling_engine", STAGE4_SAMPLING_ENGINE_INHERIT))
+    if stage4_sampling_engine not in STAGE4_SAMPLING_ENGINE_CHOICES:
+        _fail("--stage4-sampling-engine must be one of " f"{', '.join(STAGE4_SAMPLING_ENGINE_CHOICES)}.")
+    if stage4_sampling_engine != STAGE4_SAMPLING_ENGINE_INHERIT and fit_mode != FIT_MODE_SEQUENTIAL:
+        _fail("--stage4-sampling-engine is only valid with --fit-mode sequential.")
     _validate_jax_device_controls(args)
     if bool(getattr(args, "quick_diagnostics", False)) and bool(getattr(args, "exact_image_diagnostics_stage3", False)):
         _fail("--exact-image-diagnostics-stage3 cannot be combined with --quick-diagnostics.")
@@ -8728,19 +11405,13 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     if start_at_stage3:
         if fit_mode != FIT_MODE_SEQUENTIAL:
             _fail("--start-at-stage3 is only valid with --fit-mode sequential.")
-        if mode not in {
-            IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
-            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
-            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
-            IMAGE_PLANE_MODE_FORWARD_METRIC,
-            IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
-            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
-            IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
-            IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
-        }:
-            _fail("--start-at-stage3 requires a stage-3-capable --image-plane-mode.")
         if bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)):
             _fail("--start-at-stage3 requires stage 3 and is incompatible with --skip-stage3-image-plane-local-jacobian.")
+        if not _stage3_image_plane_enabled(args):
+            _fail(
+                "--start-at-stage3 requires a stage-3-capable --image-plane-mode "
+                "or an explicit --stage3-image-plane-mode."
+            )
     ns_num_live_points = getattr(args, "ns_num_live_points", None)
     if ns_num_live_points is not None and int(ns_num_live_points) <= 0:
         _fail("--ns-num-live-points must be positive when provided.")
@@ -8775,6 +11446,7 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         or float(getattr(args, "smc_mala_step_size", DEFAULT_SMC_MALA_STEP_SIZE)) <= 0.0
     ):
         _fail("--smc-mala-step-size must be positive.")
+    _validate_microcanonical_controls(args)
     if float(getattr(args, "linearized_beta_prior_sigma_arcsec", DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC)) <= 0.0:
         _fail("--linearized-beta-prior-sigma-arcsec must be positive.")
     critical_det_threshold = float(
@@ -8798,6 +11470,16 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     cutout_rgb_minimum = getattr(args, "image_catalog_family_cutout_rgb_minimum", None)
     if cutout_rgb_minimum is not None and not np.isfinite(float(cutout_rgb_minimum)):
         _fail("--image-catalog-family-cutout-rgb-minimum must be finite.")
+    cutout_mode = str(getattr(args, "image_catalog_family_cutout_mode", "full"))
+    if cutout_mode not in {"full", "fast"}:
+        _fail("--image-catalog-family-cutout-mode must be one of full, fast.")
+    cutout_critical_lines = str(getattr(args, "image_catalog_family_cutout_critical_lines", "auto"))
+    if cutout_critical_lines not in {"auto", "on", "off"}:
+        _fail("--image-catalog-family-cutout-critical-lines must be one of auto, on, off.")
+    for option_name in ("image_catalog_family_cutout_dpi", "image_catalog_family_cutout_max_side_pixels"):
+        option_value = getattr(args, option_name, None)
+        if option_value is not None and int(option_value) <= 0:
+            _fail(f"--{option_name.replace('_', '-')} must be positive.")
     anchored_solve_steps = int(
         getattr(args, "anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)
     )
@@ -8838,11 +11520,127 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     )
     if not np.isfinite(critical_arc_singular_threshold) or critical_arc_singular_threshold <= 0.0:
         _fail("--critical-arc-singular-threshold must be finite and positive.")
+    critical_arc_threshold_lower = float(
+        getattr(
+            args,
+            "critical_arc_singular_threshold_lower",
+            DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_LOWER,
+        )
+    )
+    critical_arc_threshold_upper = float(
+        getattr(
+            args,
+            "critical_arc_singular_threshold_upper",
+            DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_UPPER,
+        )
+    )
+    critical_arc_threshold_prior_median = float(
+        getattr(
+            args,
+            "critical_arc_singular_threshold_prior_median",
+            DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_MEDIAN,
+        )
+    )
+    critical_arc_threshold_prior_log_sigma = float(
+        getattr(
+            args,
+            "critical_arc_singular_threshold_prior_log_sigma",
+            DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_LOG_SIGMA,
+        )
+    )
+    if (
+        not np.isfinite(critical_arc_threshold_lower)
+        or not np.isfinite(critical_arc_threshold_upper)
+        or critical_arc_threshold_lower <= 0.0
+        or critical_arc_threshold_lower >= critical_arc_threshold_upper
+    ):
+        _fail("--critical-arc-singular-threshold-lower/upper must be finite, positive, and ordered.")
+    if (
+        not np.isfinite(critical_arc_threshold_prior_median)
+        or not (critical_arc_threshold_lower < critical_arc_threshold_prior_median < critical_arc_threshold_upper)
+    ):
+        _fail("--critical-arc-singular-threshold-prior-median must lie between the sampled threshold bounds.")
+    if not np.isfinite(critical_arc_threshold_prior_log_sigma) or critical_arc_threshold_prior_log_sigma <= 0.0:
+        _fail("--critical-arc-singular-threshold-prior-log-sigma must be finite and positive.")
+    if bool(getattr(args, "sample_critical_arc_singular_threshold", False)):
+        stage4_likelihood = _stage4_sample_likelihood_mode(args)
+        active_likelihoods = (
+            [
+                value
+                for value in (_stage3_sample_likelihood_mode(args), stage4_likelihood)
+                if value is not None
+            ]
+            if str(getattr(args, "fit_mode", FIT_MODE_SEQUENTIAL)) == FIT_MODE_SEQUENTIAL
+            else [str(getattr(args, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))]
+        )
+        if not any(_sample_likelihood_uses_critical_arc_terms(value) for value in active_likelihoods):
+            _fail(
+                "--sample-critical-arc-singular-threshold is only valid with "
+                "a critical-arc mixture image-plane likelihood."
+            )
     critical_arc_singular_softness = float(
         getattr(args, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
     )
     if not np.isfinite(critical_arc_singular_softness) or critical_arc_singular_softness <= 0.0:
         _fail("--critical-arc-singular-softness must be finite and positive.")
+    critical_arc_softness_lower = float(
+        getattr(
+            args,
+            "critical_arc_singular_softness_lower",
+            DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_LOWER,
+        )
+    )
+    critical_arc_softness_upper = float(
+        getattr(
+            args,
+            "critical_arc_singular_softness_upper",
+            DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER,
+        )
+    )
+    critical_arc_softness_prior_median = float(
+        getattr(
+            args,
+            "critical_arc_singular_softness_prior_median",
+            DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_MEDIAN,
+        )
+    )
+    critical_arc_softness_prior_log_sigma = float(
+        getattr(
+            args,
+            "critical_arc_singular_softness_prior_log_sigma",
+            DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_LOG_SIGMA,
+        )
+    )
+    if (
+        not np.isfinite(critical_arc_softness_lower)
+        or not np.isfinite(critical_arc_softness_upper)
+        or critical_arc_softness_lower <= 0.0
+        or critical_arc_softness_lower >= critical_arc_softness_upper
+    ):
+        _fail("--critical-arc-singular-softness-lower/upper must be finite, positive, and ordered.")
+    if (
+        not np.isfinite(critical_arc_softness_prior_median)
+        or not (critical_arc_softness_lower < critical_arc_softness_prior_median < critical_arc_softness_upper)
+    ):
+        _fail("--critical-arc-singular-softness-prior-median must lie between the sampled softness bounds.")
+    if not np.isfinite(critical_arc_softness_prior_log_sigma) or critical_arc_softness_prior_log_sigma <= 0.0:
+        _fail("--critical-arc-singular-softness-prior-log-sigma must be finite and positive.")
+    if bool(getattr(args, "sample_critical_arc_singular_softness", False)):
+        stage4_likelihood = _stage4_sample_likelihood_mode(args)
+        active_likelihoods = (
+            [
+                value
+                for value in (_stage3_sample_likelihood_mode(args), stage4_likelihood)
+                if value is not None
+            ]
+            if str(getattr(args, "fit_mode", FIT_MODE_SEQUENTIAL)) == FIT_MODE_SEQUENTIAL
+            else [str(getattr(args, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))]
+        )
+        if not any(_sample_likelihood_uses_critical_arc_terms(value) for value in active_likelihoods):
+            _fail(
+                "--sample-critical-arc-singular-softness is only valid with "
+                "a critical-arc mixture image-plane likelihood."
+            )
     critical_arc_lm_relative = float(
         getattr(args, "critical_arc_lm_damping_relative", DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE)
     )
@@ -8858,15 +11656,15 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     )
     if not np.isfinite(critical_arc_lm_trust_radius) or critical_arc_lm_trust_radius <= 0.0:
         _fail("--critical-arc-lm-trust-radius-arcsec must be finite and positive.")
-    try:
-        arc_aware_noncritical_support_radius = _resolve_arc_aware_noncritical_support_radius_arcsec(
-            getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
-            getattr(args, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE),
-        )
-    except ValueError:
-        _fail("--arc-aware-noncritical-support-radius-arcsec must be finite and positive.")
-    if not np.isfinite(arc_aware_noncritical_support_radius) or arc_aware_noncritical_support_radius <= 0.0:
-        _fail("--arc-aware-noncritical-support-radius-arcsec must be finite and positive.")
+    arc_recovery_p_arc_threshold = float(
+        getattr(args, "arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
+    )
+    if (
+        not np.isfinite(arc_recovery_p_arc_threshold)
+        or arc_recovery_p_arc_threshold < 0.0
+        or arc_recovery_p_arc_threshold > 1.0
+    ):
+        _fail("--arc-recovery-p-arc-threshold must be finite and in [0, 1].")
     arc_aware_max_arclength = float(
         getattr(args, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
     )
@@ -9011,6 +11809,18 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         _fail("--likelihood-stabilizer-student-t-nu must be positive.")
     if int(getattr(args, "fit_quality_draws", 0)) < 0:
         _fail("--fit-quality-draws must be non-negative.")
+    exact_image_min_distance_arcsec = float(
+        getattr(args, "exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)
+    )
+    if not np.isfinite(exact_image_min_distance_arcsec) or exact_image_min_distance_arcsec <= 0.0:
+        _fail("--exact-image-min-distance-arcsec must be finite and positive.")
+    exact_image_precision_limit = float(
+        getattr(args, "exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)
+    )
+    if not np.isfinite(exact_image_precision_limit) or exact_image_precision_limit <= 0.0:
+        _fail("--exact-image-precision-limit must be finite and positive.")
+    if int(getattr(args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)) <= 0:
+        _fail("--exact-image-num-iter-max must be positive.")
     try:
         _cosmology_init_overrides_from_args(args)
     except ValueError as exc:
@@ -9024,12 +11834,30 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     if not np.isfinite(caustic_plot_grid_scale_arcsec) or caustic_plot_grid_scale_arcsec <= 0.0:
         _fail("--caustic-plot-grid-scale-arcsec must be finite and positive.")
     kappa_true_fits = getattr(args, "kappa_true_fits", None)
+    kappa_true_available = False
     if kappa_true_fits is not None:
         kappa_true_text = str(kappa_true_fits).strip()
         if not kappa_true_text:
             _fail("--kappa-true-fits must be a non-empty path when provided.")
         if not Path(kappa_true_text).is_file():
             _fail(f"--kappa-true-fits does not exist: {kappa_true_text}")
+        kappa_true_available = True
+    gamma_true_paths = {
+        "gammax": getattr(args, "gammax_true_fits", None),
+        "gammay": getattr(args, "gammay_true_fits", None),
+    }
+    gamma_true_present = {name: value is not None and bool(str(value).strip()) for name, value in gamma_true_paths.items()}
+    if any(value is not None and not str(value).strip() for value in gamma_true_paths.values()):
+        _fail("--gammax-true-fits/--gammay-true-fits must be non-empty paths when provided.")
+    if any(gamma_true_present.values()):
+        if not kappa_true_available:
+            _fail("--gammax-true-fits/--gammay-true-fits require --kappa-true-fits.")
+        if not all(gamma_true_present.values()):
+            _fail("--gammax-true-fits and --gammay-true-fits must be provided together.")
+        for option_name, path_value in gamma_true_paths.items():
+            path_text = str(path_value).strip()
+            if not Path(path_text).is_file():
+                _fail(f"--{option_name}-true-fits does not exist: {path_text}")
     evidence_prior_sigma = getattr(args, "evidence_source_prior_sigma_arcsec", None)
     if evidence_prior_sigma is not None and float(evidence_prior_sigma) <= 0.0:
         _fail("--evidence-source-prior-sigma-arcsec must be positive.")
@@ -9062,11 +11890,12 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         if bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)):
             _fail("--skip-stage3-image-plane-local-jacobian is not valid with --fit-mode evidence-ns.")
         if (
-            str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_REFRESHING_SURROGATE
+            str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL))
+            in {SAMPLING_ENGINE_REFRESHING_SURROGATE, SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT}
             and int(getattr(args, "image_plane_newton_steps", 0)) > 0
         ):
             _fail(
-                "--sampling-engine refreshing_surrogate with linearized-forward-beta-image-plane "
+                "--sampling-engine refreshing_surrogate or refreshing_surrogate_flat with linearized-forward-beta-image-plane "
                 "requires --image-plane-newton-steps 0."
             )
         if (
@@ -9111,7 +11940,6 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     if mode in {
         IMAGE_PLANE_MODE_FORWARD_METRIC,
         IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
-        IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
         IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
     }:
@@ -9127,11 +11955,12 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
             )
     if (
         mode == IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA
-        and str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_REFRESHING_SURROGATE
+        and str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL))
+        in {SAMPLING_ENGINE_REFRESHING_SURROGATE, SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT}
         and anchored_solve_steps > 0
     ):
         _fail(
-            "--sampling-engine refreshing_surrogate is not supported with "
+            "--sampling-engine refreshing_surrogate or refreshing_surrogate_flat is not supported with "
             "--image-plane-mode anchored-solved-forward-beta-image-plane unless "
             "--anchored-image-plane-solve-steps is 0."
         )
@@ -9142,7 +11971,17 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     samples = [int(value) for value in _stage_arg_values(getattr(args, "samples", DEFAULT_SAMPLES), flag_name="--samples")]
 
     invalid_fit_methods = sorted(
-        set(fit_methods).difference({FIT_METHOD_SVI, FIT_METHOD_SVI_NUTS, FIT_METHOD_NUTS, FIT_METHOD_NS, FIT_METHOD_SMC})
+        set(fit_methods).difference(
+            {
+                FIT_METHOD_SVI,
+                FIT_METHOD_SVI_NUTS,
+                FIT_METHOD_NUTS,
+                FIT_METHOD_NS,
+                FIT_METHOD_SMC,
+                FIT_METHOD_MCHMC,
+                FIT_METHOD_MCLMC,
+            }
+        )
     )
     if invalid_fit_methods:
         _fail(f"--fit-method has unsupported value(s): {', '.join(invalid_fit_methods)}")
@@ -9163,29 +12002,21 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     has_stage_specific_values = max_value_count >= 2
     has_three_stage_values = max_value_count == 3
     is_sequential = fit_mode == FIT_MODE_SEQUENTIAL
-    has_stage3_or_stage4 = is_sequential and mode in {
-        IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
-        IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
-        IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
-        IMAGE_PLANE_MODE_FORWARD_METRIC,
-        IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
-        IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
-        IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
-        IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
-    }
     has_stage4 = _stage4_image_plane_enabled(args)
-    has_stage3 = _local_jacobian_stage_enabled(args)
+    has_stage3 = is_sequential and _stage3_image_plane_enabled(args)
+    has_stage3_or_stage4 = is_sequential and (has_stage3 or has_stage4)
     if bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)) and not has_stage4:
         _fail("--skip-stage3-image-plane-local-jacobian is only valid with a final stage-4 image-plane mode.")
     if has_stage4 and not is_sequential:
         _fail("Stage-4 image-plane modes require --fit-mode sequential.")
     if (
         _linearized_stage_enabled(args)
-        and str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_REFRESHING_SURROGATE
+        and str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL))
+        in {SAMPLING_ENGINE_REFRESHING_SURROGATE, SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT}
         and int(getattr(args, "image_plane_newton_steps", 0)) > 0
     ):
         _fail(
-            "--sampling-engine refreshing_surrogate with linearized-forward-beta-image-plane "
+            "--sampling-engine refreshing_surrogate or refreshing_surrogate_flat with linearized-forward-beta-image-plane "
             "requires --image-plane-newton-steps 0."
         )
     if has_stage_specific_values and not has_stage3_or_stage4:
@@ -9193,10 +12024,10 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
             "Two-value --fit-method, --svi-steps, --warmup, --samples, or --max-tree-depth is only valid with "
             "--fit-mode sequential and an image-plane mode."
         )
-    if has_three_stage_values and not has_stage4:
+    if has_three_stage_values and not (has_stage3 and has_stage4):
         _fail(
             "Three-value --fit-method, --svi-steps, --warmup, --samples, or --max-tree-depth is only valid with "
-            "a final stage-4 image-plane mode."
+            "both an enabled stage 3 and a final stage-4 image-plane mode."
         )
 
     def stage_value(values: list[Any], index: int) -> Any:
@@ -9245,17 +12076,24 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     smc_stages: list[str] = []
     if controls["stage2"].fit_method == FIT_METHOD_SMC:
         smc_stages.append("stage2")
-    if _local_jacobian_stage_enabled(args) and controls["stage3"].fit_method == FIT_METHOD_SMC:
+    if has_stage3 and controls["stage3"].fit_method == FIT_METHOD_SMC:
         smc_stages.append("stage3")
     if has_stage4 and controls["stage4"].fit_method == FIT_METHOD_SMC:
         smc_stages.append("stage4")
     nuts_stages: list[str] = []
     if controls["stage2"].fit_method == FIT_METHOD_NUTS:
         nuts_stages.append("stage2")
-    if _local_jacobian_stage_enabled(args) and controls["stage3"].fit_method == FIT_METHOD_NUTS:
+    if has_stage3 and controls["stage3"].fit_method == FIT_METHOD_NUTS:
         nuts_stages.append("stage3")
     if has_stage4 and controls["stage4"].fit_method == FIT_METHOD_NUTS:
         nuts_stages.append("stage4")
+    microcanonical_stages: list[str] = []
+    if controls["stage2"].fit_method in MICROCANONICAL_FIT_METHODS:
+        microcanonical_stages.append("stage2")
+    if has_stage3 and controls["stage3"].fit_method in MICROCANONICAL_FIT_METHODS:
+        microcanonical_stages.append("stage3")
+    if has_stage4 and controls["stage4"].fit_method in MICROCANONICAL_FIT_METHODS:
+        microcanonical_stages.append("stage4")
     if _blocked_linearized_stage_enabled(args) and controls["stage4"].fit_method != FIT_METHOD_SVI_NUTS:
         _fail(
             "--image-plane-mode linearized-forward-beta-blocked-image-plane requires "
@@ -9272,6 +12110,11 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
             _fail("--potfile-mass-size-reparam is not supported with blocked linearized stage 4 NUTS.")
         if smc_stages:
             _fail("--potfile-mass-size-reparam is only supported with NumPyro SVI/NUTS samplers, not --fit-method smc.")
+        if microcanonical_stages:
+            _fail(
+                "--potfile-mass-size-reparam is only supported with NumPyro SVI/NUTS samplers, "
+                "not --fit-method mchmc or mclmc."
+            )
     return controls
 
 
@@ -9502,6 +12345,146 @@ def _filter_potfiles_by_fov(
     return filtered_potfiles, summary
 
 
+def _normalize_potfile_member_brightest_counts(
+    brightest_n: Any,
+    potfiles: list[dict[str, Any]],
+) -> list[int] | None:
+    if brightest_n is None:
+        return None
+    if isinstance(brightest_n, (int, np.integer)):
+        values = [int(brightest_n)]
+    else:
+        values = [int(value) for value in brightest_n]
+    if not values:
+        return None
+    if any(value <= 0 for value in values):
+        raise ValueError("--potfile-member-brightest-n values must be positive integers.")
+    if len(values) == 1:
+        return [int(values[0]) for _ in potfiles]
+    if len(values) != len(potfiles):
+        potfile_ids = [str(potfile.get("id", f"potfile{idx}")) for idx, potfile in enumerate(potfiles)]
+        raise ValueError(
+            "--potfile-member-brightest-n expects either one value for all potfiles or exactly one value per potfile. "
+            f"Detected {len(potfiles)} potfiles {potfile_ids}, received {len(values)} value(s): {values}."
+        )
+    return values
+
+
+def _normalize_potfile_member_mag_max_values(
+    mag_max: Any,
+    potfiles: list[dict[str, Any]],
+) -> list[float] | None:
+    if mag_max is None:
+        return None
+    if isinstance(mag_max, (int, float, np.integer, np.floating)):
+        values = [float(mag_max)]
+    else:
+        values = [float(value) for value in mag_max]
+    if not values:
+        return None
+    if any(not np.isfinite(value) for value in values):
+        raise ValueError("--potfile-member-mag-max values must be finite.")
+    if len(values) == 1:
+        return [float(values[0]) for _ in potfiles]
+    if len(values) != len(potfiles):
+        potfile_ids = [str(potfile.get("id", f"potfile{idx}")) for idx, potfile in enumerate(potfiles)]
+        raise ValueError(
+            "--potfile-member-mag-max expects either one value for all potfiles or exactly one value per potfile. "
+            f"Detected {len(potfiles)} potfiles {potfile_ids}, received {len(values)} value(s): {values}."
+        )
+    return values
+
+
+def _validated_potfile_catalog_magnitudes(catalog_df: pd.DataFrame, *, potfile_id: str, option_name: str) -> pd.Series:
+    if "catalog_mag" not in catalog_df.columns:
+        raise ValueError(f"Potfile {potfile_id!r} cannot apply {option_name}: missing catalog_mag column.")
+    magnitudes = pd.to_numeric(catalog_df["catalog_mag"], errors="coerce")
+    if magnitudes.isna().any() or not np.isfinite(magnitudes.to_numpy(dtype=float)).all():
+        raise ValueError(f"Potfile {potfile_id!r} cannot apply {option_name}: catalog_mag contains non-finite values.")
+    return magnitudes
+
+
+def _sort_potfile_catalog_by_brightness(catalog_df: pd.DataFrame, *, potfile_id: str) -> pd.DataFrame:
+    magnitudes = _validated_potfile_catalog_magnitudes(
+        catalog_df,
+        potfile_id=potfile_id,
+        option_name="--potfile-member-brightest-n",
+    )
+    sortable = catalog_df.copy()
+    sortable["_brightness_sort_mag"] = magnitudes.to_numpy(dtype=float)
+    sortable["_brightness_sort_id"] = sortable["id"].astype(str) if "id" in sortable.columns else sortable.index.astype(str)
+    return (
+        sortable.sort_values(["_brightness_sort_mag", "_brightness_sort_id"], kind="mergesort")
+        .drop(columns=["_brightness_sort_mag", "_brightness_sort_id"])
+        .reset_index(drop=True)
+    )
+
+
+def _filter_potfiles_by_brightest_members(
+    potfiles: list[dict[str, Any]],
+    brightest_n: Any,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
+    counts = _normalize_potfile_member_brightest_counts(brightest_n, potfiles)
+    if counts is None:
+        return potfiles, {}
+    filtered_potfiles: list[dict[str, Any]] = []
+    summary: dict[str, dict[str, int]] = {}
+    for index, potfile in enumerate(potfiles):
+        catalog_df = potfile.get("catalog_df")
+        if not isinstance(catalog_df, pd.DataFrame):
+            filtered_potfiles.append(potfile)
+            continue
+        potfile_id = str(potfile.get("id", f"potfile{index}"))
+        n_keep = int(counts[index])
+        sorted_catalog = _sort_potfile_catalog_by_brightness(catalog_df, potfile_id=potfile_id)
+        filtered_catalog = sorted_catalog.iloc[: min(n_keep, len(sorted_catalog))].copy().reset_index(drop=True)
+        filtered_potfile = dict(potfile)
+        filtered_potfile["catalog_df"] = filtered_catalog
+        filtered_potfiles.append(filtered_potfile)
+        summary[potfile_id] = {
+            "total": int(len(catalog_df)),
+            "kept": int(len(filtered_catalog)),
+            "dropped": int(len(catalog_df) - len(filtered_catalog)),
+            "n": int(n_keep),
+        }
+    return filtered_potfiles, summary
+
+
+def _filter_potfiles_by_member_mag_max(
+    potfiles: list[dict[str, Any]],
+    mag_max: Any,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, int | float]]]:
+    values = _normalize_potfile_member_mag_max_values(mag_max, potfiles)
+    if values is None:
+        return potfiles, {}
+    filtered_potfiles: list[dict[str, Any]] = []
+    summary: dict[str, dict[str, int | float]] = {}
+    for index, potfile in enumerate(potfiles):
+        catalog_df = potfile.get("catalog_df")
+        if not isinstance(catalog_df, pd.DataFrame):
+            filtered_potfiles.append(potfile)
+            continue
+        potfile_id = str(potfile.get("id", f"potfile{index}"))
+        threshold = float(values[index])
+        magnitudes = _validated_potfile_catalog_magnitudes(
+            catalog_df,
+            potfile_id=potfile_id,
+            option_name="--potfile-member-mag-max",
+        )
+        mask = magnitudes.to_numpy(dtype=float) <= threshold
+        filtered_catalog = catalog_df.loc[mask].copy().reset_index(drop=True)
+        filtered_potfile = dict(potfile)
+        filtered_potfile["catalog_df"] = filtered_catalog
+        filtered_potfiles.append(filtered_potfile)
+        summary[potfile_id] = {
+            "total": int(len(catalog_df)),
+            "kept": int(len(filtered_catalog)),
+            "dropped": int(len(catalog_df) - len(filtered_catalog)),
+            "mag_max": float(threshold),
+        }
+    return filtered_potfiles, summary
+
+
 def _bin_redshifts_by_lensing_efficiency(
     redshifts: list[float],
     *,
@@ -9669,6 +12652,103 @@ def _parameter_sample_sites(parameter_specs: list[ParameterSpec]) -> list[_Sampl
             raise ValueError(f"Vector sample site {site_name!r} has non-contiguous indices {actual}; expected {expected}.")
         sites.append(_SampleSiteSpec(name=site_name, indices=tuple(int(item[0]) for item in ordered)))
     return sites
+
+
+def _unique_sample_site_names(parameter_specs: Iterable[ParameterSpec]) -> tuple[str, ...]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for spec in parameter_specs:
+        name = _spec_sample_site_name(spec)
+        if name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return tuple(names)
+
+
+def _source_position_dense_mass_blocks(parameter_specs: list[ParameterSpec]) -> tuple[tuple[str, ...], ...]:
+    grouped: dict[str, list[tuple[int, ParameterSpec]]] = {}
+    group_order: list[str] = []
+    for idx, spec in enumerate(parameter_specs):
+        if str(getattr(spec, "component_family", "")) != "source_position":
+            continue
+        group_name = str(getattr(spec, "potential_id", "") or getattr(spec, "sample_site_name", "") or spec.sample_name)
+        if group_name not in grouped:
+            grouped[group_name] = []
+            group_order.append(group_name)
+        grouped[group_name].append((idx, spec))
+
+    field_rank = {
+        "beta_x": 0,
+        "x": 0,
+        "source_x": 0,
+        "beta_y": 1,
+        "y": 1,
+        "source_y": 1,
+    }
+    blocks: list[tuple[str, ...]] = []
+    for group_name in group_order:
+        ordered_specs = [
+            spec
+            for _idx, spec in sorted(
+                grouped[group_name],
+                key=lambda item: (field_rank.get(str(getattr(item[1], "field", "")), 10), item[0]),
+            )
+        ]
+        site_names = _unique_sample_site_names(ordered_specs)
+        if site_names:
+            blocks.append(site_names)
+    return tuple(blocks)
+
+
+def _structured_nuts_dense_mass_blocks(parameter_specs: list[ParameterSpec]) -> tuple[tuple[str, ...], ...]:
+    non_source_sites = _unique_sample_site_names(
+        spec for spec in parameter_specs if str(getattr(spec, "component_family", "")) != "source_position"
+    )
+    blocks: list[tuple[str, ...]] = []
+    if non_source_sites:
+        blocks.append(non_source_sites)
+    blocks.extend(_source_position_dense_mass_blocks(parameter_specs))
+    return tuple(blocks)
+
+
+def _resolved_nuts_dense_mass_structure(args: argparse.Namespace, state: BuildState | None = None) -> str:
+    requested = str(getattr(args, "dense_mass", DEFAULT_NUTS_DENSE_MASS))
+    if requested not in NUTS_DENSE_MASS_CHOICES:
+        raise ValueError(f"Unsupported NUTS dense mass mode {requested!r}.")
+    return requested
+
+
+def _nuts_dense_mass_argument(args: argparse.Namespace, state: BuildState) -> bool | list[tuple[str, ...]]:
+    structure = _resolved_nuts_dense_mass_structure(args, state)
+    if structure == NUTS_DENSE_MASS_DIAGONAL:
+        return False
+    if structure == NUTS_DENSE_MASS_FULL:
+        return True
+    has_source_positions = any(
+        str(getattr(spec, "component_family", "")) == "source_position"
+        for spec in getattr(state, "parameter_specs", [])
+    )
+    if not has_source_positions:
+        return True
+    blocks = _structured_nuts_dense_mass_blocks(list(getattr(state, "parameter_specs", [])))
+    return list(blocks) if blocks else False
+
+
+def _blocked_nuts_dense_mass_argument(args: argparse.Namespace) -> bool:
+    return _resolved_nuts_dense_mass_structure(args) != NUTS_DENSE_MASS_DIAGONAL
+
+
+def _nuts_dense_mass_diagnostic_value(dense_mass: bool | list[tuple[str, ...]]) -> bool | list[list[str]]:
+    if isinstance(dense_mass, bool):
+        return dense_mass
+    return [list(block) for block in dense_mass]
+
+
+def _format_nuts_dense_mass_for_log(dense_mass: bool | list[tuple[str, ...]]) -> str:
+    if isinstance(dense_mass, bool):
+        return str(dense_mass)
+    return f"structured[{len(dense_mass)} blocks]"
 
 
 def _site_value_from_theta(theta: np.ndarray | jnp.ndarray, site: _SampleSiteSpec) -> jnp.ndarray:
@@ -10697,6 +13777,86 @@ def _build_image_scatter_parameter_spec(
     )
 
 
+def _build_critical_arc_singular_threshold_parameter_spec(
+    start_index: int,
+    *,
+    lower: float = DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_LOWER,
+    upper: float = DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_UPPER,
+    prior_median: float = DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_MEDIAN,
+    prior_log_sigma: float = DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_LOG_SIGMA,
+) -> ParameterSpec:
+    del start_index
+    lower_f = float(lower)
+    upper_f = float(upper)
+    median_f = float(prior_median)
+    log_sigma_f = float(prior_log_sigma)
+    if not np.isfinite(lower_f) or not np.isfinite(upper_f) or lower_f <= 0.0 or lower_f >= upper_f:
+        raise ValueError("critical arc singular threshold bounds must be finite, positive, and ordered.")
+    if not np.isfinite(median_f) or not (lower_f < median_f < upper_f):
+        raise ValueError("critical arc singular threshold prior median must lie between bounds.")
+    if not np.isfinite(log_sigma_f) or log_sigma_f <= 0.0:
+        raise ValueError("critical arc singular threshold prior log sigma must be finite and positive.")
+    return ParameterSpec(
+        name="critical_arc.singular_threshold",
+        sample_name=CRITICAL_ARC_SINGULAR_THRESHOLD_SAMPLE_NAME,
+        potential_id="critical_arc",
+        profile_type=0,
+        field="singular_threshold",
+        prior_kind="truncated_normal",
+        lower=float(np.log(lower_f)),
+        upper=float(np.log(upper_f)),
+        step=0.05,
+        mean=float(np.log(median_f)),
+        std=log_sigma_f,
+        component_family=CRITICAL_ARC_HYPERPARAMETER_COMPONENT_FAMILY,
+        transform_kind="log_positive",
+        physical_lower=lower_f,
+        physical_upper=upper_f,
+        physical_mean=median_f,
+        physical_std=None,
+    )
+
+
+def _build_critical_arc_singular_softness_parameter_spec(
+    start_index: int,
+    *,
+    lower: float = DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_LOWER,
+    upper: float = DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER,
+    prior_median: float = DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_MEDIAN,
+    prior_log_sigma: float = DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_LOG_SIGMA,
+) -> ParameterSpec:
+    del start_index
+    lower_f = float(lower)
+    upper_f = float(upper)
+    median_f = float(prior_median)
+    log_sigma_f = float(prior_log_sigma)
+    if not np.isfinite(lower_f) or not np.isfinite(upper_f) or lower_f <= 0.0 or lower_f >= upper_f:
+        raise ValueError("critical arc singular softness bounds must be finite, positive, and ordered.")
+    if not np.isfinite(median_f) or not (lower_f < median_f < upper_f):
+        raise ValueError("critical arc singular softness prior median must lie between bounds.")
+    if not np.isfinite(log_sigma_f) or log_sigma_f <= 0.0:
+        raise ValueError("critical arc singular softness prior log sigma must be finite and positive.")
+    return ParameterSpec(
+        name="critical_arc.singular_softness",
+        sample_name=CRITICAL_ARC_SINGULAR_SOFTNESS_SAMPLE_NAME,
+        potential_id="critical_arc",
+        profile_type=0,
+        field="singular_softness",
+        prior_kind="truncated_normal",
+        lower=float(np.log(lower_f)),
+        upper=float(np.log(upper_f)),
+        step=0.05,
+        mean=float(np.log(median_f)),
+        std=log_sigma_f,
+        component_family=CRITICAL_ARC_HYPERPARAMETER_COMPONENT_FAMILY,
+        transform_kind="log_positive",
+        physical_lower=lower_f,
+        physical_upper=upper_f,
+        physical_mean=median_f,
+        physical_std=None,
+    )
+
+
 def _build_cosmology_parameter_specs(start_index: int, cosmo: Any) -> list[ParameterSpec]:
     del start_index
     om0_value = _om0_from_config(cosmo) if isinstance(cosmo, dict) else float(getattr(cosmo, "Om0", 0.3))
@@ -11344,6 +14504,9 @@ class ClusterJAXEvaluator:
         self,
         state: BuildState,
         match_tolerance_arcsec: float,
+        exact_image_min_distance_arcsec: float = DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC,
+        exact_image_precision_limit: float = DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
+        exact_image_num_iter_max: int = DEFAULT_EXACT_IMAGE_NUM_ITER_MAX,
         sampling_engine: str = "full",
         active_scaling_galaxies: list[int] | int | None = None,
         active_scaling_selection: str = "adaptive",
@@ -11367,7 +14530,7 @@ class ClusterJAXEvaluator:
         critical_arc_lm_damping_relative: float = DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE,
         critical_arc_lm_damping_absolute: float = DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE,
         critical_arc_lm_trust_radius_arcsec: float = DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC,
-        arc_aware_noncritical_support_radius_arcsec: float | None = None,
+        arc_recovery_p_arc_threshold: float = DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD,
         arc_aware_max_arclength_arcsec: float = DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC,
         arc_aware_curve_step_arcsec: float = DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC,
         fold_curvature_arcsec_inv: float = DEFAULT_FOLD_CURVATURE_ARCSEC_INV,
@@ -11399,6 +14562,15 @@ class ClusterJAXEvaluator:
     ):
         self.state = state
         self.match_tolerance_arcsec = float(match_tolerance_arcsec)
+        self.exact_image_min_distance_arcsec = float(exact_image_min_distance_arcsec)
+        self.exact_image_precision_limit = float(exact_image_precision_limit)
+        self.exact_image_num_iter_max = int(exact_image_num_iter_max)
+        if not np.isfinite(self.exact_image_min_distance_arcsec) or self.exact_image_min_distance_arcsec <= 0.0:
+            raise ValueError("exact_image_min_distance_arcsec must be finite and positive.")
+        if not np.isfinite(self.exact_image_precision_limit) or self.exact_image_precision_limit <= 0.0:
+            raise ValueError("exact_image_precision_limit must be finite and positive.")
+        if self.exact_image_num_iter_max <= 0:
+            raise ValueError("exact_image_num_iter_max must be positive.")
         self.sampling_engine = str(sampling_engine)
         if self.sampling_engine not in SAMPLING_ENGINES:
             raise ValueError(
@@ -11421,17 +14593,38 @@ class ClusterJAXEvaluator:
             SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
         }:
             raise ValueError(f"Unsupported sample_likelihood_mode={self.sample_likelihood_mode!r}.")
+        if self.sampling_engine == SAMPLING_ENGINE_FULL_FLAT and self.sample_likelihood_mode not in {
+            SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
+        }:
+            raise ValueError(
+                "sampling_engine='full_flat' is experimental and currently only supports "
+                "local-jacobian, critical-arc-mixture-image-plane, and "
+                "critical-arc-mixture-centroid-image-plane."
+            )
+        if self.sampling_engine == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT and self.sample_likelihood_mode not in {
+            SAMPLE_LIKELIHOOD_SOURCE,
+            SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
+        }:
+            raise ValueError(
+                "sampling_engine='refreshing_surrogate_flat' does not yet support "
+                f"sample_likelihood_mode={self.sample_likelihood_mode!r}; use "
+                "sampling_engine='refreshing_surrogate' for the legacy per-bin surrogate path."
+            )
         requested_image_plane_newton_steps = int(image_plane_newton_steps)
         if (
             self.sample_likelihood_mode
             in {
                 SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
                 SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
-                SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
                 SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
                 SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
             }
@@ -11439,12 +14632,12 @@ class ClusterJAXEvaluator:
         ):
             raise ValueError(f"{self.sample_likelihood_mode} requires image_plane_newton_steps=0.")
         if (
-            self.sampling_engine == SAMPLING_ENGINE_REFRESHING_SURROGATE
+            self.sampling_engine in {SAMPLING_ENGINE_REFRESHING_SURROGATE, SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT}
             and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
             and requested_image_plane_newton_steps > 0
         ):
             raise ValueError(
-                "refreshing_surrogate with linearized-forward-beta-image-plane requires "
+                "refreshing_surrogate or refreshing_surrogate_flat with linearized-forward-beta-image-plane requires "
                 "image_plane_newton_steps=0; Newton updates move image positions away from the observed-position cache."
             )
         self.image_plane_newton_steps = max(0, min(3, requested_image_plane_newton_steps))
@@ -11452,12 +14645,12 @@ class ClusterJAXEvaluator:
         if requested_anchored_steps < 0:
             raise ValueError("anchored_image_plane_solve_steps must be non-negative.")
         if (
-            self.sampling_engine == SAMPLING_ENGINE_REFRESHING_SURROGATE
+            self.sampling_engine in {SAMPLING_ENGINE_REFRESHING_SURROGATE, SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT}
             and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE
             and requested_anchored_steps > 0
         ):
             raise ValueError(
-                "anchored-solved-forward-beta-image-plane with refreshing_surrogate requires "
+                "anchored-solved-forward-beta-image-plane with refreshing_surrogate or refreshing_surrogate_flat requires "
                 "anchored_image_plane_solve_steps=0."
             )
         self.anchored_image_plane_solve_steps = requested_anchored_steps
@@ -11487,10 +14680,7 @@ class ClusterJAXEvaluator:
         self.critical_arc_lm_damping_relative = float(critical_arc_lm_damping_relative)
         self.critical_arc_lm_damping_absolute = float(critical_arc_lm_damping_absolute)
         self.critical_arc_lm_trust_radius_arcsec = float(critical_arc_lm_trust_radius_arcsec)
-        self.arc_aware_noncritical_support_radius_arcsec = _resolve_arc_aware_noncritical_support_radius_arcsec(
-            arc_aware_noncritical_support_radius_arcsec,
-            self.match_tolerance_arcsec,
-        )
+        self.arc_recovery_p_arc_threshold = float(arc_recovery_p_arc_threshold)
         self.arc_aware_max_arclength_arcsec = float(arc_aware_max_arclength_arcsec)
         self.arc_aware_curve_step_arcsec = float(arc_aware_curve_step_arcsec)
         self.fold_curvature_arcsec_inv = float(fold_curvature_arcsec_inv)
@@ -11543,10 +14733,11 @@ class ClusterJAXEvaluator:
         ):
             raise ValueError("critical_arc_lm_trust_radius_arcsec must be finite and positive.")
         if (
-            not np.isfinite(self.arc_aware_noncritical_support_radius_arcsec)
-            or self.arc_aware_noncritical_support_radius_arcsec <= 0.0
+            not np.isfinite(self.arc_recovery_p_arc_threshold)
+            or self.arc_recovery_p_arc_threshold < 0.0
+            or self.arc_recovery_p_arc_threshold > 1.0
         ):
-            raise ValueError("arc_aware_noncritical_support_radius_arcsec must be finite and positive.")
+            raise ValueError("arc_recovery_p_arc_threshold must be finite and in [0, 1].")
         if not np.isfinite(self.arc_aware_max_arclength_arcsec) or self.arc_aware_max_arclength_arcsec <= 0.0:
             raise ValueError("arc_aware_max_arclength_arcsec must be finite and positive.")
         if not np.isfinite(self.arc_aware_curve_step_arcsec) or self.arc_aware_curve_step_arcsec <= 0.0:
@@ -11670,6 +14861,11 @@ class ClusterJAXEvaluator:
             )
             for effective_z_source in geometry_cache.effective_z_source_values
         }
+        self.flat_lens_model = LensModelBulk(
+            unique_lens_model_list=unique_lens_model_list,
+            multi_plane=False,
+            cosmo=self.cosmo,
+        )
         if getattr(state.arc_data, "n_arcs", 0):
             self.models_by_effective_z[float(CAB_MORPHOLOGY_MODEL_KEY)] = LensModelBulk(
                 unique_lens_model_list=unique_lens_model_list,
@@ -11725,6 +14921,54 @@ class ClusterJAXEvaluator:
         ]
         self.image_sigma_int_param_index = int(image_scatter_indices[0]) if image_scatter_indices else -1
         self.image_sigma_int_sampled = self.fixed_image_sigma_int_arcsec is None and self.image_sigma_int_param_index >= 0
+        critical_arc_threshold_indices = [
+            idx
+            for idx, spec in enumerate(self.state.parameter_specs)
+            if spec.sample_name == CRITICAL_ARC_SINGULAR_THRESHOLD_SAMPLE_NAME
+        ]
+        self.critical_arc_singular_threshold_param_index = (
+            int(critical_arc_threshold_indices[0]) if critical_arc_threshold_indices else -1
+        )
+        self.critical_arc_singular_threshold_sampled = self.critical_arc_singular_threshold_param_index >= 0
+        self.critical_arc_singular_threshold_surrogate_cutoff = float(self.critical_arc_singular_threshold)
+        if self.critical_arc_singular_threshold_sampled:
+            threshold_spec = self.state.parameter_specs[self.critical_arc_singular_threshold_param_index]
+            threshold_upper = getattr(threshold_spec, "physical_upper", None)
+            if threshold_upper is None:
+                threshold_upper = (
+                    np.exp(float(threshold_spec.upper))
+                    if str(getattr(threshold_spec, "transform_kind", "")) == "log_positive"
+                    else float(threshold_spec.upper)
+                )
+            if np.isfinite(float(threshold_upper)):
+                self.critical_arc_singular_threshold_surrogate_cutoff = max(
+                    float(self.critical_arc_singular_threshold),
+                    float(threshold_upper),
+                )
+        critical_arc_softness_indices = [
+            idx
+            for idx, spec in enumerate(self.state.parameter_specs)
+            if spec.sample_name == CRITICAL_ARC_SINGULAR_SOFTNESS_SAMPLE_NAME
+        ]
+        self.critical_arc_singular_softness_param_index = (
+            int(critical_arc_softness_indices[0]) if critical_arc_softness_indices else -1
+        )
+        self.critical_arc_singular_softness_sampled = self.critical_arc_singular_softness_param_index >= 0
+        self.critical_arc_singular_softness_surrogate_cutoff = float(self.critical_arc_singular_softness)
+        if self.critical_arc_singular_softness_sampled:
+            softness_spec = self.state.parameter_specs[self.critical_arc_singular_softness_param_index]
+            softness_upper = getattr(softness_spec, "physical_upper", None)
+            if softness_upper is None:
+                softness_upper = (
+                    np.exp(float(softness_spec.upper))
+                    if str(getattr(softness_spec, "transform_kind", "")) == "log_positive"
+                    else float(softness_spec.upper)
+                )
+            if np.isfinite(float(softness_upper)):
+                self.critical_arc_singular_softness_surrogate_cutoff = max(
+                    float(self.critical_arc_singular_softness),
+                    float(softness_upper),
+                )
         self.cosmology_om0_param_index = next(
             (
                 idx
@@ -11780,7 +15024,6 @@ class ClusterJAXEvaluator:
             in {
                 SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
                 SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
-                SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
                 SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
                 SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
             }
@@ -11827,6 +15070,7 @@ class ClusterJAXEvaluator:
         self.potfile_mass_size_cut_offsets = jnp.asarray(coupling_arrays["cut_offsets"], dtype=jnp.float64)
         self.potfile_mass_size_reparam_group_count = int(len(coupling_arrays["mass_indices"]))
         self.packed_spec_jax = self._prepare_packed_spec_arrays()
+        self.flat_critical_arc_data = self._build_flat_critical_arc_data()
         self.scaling_rank_df = self._build_scaling_rank_diagnostics()
         self.active_scaling_component_indices = np.asarray(
             self.scaling_rank_df.loc[self.scaling_rank_df["selected_active"], "component_index"].to_numpy(dtype=np.int32)
@@ -11865,15 +15109,7 @@ class ClusterJAXEvaluator:
         self.active_scaling_component_indices_jax = jnp.asarray(self.active_scaling_component_indices, dtype=jnp.int32)
         self.active_component_indices_jax = jnp.asarray(self.active_component_indices, dtype=jnp.int32)
         stage4_refreshing_surrogate_supported = (
-            self.sample_likelihood_mode
-            in {
-                SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
-                SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
-                SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
-                SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-                SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
-                SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
-            }
+            _sample_likelihood_uses_image_plane_jacobian(self.sample_likelihood_mode)
             and self.image_plane_newton_steps == 0
             and (
                 self.sample_likelihood_mode != SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE
@@ -11884,7 +15120,10 @@ class ClusterJAXEvaluator:
             self.sample_likelihood_mode
         )
         self.surrogate_enabled = (
-            self.sampling_engine == SAMPLING_ENGINE_REFRESHING_SURROGATE
+            self.sampling_engine in {
+                SAMPLING_ENGINE_REFRESHING_SURROGATE,
+                SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+            }
             and self.use_bulk_ray_shooting
             and len(self.scaling_component_indices) > 0
             and len(self.inactive_scaling_component_indices) > 0
@@ -11894,10 +15133,12 @@ class ClusterJAXEvaluator:
         self.surrogate_reference_params: np.ndarray | None = None
         self.surrogate_reference_param_values = np.zeros(len(self.surrogate_param_indices), dtype=float)
         self.surrogate_cache_by_z: dict[float, SurrogateBinCache] = {}
+        self.flat_surrogate_cache: FlatSurrogateCache | None = None
         self.scaling_scatter_reference_params: np.ndarray | None = None
         self.scaling_scatter_cache_by_z: dict[float, dict[str, np.ndarray]] = {}
         self.source_metric_reference_params: np.ndarray | None = None
         self.source_metric_cache_by_z: dict[float, dict[str, np.ndarray]] = {}
+        self.flat_source_metric_cache = self._flat_source_metric_arrays_from_cache()
         self._source_loglike_fn = jax.jit(self._source_loglike_impl)
 
     def _active_subset_effective(self) -> bool:
@@ -11938,6 +15179,213 @@ class ClusterJAXEvaluator:
             effective_z_index=int(self.cosmology_effective_z_to_index.get(float(bin_data.effective_z_source), -1)),
             constrained_image_indices=jnp.asarray(np.flatnonzero(image_has_constraint), dtype=jnp.int32),
         )
+
+    def _build_flat_critical_arc_data(self) -> FlatCriticalArcData:
+        x_obs: list[np.ndarray] = []
+        y_obs: list[np.ndarray] = []
+        sigma_per_image: list[np.ndarray] = []
+        reliability_per_image: list[np.ndarray] = []
+        image_has_constraint: list[np.ndarray] = []
+        effective_z_index_per_image: list[np.ndarray] = []
+        global_family_index_per_image: list[np.ndarray] = []
+        bin_index_per_image: list[np.ndarray] = []
+        local_image_index_per_image: list[np.ndarray] = []
+        family_ids: list[str] = []
+        source_x_indices: list[int] = []
+        source_y_indices: list[int] = []
+        prior_x: list[float] = []
+        prior_y: list[float] = []
+        prior_sigma: list[float] = []
+        spec_by_index = {idx: spec for idx, spec in enumerate(self.state.parameter_specs)}
+        family_offset = 0
+        for bin_index, bin_data in enumerate(self.traced_bin_data):
+            n_images = int(np.asarray(bin_data.x_obs).size)
+            local_family_idx = np.asarray(bin_data.family_index_per_image, dtype=np.int32)
+            x_obs.append(np.asarray(bin_data.x_obs, dtype=float))
+            y_obs.append(np.asarray(bin_data.y_obs, dtype=float))
+            sigma_per_image.append(np.asarray(bin_data.sigma_per_image, dtype=float))
+            reliability_per_image.append(np.asarray(bin_data.reliability_per_image, dtype=float))
+            image_has_constraint.append(np.asarray(bin_data.image_has_constraint, dtype=bool))
+            effective_z_index_per_image.append(
+                np.full(n_images, int(getattr(bin_data, "effective_z_index", -1)), dtype=np.int32)
+            )
+            global_family_index_per_image.append(local_family_idx + family_offset)
+            bin_index_per_image.append(np.full(n_images, int(bin_index), dtype=np.int32))
+            local_image_index_per_image.append(np.arange(n_images, dtype=np.int32))
+            for family_id in bin_data.family_ids:
+                family_ids.append(str(family_id))
+                idx_x, idx_y = self.source_position_param_indices_by_family.get(str(family_id), (-1, -1))
+                source_x_indices.append(int(idx_x))
+                source_y_indices.append(int(idx_y))
+                spec_x = spec_by_index.get(int(idx_x))
+                spec_y = spec_by_index.get(int(idx_y))
+                prior_x.append(float(spec_x.physical_mean if spec_x is not None and spec_x.physical_mean is not None else 0.0))
+                prior_y.append(float(spec_y.physical_mean if spec_y is not None and spec_y.physical_mean is not None else 0.0))
+                sigma_x = float(spec_x.physical_std if spec_x is not None and spec_x.physical_std is not None else 1.0)
+                sigma_y = float(spec_y.physical_std if spec_y is not None and spec_y.physical_std is not None else sigma_x)
+                prior_sigma.append(max(0.5 * (sigma_x + sigma_y), 1.0e-9))
+            family_offset += int(bin_data.n_families)
+
+        def concat_or_empty(values: list[np.ndarray], dtype: Any) -> jnp.ndarray:
+            if values:
+                return jnp.asarray(np.concatenate(values), dtype=dtype)
+            return jnp.asarray([], dtype=dtype)
+
+        n_images_total = int(sum(np.asarray(item).size for item in x_obs))
+        zero_float = jnp.zeros(n_images_total, dtype=jnp.float64)
+        return FlatCriticalArcData(
+            family_ids=tuple(family_ids),
+            n_families=int(len(family_ids)),
+            x_obs=concat_or_empty(x_obs, jnp.float64),
+            y_obs=concat_or_empty(y_obs, jnp.float64),
+            sigma_per_image=concat_or_empty(sigma_per_image, jnp.float64),
+            reliability_per_image=concat_or_empty(reliability_per_image, jnp.float64),
+            image_has_constraint=concat_or_empty(image_has_constraint, bool),
+            effective_z_index_per_image=concat_or_empty(effective_z_index_per_image, jnp.int32),
+            global_family_index_per_image=concat_or_empty(global_family_index_per_image, jnp.int32),
+            global_family_source_x_param_index=jnp.asarray(source_x_indices, dtype=jnp.int32),
+            global_family_source_y_param_index=jnp.asarray(source_y_indices, dtype=jnp.int32),
+            global_family_prior_x=jnp.asarray(prior_x, dtype=jnp.float64),
+            global_family_prior_y=jnp.asarray(prior_y, dtype=jnp.float64),
+            global_family_prior_sigma=jnp.asarray(prior_sigma, dtype=jnp.float64),
+            bin_index_per_image=concat_or_empty(bin_index_per_image, jnp.int32),
+            local_image_index_per_image=concat_or_empty(local_image_index_per_image, jnp.int32),
+            sigma_scatter_x=zero_float,
+            sigma_scatter_y=zero_float,
+            core_scatter_x=zero_float,
+            core_scatter_y=zero_float,
+            cut_scatter_x=zero_float,
+            cut_scatter_y=zero_float,
+        )
+
+    def _flat_scaling_scatter_arrays_from_cache(self) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        base = getattr(self, "flat_critical_arc_data", None)
+        if base is None:
+            empty = jnp.asarray([], dtype=jnp.float64)
+            return empty, empty, empty, empty, empty, empty
+        keys = ("sigma_x", "sigma_y", "core_x", "core_y", "cut_x", "cut_y")
+        values_by_key: dict[str, list[np.ndarray]] = {key: [] for key in keys}
+        for bin_data in self.traced_bin_data:
+            n_images = int(np.asarray(bin_data.x_obs).size)
+            cache = self.scaling_scatter_cache_by_z.get(float(bin_data.effective_z_source))
+            for key in keys:
+                if cache is None:
+                    values_by_key[key].append(np.zeros(n_images, dtype=float))
+                else:
+                    values_by_key[key].append(np.asarray(cache.get(key, np.zeros(n_images, dtype=float)), dtype=float))
+        return tuple(
+            jnp.asarray(np.concatenate(values_by_key[key]) if values_by_key[key] else np.asarray([], dtype=float), dtype=jnp.float64)
+            for key in keys
+        )
+
+    def _refresh_flat_critical_arc_scatter_arrays(self) -> None:
+        base = getattr(self, "flat_critical_arc_data", None)
+        if base is None:
+            return
+        sigma_x, sigma_y, core_x, core_y, cut_x, cut_y = self._flat_scaling_scatter_arrays_from_cache()
+        self.flat_critical_arc_data = replace(
+            base,
+            sigma_scatter_x=sigma_x,
+            sigma_scatter_y=sigma_y,
+            core_scatter_x=core_x,
+            core_scatter_y=core_y,
+            cut_scatter_x=cut_x,
+            cut_scatter_y=cut_y,
+        )
+
+    def _flat_source_metric_arrays_from_cache(self) -> FlatSourceMetricCache:
+        flat_data = getattr(self, "flat_critical_arc_data", None)
+        if flat_data is None:
+            empty = jnp.asarray([], dtype=jnp.float64)
+            return FlatSourceMetricCache(empty, empty, empty, empty, empty)
+        values_by_key: dict[str, list[np.ndarray]] = {
+            "inv_abs_mu": [],
+            "jac_a00": [],
+            "jac_a01": [],
+            "jac_a10": [],
+            "jac_a11": [],
+        }
+        for bin_data in self.traced_bin_data:
+            n_images = int(np.asarray(bin_data.x_obs).size)
+            cache = self.source_metric_cache_by_z.get(float(bin_data.effective_z_source))
+            if cache is None:
+                values_by_key["inv_abs_mu"].append(np.ones(n_images, dtype=float))
+                values_by_key["jac_a00"].append(np.ones(n_images, dtype=float))
+                values_by_key["jac_a01"].append(np.zeros(n_images, dtype=float))
+                values_by_key["jac_a10"].append(np.zeros(n_images, dtype=float))
+                values_by_key["jac_a11"].append(np.ones(n_images, dtype=float))
+            else:
+                values_by_key["inv_abs_mu"].append(np.asarray(cache.get("inv_abs_mu", np.ones(n_images)), dtype=float))
+                values_by_key["jac_a00"].append(np.asarray(cache.get("jac_a00", np.ones(n_images)), dtype=float))
+                values_by_key["jac_a01"].append(np.asarray(cache.get("jac_a01", np.zeros(n_images)), dtype=float))
+                values_by_key["jac_a10"].append(np.asarray(cache.get("jac_a10", np.zeros(n_images)), dtype=float))
+                values_by_key["jac_a11"].append(np.asarray(cache.get("jac_a11", np.ones(n_images)), dtype=float))
+
+        def concat(key: str) -> jnp.ndarray:
+            values = values_by_key[key]
+            return jnp.asarray(np.concatenate(values) if values else np.asarray([], dtype=float), dtype=jnp.float64)
+
+        return FlatSourceMetricCache(
+            inv_abs_mu=concat("inv_abs_mu"),
+            jac_a00=concat("jac_a00"),
+            jac_a01=concat("jac_a01"),
+            jac_a10=concat("jac_a10"),
+            jac_a11=concat("jac_a11"),
+        )
+
+    def _refresh_flat_source_metric_arrays(self) -> None:
+        self.flat_source_metric_cache = self._flat_source_metric_arrays_from_cache()
+
+    def _flat_surrogate_cache_from_bins(self) -> FlatSurrogateCache | None:
+        if not self.surrogate_cache_by_z:
+            return None
+        ordered: list[SurrogateBinCache] = []
+        for bin_data in self.traced_bin_data:
+            cache = self.surrogate_cache_by_z.get(float(bin_data.effective_z_source))
+            if cache is None:
+                return None
+            ordered.append(cache)
+
+        def concat_1d(field_name: str) -> jnp.ndarray:
+            return jnp.asarray(
+                np.concatenate([np.asarray(getattr(cache, field_name), dtype=float) for cache in ordered]),
+                dtype=jnp.float64,
+            )
+
+        def concat_derivative(field_name: str) -> jnp.ndarray | None:
+            values = [getattr(cache, field_name) for cache in ordered]
+            if any(value is None for value in values):
+                return None
+            return jnp.asarray(
+                np.concatenate([np.asarray(value, dtype=float) for value in values if value is not None], axis=1),
+                dtype=jnp.float64,
+            )
+
+        return FlatSurrogateCache(
+            inactive_alpha_x=concat_1d("inactive_alpha_x"),
+            inactive_alpha_y=concat_1d("inactive_alpha_y"),
+            inactive_alpha_dx_dparams=concat_derivative("inactive_alpha_dx_dparams"),
+            inactive_alpha_dy_dparams=concat_derivative("inactive_alpha_dy_dparams"),
+            inactive_jacobian_delta_a00=concat_1d("inactive_jacobian_delta_a00")
+            if ordered and ordered[0].inactive_jacobian_delta_a00 is not None
+            else None,
+            inactive_jacobian_delta_a01=concat_1d("inactive_jacobian_delta_a01")
+            if ordered and ordered[0].inactive_jacobian_delta_a01 is not None
+            else None,
+            inactive_jacobian_delta_a10=concat_1d("inactive_jacobian_delta_a10")
+            if ordered and ordered[0].inactive_jacobian_delta_a10 is not None
+            else None,
+            inactive_jacobian_delta_a11=concat_1d("inactive_jacobian_delta_a11")
+            if ordered and ordered[0].inactive_jacobian_delta_a11 is not None
+            else None,
+            inactive_jacobian_delta_da00_dparams=concat_derivative("inactive_jacobian_delta_da00_dparams"),
+            inactive_jacobian_delta_da01_dparams=concat_derivative("inactive_jacobian_delta_da01_dparams"),
+            inactive_jacobian_delta_da10_dparams=concat_derivative("inactive_jacobian_delta_da10_dparams"),
+            inactive_jacobian_delta_da11_dparams=concat_derivative("inactive_jacobian_delta_da11_dparams"),
+        )
+
+    def _refresh_flat_surrogate_cache(self) -> None:
+        self.flat_surrogate_cache = self._flat_surrogate_cache_from_bins()
 
     def _prepare_traced_arc_constraint_data(self, arc_data: ArcConstraintData | None) -> TracedArcConstraintData:
         if arc_data is None or int(getattr(arc_data, "n_arcs", 0)) <= 0:
@@ -12065,6 +15513,40 @@ class ClusterJAXEvaluator:
         physical_params = _convert_theta_to_physical(params_array, self.state.parameter_specs)
         return float(physical_params[self.image_sigma_int_param_index])
 
+    def _critical_arc_singular_threshold_from_physical(self, physical_params: jnp.ndarray) -> jnp.ndarray:
+        param_index = int(getattr(self, "critical_arc_singular_threshold_param_index", -1))
+        if param_index < 0:
+            return jnp.asarray(float(self.critical_arc_singular_threshold), dtype=jnp.float64)
+        return jnp.take(
+            physical_params,
+            jnp.asarray(param_index, dtype=jnp.int32),
+        )
+
+    def _critical_arc_singular_threshold_numpy(self, params: np.ndarray | jnp.ndarray) -> float:
+        param_index = int(getattr(self, "critical_arc_singular_threshold_param_index", -1))
+        if param_index < 0:
+            return float(self.critical_arc_singular_threshold)
+        params_array = np.asarray(params, dtype=float)
+        physical_params = _convert_theta_to_physical(params_array, self.state.parameter_specs)
+        return float(physical_params[param_index])
+
+    def _critical_arc_singular_softness_from_physical(self, physical_params: jnp.ndarray) -> jnp.ndarray:
+        param_index = int(getattr(self, "critical_arc_singular_softness_param_index", -1))
+        if param_index < 0:
+            return jnp.asarray(float(self.critical_arc_singular_softness), dtype=jnp.float64)
+        return jnp.take(
+            physical_params,
+            jnp.asarray(param_index, dtype=jnp.int32),
+        )
+
+    def _critical_arc_singular_softness_numpy(self, params: np.ndarray | jnp.ndarray) -> float:
+        param_index = int(getattr(self, "critical_arc_singular_softness_param_index", -1))
+        if param_index < 0:
+            return float(self.critical_arc_singular_softness)
+        params_array = np.asarray(params, dtype=float)
+        physical_params = _convert_theta_to_physical(params_array, self.state.parameter_specs)
+        return float(physical_params[param_index])
+
     def _source_position_vectors_for_bin(
         self,
         physical_params: jnp.ndarray,
@@ -12191,6 +15673,44 @@ class ClusterJAXEvaluator:
             jnp.where(finite, correction, jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64)),
         )
 
+    def _centroid_source_position_vectors_for_bin(
+        self,
+        bin_data: TracedBinData,
+        beta_x: jnp.ndarray,
+        beta_y: jnp.ndarray,
+        image_sigma_int: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        sigma2 = (
+            jnp.square(bin_data.sigma_per_image)
+            + jnp.square(image_sigma_int)
+            + jnp.asarray(self.source_plane_covariance_floor, dtype=jnp.float64)
+        )
+        reliability = jnp.clip(bin_data.reliability_per_image, 1.0e-6, 1.0)
+        weights = jnp.where(
+            bin_data.image_has_constraint,
+            reliability / jnp.maximum(sigma2, jnp.asarray(1.0e-18, dtype=jnp.float64)),
+            jnp.asarray(0.0, dtype=jnp.float64),
+        )
+        family_idx = bin_data.family_index_per_image
+        n_families = int(bin_data.n_families)
+        sum_w = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights)
+        sum_bx = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights * beta_x)
+        sum_by = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights * beta_y)
+        safe_sum_w = jnp.maximum(sum_w, jnp.asarray(1.0e-18, dtype=jnp.float64))
+        centroid_x = sum_bx / safe_sum_w
+        centroid_y = sum_by / safe_sum_w
+        finite = (
+            jnp.all(sum_w > 0.0)
+            & jnp.all(jnp.isfinite(centroid_x))
+            & jnp.all(jnp.isfinite(centroid_y))
+        )
+        return (
+            centroid_x[family_idx],
+            centroid_y[family_idx],
+            finite,
+            jnp.asarray(0.0, dtype=jnp.float64),
+        )
+
     def _explicit_source_position_vectors_for_bin(
         self,
         params: jnp.ndarray,
@@ -12214,6 +15734,148 @@ class ClusterJAXEvaluator:
             )
         source_x, source_y, finite = self._source_position_vectors_for_bin(physical_params, bin_data)
         return source_x, source_y, finite, jnp.asarray(0.0, dtype=jnp.float64)
+
+    def _flat_source_position_vectors(
+        self,
+        params: jnp.ndarray,
+        physical_params: jnp.ndarray,
+        flat_data: FlatCriticalArcData,
+        beta_x: jnp.ndarray,
+        beta_y: jnp.ndarray,
+        image_sigma_int: jnp.ndarray,
+        jacobian_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE:
+            return self._flat_centroid_source_position_vectors(flat_data, beta_x, beta_y, image_sigma_int)
+        if self.source_position_conditional:
+            return self._flat_conditional_source_position_transport(
+                params,
+                flat_data,
+                beta_x,
+                beta_y,
+                image_sigma_int,
+                jacobian_entries,
+            )
+        x_indices = flat_data.global_family_source_x_param_index
+        y_indices = flat_data.global_family_source_y_param_index
+        has_source_positions = jnp.all((x_indices >= 0) & (y_indices >= 0))
+        source_x = jnp.take(physical_params, jnp.maximum(x_indices, 0))
+        source_y = jnp.take(physical_params, jnp.maximum(y_indices, 0))
+        family_idx = flat_data.global_family_index_per_image
+        return source_x[family_idx], source_y[family_idx], has_source_positions, jnp.asarray(0.0, dtype=jnp.float64)
+
+    def _flat_centroid_source_position_vectors(
+        self,
+        flat_data: FlatCriticalArcData,
+        beta_x: jnp.ndarray,
+        beta_y: jnp.ndarray,
+        image_sigma_int: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        sigma2 = (
+            jnp.square(flat_data.sigma_per_image)
+            + jnp.square(image_sigma_int)
+            + jnp.asarray(self.source_plane_covariance_floor, dtype=jnp.float64)
+        )
+        reliability = jnp.clip(flat_data.reliability_per_image, 1.0e-6, 1.0)
+        weights = jnp.where(
+            flat_data.image_has_constraint,
+            reliability / jnp.maximum(sigma2, jnp.asarray(1.0e-18, dtype=jnp.float64)),
+            jnp.asarray(0.0, dtype=jnp.float64),
+        )
+        family_idx = flat_data.global_family_index_per_image
+        zeros = jnp.zeros(int(flat_data.n_families), dtype=jnp.float64)
+        sum_w = zeros.at[family_idx].add(weights)
+        sum_bx = zeros.at[family_idx].add(weights * beta_x)
+        sum_by = zeros.at[family_idx].add(weights * beta_y)
+        safe_sum_w = jnp.maximum(sum_w, jnp.asarray(1.0e-18, dtype=jnp.float64))
+        centroid_x = sum_bx / safe_sum_w
+        centroid_y = sum_by / safe_sum_w
+        finite = (
+            jnp.all(sum_w > 0.0)
+            & jnp.all(jnp.isfinite(centroid_x))
+            & jnp.all(jnp.isfinite(centroid_y))
+        )
+        return centroid_x[family_idx], centroid_y[family_idx], finite, jnp.asarray(0.0, dtype=jnp.float64)
+
+    def _flat_conditional_source_position_transport(
+        self,
+        params: jnp.ndarray,
+        flat_data: FlatCriticalArcData,
+        beta_x: jnp.ndarray,
+        beta_y: jnp.ndarray,
+        image_sigma_int: jnp.ndarray,
+        jacobian_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        x_indices = flat_data.global_family_source_x_param_index
+        y_indices = flat_data.global_family_source_y_param_index
+        has_source_positions = jnp.all((x_indices >= 0) & (y_indices >= 0))
+        eta_x = jnp.take(params, jnp.maximum(x_indices, 0))
+        eta_y = jnp.take(params, jnp.maximum(y_indices, 0))
+        mu_x = flat_data.global_family_prior_x
+        mu_y = flat_data.global_family_prior_y
+        sigma_prior = flat_data.global_family_prior_sigma
+        prior_precision = 1.0 / jnp.square(sigma_prior)
+
+        jac_a00, jac_a01, jac_a10, jac_a11 = jacobian_entries
+        inv00, inv01, inv10, inv11, inverse_finite = _linearized_image_plane_inverse_operator(
+            jac_a00,
+            jac_a01,
+            jac_a10,
+            jac_a11,
+            determinant_floor=1.0e-10,
+            max_gain=self.likelihood_stabilizer_max_gain,
+            require_determinant_floor=False,
+        )
+        sigma2 = _image_plane_effective_sigma2(
+            flat_data.sigma_per_image,
+            image_sigma_int,
+            self.source_plane_covariance_floor,
+        )
+        reliability = jnp.clip(flat_data.reliability_per_image, 1.0e-6, 1.0)
+        weight = reliability / sigma2
+        lambda00 = weight * (jnp.square(inv00) + jnp.square(inv10))
+        lambda01 = weight * (inv00 * inv01 + inv10 * inv11)
+        lambda11 = weight * (jnp.square(inv01) + jnp.square(inv11))
+        family_idx = flat_data.global_family_index_per_image
+        image_mask = flat_data.image_has_constraint
+        lambda00 = jnp.where(image_mask, lambda00, 0.0)
+        lambda01 = jnp.where(image_mask, lambda01, 0.0)
+        lambda11 = jnp.where(image_mask, lambda11, 0.0)
+        zeros = jnp.zeros(int(flat_data.n_families), dtype=jnp.float64)
+        p00 = prior_precision + zeros.at[family_idx].add(lambda00)
+        p01 = zeros.at[family_idx].add(lambda01)
+        p11 = prior_precision + zeros.at[family_idx].add(lambda11)
+        rhs_x = prior_precision * mu_x + zeros.at[family_idx].add(lambda00 * beta_x + lambda01 * beta_y)
+        rhs_y = prior_precision * mu_y + zeros.at[family_idx].add(lambda01 * beta_x + lambda11 * beta_y)
+        precision_det = jnp.maximum(p00 * p11 - jnp.square(p01), 1.0e-18)
+        mean_x = (p11 * rhs_x - p01 * rhs_y) / precision_det
+        mean_y = (-p01 * rhs_x + p00 * rhs_y) / precision_det
+        cov00 = p11 / precision_det
+        cov01 = -p01 / precision_det
+        cov11 = p00 / precision_det
+        chol00 = jnp.sqrt(jnp.maximum(cov00, 1.0e-18))
+        chol10 = cov01 / chol00
+        chol11 = jnp.sqrt(jnp.maximum(cov11 - jnp.square(chol10), 1.0e-18))
+        source_x_by_family = mean_x + chol00 * eta_x
+        source_y_by_family = mean_y + chol10 * eta_x + chol11 * eta_y
+        prior_quad = (jnp.square(source_x_by_family - mu_x) + jnp.square(source_y_by_family - mu_y)) * prior_precision
+        log_prior_beta = -0.5 * (prior_quad + 2.0 * jnp.log(2.0 * jnp.pi * jnp.square(sigma_prior)))
+        log_eta = -0.5 * (jnp.square(eta_x) + jnp.square(eta_y) + 2.0 * jnp.log(2.0 * jnp.pi))
+        log_det_transport = jnp.log(chol00) + jnp.log(chol11)
+        correction = jnp.sum(log_prior_beta + log_det_transport - log_eta)
+        finite = (
+            has_source_positions
+            & jnp.all(inverse_finite)
+            & jnp.all(jnp.isfinite(source_x_by_family))
+            & jnp.all(jnp.isfinite(source_y_by_family))
+            & jnp.all(jnp.isfinite(correction))
+        )
+        return (
+            source_x_by_family[family_idx],
+            source_y_by_family[family_idx],
+            finite,
+            jnp.where(finite, correction, jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64)),
+        )
 
     def _reported_physical_parameter_vector(self, params: jnp.ndarray) -> jnp.ndarray:
         params_jax = jnp.asarray(params, dtype=jnp.float64)
@@ -12453,10 +16115,6 @@ class ClusterJAXEvaluator:
         zeros = jnp.zeros_like(jac_a00)
         if len(self._fit_scaling_component_indices()) == 0 or len(self.scaling_scatter_param_indices) == 0:
             return zeros, zeros, zeros, jnp.ones_like(jac_a00, dtype=bool)
-        cache = self.scaling_scatter_cache_by_z.get(float(bin_data.effective_z_source))
-        if cache is None:
-            return zeros, zeros, zeros, jnp.ones_like(jac_a00, dtype=bool)
-        sigma_scatter, core_scatter, cut_scatter = self._scaling_scatter_field_scales_from_physical(physical_params)
         inv00, inv01, inv10, inv11, inverse_finite = _linearized_image_plane_inverse_operator(
             jac_a00,
             jac_a01,
@@ -12465,6 +16123,33 @@ class ClusterJAXEvaluator:
             max_gain=self.likelihood_stabilizer_max_gain,
             require_determinant_floor=False,
         )
+        return self._scaling_scatter_image_covariance_from_inverse(
+            physical_params,
+            bin_data,
+            inv00,
+            inv01,
+            inv10,
+            inv11,
+            inverse_finite,
+        )
+
+    def _scaling_scatter_image_covariance_from_inverse(
+        self,
+        physical_params: jnp.ndarray,
+        bin_data: BinData | TracedBinData,
+        inv00: jnp.ndarray,
+        inv01: jnp.ndarray,
+        inv10: jnp.ndarray,
+        inv11: jnp.ndarray,
+        inverse_finite: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        zeros = jnp.zeros_like(inv00)
+        if len(self._fit_scaling_component_indices()) == 0 or len(self.scaling_scatter_param_indices) == 0:
+            return zeros, zeros, zeros, jnp.ones_like(inv00, dtype=bool)
+        cache = self.scaling_scatter_cache_by_z.get(float(bin_data.effective_z_source))
+        if cache is None:
+            return zeros, zeros, zeros, jnp.ones_like(inv00, dtype=bool)
+        sigma_scatter, core_scatter, cut_scatter = self._scaling_scatter_field_scales_from_physical(physical_params)
 
         def _image_displacement_covariance(scale: jnp.ndarray, key_x: str, key_y: str) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
             source_dx = scale * jnp.asarray(cache[key_x], dtype=jnp.float64)
@@ -12533,6 +16218,7 @@ class ClusterJAXEvaluator:
             if not bool(np.asarray(validity["is_valid"], dtype=bool)):
                 self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
                 self.scaling_scatter_cache_by_z = {}
+                self._refresh_flat_critical_arc_scatter_arrays()
                 return
             beta_x, beta_y = self._ray_shooting_for_components(
                 bin_data.effective_z_source,
@@ -12554,9 +16240,11 @@ class ClusterJAXEvaluator:
             }
             if not all(np.isfinite(value).all() for value in derivatives.values()):
                 self.scaling_scatter_cache_by_z = {}
+                self._refresh_flat_critical_arc_scatter_arrays()
                 return
             self.scaling_scatter_cache_by_z[float(bin_data.effective_z_source)] = derivatives
         self.scaling_scatter_reference_params = reference.copy()
+        self._refresh_flat_critical_arc_scatter_arrays()
         self._source_loglike_fn = jax.jit(self._source_loglike_impl)
 
     def refresh_source_metric_cache(self, reference_params: np.ndarray, reason: str = "manual") -> None:
@@ -12596,6 +16284,7 @@ class ClusterJAXEvaluator:
             }
         self.source_metric_cache_by_z = refreshed_cache
         self.source_metric_reference_params = reference.copy()
+        self._refresh_flat_source_metric_arrays()
         self._source_loglike_fn = jax.jit(self._source_loglike_impl)
 
     def _magnification_inv_abs_mu(self, bin_data: TracedBinData) -> jnp.ndarray:
@@ -12659,6 +16348,33 @@ class ClusterJAXEvaluator:
         }
         return {"all_kwargs": all_kwargs, "index_list": jnp.asarray(self.bulk_index_list[component_indices], dtype=jnp.int32)}
 
+    def _flat_bulk_ray_shooting_kwargs_from_indices(
+        self,
+        packed_state: dict[str, Any],
+        component_indices: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        if component_indices is None:
+            component_indices = np.arange(len(self.bulk_index_list), dtype=np.int32)
+        component_indices_jax = jnp.asarray(component_indices, dtype=jnp.int32)
+
+        def take_components(value: Any, dtype: Any = jnp.float64) -> jnp.ndarray:
+            return jnp.take(jnp.asarray(value, dtype=dtype), component_indices_jax, axis=0)
+
+        all_kwargs = {
+            "sigma0": take_components(packed_state["sigma0"]),
+            "Ra": take_components(packed_state["Ra"]),
+            "Rs": take_components(packed_state["Rs"]),
+            "e1": take_components(packed_state["e1"]),
+            "e2": take_components(packed_state["e2"]),
+            "center_x": take_components(packed_state["center_x"]),
+            "center_y": take_components(packed_state["center_y"]),
+            "gamma1": take_components(packed_state["gamma1"]),
+            "gamma2": take_components(packed_state["gamma2"]),
+            "ra_0": jnp.zeros_like(take_components(packed_state["gamma1"])),
+            "dec_0": jnp.zeros_like(take_components(packed_state["gamma2"])),
+        }
+        return {"all_kwargs": all_kwargs, "index_list": jnp.asarray(self.bulk_index_list[component_indices], dtype=jnp.int32)}
+
     def _packed_state_to_kwargs_lens_jax(
         self,
         packed_state: dict[str, Any],
@@ -12696,6 +16412,666 @@ class ClusterJAXEvaluator:
             else:  # pragma: no cover
                 raise ValueError(f"Unsupported profile type {profile}.")
         return kwargs_lens
+
+    def _flat_scaling_scatter_image_covariance_from_inverse(
+        self,
+        physical_params: jnp.ndarray,
+        flat_data: FlatCriticalArcData,
+        inv00: jnp.ndarray,
+        inv01: jnp.ndarray,
+        inv10: jnp.ndarray,
+        inv11: jnp.ndarray,
+        inverse_finite: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        zeros = jnp.zeros_like(inv00)
+        if len(self._fit_scaling_component_indices()) == 0 or len(self.scaling_scatter_param_indices) == 0:
+            return zeros, zeros, zeros, jnp.ones_like(inv00, dtype=bool)
+        sigma_scatter, core_scatter, cut_scatter = self._scaling_scatter_field_scales_from_physical(physical_params)
+
+        def image_cov(scale: jnp.ndarray, source_dx: jnp.ndarray, source_dy: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+            source_dx = scale * source_dx
+            source_dy = scale * source_dy
+            image_dx = inv00 * source_dx + inv01 * source_dy
+            image_dy = inv10 * source_dx + inv11 * source_dy
+            return jnp.square(image_dx), image_dx * image_dy, jnp.square(image_dy)
+
+        sigma00, sigma01, sigma11 = image_cov(sigma_scatter, flat_data.sigma_scatter_x, flat_data.sigma_scatter_y)
+        core00, core01, core11 = image_cov(core_scatter, flat_data.core_scatter_x, flat_data.core_scatter_y)
+        cut00, cut01, cut11 = image_cov(cut_scatter, flat_data.cut_scatter_x, flat_data.cut_scatter_y)
+        cov00 = sigma00 + core00 + cut00
+        cov01 = sigma01 + core01 + cut01
+        cov11 = sigma11 + core11 + cut11
+        finite = inverse_finite & jnp.isfinite(cov00) & jnp.isfinite(cov01) & jnp.isfinite(cov11)
+        return cov00, cov01, cov11, finite
+
+    def _flat_scaling_scatter_extra_variance_from_physical(
+        self,
+        physical_params: jnp.ndarray,
+        flat_data: FlatCriticalArcData,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        zeros = jnp.zeros_like(flat_data.x_obs)
+        if len(self._fit_scaling_component_indices()) == 0 or len(self.scaling_scatter_param_indices) == 0:
+            return zeros, zeros
+        sigma_scatter, core_scatter, cut_scatter = self._scaling_scatter_field_scales_from_physical(physical_params)
+        var_x = (
+            jnp.square(sigma_scatter * flat_data.sigma_scatter_x)
+            + jnp.square(core_scatter * flat_data.core_scatter_x)
+            + jnp.square(cut_scatter * flat_data.cut_scatter_x)
+        )
+        var_y = (
+            jnp.square(sigma_scatter * flat_data.sigma_scatter_y)
+            + jnp.square(core_scatter * flat_data.core_scatter_y)
+            + jnp.square(cut_scatter * flat_data.cut_scatter_y)
+        )
+        return var_x, var_y
+
+    def _flat_cached_surrogate_vector(
+        self,
+        base: jnp.ndarray | None,
+        derivative: jnp.ndarray | None,
+        delta: jnp.ndarray,
+        *,
+        field_name: str,
+    ) -> jnp.ndarray:
+        if base is None or derivative is None:
+            raise RuntimeError(
+                f"Flat surrogate cache is missing {field_name}; refresh the stage-specific surrogate first."
+            )
+        return jnp.asarray(base, dtype=jnp.float64) + jnp.tensordot(
+            delta,
+            jnp.asarray(derivative, dtype=jnp.float64),
+            axes=1,
+        )
+
+    def _flat_surrogate_inactive_alpha(self, params: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        cache = self.flat_surrogate_cache
+        if cache is None:
+            raise RuntimeError("Flat surrogate cache is unavailable; refresh the surrogate before evaluating.")
+        delta = self._surrogate_parameter_delta(params)
+        inactive_alpha_x = self._flat_cached_surrogate_vector(
+            cache.inactive_alpha_x,
+            cache.inactive_alpha_dx_dparams,
+            delta,
+            field_name="inactive_alpha_x",
+        )
+        inactive_alpha_y = self._flat_cached_surrogate_vector(
+            cache.inactive_alpha_y,
+            cache.inactive_alpha_dy_dparams,
+            delta,
+            field_name="inactive_alpha_y",
+        )
+        return inactive_alpha_x, inactive_alpha_y
+
+    def _flat_surrogate_beta(
+        self,
+        params: jnp.ndarray,
+        physical_params: jnp.ndarray,
+        flat_data: FlatCriticalArcData,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, dict[str, Any]]:
+        sampled_kpc_per_arcsec = None
+        sampled_dpie_sigma0_factors = None
+        if bool(getattr(self, "fit_cosmology_flat_wcdm", False)):
+            sampled_kpc_per_arcsec, sampled_dpie_sigma0_factors = self._sampled_cosmology_geometry_for_physical(
+                physical_params
+            )
+        packed_state, validity = self._build_flat_packed_lens_state_with_validity_from_physical(
+            physical_params,
+            flat_data,
+            stop_gradient=True,
+            kpc_per_arcsec=sampled_kpc_per_arcsec,
+            dpie_sigma0_factors=sampled_dpie_sigma0_factors,
+        )
+        self._maybe_record_invalid_state(validity)
+        invalid = ~validity["is_valid"]
+        beta_active_x, beta_active_y = jax.lax.cond(
+            invalid,
+            lambda _: (flat_data.x_obs, flat_data.y_obs),
+            lambda current_state: self._flat_ray_shooting_for_components(
+                flat_data.x_obs,
+                flat_data.y_obs,
+                current_state,
+                self.active_component_indices,
+            ),
+            packed_state,
+        )
+        active_alpha_x = flat_data.x_obs - beta_active_x
+        active_alpha_y = flat_data.y_obs - beta_active_y
+        inactive_alpha_x, inactive_alpha_y = self._flat_surrogate_inactive_alpha(params)
+        beta_x = flat_data.x_obs - active_alpha_x - inactive_alpha_x
+        beta_y = flat_data.y_obs - active_alpha_y - inactive_alpha_y
+        return beta_x, beta_y, invalid, packed_state
+
+    def _flat_surrogate_jacobian_entries(
+        self,
+        params: jnp.ndarray,
+        flat_data: FlatCriticalArcData,
+        packed_state: dict[str, Any],
+        invalid: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        active_jacobian_entries = jax.lax.cond(
+            invalid,
+            lambda _: (
+                jnp.ones_like(flat_data.x_obs),
+                jnp.zeros_like(flat_data.x_obs),
+                jnp.zeros_like(flat_data.y_obs),
+                jnp.ones_like(flat_data.y_obs),
+            ),
+            lambda current_state: self._flat_lensing_jacobian_for_components(
+                flat_data.x_obs,
+                flat_data.y_obs,
+                current_state,
+                self.active_component_indices,
+            ),
+            packed_state,
+        )
+        cache = self.flat_surrogate_cache
+        if cache is None:
+            raise RuntimeError("Flat surrogate cache is unavailable; refresh the surrogate before evaluating.")
+        delta = self._surrogate_parameter_delta(params)
+        inactive_delta_a00 = self._flat_cached_surrogate_vector(
+            cache.inactive_jacobian_delta_a00,
+            cache.inactive_jacobian_delta_da00_dparams,
+            delta,
+            field_name="inactive_jacobian_delta_a00",
+        )
+        inactive_delta_a01 = self._flat_cached_surrogate_vector(
+            cache.inactive_jacobian_delta_a01,
+            cache.inactive_jacobian_delta_da01_dparams,
+            delta,
+            field_name="inactive_jacobian_delta_a01",
+        )
+        inactive_delta_a10 = self._flat_cached_surrogate_vector(
+            cache.inactive_jacobian_delta_a10,
+            cache.inactive_jacobian_delta_da10_dparams,
+            delta,
+            field_name="inactive_jacobian_delta_a10",
+        )
+        inactive_delta_a11 = self._flat_cached_surrogate_vector(
+            cache.inactive_jacobian_delta_a11,
+            cache.inactive_jacobian_delta_da11_dparams,
+            delta,
+            field_name="inactive_jacobian_delta_a11",
+        )
+        active_a00, active_a01, active_a10, active_a11 = active_jacobian_entries
+        return (
+            active_a00 + inactive_delta_a00,
+            active_a01 + inactive_delta_a01,
+            active_a10 + inactive_delta_a10,
+            active_a11 + inactive_delta_a11,
+        )
+
+    def _flat_refreshing_surrogate_source_loglike_impl(self, params: jnp.ndarray) -> jnp.ndarray:
+        flat_data = self.flat_critical_arc_data
+        params = jnp.asarray(params, dtype=jnp.float64)
+        physical_params = self._physical_parameter_vector(params)
+        source_sigma_int = self._source_sigma_int_from_physical(physical_params)
+        beta_x, beta_y, invalid, _packed_state = self._flat_surrogate_beta(params, physical_params, flat_data)
+        scatter_var_x, scatter_var_y = self._flat_scaling_scatter_extra_variance_from_physical(
+            physical_params,
+            flat_data,
+        )
+        source_metric = self.flat_source_metric_cache
+        flat_loglike = _source_plane_bin_loglike(
+            beta_x=beta_x,
+            beta_y=beta_y,
+            family_idx=flat_data.global_family_index_per_image,
+            n_families=flat_data.n_families,
+            sigma_per_image=flat_data.sigma_per_image,
+            reliability_per_image=jnp.clip(flat_data.reliability_per_image, 1.0e-6, 1.0 - 1.0e-6),
+            image_has_constraint=flat_data.image_has_constraint,
+            source_sigma_int=source_sigma_int,
+            scatter_var_x=scatter_var_x,
+            scatter_var_y=scatter_var_y,
+            inv_abs_mu=source_metric.inv_abs_mu,
+            covariance_floor=self.source_plane_covariance_floor,
+            outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
+            max_gain=self.likelihood_stabilizer_max_gain,
+            max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
+            residual_loss=self.likelihood_stabilizer_residual_loss,
+            student_t_nu=self.likelihood_stabilizer_student_t_nu,
+        )
+        invalid = (
+            invalid
+            | (~jnp.all(jnp.isfinite(beta_x)))
+            | (~jnp.all(jnp.isfinite(beta_y)))
+            | (~jnp.all(jnp.isfinite(scatter_var_x)))
+            | (~jnp.all(jnp.isfinite(scatter_var_y)))
+            | (~jnp.isfinite(flat_loglike))
+        )
+        return jnp.where(
+            invalid,
+            jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64),
+            jnp.nan_to_num(flat_loglike, nan=BAD_LOG_LIKE, posinf=BAD_LOG_LIKE, neginf=BAD_LOG_LIKE),
+        )
+
+    def _flat_refreshing_surrogate_local_jacobian_source_loglike_impl(self, params: jnp.ndarray) -> jnp.ndarray:
+        flat_data = self.flat_critical_arc_data
+        params = jnp.asarray(params, dtype=jnp.float64)
+        physical_params = self._physical_parameter_vector(params)
+        source_sigma_int = self._source_sigma_int_from_physical(physical_params)
+        beta_x, beta_y, invalid, _packed_state = self._flat_surrogate_beta(params, physical_params, flat_data)
+        scatter_var_x, scatter_var_y = self._flat_scaling_scatter_extra_variance_from_physical(
+            physical_params,
+            flat_data,
+        )
+        source_metric = self.flat_source_metric_cache
+        flat_loglike = _local_jacobian_bin_loglike(
+            beta_x=beta_x,
+            beta_y=beta_y,
+            family_idx=flat_data.global_family_index_per_image,
+            n_families=flat_data.n_families,
+            sigma_per_image=flat_data.sigma_per_image,
+            reliability_per_image=jnp.clip(flat_data.reliability_per_image, 1.0e-6, 1.0 - 1.0e-6),
+            image_has_constraint=flat_data.image_has_constraint,
+            source_sigma_int=source_sigma_int,
+            scatter_var_x=scatter_var_x,
+            scatter_var_y=scatter_var_y,
+            jac_a00=source_metric.jac_a00,
+            jac_a01=source_metric.jac_a01,
+            jac_a10=source_metric.jac_a10,
+            jac_a11=source_metric.jac_a11,
+            covariance_floor=self.source_plane_covariance_floor,
+            outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
+            max_gain=self.likelihood_stabilizer_max_gain,
+            max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
+            residual_loss=self.likelihood_stabilizer_residual_loss,
+            student_t_nu=self.likelihood_stabilizer_student_t_nu,
+        )
+        invalid = (
+            invalid
+            | (~jnp.all(jnp.isfinite(beta_x)))
+            | (~jnp.all(jnp.isfinite(beta_y)))
+            | (~jnp.all(jnp.isfinite(scatter_var_x)))
+            | (~jnp.all(jnp.isfinite(scatter_var_y)))
+            | (~jnp.isfinite(flat_loglike))
+        )
+        return jnp.where(
+            invalid,
+            jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64),
+            jnp.nan_to_num(flat_loglike, nan=BAD_LOG_LIKE, posinf=BAD_LOG_LIKE, neginf=BAD_LOG_LIKE),
+        )
+
+    def _flat_refreshing_surrogate_critical_arc_source_loglike_impl(self, params: jnp.ndarray) -> jnp.ndarray:
+        flat_data = self.flat_critical_arc_data
+        total_loglike = jnp.asarray(0.0, dtype=jnp.float64)
+        params = jnp.asarray(params, dtype=jnp.float64)
+        physical_params = self._physical_parameter_vector(params)
+        image_sigma_int = self._image_sigma_int_from_physical(physical_params)
+        critical_arc_singular_threshold = (
+            self._critical_arc_singular_threshold_from_physical(physical_params)
+            if hasattr(self, "_critical_arc_singular_threshold_from_physical")
+            else jnp.asarray(
+                float(getattr(self, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)),
+                dtype=jnp.float64,
+            )
+        )
+        critical_arc_singular_softness = (
+            self._critical_arc_singular_softness_from_physical(physical_params)
+            if hasattr(self, "_critical_arc_singular_softness_from_physical")
+            else jnp.asarray(
+                float(getattr(self, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)),
+                dtype=jnp.float64,
+            )
+        )
+        beta_x, beta_y, invalid, packed_state = self._flat_surrogate_beta(params, physical_params, flat_data)
+        observed_jacobian_entries = self._flat_surrogate_jacobian_entries(
+            params,
+            flat_data,
+            packed_state,
+            invalid,
+        )
+        beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._flat_source_position_vectors(
+            params,
+            physical_params,
+            flat_data,
+            beta_x,
+            beta_y,
+            image_sigma_int,
+            observed_jacobian_entries,
+        )
+        (
+            residual_x,
+            residual_y,
+            singular_min,
+            singular_max,
+            critical_p00,
+            critical_p01,
+            critical_p11,
+            residual_finite,
+        ) = _critical_arc_lm_geometry_from_jacobian(
+            beta_x - beta_family_x,
+            beta_y - beta_family_y,
+            *observed_jacobian_entries,
+            trust_radius_arcsec=self.critical_arc_lm_trust_radius_arcsec,
+            lm_damping_relative=self.critical_arc_lm_damping_relative,
+            lm_damping_absolute=self.critical_arc_lm_damping_absolute,
+        )
+        (
+            critical_inv00,
+            critical_inv01,
+            critical_inv10,
+            critical_inv11,
+            critical_inverse_finite,
+        ) = _critical_arc_lm_inverse_operator_from_jacobian(
+            *observed_jacobian_entries,
+            lm_damping_relative=self.critical_arc_lm_damping_relative,
+            lm_damping_absolute=self.critical_arc_lm_damping_absolute,
+        )
+        scatter_cov00, scatter_cov01, scatter_cov11, scatter_cov_finite = (
+            self._flat_scaling_scatter_image_covariance_from_inverse(
+                physical_params,
+                flat_data,
+                critical_inv00,
+                critical_inv01,
+                critical_inv10,
+                critical_inv11,
+                critical_inverse_finite,
+            )
+        )
+        invalid = (
+            invalid
+            | (~has_source_positions)
+            | (~jnp.all(residual_finite))
+            | (~jnp.all(scatter_cov_finite))
+        )
+        flat_loglike = _critical_arc_mixture_image_plane_bin_loglike(
+            residual_x=residual_x,
+            residual_y=residual_y,
+            jac_a00=observed_jacobian_entries[0],
+            jac_a01=observed_jacobian_entries[1],
+            jac_a10=observed_jacobian_entries[2],
+            jac_a11=observed_jacobian_entries[3],
+            family_idx=flat_data.global_family_index_per_image,
+            n_families=flat_data.n_families,
+            sigma_per_image=flat_data.sigma_per_image,
+            reliability_per_image=jnp.clip(flat_data.reliability_per_image, 1.0e-6, 1.0 - 1.0e-6),
+            image_has_constraint=flat_data.image_has_constraint,
+            image_sigma_int=image_sigma_int,
+            covariance_floor=self.source_plane_covariance_floor,
+            outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
+            image_presence_penalty_weight=self.image_presence_penalty_weight,
+            image_presence_match_radius_arcsec=self.image_presence_match_radius_arcsec,
+            image_presence_temperature_arcsec=self.image_presence_temperature_arcsec,
+            image_presence_count_softness=self.image_presence_count_softness,
+            image_presence_count_margin=self.image_presence_count_margin,
+            residual_loss=self.likelihood_stabilizer_residual_loss,
+            student_t_nu=self.likelihood_stabilizer_student_t_nu,
+            critical_direction_sigma_arcsec=self.critical_arc_critical_direction_sigma_arcsec,
+            base_prob=self.critical_arc_base_prob,
+            max_prob=self.critical_arc_max_prob,
+            singular_threshold=critical_arc_singular_threshold,
+            singular_softness=critical_arc_singular_softness,
+            singular_min_precomputed=singular_min,
+            singular_max_precomputed=singular_max,
+            critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+            scatter_cov00=scatter_cov00,
+            scatter_cov01=scatter_cov01,
+            scatter_cov11=scatter_cov11,
+        )
+        total_loglike = jnp.where(invalid, total_loglike, flat_loglike + source_transport_correction)
+        invalid_seen = invalid
+        arc_data = getattr(self, "traced_arc_data", None)
+        cab_likelihood_weight = float(getattr(self, "cab_likelihood_weight", 0.0))
+        if arc_data is not None and int(getattr(arc_data, "n_arcs", 0)) > 0 and cab_likelihood_weight > 0.0:
+            cab_packed_state, cab_validity = self._build_cab_packed_lens_state_with_validity_from_physical(
+                physical_params,
+                stop_gradient=True,
+            )
+            self._maybe_record_invalid_state(cab_validity)
+            cab_invalid = ~cab_validity["is_valid"]
+            cab_loglike = self._cab_morphology_loglike_for_arcs(
+                arc_data,
+                cab_packed_state,
+                None,
+            )
+            total_loglike = jnp.where(cab_invalid, total_loglike, total_loglike + cab_loglike)
+            invalid_seen = jnp.logical_or(invalid_seen, cab_invalid)
+        return jnp.where(
+            invalid_seen,
+            jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64),
+            jnp.nan_to_num(total_loglike, nan=BAD_LOG_LIKE, posinf=BAD_LOG_LIKE, neginf=BAD_LOG_LIKE),
+        )
+
+    def _flat_local_jacobian_source_loglike_impl(self, params: jnp.ndarray) -> jnp.ndarray:
+        flat_data = self.flat_critical_arc_data
+        physical_params = self._physical_parameter_vector(jnp.asarray(params, dtype=jnp.float64))
+        source_sigma_int = self._source_sigma_int_from_physical(physical_params)
+        sampled_kpc_per_arcsec = None
+        sampled_dpie_sigma0_factors = None
+        if bool(getattr(self, "fit_cosmology_flat_wcdm", False)):
+            sampled_kpc_per_arcsec, sampled_dpie_sigma0_factors = self._sampled_cosmology_geometry_for_physical(
+                physical_params
+            )
+        packed_state, validity = self._build_flat_packed_lens_state_with_validity_from_physical(
+            physical_params,
+            flat_data,
+            stop_gradient=True,
+            kpc_per_arcsec=sampled_kpc_per_arcsec,
+            dpie_sigma0_factors=sampled_dpie_sigma0_factors,
+        )
+        self._maybe_record_invalid_state(validity)
+        invalid = ~validity["is_valid"]
+        beta_x, beta_y = jax.lax.cond(
+            invalid,
+            lambda _: (flat_data.x_obs, flat_data.y_obs),
+            lambda current_state: self._flat_ray_shooting_for_components(
+                flat_data.x_obs,
+                flat_data.y_obs,
+                current_state,
+            ),
+            packed_state,
+        )
+        jac_a00, jac_a01, jac_a10, jac_a11 = self._flat_lensing_jacobian_for_components(
+            flat_data.x_obs,
+            flat_data.y_obs,
+            packed_state,
+        )
+        scatter_var_x, scatter_var_y = self._flat_scaling_scatter_extra_variance_from_physical(
+            physical_params,
+            flat_data,
+        )
+        flat_loglike = _local_jacobian_bin_loglike(
+            beta_x=beta_x,
+            beta_y=beta_y,
+            family_idx=flat_data.global_family_index_per_image,
+            n_families=flat_data.n_families,
+            sigma_per_image=flat_data.sigma_per_image,
+            reliability_per_image=jnp.clip(flat_data.reliability_per_image, 1.0e-6, 1.0 - 1.0e-6),
+            image_has_constraint=flat_data.image_has_constraint,
+            source_sigma_int=source_sigma_int,
+            scatter_var_x=scatter_var_x,
+            scatter_var_y=scatter_var_y,
+            jac_a00=jac_a00,
+            jac_a01=jac_a01,
+            jac_a10=jac_a10,
+            jac_a11=jac_a11,
+            covariance_floor=self.source_plane_covariance_floor,
+            outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
+            max_gain=self.likelihood_stabilizer_max_gain,
+            max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
+            residual_loss=self.likelihood_stabilizer_residual_loss,
+            student_t_nu=self.likelihood_stabilizer_student_t_nu,
+        )
+        invalid = (
+            invalid
+            | (~jnp.all(jnp.isfinite(beta_x)))
+            | (~jnp.all(jnp.isfinite(beta_y)))
+            | (~jnp.all(jnp.isfinite(jac_a00)))
+            | (~jnp.all(jnp.isfinite(jac_a01)))
+            | (~jnp.all(jnp.isfinite(jac_a10)))
+            | (~jnp.all(jnp.isfinite(jac_a11)))
+            | (~jnp.all(jnp.isfinite(scatter_var_x)))
+            | (~jnp.all(jnp.isfinite(scatter_var_y)))
+            | (~jnp.isfinite(flat_loglike))
+        )
+        return jnp.where(
+            invalid,
+            jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64),
+            jnp.nan_to_num(flat_loglike, nan=BAD_LOG_LIKE, posinf=BAD_LOG_LIKE, neginf=BAD_LOG_LIKE),
+        )
+
+    def _flat_critical_arc_source_loglike_impl(self, params: jnp.ndarray) -> jnp.ndarray:
+        flat_data = self.flat_critical_arc_data
+        total_loglike = jnp.asarray(0.0, dtype=jnp.float64)
+        physical_params = self._physical_parameter_vector(jnp.asarray(params, dtype=jnp.float64))
+        image_sigma_int = self._image_sigma_int_from_physical(physical_params)
+        critical_arc_singular_threshold = (
+            self._critical_arc_singular_threshold_from_physical(physical_params)
+            if hasattr(self, "_critical_arc_singular_threshold_from_physical")
+            else jnp.asarray(
+                float(getattr(self, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)),
+                dtype=jnp.float64,
+            )
+        )
+        critical_arc_singular_softness = (
+            self._critical_arc_singular_softness_from_physical(physical_params)
+            if hasattr(self, "_critical_arc_singular_softness_from_physical")
+            else jnp.asarray(
+                float(getattr(self, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)),
+                dtype=jnp.float64,
+            )
+        )
+        sampled_kpc_per_arcsec = None
+        sampled_dpie_sigma0_factors = None
+        if bool(getattr(self, "fit_cosmology_flat_wcdm", False)):
+            sampled_kpc_per_arcsec, sampled_dpie_sigma0_factors = self._sampled_cosmology_geometry_for_physical(
+                physical_params
+            )
+        packed_state, validity = self._build_flat_packed_lens_state_with_validity_from_physical(
+            physical_params,
+            flat_data,
+            stop_gradient=True,
+            kpc_per_arcsec=sampled_kpc_per_arcsec,
+            dpie_sigma0_factors=sampled_dpie_sigma0_factors,
+        )
+        self._maybe_record_invalid_state(validity)
+        invalid = ~validity["is_valid"]
+        beta_x, beta_y = jax.lax.cond(
+            invalid,
+            lambda _: (flat_data.x_obs, flat_data.y_obs),
+            lambda current_state: self._flat_ray_shooting_for_components(
+                flat_data.x_obs,
+                flat_data.y_obs,
+                current_state,
+            ),
+            packed_state,
+        )
+        observed_jacobian_entries = self._flat_lensing_jacobian_for_components(
+            flat_data.x_obs,
+            flat_data.y_obs,
+            packed_state,
+        )
+        beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._flat_source_position_vectors(
+            jnp.asarray(params, dtype=jnp.float64),
+            physical_params,
+            flat_data,
+            beta_x,
+            beta_y,
+            image_sigma_int,
+            observed_jacobian_entries,
+        )
+        (
+            residual_x,
+            residual_y,
+            singular_min,
+            singular_max,
+            critical_p00,
+            critical_p01,
+            critical_p11,
+            residual_finite,
+        ) = _critical_arc_lm_geometry_from_jacobian(
+            beta_x - beta_family_x,
+            beta_y - beta_family_y,
+            *observed_jacobian_entries,
+            trust_radius_arcsec=self.critical_arc_lm_trust_radius_arcsec,
+            lm_damping_relative=self.critical_arc_lm_damping_relative,
+            lm_damping_absolute=self.critical_arc_lm_damping_absolute,
+        )
+        (
+            critical_inv00,
+            critical_inv01,
+            critical_inv10,
+            critical_inv11,
+            critical_inverse_finite,
+        ) = _critical_arc_lm_inverse_operator_from_jacobian(
+            *observed_jacobian_entries,
+            lm_damping_relative=self.critical_arc_lm_damping_relative,
+            lm_damping_absolute=self.critical_arc_lm_damping_absolute,
+        )
+        scatter_cov00, scatter_cov01, scatter_cov11, scatter_cov_finite = (
+            self._flat_scaling_scatter_image_covariance_from_inverse(
+                physical_params,
+                flat_data,
+                critical_inv00,
+                critical_inv01,
+                critical_inv10,
+                critical_inv11,
+                critical_inverse_finite,
+            )
+        )
+        invalid = (
+            invalid
+            | (~has_source_positions)
+            | (~jnp.all(residual_finite))
+            | (~jnp.all(scatter_cov_finite))
+        )
+        flat_loglike = _critical_arc_mixture_image_plane_bin_loglike(
+            residual_x=residual_x,
+            residual_y=residual_y,
+            jac_a00=observed_jacobian_entries[0],
+            jac_a01=observed_jacobian_entries[1],
+            jac_a10=observed_jacobian_entries[2],
+            jac_a11=observed_jacobian_entries[3],
+            family_idx=flat_data.global_family_index_per_image,
+            n_families=flat_data.n_families,
+            sigma_per_image=flat_data.sigma_per_image,
+            reliability_per_image=jnp.clip(flat_data.reliability_per_image, 1.0e-6, 1.0 - 1.0e-6),
+            image_has_constraint=flat_data.image_has_constraint,
+            image_sigma_int=image_sigma_int,
+            covariance_floor=self.source_plane_covariance_floor,
+            outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
+            image_presence_penalty_weight=self.image_presence_penalty_weight,
+            image_presence_match_radius_arcsec=self.image_presence_match_radius_arcsec,
+            image_presence_temperature_arcsec=self.image_presence_temperature_arcsec,
+            image_presence_count_softness=self.image_presence_count_softness,
+            image_presence_count_margin=self.image_presence_count_margin,
+            residual_loss=self.likelihood_stabilizer_residual_loss,
+            student_t_nu=self.likelihood_stabilizer_student_t_nu,
+            critical_direction_sigma_arcsec=self.critical_arc_critical_direction_sigma_arcsec,
+            base_prob=self.critical_arc_base_prob,
+            max_prob=self.critical_arc_max_prob,
+            singular_threshold=critical_arc_singular_threshold,
+            singular_softness=critical_arc_singular_softness,
+            singular_min_precomputed=singular_min,
+            singular_max_precomputed=singular_max,
+            critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+            scatter_cov00=scatter_cov00,
+            scatter_cov01=scatter_cov01,
+            scatter_cov11=scatter_cov11,
+        )
+        total_loglike = jnp.where(invalid, total_loglike, flat_loglike + source_transport_correction)
+        invalid_seen = invalid
+        arc_data = getattr(self, "traced_arc_data", None)
+        cab_likelihood_weight = float(getattr(self, "cab_likelihood_weight", 0.0))
+        if arc_data is not None and int(getattr(arc_data, "n_arcs", 0)) > 0 and cab_likelihood_weight > 0.0:
+            cab_packed_state, cab_validity = self._build_cab_packed_lens_state_with_validity_from_physical(
+                physical_params,
+                stop_gradient=True,
+            )
+            self._maybe_record_invalid_state(cab_validity)
+            cab_invalid = ~cab_validity["is_valid"]
+            cab_loglike = self._cab_morphology_loglike_for_arcs(
+                arc_data,
+                cab_packed_state,
+                None,
+            )
+            total_loglike = jnp.where(cab_invalid, total_loglike, total_loglike + cab_loglike)
+            invalid_seen = jnp.logical_or(invalid_seen, cab_invalid)
+        return jnp.where(
+            invalid_seen,
+            jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64),
+            jnp.nan_to_num(total_loglike, nan=BAD_LOG_LIKE, posinf=BAD_LOG_LIKE, neginf=BAD_LOG_LIKE),
+        )
 
     def _build_scaling_rank_diagnostics(self) -> pd.DataFrame:
         scaling_component_records = getattr(self.state, "scaling_component_records", [])
@@ -13254,6 +17630,130 @@ class ClusterJAXEvaluator:
         self.timing_totals["packed_parameter_update"] += time.perf_counter() - pack_start
         return packed_state
 
+    def _build_flat_packed_lens_state_with_validity_from_physical(
+        self,
+        physical_params: jnp.ndarray,
+        flat_data: FlatCriticalArcData,
+        *,
+        stop_gradient: bool,
+        kpc_per_arcsec: jnp.ndarray | None = None,
+        dpie_sigma0_factors: jnp.ndarray | None = None,
+    ) -> tuple[dict[str, Any], dict[str, jnp.ndarray]]:
+        spec_jax = self.packed_spec_jax
+        x_center = self._apply_param_updates(spec_jax["x_center_base"], spec_jax["x_center_param_index"], physical_params)
+        y_center = self._apply_param_updates(spec_jax["y_center_base"], spec_jax["y_center_param_index"], physical_params)
+        e1 = self._apply_param_updates(spec_jax["e1_base"], spec_jax["e1_param_index"], physical_params)
+        e2 = self._apply_param_updates(spec_jax["e2_base"], spec_jax["e2_param_index"], physical_params)
+        core_radius_kpc = self._apply_param_updates(
+            spec_jax["core_radius_kpc_base"], spec_jax["core_radius_param_index"], physical_params
+        )
+        cut_radius_kpc = self._apply_param_updates(
+            spec_jax["cut_radius_kpc_base"], spec_jax["cut_radius_param_index"], physical_params
+        )
+        v_disp = self._apply_param_updates(spec_jax["v_disp_base"], spec_jax["v_disp_param_index"], physical_params)
+        gamma1 = self._apply_param_updates(spec_jax["gamma1_base"], spec_jax["gamma1_param_index"], physical_params)
+        gamma2 = self._apply_param_updates(spec_jax["gamma2_base"], spec_jax["gamma2_param_index"], physical_params)
+
+        profile_type = spec_jax["profile_type"]
+        component_family = spec_jax["component_family"]
+        is_dpie = profile_type == DP_IE_PROFILE
+        is_shear = profile_type == SHEAR_PROFILE
+        is_scaling = component_family == 1
+
+        luminosity_ratio = spec_jax["luminosity_ratio"]
+        sigma_ref = self._apply_param_updates(
+            spec_jax["sigma_ref_base"], spec_jax["sigma_ref_param_index"], physical_params
+        )
+        cut_ref = self._apply_param_updates(
+            spec_jax["cut_ref_base"], spec_jax["cut_ref_param_index"], physical_params
+        )
+        core_ref = self._apply_param_updates(
+            spec_jax["core_ref_base"], spec_jax["core_ref_param_index"], physical_params
+        )
+        vdslope = self._apply_param_updates(
+            spec_jax["vdslope_base"], spec_jax["vdslope_param_index"], physical_params
+        )
+        slope = self._apply_param_updates(
+            spec_jax["slope_base"], spec_jax["slope_param_index"], physical_params
+        )
+        safe_vdslope = _safe_signed_min_abs(vdslope, SAFE_SCALING_EXPONENT_ABS_MIN)
+        safe_slope = _safe_signed_min_abs(slope, SAFE_SCALING_EXPONENT_ABS_MIN)
+        scaled_vdisp = sigma_ref * jnp.power(luminosity_ratio, 1.0 / safe_vdslope)
+        scaled_core = core_ref * jnp.power(luminosity_ratio, 0.5)
+        scaled_cut = cut_ref * jnp.power(luminosity_ratio, 2.0 / safe_slope)
+        v_disp = jnp.where(is_scaling, scaled_vdisp, v_disp)
+        core_radius_kpc = jnp.where(is_scaling, scaled_core, core_radius_kpc)
+        cut_radius_kpc = jnp.where(is_scaling, scaled_cut, cut_radius_kpc)
+
+        if kpc_per_arcsec is None:
+            kpc_per_arcsec = self._kpc_per_arcsec_for_physical(physical_params)
+        kpc_per_arcsec = jnp.asarray(kpc_per_arcsec, dtype=jnp.float64)
+        ra_raw = core_radius_kpc / kpc_per_arcsec
+        rs_raw = cut_radius_kpc / kpc_per_arcsec
+        ra = jnp.maximum(ra_raw, SAFE_RADIUS_MARGIN_ARCSEC)
+        rs = jnp.maximum(rs_raw, ra + SAFE_RADIUS_MARGIN_ARCSEC)
+        if dpie_sigma0_factors is None:
+            if bool(getattr(self, "fit_cosmology_flat_wcdm", False)):
+                _kpc_per_arcsec, dpie_sigma0_factors = self._sampled_cosmology_geometry_for_physical(physical_params)
+            else:
+                dpie_sigma0_factors = jnp.asarray(
+                    [self._dpie_sigma0_factor_for_z_source(float(z_source)) for z_source in self.cosmology_effective_z_values],
+                    dtype=jnp.float64,
+                )
+        factor_per_image = jnp.take(
+            jnp.asarray(dpie_sigma0_factors, dtype=jnp.float64),
+            flat_data.effective_z_index_per_image,
+        )
+        safe_factor = jnp.where(jnp.isfinite(factor_per_image), factor_per_image, 0.0)
+        sigma0 = (v_disp[:, None] ** 2) * safe_factor[None, :] / ra[:, None]
+
+        packed_state = {
+            "__packed__": True,
+            "profile_type": profile_type,
+            "sigma0": jnp.where(is_dpie[:, None], sigma0, 0.0),
+            "Ra": jnp.where(is_dpie, ra, 0.0),
+            "Rs": jnp.where(is_dpie, rs, 0.0),
+            "e1": jnp.where(is_dpie, e1, 0.0),
+            "e2": jnp.where(is_dpie, e2, 0.0),
+            "center_x": x_center,
+            "center_y": y_center,
+            "gamma1": jnp.where(is_shear, gamma1, 0.0),
+            "gamma2": jnp.where(is_shear, gamma2, 0.0),
+        }
+        reason_flags = jnp.stack(
+            [
+                jnp.any(is_dpie[:, None] & ~jnp.isfinite(sigma0)),
+                jnp.any(is_dpie & (ra_raw <= 0.0)),
+                jnp.any(is_dpie & (rs_raw <= ra_raw)),
+                jnp.any(is_dpie & ~jnp.isfinite(rs_raw)),
+                jnp.any(is_dpie & ~jnp.isfinite(v_disp)),
+                jnp.any(
+                    is_scaling
+                    & (
+                        ~jnp.isfinite(vdslope)
+                        | ~jnp.isfinite(slope)
+                        | (jnp.abs(vdslope) < SAFE_SCALING_EXPONENT_ABS_MIN)
+                        | (jnp.abs(slope) < SAFE_SCALING_EXPONENT_ABS_MIN)
+                    )
+                ),
+                jnp.any(~jnp.isfinite(x_center) | ~jnp.isfinite(y_center)),
+                jnp.any(is_shear & (~jnp.isfinite(gamma1) | ~jnp.isfinite(gamma2))),
+                jnp.any(
+                    is_dpie
+                    & (
+                        ~jnp.isfinite(e1)
+                        | ~jnp.isfinite(e2)
+                        | ((jnp.square(e1) + jnp.square(e2)) >= 1.0)
+                    )
+                ),
+                jnp.any(~jnp.isfinite(factor_per_image)),
+            ],
+            axis=0,
+        )
+        if stop_gradient:
+            reason_flags = jax.lax.stop_gradient(reason_flags)
+        return packed_state, {"is_valid": ~jnp.any(reason_flags), "reason_flags": reason_flags}
+
     def _maybe_record_invalid_state(self, validity: dict[str, jnp.ndarray]) -> None:
         reason_flags = validity["reason_flags"]
         _ = jax.lax.cond(
@@ -13279,6 +17779,16 @@ class ClusterJAXEvaluator:
             return model.ray_shooting(x, y, packed_state, k=tuple(int(idx) for idx in component_indices.tolist()))
         return model.ray_shooting(x, y, packed_state)
 
+    def _flat_ray_shooting_for_components(
+        self,
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        packed_state: dict[str, Any],
+        component_indices: np.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        kwargs = self._flat_bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices)
+        return self.flat_lens_model.ray_shooting(x, y, kwargs)
+
     def _lensing_jacobian_for_components(
         self,
         z_source: float,
@@ -13292,6 +17802,17 @@ class ClusterJAXEvaluator:
         model = self.models_by_effective_z[z_source]
         kwargs = self._bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices)
         f_xx, f_xy, f_yx, f_yy = model.hessian(x, y, kwargs)
+        return 1.0 - f_xx, -f_xy, -f_yx, 1.0 - f_yy
+
+    def _flat_lensing_jacobian_for_components(
+        self,
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        packed_state: dict[str, Any],
+        component_indices: np.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        kwargs = self._flat_bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices)
+        f_xx, f_xy, f_yx, f_yy = self.flat_lens_model.hessian(x, y, kwargs)
         return 1.0 - f_xx, -f_xy, -f_yx, 1.0 - f_yy
 
     def _cab_morphology_predictions_for_anchors(
@@ -13889,6 +18410,7 @@ class ClusterJAXEvaluator:
         self.surrogate_reference_params = reference.copy()
         self.surrogate_reference_param_values = reference[self.surrogate_param_indices].copy()
         self.surrogate_cache_by_z = {}
+        self.flat_surrogate_cache = None
         reference_jax = jnp.asarray(reference, dtype=jnp.float64)
         for bin_data in self.traced_bin_data:
             x_obs = jnp.asarray(bin_data.x_obs, dtype=jnp.float64)
@@ -13898,6 +18420,7 @@ class ClusterJAXEvaluator:
             if not bool(np.asarray(validity["is_valid"], dtype=bool)):
                 self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
                 self.surrogate_cache_by_z = {}
+                self.flat_surrogate_cache = None
                 self.surrogate_reference_params = None
                 self.surrogate_reference_param_values = np.zeros(len(self.surrogate_param_indices), dtype=float)
                 return
@@ -13906,20 +18429,11 @@ class ClusterJAXEvaluator:
                 bin_data.effective_z_source,
                 x_obs,
                 y_obs,
-                include_jacobian=(
-                    self.sample_likelihood_mode
-                    in {
-                        SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
-                        SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
-                        SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
-                        SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-                        SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
-                        SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
-                    }
-                ),
+                include_jacobian=_sample_likelihood_uses_image_plane_jacobian(self.sample_likelihood_mode),
             )
             if inactive_surrogate is None:
                 self.surrogate_cache_by_z = {}
+                self.flat_surrogate_cache = None
                 self.surrogate_reference_params = None
                 self.surrogate_reference_param_values = np.zeros(len(self.surrogate_param_indices), dtype=float)
                 return
@@ -14011,6 +18525,8 @@ class ClusterJAXEvaluator:
                 catastrophe_kappa_tangent_y=catastrophe_kappa_tangent_y,
                 **inactive_surrogate,
             )
+        if self.sampling_engine == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT:
+            self._refresh_flat_surrogate_cache()
         self.full_refresh_count += 1
         self._source_loglike_fn = jax.jit(self._source_loglike_impl)
 
@@ -14047,7 +18563,19 @@ class ClusterJAXEvaluator:
         diff = normal00 - normal11
         gap = np.sqrt(np.maximum(np.square(diff) + 4.0 * np.square(normal01), 0.0))
         metric = np.sqrt(np.maximum(0.5 * (trace - gap), 0.0))
-        cutoff = float(self.critical_arc_singular_threshold) + 3.0 * float(self.critical_arc_singular_softness)
+        cutoff = float(
+            getattr(
+                self,
+                "critical_arc_singular_threshold_surrogate_cutoff",
+                self.critical_arc_singular_threshold,
+            )
+        ) + 3.0 * float(
+            getattr(
+                self,
+                "critical_arc_singular_softness_surrogate_cutoff",
+                self.critical_arc_singular_softness,
+            )
+        )
         finite = (
             np.isfinite(a00)
             & np.isfinite(a01)
@@ -14263,15 +18791,58 @@ class ClusterJAXEvaluator:
         return kwargs_lens
 
     def _source_loglike_impl(self, params: jnp.ndarray) -> jnp.ndarray:
+        if str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT:
+            if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_SOURCE:
+                return self._flat_refreshing_surrogate_source_loglike_impl(params)
+            if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
+                return self._flat_refreshing_surrogate_local_jacobian_source_loglike_impl(params)
+            if self.sample_likelihood_mode in {
+                SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+                SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
+            }:
+                return self._flat_refreshing_surrogate_critical_arc_source_loglike_impl(params)
+            return jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64)
+        if (
+            str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_FULL_FLAT
+            and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
+        ):
+            return self._flat_local_jacobian_source_loglike_impl(params)
+        if (
+            str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_FULL_FLAT
+            and self.sample_likelihood_mode
+            in {
+                SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+                SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
+            }
+        ):
+            return self._flat_critical_arc_source_loglike_impl(params)
+
         total_loglike = jnp.array(0.0, dtype=jnp.float64)
         invalid_seen = jnp.array(False)
         physical_params = self._physical_parameter_vector(jnp.asarray(params, dtype=jnp.float64))
         source_sigma_int = self._source_sigma_int_from_physical(physical_params)
         image_sigma_int = self._image_sigma_int_from_physical(physical_params)
+        critical_arc_singular_threshold = (
+            self._critical_arc_singular_threshold_from_physical(physical_params)
+            if hasattr(self, "_critical_arc_singular_threshold_from_physical")
+            else jnp.asarray(
+                float(getattr(self, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)),
+                dtype=jnp.float64,
+            )
+        )
+        critical_arc_singular_softness = (
+            self._critical_arc_singular_softness_from_physical(physical_params)
+            if hasattr(self, "_critical_arc_singular_softness_from_physical")
+            else jnp.asarray(
+                float(getattr(self, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)),
+                dtype=jnp.float64,
+            )
+        )
         fit_component_indices = self._fit_component_indices() if hasattr(self, "_fit_component_indices") else None
         if self.sample_likelihood_mode in {
             SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
         }:
             fit_component_indices = None
         sampled_kpc_per_arcsec = None
@@ -14496,7 +19067,7 @@ class ClusterJAXEvaluator:
                     student_t_nu=self.likelihood_stabilizer_student_t_nu,
                 )
                 bin_loglike = bin_loglike + source_transport_correction
-            elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE:
+            elif _sample_likelihood_uses_critical_arc_terms(self.sample_likelihood_mode):
                 observed_beta_x = beta_x
                 observed_beta_y = beta_y
                 if self.surrogate_enabled and self.surrogate_cache_by_z:
@@ -14513,15 +19084,23 @@ class ClusterJAXEvaluator:
                         y_obs,
                         packed_state,
                     )
-                beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._explicit_source_position_vectors_for_bin(
-                    jnp.asarray(params, dtype=jnp.float64),
-                    physical_params,
-                    bin_data,
-                    observed_beta_x,
-                    observed_beta_y,
-                    image_sigma_int,
-                    observed_jacobian_entries,
-                )
+                if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE:
+                    beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._centroid_source_position_vectors_for_bin(
+                        bin_data,
+                        observed_beta_x,
+                        observed_beta_y,
+                        image_sigma_int,
+                    )
+                else:
+                    beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._explicit_source_position_vectors_for_bin(
+                        jnp.asarray(params, dtype=jnp.float64),
+                        physical_params,
+                        bin_data,
+                        observed_beta_x,
+                        observed_beta_y,
+                        image_sigma_int,
+                        observed_jacobian_entries,
+                    )
                 (
                     residual_x,
                     residual_y,
@@ -14539,7 +19118,34 @@ class ClusterJAXEvaluator:
                     lm_damping_relative=self.critical_arc_lm_damping_relative,
                     lm_damping_absolute=self.critical_arc_lm_damping_absolute,
                 )
-                invalid = invalid | (~has_source_positions) | (~jnp.all(residual_finite))
+                (
+                    critical_inv00,
+                    critical_inv01,
+                    critical_inv10,
+                    critical_inv11,
+                    critical_inverse_finite,
+                ) = _critical_arc_lm_inverse_operator_from_jacobian(
+                    *observed_jacobian_entries,
+                    lm_damping_relative=self.critical_arc_lm_damping_relative,
+                    lm_damping_absolute=self.critical_arc_lm_damping_absolute,
+                )
+                scatter_cov00, scatter_cov01, scatter_cov11, scatter_cov_finite = (
+                    self._scaling_scatter_image_covariance_from_inverse(
+                        physical_params,
+                        bin_data,
+                        critical_inv00,
+                        critical_inv01,
+                        critical_inv10,
+                        critical_inv11,
+                        critical_inverse_finite,
+                    )
+                )
+                invalid = (
+                    invalid
+                    | (~has_source_positions)
+                    | (~jnp.all(residual_finite))
+                    | (~jnp.all(scatter_cov_finite))
+                )
                 bin_loglike = _critical_arc_mixture_image_plane_bin_loglike(
                     residual_x=residual_x,
                     residual_y=residual_y,
@@ -14565,11 +19171,14 @@ class ClusterJAXEvaluator:
                     critical_direction_sigma_arcsec=self.critical_arc_critical_direction_sigma_arcsec,
                     base_prob=self.critical_arc_base_prob,
                     max_prob=self.critical_arc_max_prob,
-                    singular_threshold=self.critical_arc_singular_threshold,
-                    singular_softness=self.critical_arc_singular_softness,
+                    singular_threshold=critical_arc_singular_threshold,
+                    singular_softness=critical_arc_singular_softness,
                     singular_min_precomputed=singular_min,
                     singular_max_precomputed=singular_max,
                     critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+                    scatter_cov00=scatter_cov00,
+                    scatter_cov01=scatter_cov01,
+                    scatter_cov11=scatter_cov11,
                 )
                 bin_loglike = bin_loglike + source_transport_correction
             elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE:
@@ -15137,12 +19746,12 @@ class ClusterJAXEvaluator:
                 source_y,
                 kwargs_lens,
                 solver="lenstronomy",
-                min_distance=0.2,
+                min_distance=float(getattr(self, "exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)),
                 search_window=family.search_window,
                 x_center=family.x_center,
                 y_center=family.y_center,
-                num_iter_max=200,
-                precision_limit=1e-8,
+                num_iter_max=int(getattr(self, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)),
+                precision_limit=float(getattr(self, "exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)),
             )
             self.exact_lenstronomy_count = int(getattr(self, "exact_lenstronomy_count", 0)) + 1
             return np.asarray(x_pred, dtype=float), np.asarray(y_pred, dtype=float)
@@ -15337,6 +19946,8 @@ class ClusterJAXEvaluator:
             "arc_s_max": np.full(n_images, np.nan, dtype=float),
             "arc_detA": np.full(n_images, np.nan, dtype=float),
             "arc_prior_probability": np.full(n_images, np.nan, dtype=float),
+            "p_arc": np.full(n_images, np.nan, dtype=float),
+            "arc_log_odds": np.full(n_images, np.nan, dtype=float),
             "arc_curve_distance_arcsec": np.full(n_images, np.nan, dtype=float),
             "arc_curve_arclength_arcsec": np.full(n_images, np.nan, dtype=float),
             "arc_curve_finite": np.zeros(n_images, dtype=bool),
@@ -15479,11 +20090,107 @@ class ClusterJAXEvaluator:
             effective_z = float(family.z_source)
         try:
             params_jax = jnp.asarray(params, dtype=jnp.float64)
+            try:
+                physical_params = self._physical_parameter_vector(params_jax)
+            except Exception:
+                physical_params = params_jax
+            try:
+                image_sigma_int = self._image_sigma_int_from_physical(physical_params)
+            except Exception:
+                image_sigma_int = jnp.asarray(0.0, dtype=jnp.float64)
             packed_state = self._build_packed_lens_state(params_jax, effective_z)
             x_obs = jnp.asarray(family.x_obs, dtype=jnp.float64)
             y_obs = jnp.asarray(family.y_obs, dtype=jnp.float64)
             beta_x, beta_y = self._ray_shooting_for_components(effective_z, x_obs, y_obs, packed_state)
             jac_a00, jac_a01, jac_a10, jac_a11 = self._lensing_jacobian_for_components(effective_z, x_obs, y_obs, packed_state)
+            sigma_per_image = np.full(
+                n_images,
+                float(getattr(family, "sigma_arcsec", getattr(self, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE))),
+                dtype=float,
+            )
+            reliability_per_image = np.asarray(getattr(family, "reliability", np.ones(n_images, dtype=float)), dtype=float).reshape(-1)
+            if reliability_per_image.shape != (n_images,):
+                reliability_per_image = np.ones(n_images, dtype=float)
+            scatter_cov00 = jnp.zeros_like(x_obs)
+            scatter_cov01 = jnp.zeros_like(x_obs)
+            scatter_cov11 = jnp.zeros_like(x_obs)
+            if (
+                len(getattr(self, "scaling_scatter_param_indices", [])) > 0
+                and hasattr(self, "scaling_scatter_cache_by_z")
+                and callable(getattr(self, "_scaling_scatter_field_scales_from_physical", None))
+            ):
+                try:
+                    (
+                        critical_inv00,
+                        critical_inv01,
+                        critical_inv10,
+                        critical_inv11,
+                        critical_inverse_finite,
+                    ) = _critical_arc_lm_inverse_operator_from_jacobian(
+                        jac_a00,
+                        jac_a01,
+                        jac_a10,
+                        jac_a11,
+                        lm_damping_relative=self.critical_arc_lm_damping_relative,
+                        lm_damping_absolute=self.critical_arc_lm_damping_absolute,
+                    )
+                    family_indices = None
+                    for traced_bin in getattr(self, "traced_bin_data", []):
+                        if abs(float(getattr(traced_bin, "effective_z_source", np.nan)) - float(effective_z)) > 1.0e-10:
+                            continue
+                        family_ids = tuple(str(value) for value in getattr(traced_bin, "family_ids", ()))
+                        if str(getattr(family, "family_id", "")) not in family_ids:
+                            continue
+                        family_slot = family_ids.index(str(getattr(family, "family_id", "")))
+                        full_family_idx = np.asarray(traced_bin.family_index_per_image, dtype=int).reshape(-1)
+                        candidate = np.flatnonzero(full_family_idx == int(family_slot))
+                        if candidate.size == n_images:
+                            family_indices = candidate
+                            break
+                    cache = getattr(self, "scaling_scatter_cache_by_z", {}).get(float(effective_z))
+                    if cache is not None and family_indices is not None:
+                        sigma_scatter, core_scatter, cut_scatter = self._scaling_scatter_field_scales_from_physical(
+                            physical_params
+                        )
+
+                        def _cache_values(name: str) -> jnp.ndarray:
+                            return jnp.asarray(np.asarray(cache[name], dtype=float)[family_indices], dtype=jnp.float64)
+
+                        def _image_displacement_covariance(
+                            scale: jnp.ndarray,
+                            key_x: str,
+                            key_y: str,
+                        ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+                            source_dx = scale * _cache_values(key_x)
+                            source_dy = scale * _cache_values(key_y)
+                            image_dx = critical_inv00 * source_dx + critical_inv01 * source_dy
+                            image_dy = critical_inv10 * source_dx + critical_inv11 * source_dy
+                            return jnp.square(image_dx), image_dx * image_dy, jnp.square(image_dy)
+
+                        sigma00, sigma01, sigma11 = _image_displacement_covariance(
+                            sigma_scatter, "sigma_x", "sigma_y"
+                        )
+                        core00, core01, core11 = _image_displacement_covariance(core_scatter, "core_x", "core_y")
+                        cut00, cut01, cut11 = _image_displacement_covariance(cut_scatter, "cut_x", "cut_y")
+                        scatter_cov00 = jnp.where(
+                            critical_inverse_finite,
+                            sigma00 + core00 + cut00,
+                            jnp.zeros_like(x_obs),
+                        )
+                        scatter_cov01 = jnp.where(
+                            critical_inverse_finite,
+                            sigma01 + core01 + cut01,
+                            jnp.zeros_like(x_obs),
+                        )
+                        scatter_cov11 = jnp.where(
+                            critical_inverse_finite,
+                            sigma11 + core11 + cut11,
+                            jnp.zeros_like(x_obs),
+                        )
+                except Exception:
+                    scatter_cov00 = jnp.zeros_like(x_obs)
+                    scatter_cov01 = jnp.zeros_like(x_obs)
+                    scatter_cov11 = jnp.zeros_like(x_obs)
 
             def jacobian_at(curve_x: np.ndarray, curve_y: np.ndarray) -> tuple[Any, Any, Any, Any]:
                 return self._lensing_jacobian_for_components(
@@ -15493,6 +20200,16 @@ class ClusterJAXEvaluator:
                     packed_state,
                 )
 
+            singular_threshold = (
+                self._critical_arc_singular_threshold_numpy(params)
+                if hasattr(self, "_critical_arc_singular_threshold_numpy")
+                else float(getattr(self, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD))
+            )
+            singular_softness = (
+                self._critical_arc_singular_softness_numpy(params)
+                if hasattr(self, "_critical_arc_singular_softness_numpy")
+                else float(getattr(self, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS))
+            )
             details = _arc_aware_image_support_from_local_linearization(
                 beta_x - jnp.asarray(float(source_x), dtype=jnp.float64),
                 beta_y - jnp.asarray(float(source_y), dtype=jnp.float64),
@@ -15505,13 +20222,36 @@ class ClusterJAXEvaluator:
                 jacobian_at=jacobian_at,
                 point_recovered_mask=point_recovered,
                 point_residual_arcsec=point_residual,
-                noncritical_support_radius_arcsec=float(
+                arc_recovery_p_arc_threshold=float(
+                    getattr(self, "arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
+                ),
+                sigma_per_image=sigma_per_image,
+                reliability_per_image=reliability_per_image,
+                image_sigma_int=image_sigma_int,
+                covariance_floor=float(getattr(self, "source_plane_covariance_floor", 0.0)),
+                outlier_sigma_arcsec=float(
+                    getattr(self, "source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
+                ),
+                residual_loss=str(
                     getattr(
                         self,
-                        "arc_aware_noncritical_support_radius_arcsec",
-                        DEFAULT_ARC_AWARE_NONCRITICAL_SUPPORT_RADIUS_ARCSEC,
+                        "likelihood_stabilizer_residual_loss",
+                        DEFAULT_LIKELIHOOD_STABILIZER_RESIDUAL_LOSS,
                     )
                 ),
+                student_t_nu=float(
+                    getattr(self, "likelihood_stabilizer_student_t_nu", DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU)
+                ),
+                critical_direction_sigma_arcsec=float(
+                    getattr(
+                        self,
+                        "critical_arc_critical_direction_sigma_arcsec",
+                        DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+                    )
+                ),
+                scatter_cov00=scatter_cov00,
+                scatter_cov01=scatter_cov01,
+                scatter_cov11=scatter_cov11,
                 max_arclength_arcsec=float(
                     getattr(self, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
                 ),
@@ -15523,8 +20263,8 @@ class ClusterJAXEvaluator:
                 lm_damping_absolute=self.critical_arc_lm_damping_absolute,
                 base_prob=self.critical_arc_base_prob,
                 max_prob=self.critical_arc_max_prob,
-                singular_threshold=self.critical_arc_singular_threshold,
-                singular_softness=self.critical_arc_singular_softness,
+                singular_threshold=singular_threshold,
+                singular_softness=singular_softness,
             )
         except Exception:
             details = self._empty_arc_aware_image_support_details(family)
@@ -15573,12 +20313,12 @@ class ClusterJAXEvaluator:
         cache.last_source_x = source_x
         cache.last_source_y = source_y
         cache.exact_validation_count += 1
-        arc_details = self._arc_aware_image_support_details(params, family, source_x, source_y)
         x_pred: np.ndarray
         y_pred: np.ndarray
         try:
             x_pred, y_pred = self._solve_exact_images_lenstronomy(family, packed_state, source_x, source_y)
         except Exception:
+            arc_details = self._arc_aware_image_support_details(params, family, source_x, source_y)
             cache.multiplicity_mismatch_count += 1
             details = {
                 **base_details,
@@ -15660,6 +20400,12 @@ class ClusterJAXEvaluator:
         self.source_metric_reference_params = None
         if hasattr(self, "_conditional_source_inverse_basis_cache"):
             self._conditional_source_inverse_basis_cache.clear()
+        clear_caches = getattr(jax, "clear_caches", None)
+        if clear_caches is not None:
+            try:
+                clear_caches()
+            except Exception:
+                pass
         gc.collect()
 
 
@@ -16213,6 +20959,15 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
     evaluator = ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=match_tolerance_arcsec,
+        exact_image_min_distance_arcsec=float(
+            saved_args.get("exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)
+        ),
+        exact_image_precision_limit=float(
+            saved_args.get("exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)
+        ),
+        exact_image_num_iter_max=int(
+            saved_args.get("exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)
+        ),
         sampling_engine="full",
         active_scaling_galaxies=saved_args.get("active_scaling_galaxies"),
         active_scaling_selection=str(saved_args.get("active_scaling_selection", "adaptive")),
@@ -16273,9 +21028,8 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
         critical_arc_lm_trust_radius_arcsec=float(
             saved_args.get("critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
         ),
-        arc_aware_noncritical_support_radius_arcsec=_resolve_arc_aware_noncritical_support_radius_arcsec(
-            saved_args.get("arc_aware_noncritical_support_radius_arcsec"),
-            match_tolerance_arcsec,
+        arc_recovery_p_arc_threshold=float(
+            saved_args.get("arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
         ),
         arc_aware_max_arclength_arcsec=float(
             saved_args.get("arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
@@ -16745,6 +21499,18 @@ def _build_state_from_inputs(
             _log(args, f"[input] fov_limit={fov_description} potfile_catalog_rows={json.dumps(potfile_fov_summary, sort_keys=True)}")
         if images_df.empty and arcs_df.empty:
             raise ValueError("No multiple-image or CAB arc constraints remain after applying FOV limits.")
+    potfiles, potfile_mag_summary = _filter_potfiles_by_member_mag_max(
+        potfiles,
+        getattr(args, "potfile_member_mag_max", None),
+    )
+    if potfile_mag_summary:
+        _log(args, f"[input] potfile_member_mag_max={json.dumps(potfile_mag_summary, sort_keys=True)}")
+    potfiles, potfile_brightest_summary = _filter_potfiles_by_brightest_members(
+        potfiles,
+        getattr(args, "potfile_member_brightest_n", None),
+    )
+    if potfile_brightest_summary:
+        _log(args, f"[input] potfile_member_brightest_n={json.dumps(potfile_brightest_summary, sort_keys=True)}")
     large_parameter_specs, large_component_param_assignments, large_lens_model_list = _build_parameter_specs(potentials_with_priors)
     if model_fit_mode == "small-only" and large_parameter_specs:
         if stage1_prior_summary is None:
@@ -16772,12 +21538,16 @@ def _build_state_from_inputs(
             potfile_mass_size_reparam=bool(getattr(args, "potfile_mass_size_reparam", False)),
         )
         parameter_specs.extend(scaling_parameter_specs)
-        scatter_fields = _parse_scaling_scatter_fields(args.scaling_scatter_fields) if args.scaling_scatter else set()
+        scatter_fields = (
+            _parse_scaling_scatter_fields(getattr(args, "scaling_scatter_fields", "sigma,core,cut"))
+            if bool(getattr(args, "scaling_scatter", False))
+            else set()
+        )
         scaling_scatter_specs, scaling_scatter_indices = _build_scaling_scatter_parameter_specs(
             potfiles,
             scatter_fields,
             start_index=len(parameter_specs),
-            scatter_max=float(args.scaling_scatter_max),
+            scatter_max=float(getattr(args, "scaling_scatter_max", 0.5)),
         )
         parameter_specs.extend(scaling_scatter_specs)
         scaling_components, scaling_assignments, scaling_component_assignments, scaling_component_records = _build_scaling_components(
@@ -16837,7 +21607,7 @@ def _build_state_from_inputs(
                     reference,
                     z_lens=z_lens,
                     cosmo_config=cosmo_config,
-                    z_bin_efficiency_tol=float(args.z_bin_efficiency_tol),
+                    z_bin_efficiency_tol=float(getattr(args, "z_bin_efficiency_tol", DEFAULT_Z_BIN_EFFICIENCY_TOL)),
                 )
     bin_data = _build_bin_data(family_data)
     arc_data = _prepare_arc_constraint_data(arcs_df, reference)
@@ -16894,8 +21664,98 @@ def _build_state_from_inputs(
                     ),
                 )
             )
+    elif family_data and _sample_likelihood_uses_image_scatter(sample_likelihood_mode):
+        if getattr(args, "fix_image_sigma_int_arcsec", None) is None:
+            parameter_specs.append(
+                _build_image_scatter_parameter_spec(
+                    start_index=len(parameter_specs),
+                    upper_arcsec=float(getattr(args, "image_plane_scatter_upper_arcsec", DEFAULT_IMAGE_SIGMA_INT_UPPER_ARCSEC)),
+                    floor_arcsec=float(getattr(args, "image_plane_scatter_floor_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC)),
+                    prior=str(getattr(args, "image_plane_scatter_prior", DEFAULT_IMAGE_PLANE_SCATTER_PRIOR)),
+                    prior_median_arcsec=float(
+                        getattr(args, "image_plane_scatter_prior_median_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_MEDIAN_ARCSEC)
+                    ),
+                    prior_log_sigma=float(
+                        getattr(args, "image_plane_scatter_prior_log_sigma", DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_LOG_SIGMA)
+                    ),
+                )
+            )
     elif family_data:
         parameter_specs.append(_build_source_scatter_parameter_spec(start_index=len(parameter_specs)))
+    if (
+        bool(getattr(args, "sample_critical_arc_singular_threshold", False))
+        and _sample_likelihood_uses_critical_arc_terms(sample_likelihood_mode)
+    ):
+        parameter_specs.append(
+            _build_critical_arc_singular_threshold_parameter_spec(
+                start_index=len(parameter_specs),
+                lower=float(
+                    getattr(
+                        args,
+                        "critical_arc_singular_threshold_lower",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_LOWER,
+                    )
+                ),
+                upper=float(
+                    getattr(
+                        args,
+                        "critical_arc_singular_threshold_upper",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_UPPER,
+                    )
+                ),
+                prior_median=float(
+                    getattr(
+                        args,
+                        "critical_arc_singular_threshold_prior_median",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_MEDIAN,
+                    )
+                ),
+                prior_log_sigma=float(
+                    getattr(
+                        args,
+                        "critical_arc_singular_threshold_prior_log_sigma",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_LOG_SIGMA,
+                    )
+                ),
+            )
+        )
+    if (
+        bool(getattr(args, "sample_critical_arc_singular_softness", False))
+        and _sample_likelihood_uses_critical_arc_terms(sample_likelihood_mode)
+    ):
+        parameter_specs.append(
+            _build_critical_arc_singular_softness_parameter_spec(
+                start_index=len(parameter_specs),
+                lower=float(
+                    getattr(
+                        args,
+                        "critical_arc_singular_softness_lower",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_LOWER,
+                    )
+                ),
+                upper=float(
+                    getattr(
+                        args,
+                        "critical_arc_singular_softness_upper",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER,
+                    )
+                ),
+                prior_median=float(
+                    getattr(
+                        args,
+                        "critical_arc_singular_softness_prior_median",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_MEDIAN,
+                    )
+                ),
+                prior_log_sigma=float(
+                    getattr(
+                        args,
+                        "critical_arc_singular_softness_prior_log_sigma",
+                        DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_LOG_SIGMA,
+                    )
+                ),
+            )
+        )
     if fit_cosmology_flat_wcdm:
         parameter_specs.extend(_build_cosmology_parameter_specs(len(parameter_specs), cosmo_config))
         if svi_init_values is None:
@@ -17220,6 +22080,15 @@ def _build_cluster_evaluator_from_args(
     return ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=args.match_tolerance_arcsec,
+        exact_image_min_distance_arcsec=float(
+            getattr(args, "exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)
+        ),
+        exact_image_precision_limit=float(
+            getattr(args, "exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)
+        ),
+        exact_image_num_iter_max=int(
+            getattr(args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)
+        ),
         sampling_engine=str(sampling_engine if sampling_engine is not None else getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)),
         active_scaling_galaxies=args.active_scaling_galaxies,
         active_scaling_selection=args.active_scaling_selection,
@@ -17279,10 +22148,8 @@ def _build_cluster_evaluator_from_args(
         critical_arc_lm_trust_radius_arcsec=float(
             getattr(args, "critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
         ),
-        arc_aware_noncritical_support_radius_arcsec=getattr(
-            args,
-            "arc_aware_noncritical_support_radius_arcsec",
-            None,
+        arc_recovery_p_arc_threshold=float(
+            getattr(args, "arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
         ),
         arc_aware_max_arclength_arcsec=float(
             getattr(args, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
@@ -17358,7 +22225,9 @@ def _prepare_direct_evaluator(
     state: BuildState,
 ) -> tuple[ClusterJAXEvaluator, np.ndarray]:
     evaluator = _build_cluster_evaluator_from_args(args, state)
+    _log_active_approximation_table(args, evaluator)
     _log_evaluator_summary(args, evaluator)
+    _log_evaluator_memory_shape_diagnostics(args, evaluator, reason="evaluator_built")
     midpoint = _default_theta(state.parameter_specs)
     if evaluator.surrogate_enabled:
         _log(
@@ -17372,6 +22241,8 @@ def _prepare_direct_evaluator(
     evaluator.refresh_scaling_scatter_cache(midpoint, reason="svi_nuts_initial")
     evaluator.refresh_source_metric_cache(midpoint, reason="svi_nuts_initial")
     _log_solver_active_approximation_warning(args, evaluator)
+    _log_evaluator_memory_shape_diagnostics(args, evaluator, reason="initial_refresh")
+    _maybe_clear_jax_caches(args, "initial_refresh")
     _log(args, "[compile] tracing first JAX likelihood evaluation")
     compile_start = time.time()
     compile_loglike = evaluator.source_loglike(midpoint)
@@ -17595,6 +22466,27 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
         evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_nuts")
         evaluator.refresh_source_metric_cache(best_fit, reason="post_nuts")
         _log(args, f"[nuts] best_fit updated from retained posterior sample index={best_index}")
+    elif str(args.fit_method) in MICROCANONICAL_FIT_METHODS:
+        method = str(args.fit_method)
+        best_fit = _reference_theta_from_init_values(state.parameter_specs, state.svi_init_values, _midpoint)
+        if evaluator.surrogate_enabled:
+            evaluator.refresh_surrogate(best_fit, reason=f"{method}_initial")
+        evaluator.refresh_scaling_scatter_cache(best_fit, reason=f"{method}_initial")
+        evaluator.refresh_source_metric_cache(best_fit, reason=f"{method}_initial")
+        posterior = _run_blackjax_microcanonical_sampler(args, state, evaluator, method)
+        microcanonical_usable, microcanonical_reason = _microcanonical_posterior_is_usable(posterior)
+        if not microcanonical_usable:
+            raise RuntimeError(f"Direct {method.upper()} posterior is unusable: {microcanonical_reason}")
+        if posterior.samples.ndim != 2 or posterior.samples.shape[0] == 0:
+            raise RuntimeError(f"Direct {method.upper()} returned no posterior samples.")
+        if np.asarray(posterior.log_prob).size and np.isfinite(posterior.log_prob).any():
+            best_index = int(np.nanargmax(posterior.log_prob))
+        else:
+            best_index = 0
+        best_fit = np.asarray(posterior.samples[best_index], dtype=float)
+        evaluator.refresh_scaling_scatter_cache(best_fit, reason=f"post_{method}")
+        evaluator.refresh_source_metric_cache(best_fit, reason=f"post_{method}")
+        _log(args, f"[{method}] best_fit updated from retained posterior sample index={best_index}")
     else:
         best_fit, posterior, svi_diagnostics = _run_svi_fit(args, state, evaluator, sample_model)
         svi_posterior = posterior
@@ -17825,10 +22717,36 @@ def _rerender_plots(
     _drop_legacy_likelihood_stabilizer_args(plot_saved_args)
     plot_saved_args["quick_diagnostics"] = quick_diagnostics
     plot_saved_args["exact_image_diagnostics_stage3"] = bool(getattr(args, "exact_image_diagnostics_stage3", False))
+    plot_saved_args["skip_grid_diagnostics"] = bool(getattr(args, "skip_grid_diagnostics", False))
     plot_saved_args["caustic_source_redshift"] = float(getattr(args, "caustic_source_redshift", 9.0))
+    exact_image_override_specs = (
+        ("exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC, float),
+        ("exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT, float),
+        ("exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX, int),
+    )
+    effective_exact_image_controls: dict[str, float | int] = {}
+    for exact_key, exact_default, exact_cast in exact_image_override_specs:
+        current_exact_value = exact_cast(getattr(args, exact_key, exact_default))
+        plot_saved_args[exact_key] = current_exact_value
+        effective_exact_image_controls[exact_key] = current_exact_value
+    _log(
+        args,
+        (
+            "[plots-only] exact image controls "
+            f"min_distance_arcsec={effective_exact_image_controls['exact_image_min_distance_arcsec']} "
+            f"precision_limit={effective_exact_image_controls['exact_image_precision_limit']} "
+            f"num_iter_max={effective_exact_image_controls['exact_image_num_iter_max']}"
+        ),
+    )
     current_kappa_true_fits = getattr(args, "kappa_true_fits", None)
     if current_kappa_true_fits is not None and str(current_kappa_true_fits).strip():
         plot_saved_args["kappa_true_fits"] = str(current_kappa_true_fits)
+    current_gammax_true_fits = getattr(args, "gammax_true_fits", None)
+    if current_gammax_true_fits is not None and str(current_gammax_true_fits).strip():
+        plot_saved_args["gammax_true_fits"] = str(current_gammax_true_fits)
+    current_gammay_true_fits = getattr(args, "gammay_true_fits", None)
+    if current_gammay_true_fits is not None and str(current_gammay_true_fits).strip():
+        plot_saved_args["gammay_true_fits"] = str(current_gammay_true_fits)
     current_cutout_dir = getattr(args, "image_catalog_family_cutout_image_dir", None)
     if current_cutout_dir is not None and str(current_cutout_dir).strip():
         plot_saved_args["image_catalog_family_cutout_image_dir"] = current_cutout_dir
@@ -17838,6 +22756,18 @@ def _rerender_plots(
         current_cutout_bands = getattr(args, "image_catalog_family_cutout_bands", None)
         if current_cutout_bands is not None:
             plot_saved_args["image_catalog_family_cutout_bands"] = list(current_cutout_bands)
+    current_cutout_mode = str(getattr(args, "image_catalog_family_cutout_mode", "full"))
+    if "image_catalog_family_cutout_mode" not in saved_args or current_cutout_mode != "full":
+        plot_saved_args["image_catalog_family_cutout_mode"] = current_cutout_mode
+    current_cutout_critical_lines = str(getattr(args, "image_catalog_family_cutout_critical_lines", "auto"))
+    if "image_catalog_family_cutout_critical_lines" not in saved_args or current_cutout_critical_lines != "auto":
+        plot_saved_args["image_catalog_family_cutout_critical_lines"] = current_cutout_critical_lines
+    current_cutout_dpi = getattr(args, "image_catalog_family_cutout_dpi", None)
+    if current_cutout_dpi is not None:
+        plot_saved_args["image_catalog_family_cutout_dpi"] = int(current_cutout_dpi)
+    current_cutout_max_side = getattr(args, "image_catalog_family_cutout_max_side_pixels", None)
+    if current_cutout_max_side is not None:
+        plot_saved_args["image_catalog_family_cutout_max_side_pixels"] = int(current_cutout_max_side)
     for cutout_rgb_key in (
         "image_catalog_family_cutout_rgb_q",
         "image_catalog_family_cutout_rgb_stretch",
@@ -17858,15 +22788,15 @@ def _rerender_plots(
     )
     if converted_legacy_refine:
         _log(args, "[plots-only] converted legacy saved posterior arrays from latent to physical units")
-    sample_likelihood_mode = str(saved_args.get("sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))
+    sample_likelihood_mode = str(plot_saved_args.get("sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))
     image_presence_penalty_weight = _effective_image_presence_penalty_weight(
-        saved_args.get("image_presence_penalty_weight"),
+        plot_saved_args.get("image_presence_penalty_weight"),
         sample_likelihood_mode=sample_likelihood_mode,
-        fit_mode=str(saved_args.get("fit_mode", FIT_MODE_SEQUENTIAL)),
-        image_plane_mode=str(saved_args.get("image_plane_mode", IMAGE_PLANE_MODE_NONE)),
+        fit_mode=str(plot_saved_args.get("fit_mode", FIT_MODE_SEQUENTIAL)),
+        image_plane_mode=str(plot_saved_args.get("image_plane_mode", IMAGE_PLANE_MODE_NONE)),
     )
-    cab_likelihood_weight = _effective_cab_likelihood_weight(saved_args.get("cab_likelihood_weight"), state)
-    saved_sampling_engine = str(saved_args.get("sampling_engine", SAMPLING_ENGINE_FULL))
+    cab_likelihood_weight = _effective_cab_likelihood_weight(plot_saved_args.get("cab_likelihood_weight"), state)
+    saved_sampling_engine = str(plot_saved_args.get("sampling_engine", SAMPLING_ENGINE_FULL))
     plot_sampling_engine = (
         SAMPLING_ENGINE_FULL if saved_sampling_engine == SAMPLING_ENGINE_ACTIVE_SUBSET else saved_sampling_engine
     )
@@ -17875,22 +22805,31 @@ def _rerender_plots(
             args,
             "[plots-only] active_subset artifacts detected; using full lens model for validation and plots",
         )
-    match_tolerance_arcsec = float(saved_args.get("match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE))
+    match_tolerance_arcsec = float(plot_saved_args.get("match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE))
     evaluator = ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=match_tolerance_arcsec,
-        sampling_engine=plot_sampling_engine,
-        active_scaling_galaxies=saved_args.get("active_scaling_galaxies"),
-        active_scaling_selection=str(saved_args.get("active_scaling_selection", "adaptive")),
-        active_scaling_cumulative_fraction=float(
-            saved_args.get("active_scaling_cumulative_fraction", DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION)
+        exact_image_min_distance_arcsec=float(
+            plot_saved_args.get("exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)
         ),
-        active_scaling_min=int(saved_args.get("active_scaling_min", DEFAULT_ACTIVE_SCALING_MIN)),
-        refresh_every=int(saved_args.get("refresh_every", DEFAULT_REFRESH_EVERY)),
-        refresh_param_drift_frac=float(saved_args.get("refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
-        source_plane_covariance_floor=float(saved_args.get("source_plane_covariance_floor", 1.0e-6)),
+        exact_image_precision_limit=float(
+            plot_saved_args.get("exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)
+        ),
+        exact_image_num_iter_max=int(
+            plot_saved_args.get("exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)
+        ),
+        sampling_engine=plot_sampling_engine,
+        active_scaling_galaxies=plot_saved_args.get("active_scaling_galaxies"),
+        active_scaling_selection=str(plot_saved_args.get("active_scaling_selection", "adaptive")),
+        active_scaling_cumulative_fraction=float(
+            plot_saved_args.get("active_scaling_cumulative_fraction", DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION)
+        ),
+        active_scaling_min=int(plot_saved_args.get("active_scaling_min", DEFAULT_ACTIVE_SCALING_MIN)),
+        refresh_every=int(plot_saved_args.get("refresh_every", DEFAULT_REFRESH_EVERY)),
+        refresh_param_drift_frac=float(plot_saved_args.get("refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
+        source_plane_covariance_floor=float(plot_saved_args.get("source_plane_covariance_floor", 1.0e-6)),
         source_plane_outlier_sigma_arcsec=float(
-            saved_args.get("source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
+            plot_saved_args.get("source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
         ),
         sample_likelihood_mode=sample_likelihood_mode,
         image_plane_newton_steps=int(saved_args.get("image_plane_newton_steps", 0)),
@@ -17939,9 +22878,8 @@ def _rerender_plots(
         critical_arc_lm_trust_radius_arcsec=float(
             saved_args.get("critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
         ),
-        arc_aware_noncritical_support_radius_arcsec=_resolve_arc_aware_noncritical_support_radius_arcsec(
-            saved_args.get("arc_aware_noncritical_support_radius_arcsec"),
-            match_tolerance_arcsec,
+        arc_recovery_p_arc_threshold=float(
+            saved_args.get("arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
         ),
         arc_aware_max_arclength_arcsec=float(
             saved_args.get("arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
@@ -17999,6 +22937,7 @@ def _rerender_plots(
     if saved_sampling_engine == SAMPLING_ENGINE_ACTIVE_SUBSET:
         evaluator.fit_sampling_engine = SAMPLING_ENGINE_ACTIVE_SUBSET
         evaluator.final_validation_sampling_engine = SAMPLING_ENGINE_FULL
+    _log_active_approximation_table(args, evaluator)
     best_fit = np.asarray(arrays["best_fit"], dtype=float)
     best_fit_latent = _run_logged_phase(
         args,
@@ -18075,6 +23014,182 @@ def _clone_args(args: argparse.Namespace, **updates: Any) -> argparse.Namespace:
     return argparse.Namespace(**payload)
 
 
+INPUT_ARCHIVE_VERSION = 1
+_INPUT_ARCHIVE_SUBDIRS = {
+    "par": "par",
+    "potfile": "potfiles",
+    "image_catalog": "image_catalogs",
+    "arc_catalog": "arc_catalogs",
+}
+
+
+def _input_archive_resolve_path(value: Any, base_dir: Path) -> Path | None:
+    candidate_value = value
+    if isinstance(value, (list, tuple)):
+        if len(value) < 2:
+            return None
+        candidate_value = value[1]
+    if not isinstance(candidate_value, (str, os.PathLike)):
+        return None
+    text = str(candidate_value).strip()
+    if not text:
+        return None
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        candidate = base_dir / candidate
+    return candidate.resolve(strict=False)
+
+
+def _input_archive_iter_blocks(parsed: dict[str, Any], key: str) -> Iterable[dict[str, Any]]:
+    value = parsed.get(key)
+    if isinstance(value, dict):
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                yield item
+
+
+def _discover_input_archive_files(state: BuildState) -> list[tuple[str, Path]]:
+    par_path = Path(state.par_path).expanduser().resolve(strict=False)
+    base_dir = par_path.parent
+    discovered: list[tuple[str, Path]] = [("par", par_path)]
+    seen: set[Path] = {par_path}
+
+    def add(kind: str, path: Path | None) -> None:
+        if path is None or path in seen:
+            return
+        seen.add(path)
+        discovered.append((kind, path))
+
+    for potfile in getattr(state, "potfiles", []) or []:
+        if not isinstance(potfile, dict):
+            continue
+        add("potfile", _input_archive_resolve_path(potfile.get("catalog_path") or potfile.get("filein"), base_dir))
+
+    parsed = getattr(state, "parsed", {}) or {}
+    if isinstance(parsed, dict):
+        runmode = parsed.get("runmode")
+        if isinstance(runmode, dict):
+            add("image_catalog", _input_archive_resolve_path(runmode.get("image"), base_dir))
+        for image_block in _input_archive_iter_blocks(parsed, "image"):
+            add("image_catalog", _input_archive_resolve_path(image_block.get("multfile"), base_dir))
+            add("arc_catalog", _input_archive_resolve_path(image_block.get("arcfile"), base_dir))
+        for image_block in _input_archive_iter_blocks(parsed, "images"):
+            add("image_catalog", _input_archive_resolve_path(image_block.get("multfile"), base_dir))
+            add("arc_catalog", _input_archive_resolve_path(image_block.get("arcfile"), base_dir))
+
+    return discovered
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _input_archive_destination(
+    archive_dir: Path,
+    kind: str,
+    source_path: Path,
+    used_names_by_subdir: dict[str, set[str]],
+) -> Path:
+    subdir_name = _INPUT_ARCHIVE_SUBDIRS[kind]
+    used_names = used_names_by_subdir.setdefault(subdir_name, set())
+    name = source_path.name or f"{kind}.txt"
+    candidate_name = name
+    index = 2
+    suffix = "".join(source_path.suffixes)
+    stem = source_path.name[: -len(suffix)] if suffix and source_path.name.endswith(suffix) else source_path.stem
+    while candidate_name in used_names:
+        candidate_name = f"{stem}__{index}{suffix}"
+        index += 1
+    used_names.add(candidate_name)
+    return archive_dir / subdir_name / candidate_name
+
+
+def _manifest_large_path_entry(kind: str, value: Any, *, extra: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    path = Path(text).expanduser().resolve(strict=False)
+    entry: dict[str, Any] = {
+        "kind": kind,
+        "path": str(path),
+        "exists": path.exists(),
+        "is_file": path.is_file(),
+        "size_bytes": path.stat().st_size if path.is_file() else None,
+    }
+    if extra:
+        entry.update(extra)
+    return entry
+
+
+def _input_archive_large_path_entries(args: argparse.Namespace) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for attr in ("kappa_true_fits", "gammax_true_fits", "gammay_true_fits"):
+        entry = _manifest_large_path_entry(attr, getattr(args, attr, None), extra={"arg": attr})
+        if entry is not None:
+            entries.append(entry)
+    cutout_dir = getattr(args, "image_catalog_family_cutout_image_dir", None)
+    cutout_bands = getattr(args, "image_catalog_family_cutout_bands", None)
+    cutout_extra: dict[str, Any] = {"arg": "image_catalog_family_cutout_image_dir"}
+    if cutout_bands is not None:
+        cutout_extra["bands"] = [str(item) for item in cutout_bands]
+    entry = _manifest_large_path_entry("image_catalog_family_cutout_image_dir", cutout_dir, extra=cutout_extra)
+    if entry is not None:
+        entries.append(entry)
+    return entries
+
+
+def _archive_run_inputs(args: argparse.Namespace, state: BuildState, run_dir: Path) -> dict[str, Any]:
+    archive_dir = run_dir / "inputs"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    copied_files: list[dict[str, Any]] = []
+    used_names_by_subdir: dict[str, set[str]] = {}
+    for kind, source_path in _discover_input_archive_files(state):
+        if kind not in _INPUT_ARCHIVE_SUBDIRS:
+            continue
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Cannot archive {kind} input; file does not exist: {source_path}")
+        destination = _input_archive_destination(archive_dir, kind, source_path, used_names_by_subdir)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, destination)
+        copied_files.append(
+            {
+                "kind": kind,
+                "original_path": str(source_path),
+                "archived_path": str(destination.relative_to(archive_dir)),
+                "size_bytes": int(destination.stat().st_size),
+                "sha256": _sha256_file(destination),
+            }
+        )
+
+    skipped_large_files = _input_archive_large_path_entries(args)
+    manifest = {
+        "version": INPUT_ARCHIVE_VERSION,
+        "run_name": state.run_name,
+        "run_dir": str(run_dir.resolve(strict=False)),
+        "archive_dir": str(archive_dir.resolve(strict=False)),
+        "copied_files": copied_files,
+        "skipped_large_files": skipped_large_files,
+    }
+    manifest_path = archive_dir / "input_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _log(
+        args,
+        (
+            f"[input-archive] copied={len(copied_files)} "
+            f"skipped_large={len(skipped_large_files)} dir={archive_dir}"
+        ),
+    )
+    return manifest
+
+
 def _stage_banner_title_from_run_name(run_name: str) -> str:
     stage_name = Path(str(run_name)).name
     labels = {
@@ -18141,8 +23256,97 @@ def _run_single_stage(
     _log_state_summary(stage_args, state)
     _log(stage_args, f"[load] parser complete in {_fmt_seconds(time.time() - load_start)}")
     run_dir = Path(stage_args.output_dir) / state.run_name
+    _configure_debug_log(stage_args, state.run_name, run_dir)
+    _archive_run_inputs(stage_args, state, run_dir)
     _run_inference(stage_args, state, run_dir)
     _log(stage_args, f"[stage] end run_name={run_name} run_dir={run_dir}")
+    return run_dir
+
+
+def _run_single_stage_spawn_worker(
+    result_queue: Any,
+    args: argparse.Namespace,
+    fit_mode: str,
+    run_name: str,
+    stage1_prior_summary: Stage1PriorSummary | None,
+    sample_likelihood_mode: str,
+    svi_init_physical_values: dict[str, float] | None,
+    source_position_prior_values: dict[str, tuple[float, float]] | None,
+    previous_stage_best_values: dict[str, float] | None,
+) -> None:
+    try:
+        run_dir = _run_single_stage(
+            args,
+            fit_mode,
+            run_name,
+            stage1_prior_summary=stage1_prior_summary,
+            sample_likelihood_mode=sample_likelihood_mode,
+            svi_init_physical_values=svi_init_physical_values,
+            source_position_prior_values=source_position_prior_values,
+            previous_stage_best_values=previous_stage_best_values,
+        )
+    except BaseException:
+        result_queue.put({"status": "error", "traceback": traceback.format_exc()})
+    else:
+        result_queue.put({"status": "ok", "run_dir": str(run_dir)})
+    finally:
+        _close_debug_log()
+
+
+def _run_single_stage_in_fresh_process(
+    args: argparse.Namespace,
+    fit_mode: str,
+    run_name: str,
+    *,
+    stage1_prior_summary: Stage1PriorSummary | None = None,
+    sample_likelihood_mode: str = SAMPLE_LIKELIHOOD_SOURCE,
+    svi_init_physical_values: dict[str, float] | None = None,
+    source_position_prior_values: dict[str, tuple[float, float]] | None = None,
+    previous_stage_best_values: dict[str, float] | None = None,
+) -> Path:
+    _log(
+        args,
+        (
+            f"[memory] launching fresh spawned stage process run_name={run_name} "
+            f"sample_likelihood_mode={sample_likelihood_mode} sampling_engine={getattr(args, 'sampling_engine', '<unknown>')}"
+        ),
+    )
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_run_single_stage_spawn_worker,
+        args=(
+            result_queue,
+            args,
+            fit_mode,
+            run_name,
+            stage1_prior_summary,
+            sample_likelihood_mode,
+            svi_init_physical_values,
+            source_position_prior_values,
+            previous_stage_best_values,
+        ),
+        name=f"lenscluster-{Path(run_name).name}",
+    )
+    process.start()
+    process.join()
+    try:
+        message = result_queue.get(timeout=1.0)
+    except queue.Empty:
+        message = {
+            "status": "error",
+            "traceback": f"fresh stage process exited without reporting a result; exitcode={process.exitcode}",
+        }
+    finally:
+        result_queue.close()
+        result_queue.join_thread()
+    if process.exitcode not in (0, None) and message.get("status") == "ok":
+        raise RuntimeError(f"Fresh stage process for {run_name} exited with code {process.exitcode}.")
+    if message.get("status") != "ok":
+        traceback_text = str(message.get("traceback", "<no traceback>"))
+        raise RuntimeError(f"Fresh stage process failed for {run_name}:\n{traceback_text}")
+    run_dir = Path(str(message["run_dir"]))
+    _log(args, f"[memory] fresh spawned stage process complete run_name={run_name} run_dir={run_dir}")
     return run_dir
 
 
@@ -18298,13 +23502,19 @@ def _run_sequential(args: argparse.Namespace) -> None:
     stage3_controls = stage_fit_controls["stage3"]
     stage4_controls = stage_fit_controls["stage4"]
     stage4_enabled = _stage4_image_plane_enabled(args)
-    stage3_enabled = _local_jacobian_stage_enabled(args)
+    stage3_enabled = _stage3_image_plane_enabled(args)
     exact_diagnostics_stage = _final_sequential_exact_diagnostics_stage(
         args,
         stage3_enabled=stage3_enabled,
         stage4_enabled=stage4_enabled,
     )
+    stage3_sample_likelihood_mode = _stage3_sample_likelihood_mode(args)
     stage4_sample_likelihood_mode = _stage4_sample_likelihood_mode(args)
+    final_sample_likelihood_mode = (
+        str(stage4_sample_likelihood_mode)
+        if stage4_enabled and stage4_sample_likelihood_mode is not None
+        else str(stage3_sample_likelihood_mode or SAMPLE_LIKELIHOOD_SOURCE)
+    )
     fit_cosmology_requested = bool(getattr(args, "fit_cosmology_flat_wcdm", False))
     sequential_cosmology_config_override = (
         _sequential_fiducial_cosmology_config() if fit_cosmology_requested else None
@@ -18324,6 +23534,7 @@ def _run_sequential(args: argparse.Namespace) -> None:
         "SEQUENTIAL WORKFLOW",
         (
             f"run_name={root_run_name} image_plane_mode={getattr(args, 'image_plane_mode', IMAGE_PLANE_MODE_NONE)} "
+            f"stage3_image_plane_mode={_stage3_image_plane_mode(args)} "
             f"stage3={'enabled' if stage3_enabled else 'disabled'} "
             f"stage4={'enabled' if stage4_enabled else 'disabled'} "
             f"start_at_stage3={bool(getattr(args, 'start_at_stage3', False))} "
@@ -18353,6 +23564,8 @@ def _run_sequential(args: argparse.Namespace) -> None:
         stage_args: argparse.Namespace,
         fit_mode: str,
         run_name: str,
+        *,
+        fresh_process: bool = False,
         **kwargs: Any,
     ) -> Path:
         run_dir = Path(stage_args.output_dir) / run_name
@@ -18376,6 +23589,8 @@ def _run_sequential(args: argparse.Namespace) -> None:
                     _log(args, f"[resume] finalizing checkpointed stage run_name={run_name} run_dir={run_dir}")
                     _rerender_plots(stage_args, run_dir)
                     return run_dir
+        if fresh_process:
+            return _run_single_stage_in_fresh_process(stage_args, fit_mode, run_name, **kwargs)
         return _run_single_stage(stage_args, fit_mode, run_name, **kwargs)
 
     stage1_run_dir: Path | None = None
@@ -18446,8 +23661,19 @@ def _run_sequential(args: argparse.Namespace) -> None:
         "resume_mode": str(resume_mode or "none"),
         "start_at_stage3": bool(start_at_stage3),
         "stage_fit_controls": stage_fit_controls_payload,
+        "stage3_image_plane_mode": _stage3_image_plane_mode(args),
+        "stage3_sample_likelihood_mode": stage3_sample_likelihood_mode,
         "skip_stage3_image_plane_local_jacobian": bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)),
         "image_plane_newton_steps": int(getattr(args, "image_plane_newton_steps", 0)),
+        "exact_image_min_distance_arcsec": float(
+            getattr(args, "exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)
+        ),
+        "exact_image_precision_limit": float(
+            getattr(args, "exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)
+        ),
+        "exact_image_num_iter_max": int(
+            getattr(args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)
+        ),
         "anchored_image_plane_solve_steps": int(
             getattr(args, "anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)
         ),
@@ -18480,8 +23706,70 @@ def _run_sequential(args: argparse.Namespace) -> None:
         "critical_arc_singular_threshold": float(
             getattr(args, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)
         ),
+        "sample_critical_arc_singular_threshold": bool(
+            getattr(args, "sample_critical_arc_singular_threshold", False)
+        ),
+        "critical_arc_singular_threshold_prior_median": float(
+            getattr(
+                args,
+                "critical_arc_singular_threshold_prior_median",
+                DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_MEDIAN,
+            )
+        ),
+        "critical_arc_singular_threshold_prior_log_sigma": float(
+            getattr(
+                args,
+                "critical_arc_singular_threshold_prior_log_sigma",
+                DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_LOG_SIGMA,
+            )
+        ),
+        "critical_arc_singular_threshold_lower": float(
+            getattr(
+                args,
+                "critical_arc_singular_threshold_lower",
+                DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_LOWER,
+            )
+        ),
+        "critical_arc_singular_threshold_upper": float(
+            getattr(
+                args,
+                "critical_arc_singular_threshold_upper",
+                DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_UPPER,
+            )
+        ),
         "critical_arc_singular_softness": float(
             getattr(args, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
+        ),
+        "sample_critical_arc_singular_softness": bool(
+            getattr(args, "sample_critical_arc_singular_softness", False)
+        ),
+        "critical_arc_singular_softness_prior_median": float(
+            getattr(
+                args,
+                "critical_arc_singular_softness_prior_median",
+                DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_MEDIAN,
+            )
+        ),
+        "critical_arc_singular_softness_prior_log_sigma": float(
+            getattr(
+                args,
+                "critical_arc_singular_softness_prior_log_sigma",
+                DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_LOG_SIGMA,
+            )
+        ),
+        "critical_arc_singular_softness_lower": float(
+            getattr(
+                args,
+                "critical_arc_singular_softness_lower",
+                DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_LOWER,
+            )
+        ),
+        "critical_arc_singular_softness_upper": float(
+            getattr(
+                args,
+                "critical_arc_singular_softness_upper",
+                DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER,
+            )
         ),
         "critical_arc_lm_damping_relative": float(
             getattr(args, "critical_arc_lm_damping_relative", DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE)
@@ -18492,9 +23780,8 @@ def _run_sequential(args: argparse.Namespace) -> None:
         "critical_arc_lm_trust_radius_arcsec": float(
             getattr(args, "critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
         ),
-        "arc_aware_noncritical_support_radius_arcsec": _resolve_arc_aware_noncritical_support_radius_arcsec(
-            getattr(args, "arc_aware_noncritical_support_radius_arcsec", None),
-            getattr(args, "match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE),
+        "arc_recovery_p_arc_threshold": float(
+            getattr(args, "arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
         ),
         "arc_aware_max_arclength_arcsec": float(
             getattr(args, "arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
@@ -18543,7 +23830,7 @@ def _run_sequential(args: argparse.Namespace) -> None:
             else float(getattr(args, "fix_image_sigma_int_arcsec"))
         ),
         "image_sigma_int_sampled": getattr(args, "fix_image_sigma_int_arcsec", None) is None
-        and _sample_likelihood_uses_image_scatter(str(stage4_sample_likelihood_mode or SAMPLE_LIKELIHOOD_SOURCE)),
+        and _sample_likelihood_uses_image_scatter(final_sample_likelihood_mode),
         "image_presence_penalty_weight": getattr(args, "image_presence_penalty_weight", None),
         "image_presence_effective_stage4_penalty_weight": _effective_image_presence_penalty_weight(
             getattr(args, "image_presence_penalty_weight", None),
@@ -18602,6 +23889,15 @@ def _run_sequential(args: argparse.Namespace) -> None:
             **stage_cosmology_updates(fit_stage_cosmology=fit_cosmology_requested),
         )
         stage3_args = _force_quick_diagnostics_for_nonfinal_stage(stage3_args, stage3_run_name, exact_diagnostics_stage)
+        if stage4_enabled and not _stage3_exact_image_diagnostics_enabled(args, stage3_run_name):
+            stage3_args = _clone_args(stage3_args, skip_grid_diagnostics=True)
+            _log(
+                args,
+                (
+                    "[memory] non-final stage3 grid diagnostics will be skipped before stage4; "
+                    "pass --exact-image-diagnostics-stage3 to request full stage3 diagnostics."
+                ),
+            )
         if fast_resume and final_stage_name != "stage3":
             stage3_run_dir = Path(args.output_dir) / stage3_run_name
             _require_fast_resume_plot_artifacts(stage3_run_dir, "stage3_image_plane")
@@ -18614,7 +23910,7 @@ def _run_sequential(args: argparse.Namespace) -> None:
                 "joint",
                 stage3_run_name,
                 stage1_prior_summary=None if start_at_stage3 else stage1_summary,
-                sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+                sample_likelihood_mode=str(stage3_sample_likelihood_mode),
                 svi_init_physical_values=stage3_init_values,
                 previous_stage_best_values=stage3_init_values,
             )
@@ -18637,15 +23933,38 @@ def _run_sequential(args: argparse.Namespace) -> None:
         stage4_init_values = _physical_best_fit_values_from_artifacts(stage4_init_artifacts_dir)
         source_position_priors = _source_position_prior_values_from_artifacts(stage4_init_artifacts_dir)
         stage4_updates = stage_cosmology_updates(fit_stage_cosmology=fit_cosmology_requested)
+        requested_stage4_sampling_engine = str(
+            getattr(args, "stage4_sampling_engine", STAGE4_SAMPLING_ENGINE_INHERIT)
+        )
+        if requested_stage4_sampling_engine != STAGE4_SAMPLING_ENGINE_INHERIT:
+            stage4_updates["sampling_engine"] = requested_stage4_sampling_engine
         stage4_args = _args_with_fit_controls(
             args,
             stage4_controls,
             **stage4_updates,
         )
+        stage4_runs_fresh = bool(getattr(args, "stage4_fresh_process", True)) and not fast_resume
+        if stage4_runs_fresh:
+            _log(
+                args,
+                (
+                    "[memory] stage4 will run in a fresh spawned Python/JAX process; "
+                    "stage3 XLA memory will not be inherited."
+                ),
+            )
+        else:
+            _log(
+                args,
+                (
+                    "[memory] stage4 will run in the current Python/JAX process; "
+                    "use --stage4-fresh-process outside --resume fast to isolate stage4 memory."
+                ),
+            )
         stage4_run_dir = maybe_run_stage(
             stage4_args,
             "joint",
             stage4_run_name,
+            fresh_process=stage4_runs_fresh,
             stage1_prior_summary=stage1_summary,
             sample_likelihood_mode=str(stage4_sample_likelihood_mode),
             svi_init_physical_values=stage4_init_values,
@@ -18653,6 +23972,9 @@ def _run_sequential(args: argparse.Namespace) -> None:
             previous_stage_best_values=stage4_init_values,
         )
         summary_payload["stage4_run_dir"] = str(stage4_run_dir)
+        summary_payload["stage4_sampling_engine_requested"] = requested_stage4_sampling_engine
+        summary_payload["stage4_sampling_engine_effective"] = str(getattr(stage4_args, "sampling_engine", args.sampling_engine))
+        summary_payload["stage4_fresh_process"] = bool(stage4_runs_fresh)
     summary_path = Path(args.output_dir) / root_run_name / "sequential_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     with summary_path.open("w", encoding="utf-8") as handle:

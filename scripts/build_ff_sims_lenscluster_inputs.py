@@ -28,6 +28,8 @@ STAGED_FITS_GLOBS = ("simulation_hst_f*.fits",)
 
 CenterPriorBox = tuple[float, float, float, float]
 CoreRadiusPrior = tuple[float, float, float]
+ExplicitCoreRadiusPrior = tuple[float, float, float, float]
+VelocityDispersionPrior = tuple[float, float, float]
 
 
 @dataclass(frozen=True)
@@ -53,13 +55,22 @@ class FFSimConfig:
     cut_radius_ref_upper_kpc: float = 250.0
     smooth_anchor_ids: tuple[str, str] = ("1", "2")
     smooth_v_disps: tuple[float, ...] = (950.0, 750.0)
+    smooth_v_disp_priors: tuple[VelocityDispersionPrior, ...] | None = None
+    smooth_ellipticity_upper: float = 0.8
     smooth_angle_positions: tuple[float, ...] | None = None
     smooth_center_prior_boxes: tuple[CenterPriorBox, ...] | None = None
+    smooth_center_prior_half_widths: tuple[float, ...] | None = None
     smooth_core_radius_priors: tuple[CoreRadiusPrior, ...] | None = None
+    explicit_galaxy_sigma_ref: float | None = None
+    explicit_galaxy_cut_radius_ref_kpc: float | None = None
+    explicit_galaxy_core_radius_kpc: float = GALAXY_CORE_RADIUS_KPC
+    explicit_galaxy_core_radius_prior: ExplicitCoreRadiusPrior | None = None
+    explicit_galaxy_free_core_ids: tuple[str, ...] | None = None
     shear_gamma: float | None = None
     shear_angle_pos: float = 0.0
     explicit_galaxy_count: int = 2
     explicit_galaxy_ids: tuple[str, ...] | None = None
+    explicit_galaxy_centers_fixed: bool = False
     explicit_galaxy_sigma_upper_factors: tuple[tuple[str, float], ...] = ()
     free_potfile_slopes: bool = False
 
@@ -102,20 +113,32 @@ CONFIGS = {
         key="ares",
         display_name="Ares",
         z_lens=0.5,
-        member_selection_band="f160w",
-        member_selection_max_mag=22.0,
+        member_selection_band="f814w",
+        member_selection_max_mag=24.0,
         scaling_band="f160w",
         mag0=18.5,
-        sigma_ref=98.0,
-        sigma_ref_uncertainty=40.0,
-        sigma_ref_lower=30.0,
-        sigma_ref_upper=250.0,
-        cut_radius_ref_kpc=262.0,
-        cut_radius_ref_uncertainty_kpc=100.0,
-        cut_radius_ref_lower_kpc=20.0,
-        cut_radius_ref_upper_kpc=700.0,
+        sigma_ref=100.0,
+        sigma_ref_uncertainty=15.0,
+        sigma_ref_lower=70.0,
+        sigma_ref_upper=135.0,
+        cut_radius_ref_kpc=270.0,
+        cut_radius_ref_uncertainty_kpc=35.0,
+        cut_radius_ref_lower_kpc=160.0,
+        cut_radius_ref_upper_kpc=340.0,
         smooth_anchor_ids=("1", "3"),
-        explicit_galaxy_ids=("1", "2", "3"),
+        smooth_v_disps=(950.0, 950.0),
+        smooth_v_disp_priors=((250.0, 500.0, 1800.0), (175.0, 600.0, 1400.0)),
+        smooth_ellipticity_upper=0.5,
+        smooth_center_prior_boxes=((15.0, 45.0, -85.0, -30.0), (-45.0, -35.0, 35.0, 45.0)),
+        smooth_core_radius_priors=((20.0, 5.0, 60.0), (20.0, 5.0, 45.0)),
+        explicit_galaxy_sigma_ref=98.0,
+        explicit_galaxy_cut_radius_ref_kpc=262.0,
+        explicit_galaxy_core_radius_kpc=0.7,
+        explicit_galaxy_core_radius_prior=(0.7, 0.5, 0.15, 3.0),
+        explicit_galaxy_free_core_ids=("1", "2"),
+        explicit_galaxy_ids=("1", "2", "3", "4", "5"),
+        explicit_galaxy_centers_fixed=True,
+        explicit_galaxy_sigma_upper_factors=(("2", 2.5),),
     ),
     "hera": FFSimConfig(
         key="hera",
@@ -136,11 +159,10 @@ CONFIGS = {
         smooth_anchor_ids=("1", "2"),
         smooth_v_disps=(800.0, 700.0),
         smooth_angle_positions=(30.0, 24.0),
-        smooth_center_prior_boxes=((14.0, 24.0, -2.0, 7.0), (-5.0, 5.0, -4.0, 4.0)),
+        smooth_center_prior_half_widths=(5.0, 5.0),
         smooth_core_radius_priors=((8.0, 2.0, 15.0), (5.0, 2.0, 15.0)),
-        shear_gamma=0.04,
-        shear_angle_pos=40.0,
-        explicit_galaxy_ids=("1", "2", "3", "5"),
+        explicit_galaxy_ids=("1", "2", "3", "4", "5", "6"),
+        explicit_galaxy_centers_fixed=True,
     ),
 }
 
@@ -315,20 +337,17 @@ def _member_mag(row: MemberRow, band: str) -> float:
 
 
 def _prepare_cats_members(members: list[MemberRow], config: FFSimConfig) -> list[MemberRow]:
-    selected: list[MemberRow] = []
+    prepared: list[MemberRow] = []
     for member in members:
-        selection_mag = _member_mag(member, config.member_selection_band)
-        if selection_mag >= config.member_selection_max_mag:
-            continue
         scaling_mag = _member_mag(member, config.scaling_band)
-        selected.append(
+        prepared.append(
             replace(
                 member,
                 scaling_mag=scaling_mag,
                 luminosity=_luminosity_from_mag(scaling_mag, config.mag0),
             )
         )
-    return selected
+    return prepared
 
 
 def _read_members(cluster_dir: Path, config: FFSimConfig) -> tuple[list[MemberRow], int]:
@@ -389,7 +408,7 @@ def _write_member_catalog(
         "#REFERENCE 3",
         "# FF-SIMS scaling-law member potfile generated from clgal_cat.txt.",
         (
-            f"# Selection: {config.member_selection_band.upper()} < {config.member_selection_max_mag:.2f}; "
+            f"# Source catalog selection: {config.member_selection_band.upper()} < {config.member_selection_max_mag:.2f}; "
             f"scaling magnitudes: {config.scaling_band.upper()}; mag0={config.mag0:.2f}."
         ),
     ]
@@ -443,16 +462,34 @@ def _field_dmax(images: list[MultipleImageRow], members: list[MemberRow], paddin
 
 
 def _scaled_sigma(row: MemberRow, config: FFSimConfig) -> float:
-    return float(config.sigma_ref * row.luminosity**0.25)
+    sigma_ref = config.explicit_galaxy_sigma_ref if config.explicit_galaxy_sigma_ref is not None else config.sigma_ref
+    return float(sigma_ref * row.luminosity**0.25)
 
 
 def _scaled_cut_radius_kpc(row: MemberRow, config: FFSimConfig) -> float:
-    return float(config.cut_radius_ref_kpc * row.luminosity**0.5)
+    cut_radius_ref = (
+        config.explicit_galaxy_cut_radius_ref_kpc
+        if config.explicit_galaxy_cut_radius_ref_kpc is not None
+        else config.cut_radius_ref_kpc
+    )
+    return float(cut_radius_ref * row.luminosity**0.5)
 
 
-def _center_prior_bounds(anchor: MemberRow, prior_box: CenterPriorBox | None) -> CenterPriorBox:
+def _center_prior_bounds(
+    anchor: MemberRow,
+    prior_box: CenterPriorBox | None,
+    prior_half_width: float | None = None,
+) -> CenterPriorBox:
     if prior_box is not None:
         return prior_box
+    if prior_half_width is not None:
+        half_width = float(prior_half_width)
+        return (
+            anchor.x_arcsec - half_width,
+            anchor.x_arcsec + half_width,
+            anchor.y_arcsec - half_width,
+            anchor.y_arcsec + half_width,
+        )
     return (
         anchor.x_arcsec - 120.0,
         anchor.x_arcsec + 120.0,
@@ -469,10 +506,13 @@ def _cluster_potential_block(
     angle_pos: float,
     *,
     center_prior_box: CenterPriorBox | None = None,
+    center_prior_half_width: float | None = None,
     core_radius_prior: CoreRadiusPrior | None = None,
+    v_disp_prior: VelocityDispersionPrior | None = None,
 ) -> str:
-    x_lower, x_upper, y_lower, y_upper = _center_prior_bounds(anchor, center_prior_box)
+    x_lower, x_upper, y_lower, y_upper = _center_prior_bounds(anchor, center_prior_box, center_prior_half_width)
     core_radius, core_lower, core_upper = core_radius_prior or (20.0, 1.0, 120.0)
+    v_disp_std, v_disp_lower, v_disp_upper = v_disp_prior or (max(100.0, 0.35 * v_disp), 100.0, 2200.0)
     return f"""potentiel {component_id}
     profil 81
     x_centre {_format_float(anchor.x_arcsec)}
@@ -487,10 +527,10 @@ def _cluster_potential_block(
 limit {component_id}
     x_centre 1 {_format_float(x_lower)} {_format_float(x_upper)} 0.10000000
     y_centre 1 {_format_float(y_lower)} {_format_float(y_upper)} 0.10000000
-    ellipticite 1 0.00000000 0.80000000 0.02000000
+    ellipticite 1 0.00000000 {_format_float(config.smooth_ellipticity_upper)} 0.02000000
     angle_pos 1 -180.00000000 180.00000000 0.50000000
     core_radius 1 {_format_float(core_lower)} {_format_float(core_upper)} 0.10000000
-    v_disp 9 {_format_float(v_disp)} {_format_float(max(100.0, 0.35 * v_disp))} 100.00000000 2200.00000000
+    v_disp 9 {_format_float(v_disp)} {_format_float(v_disp_std)} {_format_float(v_disp_lower)} {_format_float(v_disp_upper)}
     end"""
 
 
@@ -499,9 +539,19 @@ def _explicit_galaxy_sigma_upper_factor(row: MemberRow, config: FFSimConfig) -> 
     return factors.get(row.object_id, 1.5)
 
 
+def _explicit_galaxy_core_is_free(component_id: str, row: MemberRow, config: FFSimConfig) -> bool:
+    if config.explicit_galaxy_core_radius_prior is None:
+        return False
+    if config.explicit_galaxy_free_core_ids is None:
+        return True
+    free_ids = set(config.explicit_galaxy_free_core_ids)
+    return row.object_id in free_ids or component_id in free_ids
+
+
 def _galaxy_potential_block(component_id: str, row: MemberRow, config: FFSimConfig) -> str:
     sigma = _scaled_sigma(row, config)
     cut_radius = _scaled_cut_radius_kpc(row, config)
+    core_radius = float(config.explicit_galaxy_core_radius_kpc)
     x_lower = row.x_arcsec - 1.0
     x_upper = row.x_arcsec + 1.0
     y_lower = row.y_arcsec - 1.0
@@ -511,21 +561,35 @@ def _galaxy_potential_block(component_id: str, row: MemberRow, config: FFSimConf
     sigma_lower = max(10.0, 0.5 * sigma)
     sigma_upper_factor = _explicit_galaxy_sigma_upper_factor(row, config)
     sigma_upper = max(sigma_lower * 1.01, sigma_upper_factor * sigma)
+    if config.explicit_galaxy_centers_fixed:
+        x_limit = f"x_centre 0 {_format_float(row.x_arcsec)} 0"
+        y_limit = f"y_centre 0 {_format_float(row.y_arcsec)} 0"
+    else:
+        x_limit = f"x_centre 1 {_format_float(x_lower)} {_format_float(x_upper)} 0.05000000"
+        y_limit = f"y_centre 1 {_format_float(y_lower)} {_format_float(y_upper)} 0.05000000"
+    if not _explicit_galaxy_core_is_free(component_id, row, config):
+        core_limit = f"core_radius_kpc 0 {_format_float(core_radius)} 0"
+    else:
+        core_mean, core_std, core_lower, core_upper = config.explicit_galaxy_core_radius_prior
+        core_limit = (
+            f"core_radius_kpc 9 {_format_float(core_mean)} {_format_float(core_std)} "
+            f"{_format_float(core_lower)} {_format_float(core_upper)}"
+        )
     return f"""potentiel {component_id}
     profil 81
     x_centre {_format_float(row.x_arcsec)}
     y_centre {_format_float(row.y_arcsec)}
     ellipticite 0.00000000
     angle_pos 0.00000000
-    core_radius_kpc {_format_float(GALAXY_CORE_RADIUS_KPC)}
+    core_radius_kpc {_format_float(core_radius)}
     cut_radius_kpc {_format_float(cut_radius)}
     v_disp {_format_float(sigma)}
     z_lens {_format_float(config.z_lens)}
     end
 limit {component_id}
-    x_centre 1 {_format_float(x_lower)} {_format_float(x_upper)} 0.05000000
-    y_centre 1 {_format_float(y_lower)} {_format_float(y_upper)} 0.05000000
-    core_radius_kpc 0 {_format_float(GALAXY_CORE_RADIUS_KPC)} 0
+    {x_limit}
+    {y_limit}
+    {core_limit}
     cut_radius_kpc 1 {_format_float(cut_lower)} {_format_float(cut_upper)} 0.10000000
     v_disp 1 {_format_float(sigma_lower)} {_format_float(sigma_upper)} 1.00000000
     end"""
@@ -571,12 +635,22 @@ def _write_par(
     v_disps = config.smooth_v_disps
     if len(v_disps) != len(anchors):
         raise ValueError(f"{config.key} has {len(anchors)} smooth halos but {len(v_disps)} smooth-halo velocity dispersions.")
+    v_disp_priors = config.smooth_v_disp_priors or (None,) * len(anchors)
+    if len(v_disp_priors) != len(anchors):
+        raise ValueError(
+            f"{config.key} has {len(anchors)} smooth halos but {len(v_disp_priors)} velocity-dispersion priors."
+        )
     angle_positions = config.smooth_angle_positions or (0.0,) * len(anchors)
     if len(angle_positions) != len(anchors):
         raise ValueError(f"{config.key} has {len(anchors)} smooth halos but {len(angle_positions)} smooth-halo position angles.")
     center_prior_boxes = config.smooth_center_prior_boxes or (None,) * len(anchors)
     if len(center_prior_boxes) != len(anchors):
         raise ValueError(f"{config.key} has {len(anchors)} smooth halos but {len(center_prior_boxes)} center prior boxes.")
+    center_prior_half_widths = config.smooth_center_prior_half_widths or (None,) * len(anchors)
+    if len(center_prior_half_widths) != len(anchors):
+        raise ValueError(
+            f"{config.key} has {len(anchors)} smooth halos but {len(center_prior_half_widths)} center prior half-widths."
+        )
     core_radius_priors = config.smooth_core_radius_priors or (None,) * len(anchors)
     if len(core_radius_priors) != len(anchors):
         raise ValueError(f"{config.key} has {len(anchors)} smooth halos but {len(core_radius_priors)} core-radius priors.")
@@ -587,12 +661,25 @@ def _write_par(
         for component_id, member in explicit_members
     )
     shear_block = _shear_potential_block(config)
+    explicit_scaling_note = ""
+    if config.explicit_galaxy_sigma_ref is not None or config.explicit_galaxy_cut_radius_ref_kpc is not None:
+        explicit_sigma_ref = config.explicit_galaxy_sigma_ref if config.explicit_galaxy_sigma_ref is not None else config.sigma_ref
+        explicit_cut_ref = (
+            config.explicit_galaxy_cut_radius_ref_kpc
+            if config.explicit_galaxy_cut_radius_ref_kpc is not None
+            else config.cut_radius_ref_kpc
+        )
+        explicit_scaling_note = (
+            f"# Explicit galaxies are initialized with sigma*={explicit_sigma_ref:.3f} km/s "
+            f"and rcut*={explicit_cut_ref:.3f} kpc.\n"
+        )
     content = f"""# Generated by scripts/build_ff_sims_lenscluster_inputs.py
 # cluster_key {config.key}
 # source FF-SIMS {config.display_name}
 # Data-informed FF-SIMS Lenstool model: two smooth dPIE halos, explicit bright galaxies, member scaling, and optional external shear.
-# Members are selected from clgal_cat.txt with {config.member_selection_band.upper()} < {config.member_selection_max_mag:.2f}.
+# Members are read from clgal_cat.txt; source catalog selection is {config.member_selection_band.upper()} < {config.member_selection_max_mag:.2f}.
 # Galaxy scaling uses {config.scaling_band.upper()} luminosities with mag0={config.mag0:.2f}, sigma*={config.sigma_ref:.3f} km/s, rcut*={config.cut_radius_ref_kpc:.3f} kpc.
+{explicit_scaling_note.rstrip()}
 runmode
     reference 3 0.00000000 0.00000000
     end
@@ -607,9 +694,9 @@ image
     sigposArcsec 0.50000000
     end
 # O1 is the first smooth dPIE clump, anchored on clgal_cat.txt member {anchors[0].object_id}.
-{_cluster_potential_block("O1", anchors[0], config, v_disps[0], angle_positions[0], center_prior_box=center_prior_boxes[0], core_radius_prior=core_radius_priors[0])}
+{_cluster_potential_block("O1", anchors[0], config, v_disps[0], angle_positions[0], center_prior_box=center_prior_boxes[0], center_prior_half_width=center_prior_half_widths[0], core_radius_prior=core_radius_priors[0], v_disp_prior=v_disp_priors[0])}
 # O2 is the second smooth dPIE clump, anchored on clgal_cat.txt member {anchors[1].object_id}.
-{_cluster_potential_block("O2", anchors[1], config, v_disps[1], angle_positions[1], center_prior_box=center_prior_boxes[1], core_radius_prior=core_radius_priors[1])}
+{_cluster_potential_block("O2", anchors[1], config, v_disps[1], angle_positions[1], center_prior_box=center_prior_boxes[1], center_prior_half_width=center_prior_half_widths[1], core_radius_prior=core_radius_priors[1], v_disp_prior=v_disp_priors[1])}
 {shear_block}
 # Bright galaxies are explicit dPIE components and are commented out of the potfile.
 {explicit_blocks}

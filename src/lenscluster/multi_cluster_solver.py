@@ -271,9 +271,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--initial-step-size", type=float, default=single.DEFAULT_INITIAL_STEP_SIZE)
     parser.add_argument(
         "--dense-mass",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use dense mass-matrix adaptation for NumPyro NUTS. Pass --no-dense-mass for diagonal mass.",
+        choices=(single.NUTS_DENSE_MASS_STRUCTURED, single.NUTS_DENSE_MASS_FULL, single.NUTS_DENSE_MASS_DIAGONAL),
+        default=single.DEFAULT_NUTS_DENSE_MASS,
+        help="NumPyro NUTS mass-matrix adaptation: structured dense blocks, full dense matrix, or diagonal mass.",
     )
     parser.add_argument(
         "--potfile-mass-size-reparam",
