@@ -48,9 +48,7 @@ s(Z)
 \log {\rm BF}_{\rm catalog}(F_k)
 \right]
 +
-\log p(Z)
-+
-\log L_{\rm anchor}(Z).
+\log p_{\rm prior}(Z).
 $$
 
 The normalized partition posterior over the generated candidate set is
@@ -247,10 +245,20 @@ The fast path precomputes:
 
 ## Partition Prior
 
-The prior is currently CRP-like with size penalties:
+The prior contains both structural preferences and high-confidence anchor constraints:
 
 $$
-\log p(Z)
+\log p_{\rm prior}(Z)
+=
+\log p_{\rm struct}(Z)
++
+\log p_{\rm anchor}(Z).
+$$
+
+The structural prior is currently CRP-like with size penalties:
+
+$$
+\log p_{\rm struct}(Z)
 =
 K\log\alpha
 +
@@ -280,14 +288,12 @@ Definitions:
 
 This prior is still a calibration target. The shared-BF likelihood now carries most of the physical evidence.
 
-## Anchor Penalty
-
-High-confidence anchors are treated as strong constraints. Anchors can come from known same-family labels or incompatible redshift/color evidence.
+High-confidence anchors are treated as strong prior constraints. Anchors can come from known same-family labels or incompatible redshift/color evidence.
 
 For pair anchor \(a_{ij}\in\{0,1\}\),
 
 $$
-\log L_{\rm anchor}(Z)
+\log p_{\rm anchor}(Z)
 =
 -20
 \sum_{(i,j)\in A}
@@ -297,6 +303,8 @@ w_{ij}
 \mathbf{1}(z_i=z_j)\ne a_{ij}
 \right].
 $$
+
+The implementation may still report this term separately as `anchor_log_penalty` for diagnostics, but conceptually it is part of the partition prior rather than a data likelihood.
 
 ## Candidate Generation
 
@@ -337,9 +345,7 @@ s(Z)
 \log {\rm BF}_{\rm catalog}(F_k)
 \right]
 +
-\log p(Z)
-+
-\log L_{\rm anchor}(Z).
+\log p_{\rm prior}(Z).
 $$
 
 Then weights are renormalized over the repaired candidate set.
@@ -420,9 +426,7 @@ s(Z;\Theta^{(m)})
 \log {\rm BF}_{\rm catalog}(F_k)
 \right]
 +
-\log p(Z)
-+
-\log L_{\rm anchor}(Z).
+\log p_{\rm prior}(Z).
 $$
 
 Then marginalize partition evidence over lens uncertainty with log-sum-exp:
