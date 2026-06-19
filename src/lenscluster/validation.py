@@ -66,6 +66,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 from matplotlib.path import Path as MplPath
+from matplotlib.patches import PathPatch
 from matplotlib import pyplot as plt
 
 from .plotting import (
@@ -86,8 +87,30 @@ from .utils import (
     log_stage_banner as _log_stage_banner,
     run_logged_phase as _run_logged_phase,
 )
+from .family_partition import (
+    LOGIT_EPS,
+    _partition_log_prior,
+    build_pair_table,
+    canonicalize_partition,
+    create_anchor_labels,
+    combine_partition_score_callbacks,
+    family_catalog_score_callback,
+    feature_matrix,
+    fit_logistic_map,
+    run_family_partition_engine,
+    same_family_matrix,
+)
+from .source_plane_partition import (
+    cached_lens_cluster_partitions_callback,
+    cached_lens_proposal_matrix_callback,
+    cached_source_plane_score_callback,
+    lens_pair_affinity_from_cache,
+    precompute_source_plane_cache,
+    source_plane_score_callback_from_ray_shooter,
+)
 
 ORIGINAL_DPIE_PROFILE_NAME = "DPIE_NIE"
+LENSTRONOMY_DPIE_PROFILE_NAME = "PJAFFE_ELLIPSE_POTENTIAL"
 FIT_METHOD_SVI = "svi"
 FIT_METHOD_SVI_NUTS = "svi+nuts"
 FIT_METHOD_NS = "ns"
@@ -871,8 +894,8 @@ def _mock_model_and_kwargs(
     cosmo: Any,
     cosmo_config: dict[str, Any],
 ) -> tuple[LensModel, list[dict[str, float]]]:
-    lens_model_list = [ORIGINAL_DPIE_PROFILE_NAME, ORIGINAL_DPIE_PROFILE_NAME] + [
-        ORIGINAL_DPIE_PROFILE_NAME for _ in subhalo_components
+    lens_model_list = [LENSTRONOMY_DPIE_PROFILE_NAME, LENSTRONOMY_DPIE_PROFILE_NAME] + [
+        LENSTRONOMY_DPIE_PROFILE_NAME for _ in subhalo_components
     ]
     model = LensModel(
         lens_model_list=lens_model_list,
@@ -4268,6 +4291,669 @@ def run_single_bcg_validation(args: argparse.Namespace) -> list[dict[str, Path]]
     return outputs
 
 
+def _mock_partition_observed_catalog(
+    images: pd.DataFrame,
+    *,
+    seed: int,
+    train_family_ids: set[str],
+    photoz_sigma: float,
+    train_z_sigma: float,
+    blind_z_sigma: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    rng = np.random.default_rng(int(seed))
+    work = images.reset_index(drop=True).copy()
+    family_ids = sorted(work["family_id"].astype(str).unique().tolist(), key=lambda value: int(value) if value.isdigit() else value)
+    base_colors = {
+        family_id: rng.normal(0.0, 0.35, size=4)
+        for family_id in family_ids
+    }
+    rows: list[dict[str, Any]] = []
+    for row in work.itertuples(index=False):
+        family_id = str(row.family_id)
+        is_train = family_id in train_family_ids
+        z_true = float(row.z_source)
+        z_sigma = float(train_z_sigma if is_train else blind_z_sigma)
+        z_obs = float(z_true + rng.normal(0.0, train_z_sigma if is_train else photoz_sigma))
+        z_obs = max(z_obs, 0.01)
+        mag_base = 24.0 - 0.35 * math.log10(max(abs(float(getattr(row, "magnification_true", 1.0))), 1.0))
+        colors = base_colors[family_id] + rng.normal(0.0, 0.03 if is_train else 0.18, size=4)
+        observed = {
+            "object_id": str(row.image_label),
+            "image_label": str(row.image_label),
+            "true_family_id": family_id,
+            "x_obs": float(row.x_obs_arcsec),
+            "y_obs": float(row.y_obs_arcsec),
+            "catalog_z": z_obs,
+            "catalog_z_sigma": z_sigma,
+            "zspec_best": z_obs if is_train else np.nan,
+            "zspec_best_confidence": "secure" if is_train else "",
+            "zspec_best_confidence_rank": 4.0 if is_train else np.nan,
+            "zphot_best": np.nan if is_train else z_obs,
+            "family_reliability": 0.97 if is_train else 0.65,
+            "object_source": "mock_train_specz" if is_train else "mock_blind_photoz",
+            "image_size_arcsec": float(0.22 + 0.04 * abs(colors[0]) + rng.normal(0.0, 0.01 if is_train else 0.04)),
+            "image_ellipticity": float(np.clip(0.25 + 0.08 * colors[1] + rng.normal(0.0, 0.02 if is_train else 0.08), 0.02, 0.9)),
+            "mag_F606W": float(mag_base + colors[0]),
+            "mag_F814W": float(mag_base + colors[1]),
+            "mag_F125W": float(mag_base + colors[2]),
+            "mag_F160W": float(mag_base + colors[3]),
+        }
+        if is_train:
+            observed["family_id"] = family_id
+        rows.append(observed)
+    observed_df = pd.DataFrame(rows)
+    truth = observed_df.drop(columns=["family_id"], errors="ignore").copy()
+    train = observed_df.loc[observed_df["true_family_id"].astype(str).isin(train_family_ids)].copy()
+    blind = observed_df.loc[~observed_df["true_family_id"].astype(str).isin(train_family_ids)].copy()
+    blind = blind.drop(columns=["family_id"], errors="ignore")
+    return truth.reset_index(drop=True), train.reset_index(drop=True), blind.reset_index(drop=True)
+
+
+def _fit_partition_training_coefficients(train_images: pd.DataFrame, *, gaussian_prior_sigma: float) -> np.ndarray:
+    pair_table = build_pair_table(train_images)
+    x, feature_names = feature_matrix(pair_table)
+    if pair_table.empty or "same_input_family" not in pair_table.columns:
+        return np.zeros(len(feature_names), dtype=float)
+    masked_labels = pair_table["same_input_family"].fillna(False).astype(float).to_numpy(dtype=float)
+    balanced_weights = np.ones(len(pair_table), dtype=float)
+    pos = masked_labels >= 0.5
+    neg = ~pos
+    pos_total = float(np.sum(balanced_weights[pos]))
+    neg_total = float(np.sum(balanced_weights[neg]))
+    if pos_total <= 0.0 or neg_total <= 0.0:
+        labels, weights = create_anchor_labels(pair_table)
+        mask = np.isfinite(labels) & (weights > 0.0)
+        if not bool(np.any(mask)):
+            return np.zeros(len(feature_names), dtype=float)
+        masked_labels = labels[mask]
+        balanced_weights = weights[mask].copy()
+        x_fit = x[mask]
+        pos = masked_labels >= 0.5
+        neg = ~pos
+        pos_total = float(np.sum(balanced_weights[pos]))
+        neg_total = float(np.sum(balanced_weights[neg]))
+    else:
+        x_fit = x
+    if pos_total > 0.0 and neg_total > 0.0:
+        balanced_weights[pos] *= 0.5 * (pos_total + neg_total) / pos_total
+        balanced_weights[neg] *= 0.5 * (pos_total + neg_total) / neg_total
+    fit = fit_logistic_map(
+        x_fit,
+        masked_labels,
+        sample_weight=balanced_weights,
+        gaussian_prior_sigma=float(gaussian_prior_sigma),
+        feature_names=feature_names,
+    )
+    return fit.coefficients
+
+
+def _binary_auc(labels: np.ndarray, scores: np.ndarray) -> float:
+    labels = np.asarray(labels, dtype=bool)
+    scores = np.asarray(scores, dtype=float)
+    pos = scores[labels]
+    neg = scores[~labels]
+    if pos.size == 0 or neg.size == 0:
+        return float("nan")
+    wins = 0.0
+    for value in pos:
+        wins += float(np.sum(value > neg)) + 0.5 * float(np.sum(value == neg))
+    return float(wins / (pos.size * neg.size))
+
+
+def _average_precision(labels: np.ndarray, scores: np.ndarray) -> float:
+    labels = np.asarray(labels, dtype=bool)
+    scores = np.asarray(scores, dtype=float)
+    if not bool(np.any(labels)):
+        return float("nan")
+    order = np.argsort(-scores)
+    sorted_labels = labels[order]
+    tp = np.cumsum(sorted_labels.astype(float))
+    precision = tp / np.arange(1, len(sorted_labels) + 1, dtype=float)
+    return float(np.sum(precision[sorted_labels]) / np.sum(sorted_labels))
+
+
+def _adjusted_rand_index_from_arrays(labels_true: np.ndarray, labels_pred: np.ndarray) -> float:
+    true = pd.Series(labels_true.astype(str), dtype=str)
+    pred = pd.Series(labels_pred.astype(str), dtype=str)
+    if len(true) != len(pred):
+        raise ValueError("ARI label arrays must have matching lengths.")
+    n_items = len(true)
+    if n_items < 2:
+        return 1.0
+    table = pd.crosstab(true, pred)
+
+    def comb2(value: int) -> float:
+        return float(value * (value - 1) / 2)
+
+    sum_comb = float(sum(comb2(int(value)) for value in table.to_numpy().ravel()))
+    row_comb = float(sum(comb2(int(value)) for value in table.sum(axis=1).to_numpy()))
+    col_comb = float(sum(comb2(int(value)) for value in table.sum(axis=0).to_numpy()))
+    total_comb = comb2(n_items)
+    expected = row_comb * col_comb / total_comb if total_comb > 0.0 else 0.0
+    maximum = 0.5 * (row_comb + col_comb)
+    denominator = maximum - expected
+    return 1.0 if abs(denominator) < 1.0e-12 else float((sum_comb - expected) / denominator)
+
+
+def _partition_benchmark_metrics(blind_images: pd.DataFrame, result: Any) -> dict[str, Any]:
+    truth = blind_images["true_family_id"].astype(str).to_numpy()
+    truth_same = truth[:, None] == truth[None, :]
+    upper = np.triu_indices(len(blind_images), k=1)
+    labels = truth_same[upper]
+    scores = result.pair_probability[upper]
+    same_scores = scores[labels]
+    diff_scores = scores[~labels]
+    return {
+        "n_blind_images": int(len(blind_images)),
+        "n_candidate_partitions": int(len(result.partitions)),
+        "weight_sum": float(np.sum(result.weights)),
+        "top_partition_weight": float(np.max(result.weights)) if result.weights.size else float("nan"),
+        "effective_partition_count": float(1.0 / np.sum(np.square(result.weights))) if result.weights.size else float("nan"),
+        "mean_true_same_pair_probability": float(np.mean(same_scores)) if same_scores.size else float("nan"),
+        "mean_true_different_pair_probability": float(np.mean(diff_scores)) if diff_scores.size else float("nan"),
+        "pair_auc": _binary_auc(labels, scores),
+        "pair_average_precision": _average_precision(labels, scores),
+        "map_adjusted_rand_index": _adjusted_rand_index_from_arrays(truth, result.map_assignment.astype(str)),
+    }
+
+
+def _truth_partition_assignment(blind_images: pd.DataFrame) -> np.ndarray:
+    truth_labels = blind_images["true_family_id"].astype(str).to_numpy()
+    label_to_int: dict[str, int] = {}
+    values = np.empty(len(truth_labels), dtype=int)
+    for index, label in enumerate(truth_labels):
+        if label not in label_to_int:
+            label_to_int[label] = len(label_to_int)
+        values[index] = label_to_int[label]
+    return canonicalize_partition(values)
+
+
+def _partition_top_diagnostics(blind_images: pd.DataFrame, result: Any, *, top_n: int = 10) -> tuple[pd.DataFrame, dict[str, Any]]:
+    truth_assignment = _truth_partition_assignment(blind_images)
+    truth_key = tuple(truth_assignment.astype(int).tolist())
+    partition_keys = [tuple(canonicalize_partition(row).astype(int).tolist()) for row in result.partitions]
+    truth_matches = [index for index, key in enumerate(partition_keys) if key == truth_key]
+    truth_index = int(truth_matches[0]) if truth_matches else -1
+    order = np.argsort(-np.asarray(result.weights, dtype=float))
+    if truth_index >= 0:
+        truth_rank_matches = np.flatnonzero(order == truth_index)
+        truth_rank = int(truth_rank_matches[0] + 1) if truth_rank_matches.size else -1
+        truth_weight = float(result.weights[truth_index])
+        truth_log_score = float(result.log_scores[truth_index])
+    else:
+        truth_rank = -1
+        truth_weight = float("nan")
+        truth_log_score = float("nan")
+
+    truth_same = same_family_matrix(truth_assignment)
+    rows: list[dict[str, Any]] = []
+    for rank, partition_index in enumerate(order[: max(0, int(top_n))], start=1):
+        assignment = canonicalize_partition(result.partitions[int(partition_index)])
+        pred_same = same_family_matrix(assignment)
+        upper = np.triu_indices(len(assignment), k=1)
+        pair_errors = pred_same[upper] != truth_same[upper]
+        score_components = _partition_score_components_from_result(result, assignment)
+        rows.append(
+            {
+                "rank": int(rank),
+                "partition_index": int(partition_index),
+                "weight": float(result.weights[int(partition_index)]),
+                "log_score": float(result.log_scores[int(partition_index)]),
+                "delta_log_score_from_top": float(result.log_scores[int(partition_index)] - result.log_scores[int(order[0])]),
+                "pair_log_likelihood": score_components["pair_log_likelihood"],
+                "partition_log_prior": score_components["partition_log_prior"],
+                "anchor_log_penalty": score_components["anchor_log_penalty"],
+                "adjusted_rand_index": _adjusted_rand_index_from_arrays(
+                    blind_images["true_family_id"].astype(str).to_numpy(),
+                    assignment.astype(str),
+                ),
+                "n_families": int(len(np.unique(assignment))),
+                "n_pair_errors": int(np.sum(pair_errors)),
+                "assignment": json.dumps(assignment.astype(int).tolist()),
+                "truth_assignment": json.dumps(truth_assignment.astype(int).tolist()),
+            }
+        )
+    summary = {
+        "truth_partition_in_candidates": bool(truth_index >= 0),
+        "truth_partition_index": int(truth_index),
+        "truth_partition_rank": int(truth_rank),
+        "truth_partition_weight": truth_weight,
+        "truth_partition_log_score": truth_log_score,
+        "truth_assignment": truth_key,
+    }
+    return pd.DataFrame(rows), summary
+
+
+def _partition_score_components_from_result(result: Any, assignment: np.ndarray) -> dict[str, float]:
+    canonical = canonicalize_partition(assignment)
+    same = same_family_matrix(canonical)
+    pair_score_mode = str(getattr(result, "pair_score_mode", "sum"))
+    if pair_score_mode == "same_family_normalized":
+        counts = np.bincount(canonical).astype(float)
+        same_denominators = np.maximum(counts * (counts - 1.0) * 0.5, 1.0)
+        family_counts = counts
+    elif pair_score_mode == "block_normalized":
+        counts = np.bincount(canonical).astype(float)
+        same_denominators = np.maximum(counts * (counts - 1.0) * 0.5, 1.0)
+        family_counts = np.maximum(counts, 1.0)
+    else:
+        same_denominators = np.ones(max(1, int(np.max(canonical)) + 1), dtype=float)
+        family_counts = np.ones_like(same_denominators)
+    pair_log_likelihood = 0.0
+    anchor_log_penalty = 0.0
+    for row in result.pair_table.itertuples(index=False):
+        left = int(row.left_index)
+        right = int(row.right_index)
+        probability = float(getattr(row, "model_pair_probability", 0.5))
+        anchor_label = float(getattr(row, "anchor_label", np.nan))
+        anchor_weight = float(getattr(row, "anchor_weight", 0.0))
+        if np.isfinite(anchor_label) and np.isfinite(anchor_weight) and anchor_weight > 0.0:
+            probability = 1.0 - LOGIT_EPS if anchor_label >= 0.5 else LOGIT_EPS
+            if bool(round(anchor_label)) != bool(same[left, right]):
+                anchor_log_penalty -= 20.0 * anchor_weight
+        clipped = float(np.clip(probability, LOGIT_EPS, 1.0 - LOGIT_EPS))
+        if pair_score_mode != "none":
+            if bool(same[left, right]):
+                pair_weight = 1.0 / float(same_denominators[int(canonical[left])])
+            elif pair_score_mode == "block_normalized":
+                pair_weight = 1.0 / float(family_counts[int(canonical[left])] * family_counts[int(canonical[right])])
+            else:
+                pair_weight = 1.0
+            pair_log_likelihood += pair_weight * (math.log(clipped) if bool(same[left, right]) else math.log1p(-clipped))
+    return {
+        "pair_log_likelihood": float(pair_log_likelihood),
+        "partition_log_prior": float(_partition_log_prior(assignment)),
+        "anchor_log_penalty": float(anchor_log_penalty),
+    }
+
+
+def _partition_pair_disagreement_diagnostics(blind_images: pd.DataFrame, result: Any, *, partition_index: int | None = None) -> pd.DataFrame:
+    if len(blind_images) < 2 or len(result.partitions) == 0:
+        return pd.DataFrame()
+    index = int(np.argmax(result.weights)) if partition_index is None else int(partition_index)
+    assignment = canonicalize_partition(result.partitions[index])
+    truth_assignment = _truth_partition_assignment(blind_images)
+    pred_same = same_family_matrix(assignment)
+    truth_same = same_family_matrix(truth_assignment)
+    rows: list[dict[str, Any]] = []
+    for left in range(len(blind_images)):
+        for right in range(left + 1, len(blind_images)):
+            if bool(pred_same[left, right]) == bool(truth_same[left, right]):
+                continue
+            left_row = blind_images.iloc[left]
+            right_row = blind_images.iloc[right]
+            rows.append(
+                {
+                    "left_index": int(left),
+                    "right_index": int(right),
+                    "left_image_label": str(left_row.get("image_label", left)),
+                    "right_image_label": str(right_row.get("image_label", right)),
+                    "left_true_family": str(left_row["true_family_id"]),
+                    "right_true_family": str(right_row["true_family_id"]),
+                    "predicted_same": bool(pred_same[left, right]),
+                    "truth_same": bool(truth_same[left, right]),
+                    "partition_pair_probability": float(result.pair_probability[left, right]),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _plot_partition_alluvial(blind_images: pd.DataFrame, result: Any, output_path: Path) -> None:
+    """Plot truth-to-MAP family flow as an alluvial diagram."""
+    if blind_images.empty or len(result.partitions) == 0:
+        return
+    truth_labels = blind_images["true_family_id"].astype(str).to_numpy()
+    map_assignment = canonicalize_partition(result.map_assignment).astype(str)
+    flow = pd.crosstab(
+        pd.Series(truth_labels, name="truth"),
+        pd.Series(map_assignment, name="map"),
+    )
+    if flow.empty:
+        return
+
+    truth_order = flow.sum(axis=1).sort_values(ascending=False).index.tolist()
+    map_order = flow.sum(axis=0).sort_values(ascending=False).index.tolist()
+    flow = flow.loc[truth_order, map_order]
+    total = float(flow.to_numpy().sum())
+    if total <= 0.0:
+        return
+
+    def stacked_intervals(labels: list[str], counts: pd.Series) -> dict[str, tuple[float, float]]:
+        gap = 0.025
+        usable_height = 1.0 - gap * max(0, len(labels) - 1)
+        y_top = 1.0
+        intervals: dict[str, tuple[float, float]] = {}
+        for label in labels:
+            height = usable_height * float(counts.loc[label]) / total
+            y_bottom = y_top - height
+            intervals[str(label)] = (y_bottom, y_top)
+            y_top = y_bottom - gap
+        return intervals
+
+    truth_intervals = stacked_intervals(truth_order, flow.sum(axis=1))
+    map_intervals = stacked_intervals(map_order, flow.sum(axis=0))
+    truth_offsets = {str(label): truth_intervals[str(label)][0] for label in truth_order}
+    map_offsets = {str(label): map_intervals[str(label)][0] for label in map_order}
+    palette = plt.get_cmap("tab20")
+    colors = {str(label): palette(index % 20) for index, label in enumerate(truth_order)}
+
+    fig_width = 8.0
+    fig_height = max(4.0, 0.35 * (len(truth_order) + len(map_order)))
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(-0.03, 1.03)
+    ax.axis("off")
+
+    left_x0, left_x1 = 0.08, 0.18
+    right_x0, right_x1 = 0.82, 0.92
+    for label in truth_order:
+        y0, y1 = truth_intervals[str(label)]
+        ax.add_patch(plt.Rectangle((left_x0, y0), left_x1 - left_x0, y1 - y0, color=colors[str(label)], alpha=0.85))
+        ax.text(left_x0 - 0.02, 0.5 * (y0 + y1), f"truth {label}", ha="right", va="center", fontsize=9)
+    for label in map_order:
+        y0, y1 = map_intervals[str(label)]
+        ax.add_patch(plt.Rectangle((right_x0, y0), right_x1 - right_x0, y1 - y0, color="0.75", alpha=0.85))
+        ax.text(right_x1 + 0.02, 0.5 * (y0 + y1), f"MAP {label}", ha="left", va="center", fontsize=9)
+
+    for truth_label in truth_order:
+        for map_label in map_order:
+            count = int(flow.loc[truth_label, map_label])
+            if count <= 0:
+                continue
+            height = (1.0 - 0.025 * max(0, len(truth_order) - 1)) * float(count) / total
+            left_y0 = truth_offsets[str(truth_label)]
+            left_y1 = left_y0 + height
+            right_y0 = map_offsets[str(map_label)]
+            right_y1 = right_y0 + height
+            truth_offsets[str(truth_label)] = left_y1
+            map_offsets[str(map_label)] = right_y1
+
+            verts = [
+                (left_x1, left_y0),
+                (0.42, left_y0),
+                (0.58, right_y0),
+                (right_x0, right_y0),
+                (right_x0, right_y1),
+                (0.58, right_y1),
+                (0.42, left_y1),
+                (left_x1, left_y1),
+                (left_x1, left_y0),
+            ]
+            codes = [
+                MplPath.MOVETO,
+                MplPath.CURVE4,
+                MplPath.CURVE4,
+                MplPath.CURVE4,
+                MplPath.LINETO,
+                MplPath.CURVE4,
+                MplPath.CURVE4,
+                MplPath.CURVE4,
+                MplPath.CLOSEPOLY,
+            ]
+            patch = PathPatch(
+                MplPath(verts, codes),
+                facecolor=colors[str(truth_label)],
+                edgecolor="none",
+                alpha=0.38,
+            )
+            ax.add_patch(patch)
+
+    ax.text(0.13, 1.02, "Truth families", ha="center", va="bottom", fontsize=10, fontweight="bold")
+    ax.text(0.87, 1.02, "MAP families", ha="center", va="bottom", fontsize=10, fontweight="bold")
+    ax.text(
+        0.5,
+        -0.02,
+        f"n_images={int(total)}  MAP ARI={_adjusted_rand_index_from_arrays(truth_labels, map_assignment):.3f}",
+        ha="center",
+        va="top",
+        fontsize=9,
+    )
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _partition_truth_ray_shooter(truth: dict[str, Any], cosmo: Any) -> Any:
+    raw_model_list = list(truth.get("lens_model_list", []))
+    lens_model_list = [
+        LENSTRONOMY_DPIE_PROFILE_NAME if str(name) == ORIGINAL_DPIE_PROFILE_NAME else str(name)
+        for name in raw_model_list
+    ]
+    kwargs_by_z = {
+        float(key): value
+        for key, value in dict(truth.get("kwargs_lens_by_source_redshift", {})).items()
+    }
+    if not kwargs_by_z and "kwargs_lens" in truth:
+        z_source = float(dict(truth.get("config", {})).get("source_redshift", 2.0))
+        kwargs_by_z[z_source] = truth["kwargs_lens"]
+    if not lens_model_list or not kwargs_by_z:
+        raise ValueError("truth payload lacks lens_model_list or kwargs_lens_by_source_redshift.")
+
+    model_cache: dict[float, LensModel] = {}
+
+    def nearest_z(z_source: float) -> float:
+        keys = np.asarray(sorted(kwargs_by_z), dtype=float)
+        return float(keys[int(np.argmin(np.abs(keys - float(z_source))))])
+
+    def ray_shooter(x_arcsec: np.ndarray, y_arcsec: np.ndarray, z_source: float) -> tuple[np.ndarray, np.ndarray]:
+        z_key = nearest_z(float(z_source))
+        model = model_cache.get(z_key)
+        if model is None:
+            model = LensModel(
+                lens_model_list=lens_model_list,
+                z_lens=float(dict(truth.get("config", {})).get("z_lens", 0.396)),
+                z_source=z_key,
+                cosmo=cosmo,
+            )
+            model_cache[z_key] = model
+        beta_x, beta_y = model.ray_shooting(
+            np.asarray(x_arcsec, dtype=float),
+            np.asarray(y_arcsec, dtype=float),
+            kwargs_by_z[z_key],
+        )
+        return np.asarray(beta_x, dtype=float), np.asarray(beta_y, dtype=float)
+
+    return ray_shooter
+
+
+def run_partition_benchmark(args: argparse.Namespace) -> dict[str, Path]:
+    root = Path(args.output_dir) / str(args.run_name)
+    root.mkdir(parents=True, exist_ok=True)
+    config = SingleBCGMockConfig(
+        seed=int(args.seed),
+        pos_sigma_arcsec=float(args.pos_sigma_arcsec),
+        n_primary_families=int(args.n_train_families) + int(args.n_blind_families),
+        n_subhalo_families=0,
+        min_images_per_family=int(args.min_images_per_family),
+        source_redshifts=_parse_source_redshifts(args.source_redshifts, fallback=float(args.source_redshift)),
+        source_redshift=float(args.source_redshift),
+        n_subhalos=0,
+    )
+    paths, images, truth = generate_single_bcg_mock(root / "mock", config)
+    family_ids = sorted(images["family_id"].astype(str).unique().tolist(), key=lambda value: int(value) if value.isdigit() else value)
+    train_family_ids = set(family_ids[: int(args.n_train_families)])
+    truth_images, train_images, blind_images = _mock_partition_observed_catalog(
+        images,
+        seed=int(args.seed) + 17,
+        train_family_ids=train_family_ids,
+        photoz_sigma=float(args.photoz_sigma),
+        train_z_sigma=float(args.train_z_sigma),
+        blind_z_sigma=float(args.blind_z_sigma),
+    )
+    coefficients = _fit_partition_training_coefficients(
+        train_images,
+        gaussian_prior_sigma=float(args.gaussian_prior_sigma),
+    )
+    partition_score_callback = None
+    proposal_matrix_callback = None
+    proposal_partitions_callback = None
+    family_catalog_callback = None
+    if float(args.family_catalog_score_weight) != 0.0:
+        family_catalog_callback = family_catalog_score_callback(
+            blind_images,
+            redshift_weight=float(args.family_catalog_redshift_weight),
+            color_weight=float(args.family_catalog_color_weight),
+            morphology_weight=float(args.family_catalog_morphology_weight),
+            redshift_default_sigma=float(args.blind_z_sigma),
+            color_sigma=float(args.family_catalog_color_sigma),
+            morphology_sigma=float(args.family_catalog_morphology_sigma),
+            score_mode=str(args.family_catalog_score_mode),
+        )
+    if float(args.lens_source_plane_weight) != 0.0:
+        cosmo = FlatLambdaCDM(H0=70.0, Om0=0.3)
+        ray_shooter = _partition_truth_ray_shooter(truth, cosmo)
+        if bool(args.lens_source_fast_cache):
+            source_cache = precompute_source_plane_cache(
+                blind_images,
+                ray_shooter,
+                n_redshift_grid=int(args.lens_source_redshift_grid),
+                position_sigma_arcsec=float(args.pos_sigma_arcsec),
+            )
+            lens_affinity = lens_pair_affinity_from_cache(
+                source_cache,
+                source_scatter_arcsec=float(args.lens_source_scatter_arcsec),
+            )
+            partition_score_callback = cached_source_plane_score_callback(
+                source_cache,
+                source_scatter_arcsec=float(args.lens_source_scatter_arcsec),
+                outlier_sigma_arcsec=float(args.lens_source_outlier_sigma_arcsec),
+                score_mode=str(args.lens_source_score_mode),
+            )
+            proposal_matrix_callback = cached_lens_proposal_matrix_callback(
+                lens_affinity,
+                lens_weight=float(args.lens_proposal_weight),
+            )
+            if bool(args.lens_cluster_proposals):
+                radii = tuple(float(item.strip()) for item in str(args.lens_cluster_radii).split(",") if item.strip())
+                proposal_partitions_callback = cached_lens_cluster_partitions_callback(
+                    source_cache,
+                    beta_radius_grid=radii or (0.03, 0.05, 0.08, 0.12, 0.18),
+                    min_cluster_size=int(args.lens_cluster_min_size),
+                    min_redshift_weight=float(args.lens_cluster_min_redshift_weight),
+                    source_scatter_arcsec=float(args.lens_source_scatter_arcsec),
+                    catalog_weight=float(args.lens_cluster_catalog_weight),
+                    beam_width=int(args.lens_cluster_beam_width),
+                    max_cluster_hypotheses=int(args.lens_cluster_max_hypotheses),
+                )
+        else:
+            partition_score_callback = source_plane_score_callback_from_ray_shooter(
+                blind_images,
+                ray_shooter,
+                position_sigma_arcsec=float(args.pos_sigma_arcsec),
+                source_scatter_arcsec=float(args.lens_source_scatter_arcsec),
+                outlier_sigma_arcsec=float(args.lens_source_outlier_sigma_arcsec),
+            )
+    partition_score_callback = combine_partition_score_callbacks(
+        [
+            (partition_score_callback, float(args.lens_source_plane_weight)),
+            (family_catalog_callback, float(args.family_catalog_score_weight)),
+        ]
+    )
+    result = run_family_partition_engine(
+        blind_images,
+        random_seed=int(args.seed) + 23,
+        n_iterations=int(args.partition_iterations),
+        n_thresholds=int(args.partition_thresholds),
+        n_noisy_partitions=int(args.partition_noisy_partitions),
+        gaussian_prior_sigma=float(args.gaussian_prior_sigma),
+        partition_temperature=float(args.partition_temperature),
+        partition_score_callback=partition_score_callback,
+        partition_score_callback_weight=1.0,
+        proposal_matrix_callback=proposal_matrix_callback,
+        proposal_partitions_callback=proposal_partitions_callback,
+        initial_coefficients=coefficients,
+        refit_logistic=bool(args.self_train_blind),
+        pair_score_mode=str(args.pair_score_mode),
+        repair_top_k=int(args.partition_repair_top_k),
+        repair_max_rounds=int(args.partition_repair_rounds),
+    )
+    metrics = _partition_benchmark_metrics(blind_images, result)
+    top_partitions, top_summary = _partition_top_diagnostics(blind_images, result, top_n=10)
+    pair_disagreements = _partition_pair_disagreement_diagnostics(blind_images, result)
+    metrics.update(top_summary)
+    metrics.update(
+        {
+            "n_train_families": int(args.n_train_families),
+            "n_blind_families": int(args.n_blind_families),
+            "n_train_images": int(len(train_images)),
+            "photoz_sigma": float(args.photoz_sigma),
+            "partition_temperature": float(args.partition_temperature),
+            "partition_repair_top_k": int(args.partition_repair_top_k),
+            "partition_repair_rounds": int(args.partition_repair_rounds),
+            "pair_score_mode": str(args.pair_score_mode),
+            "lens_source_plane_weight": float(args.lens_source_plane_weight),
+            "lens_source_score_mode": str(args.lens_source_score_mode),
+            "family_catalog_score_weight": float(args.family_catalog_score_weight),
+            "family_catalog_score_mode": str(args.family_catalog_score_mode),
+            "family_catalog_redshift_weight": float(args.family_catalog_redshift_weight),
+            "family_catalog_color_weight": float(args.family_catalog_color_weight),
+            "family_catalog_morphology_weight": float(args.family_catalog_morphology_weight),
+            "family_catalog_color_sigma": float(args.family_catalog_color_sigma),
+            "family_catalog_morphology_sigma": float(args.family_catalog_morphology_sigma),
+            "lens_source_scatter_arcsec": float(args.lens_source_scatter_arcsec),
+            "lens_source_outlier_sigma_arcsec": float(args.lens_source_outlier_sigma_arcsec),
+            "lens_source_fast_cache": bool(args.lens_source_fast_cache),
+            "lens_source_redshift_grid": int(args.lens_source_redshift_grid),
+            "lens_proposal_weight": float(args.lens_proposal_weight),
+            "lens_cluster_proposals": bool(args.lens_cluster_proposals),
+            "lens_cluster_radii": str(args.lens_cluster_radii),
+            "lens_cluster_min_size": int(args.lens_cluster_min_size),
+            "lens_cluster_min_redshift_weight": float(args.lens_cluster_min_redshift_weight),
+            "lens_cluster_catalog_weight": float(args.lens_cluster_catalog_weight),
+            "lens_cluster_beam_width": int(args.lens_cluster_beam_width),
+            "lens_cluster_max_hypotheses": int(args.lens_cluster_max_hypotheses),
+            "mock_dir": str(paths.root),
+        }
+    )
+
+    truth_path = root / "truth_images.csv"
+    train_path = root / "training_images.csv"
+    blind_path = root / "blind_images.csv"
+    pair_path = root / "partition_pair_table.csv"
+    samples_path = root / "partition_samples.csv"
+    top_partitions_path = root / "partition_top_partitions.csv"
+    pair_disagreements_path = root / "partition_map_pair_disagreements.csv"
+    coefficients_path = root / "partition_logistic_coefficients.csv"
+    alluvial_plot_path = root / "partition_alluvial.png"
+    metrics_path = root / "partition_metrics.json"
+    truth_images.to_csv(truth_path, index=False)
+    train_images.to_csv(train_path, index=False)
+    blind_images.to_csv(blind_path, index=False)
+    result.pair_table.to_csv(pair_path, index=False)
+    pd.DataFrame(
+        {
+            "partition_index": np.arange(len(result.partitions), dtype=int),
+            "weight": result.weights,
+            "log_score": result.log_scores,
+            "assignment": [json.dumps(row.astype(int).tolist()) for row in result.partitions],
+        }
+    ).to_csv(samples_path, index=False)
+    top_partitions.to_csv(top_partitions_path, index=False)
+    pair_disagreements.to_csv(pair_disagreements_path, index=False)
+    pd.DataFrame(
+        {
+            "feature": result.logistic_fit.feature_names,
+            "coefficient": result.logistic_fit.coefficients,
+        }
+    ).to_csv(coefficients_path, index=False)
+    _plot_partition_alluvial(blind_images, result, alluvial_plot_path)
+    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    print(f"[partition-benchmark] wrote {root}")
+    print(json.dumps(metrics, indent=2))
+    return {
+        "root": root,
+        "truth_images": truth_path,
+        "training_images": train_path,
+        "blind_images": blind_path,
+        "pair_table": pair_path,
+        "partition_samples": samples_path,
+        "partition_top_partitions": top_partitions_path,
+        "partition_map_pair_disagreements": pair_disagreements_path,
+        "partition_logistic_coefficients": coefficients_path,
+        "partition_alluvial": alluvial_plot_path,
+        "metrics": metrics_path,
+    }
+
+
 def _parse_source_redshifts(raw: str | None, *, fallback: float) -> tuple[float, ...]:
     if raw is None or not str(raw).strip():
         return (float(fallback),)
@@ -4508,8 +5194,81 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _build_partition_benchmark_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Generate and run a mock benchmark for probabilistic family partitioning.")
+    parser.add_argument("command", choices=("partition-benchmark",))
+    parser.add_argument("--output-dir", default="validation_runs/family_partition")
+    parser.add_argument("--run-name", default="partition_benchmark")
+    parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--n-train-families", type=int, default=8)
+    parser.add_argument("--n-blind-families", type=int, default=12)
+    parser.add_argument("--min-images-per-family", type=int, default=3)
+    parser.add_argument("--source-redshift", type=float, default=2.0)
+    parser.add_argument("--source-redshifts", default="1.5,2.0,3.0")
+    parser.add_argument("--pos-sigma-arcsec", type=float, default=0.15)
+    parser.add_argument("--photoz-sigma", type=float, default=0.35)
+    parser.add_argument("--train-z-sigma", type=float, default=0.01)
+    parser.add_argument("--blind-z-sigma", type=float, default=0.35)
+    parser.add_argument("--partition-iterations", type=int, default=1)
+    parser.add_argument("--partition-thresholds", type=int, default=25)
+    parser.add_argument("--partition-noisy-partitions", type=int, default=100)
+    parser.add_argument("--partition-temperature", type=float, default=1.0)
+    parser.add_argument("--partition-repair-top-k", type=int, default=0)
+    parser.add_argument("--partition-repair-rounds", type=int, default=0)
+    parser.add_argument(
+        "--pair-score-mode",
+        choices=("none", "sum", "same_family_normalized", "block_normalized"),
+        default="sum",
+        help="Partition pair-likelihood scoring mode. same_family_normalized averages same-family evidence per proposed family.",
+    )
+    parser.add_argument("--family-catalog-score-weight", type=float, default=0.0)
+    parser.add_argument("--family-catalog-score-mode", choices=("raw", "likelihood_ratio"), default="raw")
+    parser.add_argument("--family-catalog-redshift-weight", type=float, default=1.0)
+    parser.add_argument("--family-catalog-color-weight", type=float, default=1.0)
+    parser.add_argument("--family-catalog-morphology-weight", type=float, default=0.3)
+    parser.add_argument("--family-catalog-color-sigma", type=float, default=0.25)
+    parser.add_argument("--family-catalog-morphology-sigma", type=float, default=0.15)
+    parser.add_argument("--lens-source-plane-weight", type=float, default=0.0)
+    parser.add_argument("--lens-source-score-mode", choices=("raw", "likelihood_ratio"), default="raw")
+    parser.add_argument("--lens-source-scatter-arcsec", type=float, default=0.08)
+    parser.add_argument("--lens-source-outlier-sigma-arcsec", type=float, default=1.0)
+    parser.add_argument("--lens-source-redshift-grid", type=int, default=8)
+    parser.add_argument("--lens-proposal-weight", type=float, default=1.0)
+    parser.add_argument("--lens-cluster-radii", default="0.03,0.05,0.08,0.12,0.18")
+    parser.add_argument("--lens-cluster-min-size", type=int, default=2)
+    parser.add_argument("--lens-cluster-min-redshift-weight", type=float, default=0.02)
+    parser.add_argument("--lens-cluster-catalog-weight", type=float, default=1.0)
+    parser.add_argument("--lens-cluster-beam-width", type=int, default=50)
+    parser.add_argument("--lens-cluster-max-hypotheses", type=int, default=400)
+    parser.add_argument(
+        "--no-lens-cluster-proposals",
+        dest="lens_cluster_proposals",
+        action="store_false",
+        help="Disable direct source-plane clustering partitions.",
+    )
+    parser.set_defaults(lens_cluster_proposals=True)
+    parser.add_argument(
+        "--no-lens-source-fast-cache",
+        dest="lens_source_fast_cache",
+        action="store_false",
+        help="Use the slower per-family ray-shooting source-plane scorer instead of the cached redshift-grid scorer.",
+    )
+    parser.set_defaults(lens_source_fast_cache=True)
+    parser.add_argument("--gaussian-prior-sigma", type=float, default=2.0)
+    parser.add_argument(
+        "--self-train-blind",
+        action="store_true",
+        help="Refit logistic weights from blind weighted partitions. Defaults off to benchmark the high-quality-family teacher.",
+    )
+    return parser
+
+
 def main() -> None:
     try:
+        if len(sys.argv) > 1 and sys.argv[1] == "partition-benchmark":
+            args = _build_partition_benchmark_parser().parse_args()
+            run_partition_benchmark(args)
+            return
         args = _build_parser().parse_args()
         _validate_validation_args(args)
         _normalize_validation_stage_fit_controls(args)
