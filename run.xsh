@@ -10,7 +10,7 @@ $JAX_NUM_CPU_DEVICES = cores
 
 PYTHON = "/home/dutra/.conda/envs/lenstronomy/bin/python"
 
-output_dir = f"jun18b_prod_nozeff_newpriors"
+output_dir = f"jun20i_stage3_blend_topksurrogate_freetopk_refresh_faster_tokpsurrogateflat_20topk_hyperscaling_bergamini"
 
 HFF_RGB_BANDS = ["F435W", "F606W", "F814W", "F105W", "F125W", "F140W", "F160W"]
 HFF_RGB_DISPLAY = {"q": 6.4, "stretch": 0.0145, "minimum": -5.5e-4, "red_gain": 0.47, "green_gain": 0.91, "blue_gain": 3.95}
@@ -128,18 +128,19 @@ image_plane_modes = {
     "catastrophe": "catastrophe-normal-form-image-plane",
 }
 image_plane_mode = image_plane_modes[mode]
-stage3_mode = "local-jacobian" #"critical-arc-mixture-image-plane"
+stage3_mode = "local-jacobian"#"local-jacobian" #"critical-arc-mixture-image-plane"
 
 fit_method = ["svi+nuts", "svi+nuts"]#, "svi+nuts"]
 refresh_every = 1000
-svi_steps = [500, 4000]#, 6000]
-warmup = [500, 4000]#, 2000]
-samples = [250, 500]#, 500]
+svi_steps = [3000, 4000]#, 4000]
+warmup = [500, 1000]#, 2000]
+samples = [150, 250]#, 500]
+sampling_refresh_runs = [1, 1]#, 1]
 max_tree_depth = [8, 8]#, 8]
 quick_diagnostics = False
 target_accept = 0.8
 chains = cores
-active_scaling_galaxies = [128]
+active_scaling_galaxies = [25]
 z_bin_efficiency_tol = 0.0
 
 # Short stage4 conditioning check before a full production run: confirm the magnification fold
@@ -151,20 +152,22 @@ if pilot:
     svi_steps = [500, 500, 500]
     fit_method = ["svi+nuts", "mchmc", "mchmc"]
     fit_method = ["svi+nuts", "svi+nuts", "svi+nuts"]
-    warmup = [500, 5000, 500]
-    samples = [250, 500, 250]
-    max_tree_depth = [8, 8, 8]
+    warmup = [200, 5000, 500]
+    samples = [100, 500, 250]
+    max_tree_depth = [6, 8, 8]
     #quick_diagnostics = True
     chains = cores
     active_scaling_galaxies = [128]
     z_bin_efficiency_tol = 0.0000001
 
 
-OUTPUT_DIR = f"{OUTPUT_DIR}_ASG{active_scaling_galaxies[-1]}_T{max_tree_depth[-2]}W{warmup[-2]}S{samples[-2]}_T{max_tree_depth[-1]}W{warmup[-1]}S{samples[-1]}"
-OUTPUT_DIR += "_prior_whitened_densestructured_refreshing_surrogateflat"
+OUTPUT_DIR = f"{OUTPUT_DIR}_ASG{active_scaling_galaxies[-1]}_T{max_tree_depth[-1]}W{warmup[-1]}S{samples[-1]}"
+#OUTPUT_DIR = f"{OUTPUT_DIR}_ASG{active_scaling_galaxies[-1]}_T{max_tree_depth[-2]}W{warmup[-2]}S{samples[-2]}_T{max_tree_depth[-1]}W{warmup[-1]}S{samples[-1]}"
 
+start_at_stage2 = False
 start_at_stage3 = True
 skip_stage3_image_plane_local_jacobian = False
+exact_image_diagnostics_stage2 = True
 image_catalog_family_cutout_image_dir = cluster_config.get("image_catalog_family_cutout_image_dir", "data/BUFFALO_Images")
 image_catalog_family_cutout_image_scale = cluster_config.get("image_catalog_family_cutout_image_scale", "30mas")
 image_catalog_family_cutout_bands = cluster_config.get(
@@ -197,9 +200,20 @@ gamma_true_args = [
 image_plane_newton_steps = 0
 linearized_beta_prior_sigma_arcsec = 3.0
 source_position_parameterization = "prior-whitened" #conditional-whitened" #"prior-whitened"
-sampling_engine = "refreshing_surrogate_flat" # "full" #"refreshing_surrogate"
-stage4_sampling_engine = "refreshing_surrogate_flat" # full_flat
-pos_sigma_arcsec = 0.3
+source_plane_covariance_mode = "magnification"
+sampling_engine = "topk_discovery_flat" # "refreshing_surrogate_flat" # "full" #"refreshing_surrogate"
+stage4_sampling_engine = "topk_discovery_flat" # "refreshing_surrogate_flat" # full_flat
+scaling_relation_mode = "bergamini-ml"
+topk_discovery_scaling_galaxies = 10
+topk_discovery_score = "alpha_jacobian"
+topk_discovery_jacobian_weight = 1.0
+topk_discovery_final_engine = "refreshing_surrogate_flat"
+topk_discovery_final_svi_polish_steps = 2000
+independent_scaling_free_log_vdisp_tau_prior_median = 0.20
+independent_scaling_free_log_core_tau_prior_median = 0.30
+independent_scaling_free_log_cut_tau_prior_median = 0.30
+independent_scaling_free_log_tau_prior_sigma = 0.40
+pos_sigma_arcsec = 0.01
 anchored_args = [
     "--anchored-image-plane-solve-steps", 0,
     "--anchored-image-plane-trust-radius-arcsec", 0.3,
@@ -247,14 +261,18 @@ smc_args = [
 
 workflow_args = [
     "--potfile-member-mag-max", 22.0,
+    "--sampling-refresh-runs", *sampling_refresh_runs,
+    *(["--start-at-stage2"] if start_at_stage2 else []),
     *(["--start-at-stage3"] if start_at_stage3 else []),
     "--fit-mode", fit_mode,
     "--stage3-image-plane-mode", stage3_mode,
     "--image-plane-mode", image_plane_mode,
     *(["--skip-stage3-image-plane-local-jacobian"] if skip_stage3_image_plane_local_jacobian else []),
+    *(["--exact-image-diagnostics-stage2"] if exact_image_diagnostics_stage2 else []),
     "--image-plane-newton-steps", image_plane_newton_steps,
     "--linearized-beta-prior-sigma-arcsec", linearized_beta_prior_sigma_arcsec,
     "--source-position-parameterization", source_position_parameterization,
+    "--source-plane-covariance-mode", source_plane_covariance_mode,
     "--stage4-fresh-process",
     "--stage4-sampling-engine", stage4_sampling_engine,
     "--fit-method", *fit_method,
@@ -275,10 +293,25 @@ workflow_args = [
 
 active_scaling_args = [
     "--sampling-engine", sampling_engine,
+    "--scaling-relation-mode", scaling_relation_mode,
+    "--topk-discovery-scaling-galaxies", topk_discovery_scaling_galaxies,
+    "--topk-discovery-score", topk_discovery_score,
+    "--topk-discovery-jacobian-weight", topk_discovery_jacobian_weight,
+    "--topk-discovery-final-engine", topk_discovery_final_engine,
+    "--topk-discovery-final-svi-polish-steps", topk_discovery_final_svi_polish_steps,
+    "--independent-scaling-free-log-vdisp-tau-prior-median", independent_scaling_free_log_vdisp_tau_prior_median,
+    "--independent-scaling-free-log-core-tau-prior-median", independent_scaling_free_log_core_tau_prior_median,
+    "--independent-scaling-free-log-cut-tau-prior-median", independent_scaling_free_log_cut_tau_prior_median,
+    "--independent-scaling-free-log-tau-prior-sigma", independent_scaling_free_log_tau_prior_sigma,
     "--active-scaling-galaxies", *active_scaling_galaxies,
-    "--active-scaling-selection", "adaptive",
+    "--active-scaling-selection", "fixed",
     "--active-scaling-cumulative-fraction", 0.995,
     "--active-scaling-min", 4,
+    #"--infer-active-scaling",
+    #"--active-scaling-prior-prob", 0.5,
+    #"--active-scaling-freeze-threshold", 0.5,
+    #"--active-scaling-inference-likelihood", "population",
+    #"--active-scaling-local-logit-prior-sigma", 0.5,
 ]
 
 scatter_and_stabilizer_args = [
@@ -289,8 +322,8 @@ scatter_and_stabilizer_args = [
     "--image-plane-scatter-prior", "log-uniform",
     "--image-plane-scatter-floor-arcsec", 0.01,
     "--image-plane-scatter-upper-arcsec", 1.0,
-    #"--scaling-scatter",
-    "--scaling-scatter-fields", "sigma",
+    "--scaling-scatter",
+    "--scaling-scatter-fields", "sigma,cut",
     #"--likelihood-stabilizer-max-gain", "50",
     # "--likelihood-stabilizer-max-residual-arcsec", "5",
     # "--likelihood-stabilizer-residual-loss", "student-t",
@@ -303,7 +336,7 @@ validation_args = [
     *(["--quick-diagnostics"] if quick_diagnostics else []),
     "--exact-image-min-distance-arcsec", 0.5,
     "--exact-image-precision-limit", 1.0e-2,
-    "--exact-image-num-iter-max", 20,
+    "--exact-image-num-iter-max", 50,
     "--match-tolerance-arcsec", 2.0,
     "--caustic-source-redshift", 9.0,
     *(image_catalog_family_cutout_args),
@@ -318,12 +351,11 @@ real_data_args = [
 
 debug_args = [
     "--no-jax-clear-caches-after-svi-refresh",
-    "--quick-diagnostics",
+    #"--quick-diagnostics",
     "--image-catalog-family-cutout-mode", "fast",
     "--numpyro-print-summary",
     "--nuts-chain-method", "parallel",
-    #"--potfile-mass-size-reparam",
-    "--skip-validation",
+    #"--skip-validation",
     "--dense-mass", "structured",
     #"--plots-only",
     "--debug-sampler-diagnostics",

@@ -275,15 +275,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=single.DEFAULT_NUTS_DENSE_MASS,
         help="NumPyro NUTS mass-matrix adaptation: structured dense blocks, full dense matrix, or diagonal mass.",
     )
-    parser.add_argument(
-        "--potfile-mass-size-reparam",
-        action="store_true",
-        default=False,
-        help=(
-            "Opt in to the single-cluster potfile sigma/cutkpc mass-size reparameterization for each "
-            "NumPyro SVI/NUTS local model."
-        ),
-    )
     parser.add_argument("--blocked-nuts-cycles", type=int, default=None)
     parser.add_argument("--blocked-nuts-pilot-warmup", type=int, default=None)
     parser.add_argument("--nuts-init-boundary-frac", type=float, default=single.DEFAULT_NUTS_INIT_BOUNDARY_FRAC)
@@ -353,10 +344,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit("--blocked-nuts-cycles must be positive when provided.")
     if args.blocked_nuts_pilot_warmup is not None and int(args.blocked_nuts_pilot_warmup) < 0:
         raise SystemExit("--blocked-nuts-pilot-warmup must be non-negative when provided.")
-    if bool(getattr(args, "potfile_mass_size_reparam", False)) and (
-        str(args.image_plane_mode) == single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED
-    ):
-        raise SystemExit("--potfile-mass-size-reparam is not supported with blocked linearized stage 4 NUTS.")
     try:
         single._cosmology_init_overrides_from_args(args)
     except ValueError as exc:
@@ -1224,7 +1211,6 @@ def _write_outputs(
         "n_parameters": len(state.parameter_specs),
         "n_cosmology_parameters": len(cosmo_specs),
         "fit_method": args.fit_method,
-        "potfile_mass_size_reparam": bool(getattr(args, "potfile_mass_size_reparam", False)),
         "sampler": posterior_physical.sampler,
         "warmup": int(args.warmup),
         "samples": int(args.samples),

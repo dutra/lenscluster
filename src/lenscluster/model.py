@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import jax.numpy as jnp
@@ -8,10 +8,6 @@ import numpy as np
 
 DEFAULT_SEARCH_PADDING = 8.0
 DEFAULT_SAMPLER = "numpyro_nuts"
-COUPLED_TRANSFORM_NONE = "none"
-COUPLED_TRANSFORM_POTFILE_MASS_SIZE = "potfile_mass_size"
-COUPLED_ROLE_MASS_NORM = "mass_norm"
-COUPLED_ROLE_SIZE = "size"
 
 
 class ParameterTransformSpec(Protocol):
@@ -44,13 +40,6 @@ class ParameterSpec:
     parent_sample_name: str | None = None
     sample_site_name: str | None = None
     sample_site_index: int | None = None
-    coupled_transform_kind: str = COUPLED_TRANSFORM_NONE
-    coupled_role: str | None = None
-    coupled_group: str | None = None
-    coupled_mass_center: float = 0.0
-    coupled_mass_scale: float = 1.0
-    coupled_size_center: float = 0.0
-    coupled_size_scale: float = 1.0
 
 
 @dataclass
@@ -89,6 +78,22 @@ class PackedLensSpec:
     sigma_log_scatter_param_index: np.ndarray
     core_log_scatter_param_index: np.ndarray
     cut_log_scatter_param_index: np.ndarray
+    alpha_sigma_base: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    gamma_ml_base: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    alpha_sigma_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    gamma_ml_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    independent_branch_role: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    independent_magnitude_feature: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    independent_free_log_v_disp_delta_unit_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    independent_free_log_core_radius_delta_unit_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    independent_free_log_cut_radius_delta_unit_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    independent_free_log_v_disp_tau_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    independent_free_log_core_radius_tau_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    independent_free_log_cut_radius_tau_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    active_gate_intercept_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    active_gate_mag_slope_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    active_gate_logit_offset_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    active_magnitude_feature: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
 
 
 @dataclass
@@ -115,6 +120,17 @@ class SurrogateBinCache:
     catastrophe_rho: np.ndarray | None = None
     catastrophe_kappa_tangent_x: np.ndarray | None = None
     catastrophe_kappa_tangent_y: np.ndarray | None = None
+
+
+@dataclass
+class ActiveInferenceFlatCache:
+    component_indices: np.ndarray
+    reference_alpha_x: jnp.ndarray
+    reference_alpha_y: jnp.ndarray
+    reference_jacobian_delta_a00: jnp.ndarray | None = None
+    reference_jacobian_delta_a01: jnp.ndarray | None = None
+    reference_jacobian_delta_a10: jnp.ndarray | None = None
+    reference_jacobian_delta_a11: jnp.ndarray | None = None
 
 
 @dataclass
@@ -281,6 +297,19 @@ class BuildState:
     previous_stage_best_values: dict[str, float] | None = None
     fit_cosmology_flat_wcdm: bool = False
     source_position_parameterization: str = "direct"
+    infer_active_scaling: bool = False
+    active_scaling_inference_likelihood: str = "population"
+    active_scaling_freeze_threshold: float = 0.5
+    independent_scaling_model: str = "log_displacement"
+    scaling_relation_mode: str = "lenstool-denominator"
+    independent_scaling_free_log_vdisp_tau_prior_median: float = 0.20
+    independent_scaling_free_log_core_tau_prior_median: float = 0.30
+    independent_scaling_free_log_cut_tau_prior_median: float = 0.30
+    independent_scaling_free_log_tau_prior_sigma: float = 0.40
+    frozen_active_scaling_component_indices: np.ndarray | None = None
+    active_scaling_frozen_from_previous_stage: bool = False
+    active_scaling_frozen_source_run_dir: str | None = None
+    active_scaling_frozen_source_path: str | None = None
 
 
 def positive_lognormal_parameters(mean: float, std: float, *, floor: float = 1.0e-6) -> tuple[float, float]:
@@ -341,129 +370,6 @@ def latent_jax_to_physical(values: jnp.ndarray, spec: ParameterTransformSpec) ->
     return array
 
 
-def _is_potfile_mass_size_spec(spec: ParameterSpec) -> bool:
-    return str(getattr(spec, "coupled_transform_kind", COUPLED_TRANSFORM_NONE)) == COUPLED_TRANSFORM_POTFILE_MASS_SIZE
-
-
-def _potfile_mass_size_groups(parameter_specs: list[ParameterSpec]) -> list[tuple[int, int]]:
-    grouped: dict[str, dict[str, int]] = {}
-    for idx, spec in enumerate(parameter_specs):
-        if not _is_potfile_mass_size_spec(spec):
-            continue
-        group_name = str(spec.coupled_group or spec.sample_site_name or spec.potential_id)
-        role = str(spec.coupled_role or "")
-        grouped.setdefault(group_name, {})[role] = idx
-    result: list[tuple[int, int]] = []
-    for role_map in grouped.values():
-        if COUPLED_ROLE_MASS_NORM in role_map and COUPLED_ROLE_SIZE in role_map:
-            result.append((role_map[COUPLED_ROLE_MASS_NORM], role_map[COUPLED_ROLE_SIZE]))
-    return result
-
-
-def _apply_potfile_mass_size_physical_transform(
-    values: np.ndarray,
-    parameter_specs: list[ParameterSpec],
-) -> np.ndarray:
-    converted = np.asarray(values, dtype=float).copy()
-    source = np.asarray(values, dtype=float)
-    for mass_idx, size_idx in _potfile_mass_size_groups(parameter_specs):
-        mass_spec = parameter_specs[mass_idx]
-        size_spec = parameter_specs[size_idx]
-        u_m = source[..., mass_idx]
-        u_s = source[..., size_idx]
-        mass_raw = float(mass_spec.coupled_mass_center) + float(mass_spec.coupled_mass_scale) * u_m
-        size_raw = float(mass_spec.coupled_size_center) + float(mass_spec.coupled_size_scale) * u_s
-        log_sigma = 0.5 * (mass_raw - size_raw)
-        converted[..., mass_idx] = np.exp(log_sigma)
-        converted[..., size_idx] = float(size_spec.transform_offset) + np.exp(size_raw)
-    return converted
-
-
-def _apply_potfile_mass_size_latent_transform(
-    values: np.ndarray,
-    parameter_specs: list[ParameterSpec],
-) -> np.ndarray:
-    converted = np.asarray(values, dtype=float).copy()
-    source = np.asarray(values, dtype=float)
-    for mass_idx, size_idx in _potfile_mass_size_groups(parameter_specs):
-        mass_spec = parameter_specs[mass_idx]
-        size_spec = parameter_specs[size_idx]
-        sigma = np.maximum(source[..., mass_idx], 1.0e-300)
-        cut_gap = np.maximum(source[..., size_idx] - float(size_spec.transform_offset), 1.0e-300)
-        log_sigma = np.log(sigma)
-        log_cut_gap = np.log(cut_gap)
-        mass_raw = 2.0 * log_sigma + log_cut_gap
-        converted[..., mass_idx] = (
-            mass_raw - float(mass_spec.coupled_mass_center)
-        ) / float(mass_spec.coupled_mass_scale)
-        converted[..., size_idx] = (
-            log_cut_gap - float(mass_spec.coupled_size_center)
-        ) / float(mass_spec.coupled_size_scale)
-    return converted
-
-
-def potfile_mass_size_coupling_arrays(parameter_specs: list[ParameterSpec]) -> dict[str, np.ndarray]:
-    groups = _potfile_mass_size_groups(parameter_specs)
-    mass_indices: list[int] = []
-    size_indices: list[int] = []
-    mass_centers: list[float] = []
-    mass_scales: list[float] = []
-    size_centers: list[float] = []
-    size_scales: list[float] = []
-    cut_offsets: list[float] = []
-    for mass_idx, size_idx in groups:
-        mass_spec = parameter_specs[mass_idx]
-        size_spec = parameter_specs[size_idx]
-        mass_indices.append(int(mass_idx))
-        size_indices.append(int(size_idx))
-        mass_centers.append(float(mass_spec.coupled_mass_center))
-        mass_scales.append(float(mass_spec.coupled_mass_scale))
-        size_centers.append(float(mass_spec.coupled_size_center))
-        size_scales.append(float(mass_spec.coupled_size_scale))
-        cut_offsets.append(float(size_spec.transform_offset))
-    return {
-        "mass_indices": np.asarray(mass_indices, dtype=np.int32),
-        "size_indices": np.asarray(size_indices, dtype=np.int32),
-        "mass_centers": np.asarray(mass_centers, dtype=float),
-        "mass_scales": np.asarray(mass_scales, dtype=float),
-        "size_centers": np.asarray(size_centers, dtype=float),
-        "size_scales": np.asarray(size_scales, dtype=float),
-        "cut_offsets": np.asarray(cut_offsets, dtype=float),
-    }
-
-
-def apply_potfile_mass_size_couplings_jax(
-    physical_params: jnp.ndarray,
-    latent_params: jnp.ndarray,
-    *,
-    mass_indices: jnp.ndarray | None = None,
-    size_indices: jnp.ndarray | None = None,
-    mass_centers: jnp.ndarray | None = None,
-    mass_scales: jnp.ndarray | None = None,
-    size_centers: jnp.ndarray | None = None,
-    size_scales: jnp.ndarray | None = None,
-    cut_offsets: jnp.ndarray | None = None,
-) -> jnp.ndarray:
-    if mass_indices is None or size_indices is None:
-        return physical_params
-    mass_indices = jnp.asarray(mass_indices, dtype=jnp.int32)
-    size_indices = jnp.asarray(size_indices, dtype=jnp.int32)
-    if mass_indices.size == 0:
-        return physical_params
-    latent = jnp.asarray(latent_params, dtype=jnp.float64)
-    u_m = jnp.take(latent, mass_indices)
-    u_s = jnp.take(latent, size_indices)
-    mass_raw = jnp.asarray(mass_centers, dtype=jnp.float64) + jnp.asarray(mass_scales, dtype=jnp.float64) * u_m
-    size_raw = jnp.asarray(size_centers, dtype=jnp.float64) + jnp.asarray(size_scales, dtype=jnp.float64) * u_s
-    log_sigma = 0.5 * (mass_raw - size_raw)
-    sigma = jnp.exp(log_sigma)
-    cut = jnp.asarray(cut_offsets, dtype=jnp.float64) + jnp.exp(size_raw)
-    result = jnp.asarray(physical_params, dtype=jnp.float64)
-    result = result.at[mass_indices].set(sigma)
-    result = result.at[size_indices].set(cut)
-    return result
-
-
 def display_lower(spec: ParameterSpec) -> float:
     return float(spec.physical_lower if spec.physical_lower is not None else spec.lower)
 
@@ -478,10 +384,8 @@ def convert_theta_to_physical(theta: np.ndarray, parameter_specs: list[Parameter
         return theta_array.copy()
     converted = theta_array.copy()
     for idx, spec in enumerate(parameter_specs):
-        if _is_potfile_mass_size_spec(spec):
-            continue
         converted[idx] = latent_to_physical(theta_array[idx], spec)
-    return _apply_potfile_mass_size_physical_transform(converted, parameter_specs)
+    return converted
 
 
 def convert_theta_to_latent(theta: np.ndarray, parameter_specs: list[ParameterSpec]) -> np.ndarray:
@@ -490,10 +394,8 @@ def convert_theta_to_latent(theta: np.ndarray, parameter_specs: list[ParameterSp
         return theta_array.copy()
     converted = theta_array.copy()
     for idx, spec in enumerate(parameter_specs):
-        if _is_potfile_mass_size_spec(spec):
-            continue
         converted[idx] = physical_to_latent(theta_array[idx], spec)
-    return _apply_potfile_mass_size_latent_transform(converted, parameter_specs)
+    return converted
 
 
 def convert_sample_matrix_to_latent(samples: np.ndarray, parameter_specs: list[ParameterSpec]) -> np.ndarray:
@@ -502,13 +404,11 @@ def convert_sample_matrix_to_latent(samples: np.ndarray, parameter_specs: list[P
         return array.copy()
     converted = array.copy()
     for idx, spec in enumerate(parameter_specs):
-        if _is_potfile_mass_size_spec(spec):
-            continue
         converted[..., idx] = np.asarray(
             [physical_to_latent(value, spec) for value in array[..., idx].reshape(-1)],
             dtype=float,
         ).reshape(array[..., idx].shape)
-    return _apply_potfile_mass_size_latent_transform(converted, parameter_specs)
+    return converted
 
 
 def apply_parameter_transforms_jax(
@@ -518,31 +418,12 @@ def apply_parameter_transforms_jax(
     transform_offset_array: jnp.ndarray,
     affine_mask: jnp.ndarray | None = None,
     transform_scale_array: jnp.ndarray | None = None,
-    potfile_mass_size_mass_indices: jnp.ndarray | None = None,
-    potfile_mass_size_size_indices: jnp.ndarray | None = None,
-    potfile_mass_size_mass_centers: jnp.ndarray | None = None,
-    potfile_mass_size_mass_scales: jnp.ndarray | None = None,
-    potfile_mass_size_size_centers: jnp.ndarray | None = None,
-    potfile_mass_size_size_scales: jnp.ndarray | None = None,
-    potfile_mass_size_cut_offsets: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     params_array = jnp.asarray(params, dtype=jnp.float64)
     if affine_mask is None:
         affine_mask = jnp.zeros_like(log_positive_mask, dtype=bool)
     if transform_scale_array is None:
         transform_scale_array = jnp.ones_like(transform_offset_array, dtype=jnp.float64)
-    if potfile_mass_size_mass_indices is not None and potfile_mass_size_size_indices is not None:
-        coupled_indices = jnp.concatenate(
-            [
-                jnp.asarray(potfile_mass_size_mass_indices, dtype=jnp.int32),
-                jnp.asarray(potfile_mass_size_size_indices, dtype=jnp.int32),
-            ]
-        )
-        coupled_mask = jnp.zeros_like(log_positive_mask, dtype=bool).at[coupled_indices].set(True)
-        active_mask = jnp.logical_not(coupled_mask)
-        log_positive_mask = jnp.logical_and(log_positive_mask, active_mask)
-        log_offset_positive_mask = jnp.logical_and(log_offset_positive_mask, active_mask)
-        affine_mask = jnp.logical_and(affine_mask, active_mask)
     safe_log_positive_params = jnp.where(log_positive_mask, params_array, 0.0)
     physical_params = jnp.where(
         log_positive_mask,
@@ -560,17 +441,7 @@ def apply_parameter_transforms_jax(
         transform_offset_array + transform_scale_array * params_array,
         physical_params,
     )
-    return apply_potfile_mass_size_couplings_jax(
-        physical_params,
-        params_array,
-        mass_indices=potfile_mass_size_mass_indices,
-        size_indices=potfile_mass_size_size_indices,
-        mass_centers=potfile_mass_size_mass_centers,
-        mass_scales=potfile_mass_size_mass_scales,
-        size_centers=potfile_mass_size_size_centers,
-        size_scales=potfile_mass_size_size_scales,
-        cut_offsets=potfile_mass_size_cut_offsets,
-    )
+    return physical_params
 
 
 def convert_sample_matrix_to_physical(samples: np.ndarray, parameter_specs: list[ParameterSpec]) -> np.ndarray:
@@ -579,7 +450,5 @@ def convert_sample_matrix_to_physical(samples: np.ndarray, parameter_specs: list
         return array.copy()
     converted = array.copy()
     for idx, spec in enumerate(parameter_specs):
-        if _is_potfile_mass_size_spec(spec):
-            continue
         converted[..., idx] = latent_array_to_physical(array[..., idx], spec)
-    return _apply_potfile_mass_size_physical_transform(converted, parameter_specs)
+    return converted

@@ -506,6 +506,16 @@ def _parse_optional_positive_int(value: str) -> int | None:
     return parsed
 
 
+def _parse_nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a nonnegative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("expected a nonnegative integer")
+    return parsed
+
+
 def _format_optional_positive_int(value: int | None) -> str:
     return "none" if value is None else str(int(value))
 
@@ -769,6 +779,7 @@ def _recovered_model_tables(
         DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
         DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
         SAMPLE_LIKELIHOOD_SOURCE,
+        SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
         ClusterJAXEvaluator,
         _convert_theta_to_latent,
     )
@@ -796,6 +807,13 @@ def _recovered_model_tables(
         refresh_every=int(_artifact_arg(artifact_args, "refresh_every", DEFAULT_REFRESH_EVERY)),
         refresh_param_drift_frac=float(_artifact_arg(artifact_args, "refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
         source_plane_covariance_floor=float(_artifact_arg(artifact_args, "source_plane_covariance_floor", 1.0e-6)),
+        source_plane_covariance_mode=str(
+            _artifact_arg(
+                artifact_args,
+                "source_plane_covariance_mode",
+                SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
+            )
+        ),
         source_plane_outlier_sigma_arcsec=float(
             _artifact_arg(artifact_args, "source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
         ),
@@ -1384,6 +1402,7 @@ def _posterior_prediction_uncertainty_tables(
         DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
         DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
         SAMPLE_LIKELIHOOD_SOURCE,
+        SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
         ClusterJAXEvaluator,
         _convert_theta_to_latent,
     )
@@ -1428,6 +1447,13 @@ def _posterior_prediction_uncertainty_tables(
             refresh_every=int(_artifact_arg(artifact_args, "refresh_every", DEFAULT_REFRESH_EVERY)),
             refresh_param_drift_frac=float(_artifact_arg(artifact_args, "refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
             source_plane_covariance_floor=float(_artifact_arg(artifact_args, "source_plane_covariance_floor", 1.0e-6)),
+            source_plane_covariance_mode=str(
+                _artifact_arg(
+                    artifact_args,
+                    "source_plane_covariance_mode",
+                    SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
+                )
+            ),
             source_plane_outlier_sigma_arcsec=float(
                 _artifact_arg(artifact_args, "source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
             ),
@@ -4330,6 +4356,20 @@ def _recovered_subhalo_mass_table(state: Any, best_fit: np.ndarray, truth: dict[
         getattr(packed, "slope_param_index", np.full(component_family.size, -1, dtype=int)),
         best_fit_values,
     )
+    alpha_sigma = _updated_component_values(
+        getattr(packed, "alpha_sigma_base", np.full(component_family.size, 0.25, dtype=float)),
+        getattr(packed, "alpha_sigma_param_index", np.full(component_family.size, -1, dtype=int)),
+        best_fit_values,
+    )
+    gamma_ml = _updated_component_values(
+        getattr(packed, "gamma_ml_base", np.zeros(component_family.size, dtype=float)),
+        getattr(packed, "gamma_ml_param_index", np.full(component_family.size, -1, dtype=int)),
+        best_fit_values,
+    )
+    alpha_sigma_param_index = np.asarray(
+        getattr(packed, "alpha_sigma_param_index", np.full(component_family.size, -1, dtype=int)),
+        dtype=int,
+    )
     mass_ref = _truth_subhalo_mass_ref(truth)
     rows: list[dict[str, Any]] = []
     for component_index in scaling_indices:
@@ -4340,6 +4380,15 @@ def _recovered_subhalo_mass_table(state: Any, best_fit: np.ndarray, truth: dict[
         cut_value = float(cut_ref[component_index])
         vdslope_value = float(vdslope[component_index])
         slope_value = float(slope[component_index])
+        uses_bergamini_ml = bool(alpha_sigma_param_index[component_index] >= 0)
+        alpha_sigma_value = float(alpha_sigma[component_index])
+        gamma_ml_value = float(gamma_ml[component_index])
+        beta_radius_value = (
+            1.0 + gamma_ml_value - 2.0 * alpha_sigma_value
+            if uses_bergamini_ml
+            else 2.0 / slope_value
+        )
+        alpha_sigma_effective = alpha_sigma_value if uses_bergamini_ml else 1.0 / vdslope_value
         if not (
             np.isfinite(luminosity)
             and luminosity > 0.0
@@ -4351,6 +4400,8 @@ def _recovered_subhalo_mass_table(state: Any, best_fit: np.ndarray, truth: dict[
             and vdslope_value > 0.0
             and np.isfinite(slope_value)
             and slope_value > 0.0
+            and np.isfinite(alpha_sigma_effective)
+            and np.isfinite(beta_radius_value)
         ):
             continue
         record = record_by_component.get(int(component_index), {})
@@ -4369,7 +4420,7 @@ def _recovered_subhalo_mass_table(state: Any, best_fit: np.ndarray, truth: dict[
             normalization *= (sigma_value / truth_sigma_ref) ** 2
         if np.isfinite(truth_cut_ref) and truth_cut_ref > 0.0:
             normalization *= cut_value / truth_cut_ref
-        exponent = 2.0 / vdslope_value + 2.0 / slope_value
+        exponent = 2.0 * alpha_sigma_effective + beta_radius_value
         mass = mass_ref * normalization * luminosity**exponent
         if not (np.isfinite(mass) and mass > 0.0):
             continue
@@ -4386,6 +4437,9 @@ def _recovered_subhalo_mass_table(state: Any, best_fit: np.ndarray, truth: dict[
                 "cut_ref_kpc": cut_value,
                 "vdslope": vdslope_value,
                 "slope": slope_value,
+                "alpha_sigma": alpha_sigma_effective,
+                "beta_radius": beta_radius_value,
+                "gamma_ml": gamma_ml_value if uses_bergamini_ml else float("nan"),
                 "mass_normalization_ratio": float(normalization),
                 "recovered_subhalo_mass_msun": float(mass),
             }
@@ -4984,7 +5038,14 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             raise SystemExit(f"{flag_name} must be one of {', '.join(JAX_DEVICE_CHOICES)}.")
     if _resume_mode_is_fast(args) and solver_fit_mode != SOLVER_FIT_MODE_SEQUENTIAL:
         raise SystemExit("--resume fast is only valid with --solver-fit-mode sequential.")
-    if bool(getattr(args, "start_at_stage3", False)):
+    start_at_stage2 = bool(getattr(args, "start_at_stage2", False))
+    start_at_stage3 = bool(getattr(args, "start_at_stage3", False))
+    if start_at_stage2:
+        if solver_fit_mode != SOLVER_FIT_MODE_SEQUENTIAL:
+            raise SystemExit("--start-at-stage2 is only valid with --solver-fit-mode sequential.")
+        if start_at_stage3:
+            raise SystemExit("--start-at-stage2 cannot be combined with --start-at-stage3.")
+    if start_at_stage3:
         if solver_fit_mode != SOLVER_FIT_MODE_SEQUENTIAL:
             raise SystemExit("--start-at-stage3 is only valid with --solver-fit-mode sequential.")
         if mode not in {
@@ -5135,6 +5196,15 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         not np.isfinite(float(fixed_image_sigma_int)) or float(fixed_image_sigma_int) < 0.0
     ):
         raise SystemExit("--fix-image-sigma-int-arcsec must be finite and nonnegative.")
+    for attr, option in (
+        ("independent_scaling_free_log_vdisp_tau_prior_median", "--independent-scaling-free-log-vdisp-tau-prior-median"),
+        ("independent_scaling_free_log_core_tau_prior_median", "--independent-scaling-free-log-core-tau-prior-median"),
+        ("independent_scaling_free_log_cut_tau_prior_median", "--independent-scaling-free-log-cut-tau-prior-median"),
+        ("independent_scaling_free_log_tau_prior_sigma", "--independent-scaling-free-log-tau-prior-sigma"),
+    ):
+        value = float(getattr(args, attr, 0.4 if attr.endswith("sigma") else 0.3))
+        if not np.isfinite(value) or value <= 0.0:
+            raise SystemExit(f"{option} must be finite and positive.")
     image_presence_penalty_weight = getattr(args, "image_presence_penalty_weight", None)
     if image_presence_penalty_weight is not None and (
         not np.isfinite(float(image_presence_penalty_weight)) or float(image_presence_penalty_weight) < 0.0
@@ -5390,11 +5460,6 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     if not np.isfinite(catastrophe_vmin) or catastrophe_vmin < 0.0:
         raise SystemExit("--catastrophe-tangential-variance-min must be finite and non-negative.")
     if solver_fit_mode == SOLVER_FIT_MODE_EVIDENCE_NS:
-        if bool(getattr(args, "potfile_mass_size_reparam", False)):
-            raise SystemExit(
-                "--potfile-mass-size-reparam is only supported with NumPyro SVI/NUTS samplers, "
-                "not --solver-fit-mode evidence-ns."
-            )
         if evidence_prior_sigma is None:
             raise SystemExit("--solver-fit-mode evidence-ns requires --evidence-source-prior-sigma-arcsec.")
         if mode != IMAGE_PLANE_MODE_NONE:
@@ -5604,6 +5669,8 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             max_tree_depth=int(stage4_value(max_tree_depths)),
         ),
     }
+    if start_at_stage2 and controls["stage2"].fit_method not in {FIT_METHOD_SVI, FIT_METHOD_SVI_NUTS}:
+        raise SystemExit("--start-at-stage2 requires stage-2 --fit-method svi or svi+nuts so SVI can initialize the stage.")
     stage4_direct_sampler_modes = {
         IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
         IMAGE_PLANE_MODE_FORWARD_METRIC,
@@ -5644,16 +5711,6 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     if nuts_stages:
         if nuts_stages != ["stage4"] or str(mode) not in stage4_direct_sampler_modes:
             raise SystemExit("--fit-method nuts is only valid for non-blocked stage 4 image-plane modes.")
-    if bool(getattr(args, "potfile_mass_size_reparam", False)):
-        if _validation_blocked_linearized_stage_enabled(args):
-            raise SystemExit("--potfile-mass-size-reparam is not supported with blocked linearized stage 4 NUTS.")
-        if smc_stages:
-            raise SystemExit("--potfile-mass-size-reparam is only supported with NumPyro SVI/NUTS samplers, not --fit-method smc.")
-        if microcanonical_stages:
-            raise SystemExit(
-                "--potfile-mass-size-reparam is only supported with NumPyro SVI/NUTS samplers, "
-                "not --fit-method mchmc or mclmc."
-            )
     return controls
 
 
@@ -6194,8 +6251,11 @@ def _validate_validation_args(args: argparse.Namespace) -> None:
             raise SystemExit("--write-stage3-recovery requires a stage 4 --image-plane-mode.")
         if bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)):
             raise SystemExit("--write-stage3-recovery requires stage 3; remove --skip-stage3-image-plane-local-jacobian.")
-    if bool(getattr(args, "quick_diagnostics", False)) and bool(getattr(args, "exact_image_diagnostics_stage3", False)):
-        raise SystemExit("--exact-image-diagnostics-stage3 cannot be combined with --quick-diagnostics.")
+    if bool(getattr(args, "quick_diagnostics", False)):
+        if bool(getattr(args, "exact_image_diagnostics_stage2", False)):
+            raise SystemExit("--exact-image-diagnostics-stage2 cannot be combined with --quick-diagnostics.")
+        if bool(getattr(args, "exact_image_diagnostics_stage3", False)):
+            raise SystemExit("--exact-image-diagnostics-stage3 cannot be combined with --quick-diagnostics.")
     exact_image_min_distance_arcsec = float(
         getattr(args, "exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)
     )
@@ -6213,9 +6273,29 @@ def _validate_validation_args(args: argparse.Namespace) -> None:
         not np.isfinite(float(fixed_image_sigma_int)) or float(fixed_image_sigma_int) < 0.0
     ):
         raise SystemExit("--fix-image-sigma-int-arcsec must be finite and nonnegative.")
+    for attr, option in (
+        ("independent_scaling_free_log_vdisp_tau_prior_median", "--independent-scaling-free-log-vdisp-tau-prior-median"),
+        ("independent_scaling_free_log_core_tau_prior_median", "--independent-scaling-free-log-core-tau-prior-median"),
+        ("independent_scaling_free_log_cut_tau_prior_median", "--independent-scaling-free-log-cut-tau-prior-median"),
+        ("independent_scaling_free_log_tau_prior_sigma", "--independent-scaling-free-log-tau-prior-sigma"),
+    ):
+        value = float(getattr(args, attr, 0.4 if attr.endswith("sigma") else 0.3))
+        if not np.isfinite(value) or value <= 0.0:
+            raise SystemExit(f"{option} must be finite and positive.")
 
 
 def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: argparse.Namespace) -> Path:
+    from .cluster_solver import (
+        DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD,
+        DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA,
+        DEFAULT_ACTIVE_SCALING_LOGIT_PRIOR_SIGMA,
+        DEFAULT_ACTIVE_SCALING_MAG_SLOPE_PRIOR_SIGMA,
+        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
+        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+    )
+
     controls = _normalize_validation_stage_fit_controls(args)
     solver_fit_mode = str(getattr(args, "solver_fit_mode", SOLVER_FIT_MODE_SEQUENTIAL))
     cmd = [
@@ -6266,8 +6346,20 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(getattr(args, "likelihood_stabilizer_student_t_nu", DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU)),
         "--sampling-engine",
         str(args.sampling_engine),
+        "--topk-discovery-scaling-galaxies",
+        str(getattr(args, "topk_discovery_scaling_galaxies", 10)),
+        "--topk-discovery-score",
+        str(getattr(args, "topk_discovery_score", "alpha_jacobian")),
+        "--topk-discovery-jacobian-weight",
+        str(getattr(args, "topk_discovery_jacobian_weight", 1.0)),
+        "--topk-discovery-final-engine",
+        str(getattr(args, "topk_discovery_final_engine", "refreshing_surrogate_flat")),
+        "--topk-discovery-final-svi-polish-steps",
+        str(getattr(args, "topk_discovery_final_svi_polish_steps", 2000)),
         "--source-plane-covariance-floor",
         str(args.source_plane_covariance_floor),
+        "--source-plane-covariance-mode",
+        str(getattr(args, "source_plane_covariance_mode", "magnification")),
         "--z-bin-efficiency-tol",
         str(args.z_bin_efficiency_tol),
         "--exact-image-min-distance-arcsec",
@@ -6282,6 +6374,46 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(args.active_scaling_cumulative_fraction),
         "--active-scaling-min",
         str(args.active_scaling_min),
+        "--active-scaling-logit-prior-sigma",
+        str(getattr(args, "active_scaling_logit_prior_sigma", DEFAULT_ACTIVE_SCALING_LOGIT_PRIOR_SIGMA)),
+        "--active-scaling-mag-slope-prior-sigma",
+        str(getattr(args, "active_scaling_mag_slope_prior_sigma", DEFAULT_ACTIVE_SCALING_MAG_SLOPE_PRIOR_SIGMA)),
+        "--active-scaling-local-logit-prior-sigma",
+        str(getattr(args, "active_scaling_local_logit_prior_sigma", DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA)),
+        "--active-scaling-freeze-threshold",
+        str(getattr(args, "active_scaling_freeze_threshold", DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD)),
+        "--independent-scaling-free-log-vdisp-tau-prior-median",
+        str(
+            getattr(
+                args,
+                "independent_scaling_free_log_vdisp_tau_prior_median",
+                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+            )
+        ),
+        "--independent-scaling-free-log-core-tau-prior-median",
+        str(
+            getattr(
+                args,
+                "independent_scaling_free_log_core_tau_prior_median",
+                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
+            )
+        ),
+        "--independent-scaling-free-log-cut-tau-prior-median",
+        str(
+            getattr(
+                args,
+                "independent_scaling_free_log_cut_tau_prior_median",
+                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+            )
+        ),
+        "--independent-scaling-free-log-tau-prior-sigma",
+        str(
+            getattr(
+                args,
+                "independent_scaling_free_log_tau_prior_sigma",
+                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+            )
+        ),
         "--pos-sigma-arcsec",
         str(args.pos_sigma_arcsec),
         "--seed",
@@ -6345,8 +6477,6 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         cmd.append("--no-mchmc-random-trajectory-length")
     _append_stage_option(cmd, "--svi-steps", args.svi_steps)
     _append_stage_option(cmd, "--max-tree-depth", args.max_tree_depth)
-    if bool(getattr(args, "potfile_mass_size_reparam", False)):
-        cmd.append("--potfile-mass-size-reparam")
     if getattr(args, "fix_image_sigma_int_arcsec", None) is not None:
         cmd.extend(["--fix-image-sigma-int-arcsec", str(float(args.fix_image_sigma_int_arcsec))])
     if getattr(args, "image_presence_penalty_weight", None) is not None:
@@ -6563,12 +6693,16 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
             cmd.extend(["--blocked-nuts-pilot-warmup", str(args.blocked_nuts_pilot_warmup)])
     if bool(getattr(args, "fit_cosmology_flat_wcdm", False)):
         cmd.append("--fit-cosmology-flat-wcdm")
+    if solver_fit_mode == SOLVER_FIT_MODE_SEQUENTIAL and bool(getattr(args, "start_at_stage2", False)):
+        cmd.append("--start-at-stage2")
     if solver_fit_mode == SOLVER_FIT_MODE_SEQUENTIAL and bool(getattr(args, "start_at_stage3", False)):
         cmd.append("--start-at-stage3")
     if solver_fit_mode == SOLVER_FIT_MODE_SEQUENTIAL and bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)):
         cmd.append("--skip-stage3-image-plane-local-jacobian")
     if bool(getattr(args, "quick_diagnostics", False)):
         cmd.append("--quick-diagnostics")
+    if bool(getattr(args, "exact_image_diagnostics_stage2", False)):
+        cmd.append("--exact-image-diagnostics-stage2")
     if bool(getattr(args, "exact_image_diagnostics_stage3", False)):
         cmd.append("--exact-image-diagnostics-stage3")
     if solver_fit_mode == SOLVER_FIT_MODE_EVIDENCE_NS:
@@ -6608,6 +6742,17 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
     if args.active_scaling_galaxies is not None:
         cmd.append("--active-scaling-galaxies")
         cmd.extend(str(value) for value in args.active_scaling_galaxies)
+    if bool(getattr(args, "infer_active_scaling", False)):
+        cmd.append("--infer-active-scaling")
+        cmd.extend(
+            [
+                "--active-scaling-inference-likelihood",
+                str(getattr(args, "active_scaling_inference_likelihood", "population")),
+            ]
+        )
+    active_scaling_prior_prob = getattr(args, "active_scaling_prior_prob", None)
+    if active_scaling_prior_prob is not None:
+        cmd.extend(["--active-scaling-prior-prob", str(active_scaling_prior_prob)])
     if args.fit_scaling_scatter and int(args.n_subhalos) > 0:
         scatter_fields: list[str] = []
         if float(args.subhalo_sigma_scatter_dex) > 0.0:
@@ -6893,6 +7038,17 @@ def _parse_source_redshifts(raw: str | None, *, fallback: float) -> tuple[float,
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    from .cluster_solver import (
+        DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD,
+        DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA,
+        DEFAULT_ACTIVE_SCALING_LOGIT_PRIOR_SIGMA,
+        DEFAULT_ACTIVE_SCALING_MAG_SLOPE_PRIOR_SIGMA,
+        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
+        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+    )
+
     parser = argparse.ArgumentParser(description="Mock-recovery validation suite for lenscluster.")
     mock_defaults = SingleBCGMockConfig()
     parser.add_argument("--mock", choices=("single-bcg",), default="single-bcg")
@@ -7050,6 +7206,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--skip-stage3-image-plane-local-jacobian",
         action="store_true",
         help="Skip solver stage 3 before a final stage 4 image-plane mode.",
+    )
+    parser.add_argument(
+        "--start-at-stage2",
+        action="store_true",
+        help="Start sequential solver validation at stage2_joint, skipping stage1_large_only and using base large-halo priors.",
     )
     parser.add_argument(
         "--start-at-stage3",
@@ -7431,10 +7592,31 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mchmc-l-estimator", choices=MCHMC_L_ESTIMATORS, default=DEFAULT_MCHMC_L_ESTIMATOR)
     parser.add_argument(
         "--sampling-engine",
-        choices=("full", "full_flat", "refreshing_surrogate", "refreshing_surrogate_flat", "active_subset"),
+        choices=(
+            "full",
+            "full_flat",
+            "refreshing_surrogate",
+            "refreshing_surrogate_flat",
+            "topk_discovery_flat",
+            "active_subset",
+        ),
         default="refreshing_surrogate",
     )
+    parser.add_argument("--topk-discovery-scaling-galaxies", type=int, default=10)
+    parser.add_argument("--topk-discovery-score", choices=("alpha_jacobian",), default="alpha_jacobian")
+    parser.add_argument("--topk-discovery-jacobian-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--topk-discovery-final-engine",
+        choices=("refreshing_surrogate_flat", "full_flat"),
+        default="refreshing_surrogate_flat",
+    )
+    parser.add_argument("--topk-discovery-final-svi-polish-steps", type=_parse_nonnegative_int, default=2000)
     parser.add_argument("--source-plane-covariance-floor", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--source-plane-covariance-mode",
+        choices=("magnification", "unit"),
+        default="magnification",
+    )
     parser.add_argument("--z-bin-efficiency-tol", type=float, default=0.01)
     parser.add_argument(
         "--fit-cosmology-flat-wcdm",
@@ -7451,6 +7633,49 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--active-scaling-selection", choices=("fixed", "adaptive"), default="adaptive")
     parser.add_argument("--active-scaling-cumulative-fraction", type=float, default=0.995)
     parser.add_argument("--active-scaling-min", type=int, default=4)
+    parser.add_argument("--infer-active-scaling", action="store_true")
+    parser.add_argument("--active-scaling-inference-likelihood", choices=("population", "blend"), default="population")
+    parser.add_argument("--active-scaling-prior-prob", type=float, default=None)
+    parser.add_argument(
+        "--active-scaling-logit-prior-sigma",
+        type=float,
+        default=DEFAULT_ACTIVE_SCALING_LOGIT_PRIOR_SIGMA,
+    )
+    parser.add_argument(
+        "--active-scaling-mag-slope-prior-sigma",
+        type=float,
+        default=DEFAULT_ACTIVE_SCALING_MAG_SLOPE_PRIOR_SIGMA,
+    )
+    parser.add_argument(
+        "--active-scaling-local-logit-prior-sigma",
+        type=float,
+        default=DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA,
+    )
+    parser.add_argument(
+        "--active-scaling-freeze-threshold",
+        type=float,
+        default=DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD,
+    )
+    parser.add_argument(
+        "--independent-scaling-free-log-vdisp-tau-prior-median",
+        type=float,
+        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+    )
+    parser.add_argument(
+        "--independent-scaling-free-log-core-tau-prior-median",
+        type=float,
+        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
+    )
+    parser.add_argument(
+        "--independent-scaling-free-log-cut-tau-prior-median",
+        type=float,
+        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+    )
+    parser.add_argument(
+        "--independent-scaling-free-log-tau-prior-sigma",
+        type=float,
+        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+    )
     parser.add_argument(
         "--fit-scaling-scatter",
         action=argparse.BooleanOptionalAction,
@@ -7499,6 +7724,14 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--exact-image-diagnostics-stage2",
+        action="store_true",
+        help=(
+            "Pass through to the sequential solver to run exact image matching and residual diagnostics for "
+            "stage2_joint even when a later image-plane stage is enabled."
+        ),
+    )
+    parser.add_argument(
         "--exact-image-diagnostics-stage3",
         action="store_true",
         help=(
@@ -7535,15 +7768,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Solver NumPyro NUTS mass-matrix adaptation: structured dense blocks, one full dense matrix, "
             "or diagonal mass."
-        ),
-    )
-    parser.add_argument(
-        "--potfile-mass-size-reparam",
-        action="store_true",
-        default=False,
-        help=(
-            "Forward solver opt-in potfile sigma/cutkpc mass-size reparameterization. "
-            "Supported for NumPyro SVI/NUTS solver paths only."
         ),
     )
     parser.add_argument("--blocked-nuts-cycles", type=int, default=None)

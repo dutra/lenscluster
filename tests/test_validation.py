@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import Future
+from dataclasses import replace
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -96,7 +97,22 @@ from lenscluster.model import (
     Stage1PriorSummary,
     SurrogateBinCache,
 )
-from lenscluster.plotting import _run_summary
+from lenscluster.plotting import (
+    _active_scaling_diagnostics_table,
+    _corner_without_source_positions,
+    _draw_independent_scaling_galaxy_map,
+    _gate_prior_sigmoid_curve,
+    _independent_scaling_diagnostics_table,
+    _independent_scaling_plot_table,
+    _observed_image_points_from_fit_quality,
+    _plot_active_scaling_summary,
+    _plot_independent_scaling_galaxy_map,
+    _plot_independent_scaling_multiplier_summary,
+    _plot_independent_scaling_rank_probability,
+    _plot_independent_scaling_summary,
+    _plot_path,
+    _run_summary,
+)
 from lenscluster.validation import (
     PARAMETER_RECOVERY_LOG_ABS_FLOOR,
     SingleBCGMockConfig,
@@ -2471,14 +2487,32 @@ def test_cluster_solver_parses_nuts_chain_method_choices(monkeypatch: pytest.Mon
             _parse_args()
 
 
-def test_cluster_solver_parses_potfile_mass_size_reparam_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cluster_solver_rejects_removed_potfile_mass_size_reparam_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par", "--potfile-mass-size-reparam"])
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+
+def test_cluster_solver_parses_scaling_relation_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par"])
     default_args = _parse_args()
-    assert default_args.potfile_mass_size_reparam is False
+    assert default_args.scaling_relation_mode == cluster_solver.SCALING_RELATION_MODE_LENSTOOL_DENOMINATOR
 
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par", "--potfile-mass-size-reparam"])
-    reparam_args = _parse_args()
-    assert reparam_args.potfile_mass_size_reparam is True
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cluster_solver", "--par-path", "input.par", "--scaling-relation-mode", "bergamini-ml"],
+    )
+    bergamini_args = _parse_args()
+    assert bergamini_args.scaling_relation_mode == cluster_solver.SCALING_RELATION_MODE_BERGAMINI_ML
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cluster_solver", "--par-path", "input.par", "--scaling-relation-mode", "unknown"],
+    )
+    with pytest.raises(SystemExit):
+        _parse_args()
 
 
 def test_multi_cluster_solver_parses_fov_limit_args() -> None:
@@ -5055,6 +5089,1683 @@ def _minimal_stage4_surrogate_state(
     )
 
 
+def test_active_scaling_candidate_selection_drives_independent_mixture() -> None:
+    potfiles = [
+        {
+            "id": "members",
+            "mag0": 20.0,
+            "catalog_df": pd.DataFrame(
+                {
+                    "id": ["faint", "bright", "mid"],
+                    "ra": [10.0, 10.0, 10.0],
+                    "dec": [0.0, 0.0, 0.0],
+                    "catalog_mag": [21.0, 18.0, 19.5],
+                }
+            ),
+        }
+    ]
+    reference = (0, 10.0, 0.0)
+    images_df = pd.DataFrame(columns=["ra", "dec"])
+
+    selected, rank_info, requested_counts, counts = cluster_solver._select_active_scaling_candidates(
+        potfiles,
+        reference,
+        images_df,
+        [1],
+        active_scaling_selection="fixed",
+        active_scaling_cumulative_fraction=0.995,
+        active_scaling_min=1,
+    )
+    selected_adaptive, _rank_info_adaptive, _requested_adaptive, counts_adaptive = (
+        cluster_solver._select_active_scaling_candidates(
+            potfiles,
+            reference,
+            images_df,
+            [2],
+            active_scaling_selection="adaptive",
+            active_scaling_cumulative_fraction=0.995,
+            active_scaling_min=1,
+        )
+    )
+    selected_all, _rank_info_all, requested_counts_all, counts_all = cluster_solver._select_active_scaling_candidates(
+        potfiles,
+        reference,
+        images_df,
+        [-1],
+        active_scaling_selection="adaptive",
+        active_scaling_cumulative_fraction=0.995,
+        active_scaling_min=1,
+    )
+
+    assert selected == [{1}]
+    assert requested_counts == {"members": 1}
+    assert counts == {"members": 1}
+    assert rank_info[(0, 1)]["rank"] == 1
+    assert selected_adaptive == [{1, 2}]
+    assert counts_adaptive == {"members": 2}
+    assert selected_all == [{0, 1, 2}]
+    assert requested_counts_all == {"members": 3}
+    assert counts_all == {"members": 3}
+
+
+def _write_active_scaling_potfile_fixture(tmp_path: Path) -> Path:
+    image_catalog_path = tmp_path / "obs_arcs.cat"
+    image_catalog_path.write_text(
+        "#REFERENCE 0\n"
+        "1.a 10.0000 0.0000 1.0 1.0 0.0 2.0 25.0\n"
+        "1.b 9.9998 0.0000 1.0 1.0 0.0 2.0 25.0\n",
+        encoding="utf-8",
+    )
+    member_catalog_path = tmp_path / "members.cat"
+    member_catalog_path.write_text(
+        "#REFERENCE 0\n"
+        "faint 10.0000 0.0000 1.0 1.0 0.0 21.0 1.0\n"
+        "bright 10.0001 0.0000 1.0 1.0 0.0 18.0 1.0\n"
+        "mid 10.0002 0.0000 1.0 1.0 0.0 19.5 1.0\n",
+        encoding="utf-8",
+    )
+    par_path = tmp_path / "input.par"
+    par_path.write_text(
+        """
+runmode
+    reference 3 10.0 0.0
+    end
+
+image
+    multfile 1 obs_arcs.cat
+    end
+
+cosmology
+    H0 70.0
+    omega 0.3
+    lambda 0.7
+    end
+
+potentiel 1
+    profil 81
+    x_centre 0.0
+    y_centre 0.0
+    ellipticite 0.0
+    angle_pos 0.0
+    core_radius 1.0
+    cut_radius 100.0
+    v_disp 700.0
+    z_lens 0.3
+    end
+
+potfile
+    filein 3 members.cat
+    zlens 0.3
+    type 81
+    corekpc 0.15
+    mag0 20.0
+    sigma 1 10.0 200.0
+    cutkpc 1 1.0 40.0
+    vdslope 0 4.0 0.0
+    slope 0 4.0 0.0
+    end
+fini
+""",
+        encoding="utf-8",
+    )
+    return par_path
+
+
+def test_topk_discovery_svi_build_creates_no_independent_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    par_path = _write_active_scaling_potfile_fixture(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            str(par_path),
+            "--fit-mode",
+            "joint",
+            "--fit-method",
+            "svi+nuts",
+            "--sampling-engine",
+            "topk_discovery_flat",
+            "--active-scaling-galaxies",
+            "3",
+            "--active-scaling-selection",
+            "fixed",
+            "--topk-discovery-scaling-galaxies",
+            "1",
+        ],
+    )
+    args = _parse_args()
+
+    state = cluster_solver._build_state_from_inputs(args)
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT,
+        active_scaling_galaxies=[3],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        topk_discovery_scaling_galaxies=1,
+    )
+
+    assert len(state.scaling_component_records) == 3
+    assert not any(bool(record.get("selected_independent", False)) for record in state.scaling_component_records)
+    assert not any(spec.component_family == "independent_scaling" for spec in state.parameter_specs)
+    assert evaluator.independent_scaling_component_indices.size == 0
+    assert evaluator.free_correction_scaling_component_indices.size == 0
+    np.testing.assert_array_equal(evaluator.cached_scaling_component_indices, evaluator.scaling_component_indices)
+    np.testing.assert_array_equal(evaluator.inactive_scaling_component_indices, evaluator.scaling_component_indices)
+
+
+def test_topk_discovery_final_rebuild_makes_only_topk_exact_and_free(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    par_path = _write_active_scaling_potfile_fixture(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            str(par_path),
+            "--fit-mode",
+            "joint",
+            "--fit-method",
+            "svi+nuts",
+            "--sampling-engine",
+            "topk_discovery_flat",
+            "--active-scaling-galaxies",
+            "3",
+            "--active-scaling-selection",
+            "fixed",
+            "--topk-discovery-scaling-galaxies",
+            "1",
+        ],
+    )
+    args = _parse_args()
+    old_state = cluster_solver._build_state_from_inputs(args)
+    final_args = argparse.Namespace(**vars(args))
+    final_args.sampling_engine = cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT
+    old_theta = cluster_solver._default_theta(old_state.parameter_specs)
+
+    state, evaluator, _sample_model, _theta, diagnostics = cluster_solver._rebuild_topk_discovery_state_from_union(
+        final_args,
+        old_state,
+        old_theta,
+        [{1}],
+        reason="topk_discovery_final",
+    )
+
+    requested_components = cluster_solver._selected_by_potfile_component_set(state, [{1}])
+    expected_active = np.asarray(sorted(requested_components), dtype=np.int32)
+    np.testing.assert_array_equal(evaluator.independent_scaling_component_indices, expected_active)
+    np.testing.assert_array_equal(evaluator.free_correction_scaling_component_indices, expected_active)
+    np.testing.assert_array_equal(evaluator.active_scaling_component_indices, expected_active)
+    np.testing.assert_array_equal(evaluator.exact_scaling_component_indices, expected_active)
+    np.testing.assert_array_equal(
+        evaluator.cached_scaling_component_indices,
+        np.asarray(
+            sorted(set(evaluator.scaling_component_indices.tolist()) - set(expected_active.tolist())),
+            dtype=np.int32,
+        ),
+    )
+    assert diagnostics["strict_active"] is True
+    assert diagnostics["active_equals_independent"] is True
+    assert len(evaluator.active_scaling_component_indices) == 1
+    assert len(evaluator.cached_scaling_component_indices) == 2
+
+
+def test_refreshing_surrogate_flat_still_uses_active_scaling_galaxies_normally(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    par_path = _write_active_scaling_potfile_fixture(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            str(par_path),
+            "--fit-mode",
+            "joint",
+            "--fit-method",
+            "svi+nuts",
+            "--sampling-engine",
+            "refreshing_surrogate_flat",
+            "--active-scaling-galaxies",
+            "2",
+            "--active-scaling-selection",
+            "fixed",
+        ],
+    )
+    args = _parse_args()
+    state = cluster_solver._build_state_from_inputs(args)
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+        active_scaling_galaxies=[2],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+
+    assert evaluator.independent_scaling_component_indices.size == 2
+    assert evaluator.active_scaling_component_indices.size == 2
+    assert evaluator.cached_scaling_component_indices.size == 1
+
+
+def test_population_active_inference_ignores_active_scaling_galaxies_for_free_corrections(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    par_path = _write_active_scaling_potfile_fixture(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            str(par_path),
+            "--fit-mode",
+            "joint",
+            "--fit-method",
+            "svi+nuts",
+            "--infer-active-scaling",
+            "--active-scaling-inference-likelihood",
+            "population",
+            "--active-scaling-galaxies",
+            "1",
+        ],
+    )
+    args = _parse_args()
+
+    state = cluster_solver._build_state_from_inputs(args)
+
+    assert len(state.scaling_component_records) == 3
+    assert not any(bool(record.get("selected_independent", False)) for record in state.scaling_component_records)
+    assert not any(spec.component_family == "independent_scaling" for spec in state.parameter_specs)
+    active_gate_specs = [
+        spec for spec in state.parameter_specs
+        if spec.component_family == cluster_solver.ACTIVE_SCALING_GATE_COMPONENT_FAMILY
+    ]
+    assert len(active_gate_specs) == 5
+    intercept_specs = [spec for spec in active_gate_specs if spec.field == "active_gate_intercept"]
+    assert len(intercept_specs) == 1
+    assert float(intercept_specs[0].mean) == pytest.approx(0.0)
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        active_scaling_galaxies=args.active_scaling_galaxies,
+        active_scaling_selection=args.active_scaling_selection,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    assert evaluator.active_scaling_inference_svi is True
+    assert evaluator.scaling_component_indices.size == 3
+    assert evaluator.active_scaling_component_indices.tolist() == evaluator.scaling_component_indices.tolist()
+    assert evaluator.free_correction_scaling_component_indices.tolist() == []
+
+
+def test_blend_active_inference_keeps_active_scaling_galaxies_for_free_corrections(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    par_path = _write_active_scaling_potfile_fixture(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            str(par_path),
+            "--fit-mode",
+            "joint",
+            "--fit-method",
+            "svi+nuts",
+            "--infer-active-scaling",
+            "--active-scaling-inference-likelihood",
+            "blend",
+            "--active-scaling-galaxies",
+            "1",
+            "--active-scaling-selection",
+            "fixed",
+        ],
+    )
+    args = _parse_args()
+
+    state = cluster_solver._build_state_from_inputs(args)
+
+    assert sum(bool(record.get("selected_independent", False)) for record in state.scaling_component_records) == 1
+    assert any(spec.component_family == "independent_scaling" for spec in state.parameter_specs)
+
+
+def _minimal_active_gate_state() -> BuildState:
+    state = _minimal_stage4_surrogate_state()
+    potfiles = [
+        {
+            "id": "members",
+            "type": cluster_solver.DP_IE_PROFILE,
+            "mag0": 20.0,
+            "catalog_df": pd.DataFrame(
+                {
+                    "id": ["galaxy-a"],
+                    "ra": [0.0],
+                    "dec": [0.0],
+                    "catalog_mag": [19.0],
+                }
+            ),
+        }
+    ]
+    records = [
+        {
+            "potfile_id": "members",
+            "potfile_order": 0,
+            "catalog_row_index": 0,
+            "component_index": 1,
+            "catalog_id": "galaxy-a",
+            "catalog_mag": 19.0,
+            "independent_magnitude_feature": 0.5,
+            "x_centre": 1.0,
+            "y_centre": 1.0,
+            "rank": 1,
+            "importance": 2.0,
+            "min_distance_arcsec": 0.75,
+            "selected_independent": False,
+            "free_component_index": -1,
+        }
+    ]
+    active_specs, active_indices = cluster_solver._build_active_scaling_parameter_specs(
+        potfiles,
+        records,
+        start_index=len(state.parameter_specs),
+        prior_prob=0.5,
+        logit_prior_sigma=1.5,
+        mag_slope_prior_sigma=1.0,
+        local_logit_prior_sigma=0.75,
+        active_selected_counts={"members": 1},
+        freeze_threshold=0.5,
+    )
+    packed, updated_records = cluster_solver._packed_lens_spec_with_active_scaling_gates(
+        state.packed_lens_spec,
+        records,
+        active_indices,
+    )
+    return replace(
+        state,
+        parameter_specs=[*state.parameter_specs, *active_specs],
+        packed_lens_spec=packed,
+        potfiles=potfiles,
+        scaling_component_records=updated_records,
+        infer_active_scaling=True,
+    )
+
+
+def test_active_scaling_gate_specs_append_after_ordinary_specs() -> None:
+    state = _minimal_stage4_surrogate_state()
+    records = [
+        {
+            "potfile_id": "members",
+            "potfile_order": 0,
+            "catalog_row_index": 0,
+            "component_index": 1,
+            "catalog_id": "galaxy-a",
+            "independent_magnitude_feature": 0.5,
+        }
+    ]
+    potfiles = [
+        {
+            "id": "members",
+            "type": cluster_solver.DP_IE_PROFILE,
+            "catalog_df": pd.DataFrame({"id": ["galaxy-a"]}),
+        }
+    ]
+
+    specs, indices = cluster_solver._build_active_scaling_parameter_specs(
+        potfiles,
+        records,
+        start_index=len(state.parameter_specs),
+        prior_prob=0.25,
+        logit_prior_sigma=1.5,
+        mag_slope_prior_sigma=1.0,
+        local_logit_prior_sigma=0.75,
+    )
+
+    assert [spec.component_family for spec in specs] == [cluster_solver.ACTIVE_SCALING_GATE_COMPONENT_FAMILY] * 3
+    assert specs[0].field == "active_gate_mag_slope"
+    assert specs[2].field == "active_gate_logit_offset"
+    assert specs[2].sample_site_name == "members_active_gate_logit_offset"
+    assert specs[2].sample_site_index == 0
+    assert indices[1]["active_gate_mag_slope"] == len(state.parameter_specs)
+    assert indices[1]["active_gate_intercept"] == len(state.parameter_specs) + 1
+    assert indices[1]["active_gate_logit_offset"] == len(state.parameter_specs) + 2
+
+
+def test_active_scaling_probability_responds_to_gate_parameters() -> None:
+    state = _minimal_active_gate_state()
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    theta = cluster_solver._default_theta(state.parameter_specs)
+    theta[1] = 2.0
+    theta[2] = 0.0
+    theta[3] = -1.0
+    physical = evaluator._physical_parameter_vector(jnp.asarray(theta, dtype=jnp.float64))
+
+    p_active = np.asarray(evaluator._active_scaling_probability_from_physical(physical), dtype=float)
+    assert p_active[0] == pytest.approx(1.0)
+    assert p_active[1] == pytest.approx(0.5, abs=1.0e-6)
+
+    theta[3] = 1.0
+    physical = evaluator._physical_parameter_vector(jnp.asarray(theta, dtype=jnp.float64))
+    p_active = np.asarray(evaluator._active_scaling_probability_from_physical(physical), dtype=float)
+    assert p_active[1] == pytest.approx(1.0 / (1.0 + np.exp(-2.0)), abs=1.0e-6)
+
+
+def test_active_population_mixture_terms_are_stable_and_directional() -> None:
+    q = jnp.asarray([0.25, 0.25, 0.25, 1.0e-15, 1.0 - 1.0e-15], dtype=jnp.float64)
+    delta = jnp.asarray([0.0, -30.0, 30.0, 0.0, 0.0], dtype=jnp.float64)
+
+    terms, responsibility = cluster_solver._active_population_mixture_terms(q, delta)
+
+    assert np.all(np.isfinite(np.asarray(terms)))
+    assert np.all(np.isfinite(np.asarray(responsibility)))
+    assert float(responsibility[0]) == pytest.approx(0.25, abs=1.0e-8)
+    assert float(responsibility[1]) > 0.999999
+    assert float(responsibility[2]) < 1.0e-10
+    assert 0.0 <= float(responsibility[3]) <= 1.0
+    assert 0.0 <= float(responsibility[4]) <= 1.0
+
+
+def test_linearized_source_population_delta_centers_family_translation() -> None:
+    delta = cluster_solver._linearized_source_plane_population_delta(
+        beta_x=jnp.asarray([0.0, 2.0], dtype=jnp.float64),
+        beta_y=jnp.asarray([0.0, 0.0], dtype=jnp.float64),
+        delta_beta_x=jnp.asarray([[1.0, 1.0]], dtype=jnp.float64),
+        delta_beta_y=jnp.asarray([[0.5, 0.5]], dtype=jnp.float64),
+        family_idx=jnp.asarray([0, 0], dtype=jnp.int32),
+        n_families=1,
+        sigma_per_image=jnp.ones(2, dtype=jnp.float64),
+        reliability_per_image=jnp.asarray([0.999999, 0.999999], dtype=jnp.float64),
+        image_has_constraint=jnp.asarray([True, True]),
+        source_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        scatter_var_x=jnp.zeros(2, dtype=jnp.float64),
+        scatter_var_y=jnp.zeros(2, dtype=jnp.float64),
+        inv_abs_mu=jnp.ones(2, dtype=jnp.float64),
+        covariance_floor=1.0e-9,
+    )
+
+    assert float(delta[0]) == pytest.approx(0.0, abs=1.0e-10)
+
+
+def test_linearized_source_population_delta_is_directional_and_matches_small_shift() -> None:
+    beta_x = jnp.asarray([0.0, 2.0], dtype=jnp.float64)
+    beta_y = jnp.asarray([0.0, 0.0], dtype=jnp.float64)
+    family_idx = jnp.asarray([0, 0], dtype=jnp.int32)
+    reliability = jnp.asarray([0.999999, 0.999999], dtype=jnp.float64)
+    constraints = jnp.asarray([True, True])
+    sigma = jnp.ones(2, dtype=jnp.float64)
+    zeros = jnp.zeros(2, dtype=jnp.float64)
+    toward = jnp.asarray([[0.0, -0.1]], dtype=jnp.float64)
+    away = jnp.asarray([[0.0, 0.1]], dtype=jnp.float64)
+
+    toward_delta = cluster_solver._linearized_source_plane_population_delta(
+        beta_x,
+        beta_y,
+        toward,
+        jnp.zeros_like(toward),
+        family_idx,
+        1,
+        sigma,
+        reliability,
+        constraints,
+        jnp.asarray(0.0, dtype=jnp.float64),
+        zeros,
+        zeros,
+        jnp.ones(2, dtype=jnp.float64),
+        1.0e-9,
+    )
+    away_delta = cluster_solver._linearized_source_plane_population_delta(
+        beta_x,
+        beta_y,
+        away,
+        jnp.zeros_like(away),
+        family_idx,
+        1,
+        sigma,
+        reliability,
+        constraints,
+        jnp.asarray(0.0, dtype=jnp.float64),
+        zeros,
+        zeros,
+        jnp.ones(2, dtype=jnp.float64),
+        1.0e-9,
+    )
+
+    assert float(toward_delta[0]) > 0.0
+    assert float(away_delta[0]) < 0.0
+
+    small_shift = jnp.asarray([[0.0, -1.0e-3]], dtype=jnp.float64)
+    linearized = cluster_solver._linearized_source_plane_population_delta(
+        beta_x,
+        beta_y,
+        small_shift,
+        jnp.zeros_like(small_shift),
+        family_idx,
+        1,
+        sigma,
+        reliability,
+        constraints,
+        jnp.asarray(0.0, dtype=jnp.float64),
+        zeros,
+        zeros,
+        jnp.ones(2, dtype=jnp.float64),
+        1.0e-9,
+    )
+    base = _source_plane_bin_loglike(
+        beta_x=beta_x,
+        beta_y=beta_y,
+        family_idx=family_idx,
+        n_families=1,
+        sigma_per_image=sigma,
+        reliability_per_image=reliability,
+        image_has_constraint=constraints,
+        source_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        scatter_var_x=zeros,
+        scatter_var_y=zeros,
+        inv_abs_mu=jnp.ones(2, dtype=jnp.float64),
+        covariance_floor=1.0e-9,
+        outlier_sigma_arcsec=100.0,
+    )
+    shifted = _source_plane_bin_loglike(
+        beta_x=beta_x + small_shift[0],
+        beta_y=beta_y,
+        family_idx=family_idx,
+        n_families=1,
+        sigma_per_image=sigma,
+        reliability_per_image=reliability,
+        image_has_constraint=constraints,
+        source_sigma_int=jnp.asarray(0.0, dtype=jnp.float64),
+        scatter_var_x=zeros,
+        scatter_var_y=zeros,
+        inv_abs_mu=jnp.ones(2, dtype=jnp.float64),
+        covariance_floor=1.0e-9,
+        outlier_sigma_arcsec=100.0,
+    )
+
+    assert float(linearized[0]) == pytest.approx(float(shifted - base), rel=1.0e-4, abs=1.0e-8)
+
+
+def test_linearized_local_jacobian_source_only_delta_matches_source_for_identity_jacobian() -> None:
+    beta_x = jnp.asarray([0.0, 2.0], dtype=jnp.float64)
+    beta_y = jnp.asarray([0.0, 0.0], dtype=jnp.float64)
+    delta_x = jnp.asarray([[0.0, -0.25]], dtype=jnp.float64)
+    delta_y = jnp.asarray([[0.0, 0.0]], dtype=jnp.float64)
+    family_idx = jnp.asarray([0, 0], dtype=jnp.int32)
+    reliability = jnp.asarray([0.999999, 0.999999], dtype=jnp.float64)
+    constraints = jnp.asarray([True, True])
+    sigma = jnp.ones(2, dtype=jnp.float64)
+    zeros = jnp.zeros(2, dtype=jnp.float64)
+
+    source_delta = cluster_solver._linearized_source_plane_population_delta(
+        beta_x,
+        beta_y,
+        delta_x,
+        delta_y,
+        family_idx,
+        1,
+        sigma,
+        reliability,
+        constraints,
+        jnp.asarray(0.0, dtype=jnp.float64),
+        zeros,
+        zeros,
+        jnp.ones(2, dtype=jnp.float64),
+        1.0e-9,
+    )
+    local_delta = cluster_solver._linearized_local_jacobian_population_delta_source_only(
+        beta_x,
+        beta_y,
+        delta_x,
+        delta_y,
+        family_idx,
+        1,
+        sigma,
+        reliability,
+        constraints,
+        jnp.asarray(0.0, dtype=jnp.float64),
+        zeros,
+        zeros,
+        jnp.ones(2, dtype=jnp.float64),
+        jnp.zeros(2, dtype=jnp.float64),
+        jnp.zeros(2, dtype=jnp.float64),
+        jnp.ones(2, dtype=jnp.float64),
+        1.0e-9,
+    )
+
+    np.testing.assert_allclose(np.asarray(local_delta), np.asarray(source_delta), rtol=1.0e-8, atol=1.0e-8)
+
+
+def test_active_population_diagnostics_match_gate_when_reference_is_exact() -> None:
+    state = _minimal_active_gate_state()
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    reference = cluster_solver._default_theta(state.parameter_specs)
+    reference[1] = 0.0
+    reference[2] = 0.0
+    reference[3] = 0.0
+    evaluator.refresh_active_inference_cache(reference, reason="test")
+    evaluator.refresh_source_metric_cache(reference, reason="test")
+
+    diagnostics = evaluator.active_population_diagnostics_for_samples(np.asarray([reference]), best_fit=reference)
+
+    assert diagnostics is not None
+    np.testing.assert_allclose(diagnostics["delta_samples"], np.zeros((1, 1)), atol=1.0e-6)
+    np.testing.assert_allclose(diagnostics["gate_samples"], np.full((1, 1), 0.5), atol=1.0e-6)
+    np.testing.assert_allclose(diagnostics["membership_samples"], np.full((1, 1), 0.5), atol=1.0e-6)
+
+
+def test_active_population_gate_probabilities_do_not_force_free_correction_indices() -> None:
+    state = _minimal_active_gate_state()
+    records = [dict(record) for record in state.scaling_component_records]
+    records[0]["selected_independent"] = True
+    state = replace(state, scaling_component_records=records)
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    theta = cluster_solver._default_theta(state.parameter_specs)
+    theta[1] = 0.0
+    theta[2] = 0.0
+    theta[3] = 0.0
+    physical = evaluator._physical_parameter_vector(jnp.asarray(theta, dtype=jnp.float64))
+
+    q_active = np.asarray(
+        evaluator._flat_active_population_gate_probabilities(
+            physical,
+            jnp.asarray([1], dtype=jnp.int32),
+        ),
+        dtype=float,
+    )
+
+    assert evaluator.free_correction_scaling_component_indices.tolist() == [1]
+    np.testing.assert_allclose(q_active, np.asarray([0.5]), atol=1.0e-6)
+
+
+def test_flat_active_inference_blend_matches_exact_and_reference_endpoints() -> None:
+    state = _minimal_active_gate_state()
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    reference = cluster_solver._default_theta(state.parameter_specs)
+    reference[1] = 0.0
+    reference[2] = 0.0
+    reference[3] = 0.0
+    evaluator.refresh_active_inference_cache(reference, reason="test")
+    assert evaluator.flat_active_inference_cache is not None
+    flat_data = evaluator.flat_critical_arc_data
+
+    current = reference.copy()
+    current[0] = 2.0
+    physical_current = evaluator._physical_parameter_vector(jnp.asarray(current, dtype=jnp.float64))
+    packed_current, validity_current = evaluator._build_flat_packed_lens_state_with_validity_from_physical(
+        physical_current,
+        flat_data,
+        stop_gradient=False,
+    )
+    assert bool(np.asarray(validity_current["is_valid"], dtype=bool))
+    exact_current = evaluator._flat_ray_shooting_for_components(
+        flat_data.x_obs,
+        flat_data.y_obs,
+        packed_current,
+    )
+    physical_reference = evaluator._physical_parameter_vector(jnp.asarray(reference, dtype=jnp.float64))
+    packed_reference, validity_reference = evaluator._build_flat_packed_lens_state_with_validity_from_physical(
+        physical_reference,
+        flat_data,
+        stop_gradient=False,
+    )
+    assert bool(np.asarray(validity_reference["is_valid"], dtype=bool))
+    exact_reference = evaluator._flat_ray_shooting_for_components(
+        flat_data.x_obs,
+        flat_data.y_obs,
+        packed_reference,
+    )
+
+    current[1] = 40.0
+    physical_active = evaluator._physical_parameter_vector(jnp.asarray(current, dtype=jnp.float64))
+    beta_active = evaluator._flat_active_inference_beta(
+        jnp.asarray(current, dtype=jnp.float64),
+        physical_active,
+        flat_data,
+    )[:2]
+    np.testing.assert_allclose(np.asarray(beta_active[0]), np.asarray(exact_current[0]), rtol=0.0, atol=1.0e-6)
+    np.testing.assert_allclose(np.asarray(beta_active[1]), np.asarray(exact_current[1]), rtol=0.0, atol=1.0e-6)
+
+    current[1] = -40.0
+    physical_inactive = evaluator._physical_parameter_vector(jnp.asarray(current, dtype=jnp.float64))
+    beta_inactive = evaluator._flat_active_inference_beta(
+        jnp.asarray(current, dtype=jnp.float64),
+        physical_inactive,
+        flat_data,
+    )[:2]
+    np.testing.assert_allclose(np.asarray(beta_inactive[0]), np.asarray(exact_reference[0]), rtol=0.0, atol=1.0e-6)
+    np.testing.assert_allclose(np.asarray(beta_inactive[1]), np.asarray(exact_reference[1]), rtol=0.0, atol=1.0e-6)
+
+
+def test_active_scaling_freeze_handoff_drops_gate_suffix() -> None:
+    state = _minimal_active_gate_state()
+    frozen_state, ordinary_count = cluster_solver._state_without_active_scaling_gate_parameters(
+        state,
+        frozen_active_component_indices=np.asarray([1], dtype=np.int32),
+    )
+    posterior = PosteriorResults(
+        samples=np.ones((3, len(state.parameter_specs)), dtype=float),
+        log_prob=np.zeros(3, dtype=float),
+        accept_prob=np.empty((0,), dtype=float),
+        diverging=np.empty((0,), dtype=bool),
+        num_steps=np.empty((0,), dtype=float),
+        warmup_steps=0,
+        sample_steps=3,
+        num_chains=0,
+    )
+    trimmed = cluster_solver._trim_posterior_results_to_parameter_count(posterior, ordinary_count)
+
+    assert ordinary_count == 1
+    assert len(frozen_state.parameter_specs) == 1
+    assert not any(spec.component_family == cluster_solver.ACTIVE_SCALING_GATE_COMPONENT_FAMILY for spec in frozen_state.parameter_specs)
+    assert frozen_state.infer_active_scaling is False
+    assert frozen_state.frozen_active_scaling_component_indices.tolist() == [1]
+    assert np.asarray(frozen_state.packed_lens_spec.active_gate_intercept_param_index).size == 0
+    assert trimmed.samples.shape == (3, 1)
+
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=frozen_state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    assert evaluator.active_scaling_component_indices.tolist() == [1]
+    assert evaluator.cached_scaling_component_indices.tolist() == []
+
+
+def test_active_scaling_diagnostics_and_summary_write_outputs(tmp_path: Path) -> None:
+    state = _minimal_active_gate_state()
+    samples = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    best_fit = samples[-1]
+    scaling_rank_df = pd.DataFrame(state.scaling_component_records)
+    scaling_rank_df["selected_active"] = False
+
+    table = _active_scaling_diagnostics_table(
+        state.parameter_specs,
+        samples,
+        best_fit,
+        scaling_rank_df,
+        state.packed_lens_spec,
+        freeze_threshold=0.5,
+    )
+    _plot_active_scaling_summary(tmp_path, table, parameter_specs=state.parameter_specs, freeze_threshold=0.5)
+
+    assert table.shape[0] == 1
+    assert table.loc[0, "p_active_median"] == pytest.approx(0.5, abs=1.0e-6)
+    assert bool(table.loc[0, "frozen_active"])
+    assert _plot_path(tmp_path, "active_scaling_summary.pdf").is_file()
+    assert not (tmp_path / "active_scaling_summary.png").exists()
+    assert table.loc[0, "active_gate_intercept_prior_kind"] == "normal"
+    assert table.loc[0, "active_gate_mag_slope_prior_kind"] == "truncated_normal"
+    assert float(table.loc[0, "active_gate_intercept_prior_mean"]) == pytest.approx(0.0)
+    assert float(table.loc[0, "active_gate_mag_slope_prior_lower"]) == pytest.approx(0.0)
+
+
+def test_active_scaling_population_diagnostics_freeze_from_membership() -> None:
+    state = _minimal_active_gate_state()
+    samples = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    scaling_rank_df = pd.DataFrame(state.scaling_component_records)
+    scaling_rank_df["selected_active"] = False
+    diagnostics = {
+        "component_indices": np.asarray([1], dtype=np.int32),
+        "gate_samples": np.asarray([[0.2], [0.2], [0.2]], dtype=float),
+        "membership_samples": np.asarray([[0.9], [0.9], [0.9]], dtype=float),
+        "delta_samples": np.asarray([[-4.0], [-4.0], [-4.0]], dtype=float),
+        "gate_map": np.asarray([0.2], dtype=float),
+        "membership_map": np.asarray([0.9], dtype=float),
+        "delta_map": np.asarray([-4.0], dtype=float),
+    }
+
+    table = _active_scaling_diagnostics_table(
+        state.parameter_specs,
+        samples,
+        samples[0],
+        scaling_rank_df,
+        state.packed_lens_spec,
+        freeze_threshold=0.5,
+        active_population_diagnostics=diagnostics,
+        active_inference_likelihood="population",
+    )
+
+    assert table.loc[0, "p_active_gate_median"] == pytest.approx(0.2)
+    assert table.loc[0, "p_active_membership_median"] == pytest.approx(0.9)
+    assert table.loc[0, "p_active_median"] == pytest.approx(0.9)
+    assert table.loc[0, "active_loglike_delta_median"] == pytest.approx(-4.0)
+    assert bool(table.loc[0, "frozen_active"])
+    assert table.loc[0, "active_inference_likelihood"] == "population"
+
+
+def _active_scaling_resume_diagnostics_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "potfile_id": ["members", "members"],
+            "potfile_order": [0, 0],
+            "catalog_id": ["galaxy-a", "galaxy-b"],
+            "catalog_row_index": [0, 1],
+            "rank": [1, 2],
+            "component_index": [1, 2],
+            "catalog_mag": [18.5, 21.0],
+            "active_magnitude_feature": [1.0, -1.0],
+            "importance": [10.0, 2.0],
+            "min_distance_arcsec": [0.5, 4.0],
+            "x_centre": [0.0, 1.0],
+            "y_centre": [0.0, -1.0],
+            "active_gate_intercept_parameter_index": [10, 10],
+            "active_gate_mag_slope_parameter_index": [11, 11],
+            "active_gate_logit_offset_parameter_index": [12, 13],
+            "active_gate_intercept_prior_kind": ["normal", "normal"],
+            "active_gate_intercept_prior_lower": [-np.inf, -np.inf],
+            "active_gate_intercept_prior_upper": [np.inf, np.inf],
+            "active_gate_intercept_prior_mean": [0.0, 0.0],
+            "active_gate_intercept_prior_std": [1.5, 1.5],
+            "active_gate_mag_slope_prior_kind": ["truncated_normal", "truncated_normal"],
+            "active_gate_mag_slope_prior_lower": [0.0, 0.0],
+            "active_gate_mag_slope_prior_upper": [np.inf, np.inf],
+            "active_gate_mag_slope_prior_mean": [0.0, 0.0],
+            "active_gate_mag_slope_prior_std": [1.0, 1.0],
+            "p_active_mean": [0.8, 0.2],
+            "p_active_median": [0.85, 0.15],
+            "p_active_p16": [0.70, 0.05],
+            "p_active_p84": [0.95, 0.35],
+            "p_active_map": [0.9, 0.1],
+            "frozen_active": [True, False],
+        }
+    )
+
+
+def test_active_scaling_prior_curve_reconstructs_from_resume_metadata() -> None:
+    diagnostics_df = _active_scaling_resume_diagnostics_df()
+
+    curve = _gate_prior_sigmoid_curve(
+        diagnostics_df,
+        diagnostics_df,
+        [],
+        intercept_column="active_gate_intercept_parameter_index",
+        slope_column="active_gate_mag_slope_parameter_index",
+        feature_column="active_magnitude_feature",
+    )
+
+    assert curve is not None
+    assert {"mag", "center", "p16", "p84"}.issubset(curve)
+    assert curve["mag"].shape == curve["center"].shape == curve["p16"].shape == curve["p84"].shape
+    assert np.all(np.isfinite(curve["center"]))
+    assert np.all((curve["center"] >= 0.0) & (curve["center"] <= 1.0))
+
+
+def test_resume_regenerates_active_scaling_summary_from_diagnostics(tmp_path: Path) -> None:
+    state = replace(_minimal_active_gate_state(), parameter_specs=[])
+    tables_dir = tmp_path / "tables"
+    tables_dir.mkdir()
+    _active_scaling_resume_diagnostics_df().to_csv(tables_dir / "active_scaling_diagnostics.csv", index=False)
+
+    regenerated = cluster_solver._regenerate_active_scaling_summary_from_diagnostics(
+        argparse.Namespace(quiet=True),
+        tmp_path,
+        state,
+        {"active_scaling_freeze_threshold": 0.4},
+        {},
+    )
+
+    assert regenerated is True
+    assert _plot_path(tmp_path, "active_scaling_summary.pdf").is_file()
+    assert not (tmp_path / "active_scaling_summary.png").exists()
+
+
+def test_resume_active_scaling_summary_skips_missing_or_empty_diagnostics(tmp_path: Path) -> None:
+    state = _minimal_active_gate_state()
+    args = argparse.Namespace(quiet=True)
+
+    assert (
+        cluster_solver._regenerate_active_scaling_summary_from_diagnostics(args, tmp_path, state, {}, {})
+        is False
+    )
+    tables_dir = tmp_path / "tables"
+    tables_dir.mkdir()
+    _active_scaling_resume_diagnostics_df().iloc[0:0].to_csv(
+        tables_dir / "active_scaling_diagnostics.csv",
+        index=False,
+    )
+
+    assert (
+        cluster_solver._regenerate_active_scaling_summary_from_diagnostics(args, tmp_path, state, {}, {})
+        is False
+    )
+    assert not _plot_path(tmp_path, "active_scaling_summary.pdf").exists()
+
+
+def test_load_frozen_active_scaling_from_previous_stage_maps_by_catalog_identity(tmp_path: Path) -> None:
+    state = _stage4_state_with_independent_and_inactive_scaling()
+    stage3_dir = tmp_path / "fit" / "stage3_image_plane"
+    tables_dir = stage3_dir / "tables"
+    tables_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "potfile_id": ["members", "members"],
+            "catalog_id": ["galaxy-a", "galaxy-b"],
+            "component_index": [101, 102],
+            "frozen_active": [False, True],
+        }
+    ).to_csv(tables_dir / "active_scaling_diagnostics.csv", index=False)
+
+    frozen_indices, diagnostics = cluster_solver._load_frozen_active_scaling_from_previous_stage(stage3_dir, state)
+
+    assert frozen_indices.tolist() == [3]
+    assert diagnostics["source"] == "diagnostics_csv"
+    assert diagnostics["frozen_active_count"] == 1
+    assert diagnostics["frozen_inactive_count"] == 1
+
+
+def test_previous_stage_frozen_active_scaling_missing_split_has_actionable_error(tmp_path: Path) -> None:
+    state = _stage4_state_with_independent_and_inactive_scaling()
+
+    with pytest.raises(ValueError, match="Stage 4 must reuse a frozen active-scaling split"):
+        cluster_solver._apply_previous_stage_frozen_active_scaling(
+            argparse.Namespace(quiet=True),
+            state,
+            tmp_path / "fit" / "stage3_image_plane",
+            require_frozen_active_scaling=True,
+        )
+
+
+def test_independent_scaling_candidates_are_active_and_not_inactive_surrogate() -> None:
+    state = _minimal_stage4_surrogate_state()
+    state = replace(
+        state,
+        potfiles=[{"id": "members", "mag0": 20.0}],
+        scaling_component_records=[
+            {
+                "potfile_id": "members",
+                "potfile_order": 0,
+                "component_index": 1,
+                "catalog_id": "galaxy-a",
+                "catalog_mag": 20.0,
+                "x_centre": 1.0,
+                "y_centre": 1.0,
+                "selected_independent": True,
+            }
+        ],
+    )
+
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state,
+        match_tolerance_arcsec=cluster_solver.DEFAULT_MATCH_TOLERANCE,
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+    )
+
+    assert evaluator.independent_scaling_component_indices.tolist() == [1]
+    assert evaluator.active_scaling_component_indices.tolist() == [1]
+    assert evaluator.inactive_scaling_component_indices.tolist() == []
+    assert evaluator.exact_scaling_component_indices.tolist() == [1]
+    assert evaluator.cached_scaling_component_indices.tolist() == []
+    assert evaluator.free_correction_scaling_component_indices.tolist() == [1]
+    assert evaluator.free_correction_free_component_indices.tolist() == []
+    assert evaluator.excluded_scaling_component_indices.tolist() == []
+    assert bool(evaluator.scaling_rank_df.loc[0, "selected_independent"])
+    assert bool(evaluator.scaling_rank_df.loc[0, "selected_active"])
+
+
+def test_independent_scaling_vector_sample_site_uses_full_uniform_vector() -> None:
+    specs = [
+        ParameterSpec(
+            name=f"members.galaxy{i}.independent_free_v_disp",
+            sample_name=f"members_galaxy{i}_independent_free_v_disp",
+            potential_id="members",
+            profile_type=cluster_solver.DP_IE_PROFILE,
+            field="independent_free_v_disp",
+            prior_kind="uniform",
+            lower=np.log(30.0),
+            upper=np.log(500.0),
+            step=0.1,
+            component_family="independent_scaling",
+            transform_kind="log_positive",
+            sample_site_name="members_independent_free_v_disp",
+            sample_site_index=i,
+        )
+        for i in range(3)
+    ]
+
+    sites = cluster_solver._parameter_sample_sites(specs)
+    distribution = cluster_solver._distribution_for_sample_site(sites[0], specs)
+
+    assert len(sites) == 1
+    assert sites[0].indices == (0, 1, 2)
+    assert tuple(distribution.event_shape) == (3,)
+    assert np.isfinite(float(distribution.log_prob(jnp.asarray([np.log(100.0), np.log(120.0), np.log(140.0)]))))
+
+
+def _single_independent_branch_evaluator() -> cluster_solver.ClusterJAXEvaluator:
+    int_missing = np.full(2, -1, dtype=np.int32)
+    float_zero = np.zeros(2, dtype=float)
+    packed = PackedLensSpec(
+        profile_type=np.asarray([cluster_solver.DP_IE_PROFILE, cluster_solver.DP_IE_PROFILE], dtype=np.int32),
+        component_family=np.asarray(
+            [cluster_solver.COMPONENT_FAMILY_SCALING, cluster_solver.COMPONENT_FAMILY_INDEPENDENT_FREE],
+            dtype=np.int32,
+        ),
+        x_center_base=float_zero.copy(),
+        y_center_base=float_zero.copy(),
+        e1_base=float_zero.copy(),
+        e2_base=float_zero.copy(),
+        core_radius_kpc_base=np.asarray([1.0, 2.0], dtype=float),
+        cut_radius_kpc_base=np.asarray([20.0, 50.0], dtype=float),
+        v_disp_base=np.asarray([100.0, 200.0], dtype=float),
+        gamma1_base=float_zero.copy(),
+        gamma2_base=float_zero.copy(),
+        x_center_param_index=int_missing.copy(),
+        y_center_param_index=int_missing.copy(),
+        e1_param_index=int_missing.copy(),
+        e2_param_index=int_missing.copy(),
+        core_radius_param_index=np.asarray([-1, 3], dtype=np.int32),
+        cut_radius_param_index=np.asarray([-1, 4], dtype=np.int32),
+        v_disp_param_index=np.asarray([-1, 2], dtype=np.int32),
+        gamma1_param_index=int_missing.copy(),
+        gamma2_param_index=int_missing.copy(),
+        luminosity_ratio=np.ones(2, dtype=float),
+        sigma_ref_base=np.asarray([100.0, 0.0], dtype=float),
+        cut_ref_base=np.asarray([20.0, 0.0], dtype=float),
+        core_ref_base=np.asarray([1.0, 0.0], dtype=float),
+        vdslope_base=np.asarray([4.0, 0.0], dtype=float),
+        slope_base=np.asarray([4.0, 0.0], dtype=float),
+        sigma_ref_param_index=int_missing.copy(),
+        cut_ref_param_index=int_missing.copy(),
+        core_ref_param_index=int_missing.copy(),
+        vdslope_param_index=int_missing.copy(),
+        slope_param_index=int_missing.copy(),
+        sigma_log_scatter_param_index=int_missing.copy(),
+        core_log_scatter_param_index=int_missing.copy(),
+        cut_log_scatter_param_index=int_missing.copy(),
+        independent_branch_role=np.asarray(
+            [cluster_solver.INDEPENDENT_BRANCH_SCALING, cluster_solver.INDEPENDENT_BRANCH_FREE],
+            dtype=np.int32,
+        ),
+        independent_magnitude_feature=np.asarray([0.0, 0.0], dtype=float),
+    )
+    evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    evaluator.state = SimpleNamespace(packed_lens_spec=packed)
+    evaluator.packed_spec_jax = cluster_solver.ClusterJAXEvaluator._prepare_packed_spec_arrays(evaluator)
+    return evaluator
+
+
+def test_packed_lens_state_independent_candidates_are_deterministically_free() -> None:
+    evaluator = _single_independent_branch_evaluator()
+
+    low_params = jnp.asarray([0.0, -60.0, 200.0, 2.0, 50.0, 1.0e-8], dtype=jnp.float64)
+    low_state, low_details = evaluator._build_packed_lens_state_details_from_physical(
+        low_params,
+        2.0,
+        kpc_per_arcsec=jnp.asarray(1.0),
+        dpie_sigma0_factor=jnp.asarray(1.0),
+    )
+    high_params = jnp.asarray([0.0, 60.0, 200.0, 2.0, 50.0, 1.0e-8], dtype=jnp.float64)
+    high_state, high_details = evaluator._build_packed_lens_state_details_from_physical(
+        high_params,
+        2.0,
+        kpc_per_arcsec=jnp.asarray(1.0),
+        dpie_sigma0_factor=jnp.asarray(1.0),
+    )
+    mid_params = jnp.asarray([0.0, 0.0, 200.0, 2.0, 50.0, 1.0e-8], dtype=jnp.float64)
+    mid_state, mid_details = evaluator._build_packed_lens_state_details_from_physical(
+        mid_params,
+        2.0,
+        kpc_per_arcsec=jnp.asarray(1.0),
+        dpie_sigma0_factor=jnp.asarray(1.0),
+    )
+
+    assert tuple(low_state["sigma0"].shape) == (2,)
+    assert tuple(high_state["sigma0"].shape) == (2,)
+    np.testing.assert_allclose(np.asarray(low_details["independent_branch_weight"]), [0.0, 1.0], atol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(high_details["independent_branch_weight"]), [0.0, 1.0], atol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(mid_details["independent_branch_weight"]), [0.0, 1.0], atol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(mid_state["sigma0"]), [0.0, 200.0**2 / 2.0], rtol=1.0e-10)
+
+
+def test_packed_lens_state_scales_core_radius_with_cut_radius_slope() -> None:
+    evaluator = _single_independent_branch_evaluator()
+    evaluator.state.packed_lens_spec.luminosity_ratio[0] = 4.0
+    evaluator.packed_spec_jax = cluster_solver.ClusterJAXEvaluator._prepare_packed_spec_arrays(evaluator)
+
+    physical_params = jnp.asarray([0.0, 0.0, 200.0, 2.0, 50.0, 1.0e-8], dtype=jnp.float64)
+    packed_state, details = evaluator._build_packed_lens_state_details_from_physical(
+        physical_params,
+        2.0,
+        kpc_per_arcsec=jnp.asarray(1.0),
+        dpie_sigma0_factor=jnp.asarray(1.0),
+    )
+
+    np.testing.assert_allclose(np.asarray(details["ra_raw"])[0], 2.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details["rs_raw"])[0], 40.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(packed_state["Ra"])[0], 2.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(packed_state["Rs"])[0], 40.0, rtol=1.0e-12)
+
+
+def test_packed_lens_state_bergamini_ml_mode_uses_derived_radius_exponent() -> None:
+    evaluator = _single_independent_branch_evaluator()
+    packed_spec = evaluator.state.packed_lens_spec
+    packed_spec.luminosity_ratio[0] = 4.0
+    packed_spec.alpha_sigma_base = np.full(2, 0.25, dtype=float)
+    packed_spec.gamma_ml_base = np.zeros(2, dtype=float)
+    packed_spec.alpha_sigma_param_index = np.asarray([0, -1], dtype=np.int32)
+    packed_spec.gamma_ml_param_index = np.asarray([1, -1], dtype=np.int32)
+    packed_spec.vdslope_param_index = np.full(2, -1, dtype=np.int32)
+    packed_spec.slope_param_index = np.full(2, -1, dtype=np.int32)
+    evaluator.packed_spec_jax = cluster_solver.ClusterJAXEvaluator._prepare_packed_spec_arrays(evaluator)
+
+    physical_params = jnp.asarray([0.25, 0.2, 200.0, 2.0, 50.0, 1.0e-8], dtype=jnp.float64)
+    packed_state, details = evaluator._build_packed_lens_state_details_from_physical(
+        physical_params,
+        2.0,
+        kpc_per_arcsec=jnp.asarray(1.0),
+        dpie_sigma0_factor=jnp.asarray(1.0),
+    )
+
+    expected_beta = 1.0 + 0.2 - 2.0 * 0.25
+    expected_size = float(4.0**expected_beta)
+    np.testing.assert_allclose(np.asarray(details["alpha_sigma"])[0], 0.25, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details["beta_radius"])[0], expected_beta, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details["gamma_ml"])[0], 0.2, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(packed_state["Ra"])[0], expected_size, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(packed_state["Rs"])[0], 20.0 * expected_size, rtol=1.0e-12)
+
+
+def test_independent_scaling_parameter_specs_log_displacement_replaces_direct_free_parameters() -> None:
+    potfiles = [
+        {
+            "id": "members",
+            "type": cluster_solver.DP_IE_PROFILE,
+            "catalog_df": pd.DataFrame({"id": ["g1", "g2"]}),
+        }
+    ]
+
+    specs, indices = cluster_solver._build_independent_scaling_parameter_specs(
+        potfiles,
+        [{0, 1}],
+        start_index=20,
+        log_vdisp_tau_prior_median=0.22,
+        log_core_tau_prior_median=0.33,
+        log_cut_tau_prior_median=0.44,
+        log_tau_prior_sigma=0.55,
+    )
+
+    fields = [spec.field for spec in specs]
+    assert "independent_free_v_disp" not in fields
+    assert "independent_free_core_radius_kpc" not in fields
+    assert "independent_free_cut_radius_kpc" not in fields
+    for field_name in (
+        "independent_free_log_v_disp_delta_unit",
+        "independent_free_log_core_radius_delta_unit",
+        "independent_free_log_cut_radius_delta_unit",
+    ):
+        field_specs = [spec for spec in specs if spec.field == field_name]
+        assert len(field_specs) == 2
+        assert {spec.sample_site_index for spec in field_specs} == {0, 1}
+        assert all(spec.prior_kind == "normal" for spec in field_specs)
+        assert all(spec.transform_kind == "identity" for spec in field_specs)
+    for field_name, median in (
+        ("independent_free_log_v_disp_tau", 0.22),
+        ("independent_free_log_core_radius_tau", 0.33),
+        ("independent_free_log_cut_radius_tau", 0.44),
+    ):
+        field_specs = [spec for spec in specs if spec.field == field_name]
+        assert len(field_specs) == 1
+        assert field_specs[0].transform_kind == "log_positive"
+        assert field_specs[0].physical_mean == pytest.approx(median)
+        assert field_specs[0].std == pytest.approx(0.55)
+    assert not any("offset" in field for field in fields)
+    assert not any("scatter" in field for field in fields)
+    assert not any("residual" in field for field in fields)
+    assert indices[0][0]["independent_free_log_v_disp_delta_unit"] >= 0
+    assert indices[0][1]["independent_free_log_v_disp_delta_unit"] >= 0
+    assert indices[0][0]["independent_free_log_v_disp_tau"] == indices[0][1][
+        "independent_free_log_v_disp_tau"
+    ]
+
+
+def _independent_scaling_plot_fixture() -> tuple[pd.DataFrame, pd.DataFrame]:
+    scaling_rank_df = pd.DataFrame(
+        {
+            "potfile_id": ["members", "members", "members"],
+            "catalog_id": ["galaxy-a", "galaxy-b", "galaxy-c"],
+            "rank": [1, 2, 3],
+            "component_index": [1, 2, 3],
+            "free_component_index": [4, -1, -1],
+            "catalog_mag": [19.0, 20.0, 21.0],
+            "independent_magnitude_feature": [-1.0, 0.0, 1.0],
+            "x_centre": [0.0, 1.0, 2.0],
+            "y_centre": [0.5, -0.5, 1.5],
+            "selected_active": [True, True, False],
+            "selected_independent": [True, False, False],
+            "requested_active_count": [2, 2, 2],
+            "importance": [0.7, 0.2, 0.1],
+            "min_distance_arcsec": [0.3, 0.8, 1.5],
+        }
+    )
+    independent_df = pd.DataFrame(
+        {
+            "potfile_id": ["members"],
+            "component_index": [1],
+            "scaling_v_disp_median": [100.0],
+            "scaling_core_radius_kpc_median": [0.15],
+            "scaling_cut_radius_kpc_median": [300.0],
+            "free_v_disp_median": [120.0],
+            "free_core_radius_kpc_median": [0.1425],
+            "free_cut_radius_kpc_median": [255.0],
+            "v_disp_ratio_median": [1.20],
+            "v_disp_ratio_p16": [1.10],
+            "v_disp_ratio_p84": [1.30],
+            "core_radius_ratio_median": [0.95],
+            "core_radius_ratio_p16": [0.90],
+            "core_radius_ratio_p84": [1.00],
+            "cut_radius_ratio_median": [0.85],
+            "cut_radius_ratio_p16": [0.80],
+            "cut_radius_ratio_p84": [0.90],
+        }
+    )
+    return scaling_rank_df, independent_df
+
+
+def _independent_scaling_gate_specs() -> list[ParameterSpec]:
+    return [
+        ParameterSpec(
+            name="members.galaxy-a.independent_free_log_v_disp_delta_unit",
+            sample_name="members_galaxy_a_independent_free_log_v_disp_delta_unit",
+            potential_id="members",
+            profile_type=cluster_solver.DP_IE_PROFILE,
+            field="independent_free_log_v_disp_delta_unit",
+            prior_kind="normal",
+            lower=float("-inf"),
+            upper=float("inf"),
+            step=0.1,
+            component_family="independent_scaling",
+        ),
+        ParameterSpec(
+            name="members.galaxy-a.independent_free_log_cut_radius_delta_unit",
+            sample_name="members_galaxy_a_independent_free_log_cut_radius_delta_unit",
+            potential_id="members",
+            profile_type=cluster_solver.DP_IE_PROFILE,
+            field="independent_free_log_cut_radius_delta_unit",
+            prior_kind="normal",
+            lower=float("-inf"),
+            upper=float("inf"),
+            step=0.1,
+            component_family="independent_scaling",
+        ),
+    ]
+
+
+def test_independent_scaling_plot_table_preserves_all_modeled_galaxies() -> None:
+    scaling_rank_df, independent_df = _independent_scaling_plot_fixture()
+
+    plot_df = _independent_scaling_plot_table(scaling_rank_df, independent_df)
+
+    assert plot_df["catalog_id"].tolist() == ["galaxy-a", "galaxy-b", "galaxy-c"]
+    independent_row = plot_df[plot_df["catalog_id"] == "galaxy-a"].iloc[0]
+    assert independent_row["independent_plot_class"] == "independent_candidate"
+    assert bool(independent_row["selected_active"])
+    assert bool(independent_row["selected_independent"])
+    assert int(independent_row["component_index"]) == 1
+    assert int(independent_row["rank"]) == 1
+    assert int(independent_row["free_component_index"]) == 4
+    assert float(independent_row["v_disp_ratio_median"]) == pytest.approx(1.20)
+    assert float(independent_row["core_radius_ratio_median"]) == pytest.approx(0.95)
+    assert float(independent_row["cut_radius_ratio_median"]) == pytest.approx(0.85)
+    active_row = plot_df[plot_df["catalog_id"] == "galaxy-b"].iloc[0]
+    inactive_row = plot_df[plot_df["catalog_id"] == "galaxy-c"].iloc[0]
+    assert active_row["independent_plot_class"] == "active_not_independent"
+    assert inactive_row["independent_plot_class"] == "not_sampled"
+    assert np.isnan(float(active_row["v_disp_ratio_median"]))
+    assert np.isnan(float(inactive_row["v_disp_ratio_median"]))
+
+
+def test_independent_scaling_plot_helpers_write_candidate_outputs(tmp_path: Path) -> None:
+    scaling_rank_df, independent_df = _independent_scaling_plot_fixture()
+    plot_df = _independent_scaling_plot_table(scaling_rank_df, independent_df)
+    samples = np.asarray(
+        [
+            [-0.20, 0.45],
+            [0.00, 0.60],
+            [0.25, 0.75],
+            [0.45, 0.90],
+        ],
+        dtype=float,
+    )
+
+    _plot_independent_scaling_galaxy_map(tmp_path, plot_df)
+    _plot_independent_scaling_rank_probability(tmp_path, plot_df)
+    _plot_independent_scaling_multiplier_summary(tmp_path, plot_df)
+    _plot_independent_scaling_summary(
+        tmp_path,
+        plot_df,
+        independent_df,
+        samples,
+        sample_weights=None,
+        parameter_specs=_independent_scaling_gate_specs(),
+    )
+
+    assert _plot_path(tmp_path, "independent_scaling_galaxy_map.png").is_file()
+    assert _plot_path(tmp_path, "independent_scaling_rank_probability.png").is_file()
+    assert _plot_path(tmp_path, "independent_scaling_multiplier_summary.png").is_file()
+    assert _plot_path(tmp_path, "independent_scaling_summary.pdf").is_file()
+    assert not (tmp_path / "independent_scaling_summary.png").exists()
+
+
+def test_observed_image_points_from_fit_quality_filters_nonfinite_rows() -> None:
+    image_df = pd.DataFrame(
+        {
+            "x_obs_arcsec": [1.0, np.nan, 3.0, 4.0],
+            "y_obs_arcsec": [2.0, 5.0, np.inf, -1.0],
+        }
+    )
+
+    points = _observed_image_points_from_fit_quality(image_df)
+
+    np.testing.assert_allclose(points, np.asarray([[1.0, 2.0], [4.0, -1.0]], dtype=float))
+
+
+def test_independent_scaling_summary_accepts_observed_image_crosses(tmp_path: Path) -> None:
+    scaling_rank_df, independent_df = _independent_scaling_plot_fixture()
+    plot_df = _independent_scaling_plot_table(scaling_rank_df, independent_df)
+    image_df = pd.DataFrame(
+        {
+            "x_obs_arcsec": [0.0, 1.5, np.nan],
+            "y_obs_arcsec": [0.25, -2.0, 3.0],
+        }
+    )
+
+    _plot_independent_scaling_summary(
+        tmp_path,
+        plot_df,
+        independent_df,
+        np.asarray([[-0.2, 0.4], [0.0, 0.6], [0.2, 0.8]], dtype=float),
+        parameter_specs=_independent_scaling_gate_specs(),
+        image_fit_quality_df=image_df,
+    )
+
+    assert _plot_path(tmp_path, "independent_scaling_summary.pdf").is_file()
+    assert not (tmp_path / "independent_scaling_summary.png").exists()
+
+
+def test_independent_scaling_summary_passes_observed_image_points_to_map(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scaling_rank_df, independent_df = _independent_scaling_plot_fixture()
+    plot_df = _independent_scaling_plot_table(scaling_rank_df, independent_df)
+    image_df = pd.DataFrame(
+        {
+            "x_obs_arcsec": [0.0, np.nan, 2.0],
+            "y_obs_arcsec": [1.0, 3.0, -1.0],
+        }
+    )
+    captured_points: list[np.ndarray] = []
+    original_draw = _plot_independent_scaling_summary.__globals__["_draw_independent_scaling_galaxy_map"]
+
+    def capture_draw(*args: Any, **kwargs: Any) -> Any:
+        captured_points.append(np.asarray(kwargs.get("observed_image_points"), dtype=float))
+        return original_draw(*args, **kwargs)
+
+    monkeypatch.setitem(
+        _plot_independent_scaling_summary.__globals__,
+        "_draw_independent_scaling_galaxy_map",
+        capture_draw,
+    )
+
+    _plot_independent_scaling_summary(
+        tmp_path,
+        plot_df,
+        independent_df,
+        np.asarray([[-0.2, 0.4], [0.0, 0.6], [0.2, 0.8]], dtype=float),
+        parameter_specs=_independent_scaling_gate_specs(),
+        image_fit_quality_df=image_df,
+    )
+
+    assert captured_points
+    np.testing.assert_allclose(captured_points[0], np.asarray([[0.0, 1.0], [2.0, -1.0]], dtype=float))
+
+
+def test_independent_scaling_summary_map_labels_catalog_ids_not_image_ids() -> None:
+    from matplotlib.colors import Normalize
+
+    class FakeAxis:
+        def __init__(self) -> None:
+            self.annotations: list[tuple[str, dict[str, Any]]] = []
+            self.scatters: list[dict[str, Any]] = []
+
+        def scatter(self, *args: Any, **kwargs: Any) -> object:
+            self.scatters.append(kwargs)
+            return object()
+
+        def annotate(self, text: object, *args: Any, **kwargs: Any) -> None:
+            self.annotations.append((str(text), kwargs))
+
+        def set_title(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def set_xlabel(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def set_ylabel(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def set_aspect(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def legend(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    inactive_rows = [
+        {
+            "catalog_id": f"inactive_{idx}",
+            "family_id": f"family_inactive_{idx}",
+            "image_label": f"image_inactive_{idx}",
+            "x_centre": float(idx),
+            "y_centre": -float(idx),
+            "rank": idx + 10,
+            "independent_plot_class": "not_sampled",
+        }
+        for idx in range(61)
+    ]
+    selected_rows = [
+        {
+            "catalog_id": "active_catalog",
+            "family_id": "active_family",
+            "image_label": "active_image",
+            "x_centre": 100.0,
+            "y_centre": 1.0,
+            "rank": 1,
+            "independent_plot_class": "active_not_independent",
+        },
+        {
+            "catalog_id": "independent_catalog",
+            "family_id": "independent_family",
+            "image_label": "independent_image",
+            "x_centre": 101.0,
+            "y_centre": 2.0,
+            "rank": 0,
+            "independent_plot_class": "independent_candidate",
+        },
+    ]
+    large_axis = FakeAxis()
+    _draw_independent_scaling_galaxy_map(
+        large_axis,
+        pd.DataFrame(inactive_rows + selected_rows),
+        potfile_id="members",
+        norm=Normalize(vmin=0.0, vmax=1.0),
+        cmap="viridis",
+        observed_image_points=np.asarray([[0.0, 1.0], [2.0, 3.0]], dtype=float),
+    )
+
+    large_labels = {text for text, _kwargs in large_axis.annotations}
+    assert {"active_catalog", "independent_catalog"}.issubset(large_labels)
+    assert "inactive_0" not in large_labels
+    assert not {"active_family", "independent_family", "active_image", "independent_image"} & large_labels
+    assert any(
+        scatter.get("label") == "observed images" and scatter.get("marker") == "x"
+        for scatter in large_axis.scatters
+    )
+
+    small_axis = FakeAxis()
+    _draw_independent_scaling_galaxy_map(
+        small_axis,
+        pd.DataFrame([inactive_rows[0], *selected_rows]),
+        potfile_id="members",
+        norm=Normalize(vmin=0.0, vmax=1.0),
+        cmap="viridis",
+        observed_image_points=np.asarray([[0.0, 1.0]], dtype=float),
+    )
+
+    small_labels = {text for text, _kwargs in small_axis.annotations}
+    assert {"inactive_0", "active_catalog", "independent_catalog"}.issubset(small_labels)
+
+
+def test_independent_scaling_plot_helpers_write_no_candidate_placeholders(tmp_path: Path) -> None:
+    scaling_rank_df, _independent_df = _independent_scaling_plot_fixture()
+    scaling_rank_df = scaling_rank_df.assign(selected_independent=False)
+    plot_df = _independent_scaling_plot_table(scaling_rank_df, pd.DataFrame())
+
+    _plot_independent_scaling_galaxy_map(tmp_path, plot_df)
+    _plot_independent_scaling_rank_probability(tmp_path, plot_df)
+    _plot_independent_scaling_multiplier_summary(tmp_path, plot_df)
+    _plot_independent_scaling_summary(tmp_path, plot_df, pd.DataFrame(), np.empty((0, 0), dtype=float))
+
+    assert _plot_path(tmp_path, "independent_scaling_galaxy_map.png").is_file()
+    assert _plot_path(tmp_path, "independent_scaling_rank_probability.png").is_file()
+    assert _plot_path(tmp_path, "independent_scaling_multiplier_summary.png").is_file()
+    assert _plot_path(tmp_path, "independent_scaling_summary.pdf").is_file()
+    assert not (tmp_path / "independent_scaling_summary.png").exists()
+
+
+def test_default_corner_excludes_independent_scaling_internals() -> None:
+    specs = [
+        ParameterSpec(
+            name="members.sigma_ref",
+            sample_name="members_sigma_ref",
+            potential_id="members",
+            profile_type=cluster_solver.DP_IE_PROFILE,
+            field="sigma_ref",
+            prior_kind="uniform",
+            lower=0.0,
+            upper=1.0,
+            step=0.1,
+            component_family="scaling",
+        ),
+        ParameterSpec(
+            name="members.galaxy-a.independent_free_log_v_disp_delta_unit",
+            sample_name="members_galaxy_a_independent_free_log_v_disp_delta_unit",
+            potential_id="members",
+            profile_type=cluster_solver.DP_IE_PROFILE,
+            field="independent_free_log_v_disp_delta_unit",
+            prior_kind="normal",
+            lower=-np.inf,
+            upper=np.inf,
+            step=0.1,
+            mean=0.0,
+            std=1.0,
+            component_family="independent_scaling",
+        ),
+        ParameterSpec(
+            name="source.1.beta_x",
+            sample_name="source_1_beta_x",
+            potential_id="1",
+            profile_type=0,
+            field="beta_x",
+            prior_kind="normal",
+            lower=-np.inf,
+            upper=np.inf,
+            step=0.1,
+            mean=0.0,
+            std=1.0,
+            component_family="source_position",
+        ),
+    ]
+
+    corner_samples, corner_specs = _corner_without_source_positions(np.ones((2, 3), dtype=float), specs)
+
+    assert corner_samples.shape == (2, 1)
+    assert [spec.component_family for spec in corner_specs] == ["scaling"]
+
+
+def test_independent_branch_weights_follow_deterministic_branch_roles() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    evaluator.packed_spec_jax = {
+        "luminosity_ratio": jnp.ones(3, dtype=jnp.float64),
+        "independent_branch_role": jnp.asarray(
+            [
+                cluster_solver.INDEPENDENT_BRANCH_NONE,
+                cluster_solver.INDEPENDENT_BRANCH_SCALING,
+                cluster_solver.INDEPENDENT_BRANCH_FREE,
+            ],
+            dtype=jnp.int32,
+        ),
+        "independent_magnitude_feature": jnp.asarray([0.0, 0.0, 1.0], dtype=jnp.float64),
+    }
+
+    weights = evaluator._independent_branch_weight_from_physical(
+        jnp.asarray([0.0, 2.0, 1.0e-8], dtype=jnp.float64)
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(weights),
+        [1.0, 0.0, 1.0],
+        rtol=1.0e-10,
+    )
+
+
 def _minimal_two_bin_local_jacobian_state() -> BuildState:
     state = _minimal_stage4_surrogate_state()
     family1 = state.family_data[0]
@@ -5093,6 +6804,39 @@ def _minimal_two_bin_local_jacobian_state() -> BuildState:
         effective_z_quadrature_weights=[[1.0], [1.0]],
         exact_z_quadrature_z=[[2.0], [3.0]],
         exact_z_quadrature_weights=[[1.0], [1.0]],
+    )
+    return state
+
+
+def _minimal_two_bin_local_jacobian_state_with_scaling_scatter() -> BuildState:
+    state = _minimal_two_bin_local_jacobian_state()
+    scatter_index = len(state.parameter_specs)
+    state.parameter_specs = [
+        *state.parameter_specs,
+        ParameterSpec(
+            name="potfile.sigma_log_scatter",
+            sample_name="potfile_sigma_log_scatter",
+            potential_id="potfile",
+            profile_type=cluster_solver.DP_IE_PROFILE,
+            field="sigma_log_scatter",
+            prior_kind="normal",
+            lower=float("-inf"),
+            upper=float("inf"),
+            step=0.1,
+            mean=float(np.log(cluster_solver.DEFAULT_SCALING_SCATTER_PRIOR_MEDIAN)),
+            std=cluster_solver.DEFAULT_SCALING_SCATTER_PRIOR_LOG_SIGMA,
+            component_family="scaling_scatter",
+            transform_kind="log_positive",
+            physical_lower=0.0,
+            physical_upper=None,
+            physical_mean=cluster_solver.DEFAULT_SCALING_SCATTER_PRIOR_MEDIAN,
+        ),
+    ]
+    sigma_scatter_indices = state.packed_lens_spec.sigma_log_scatter_param_index.copy()
+    sigma_scatter_indices[1] = scatter_index
+    state.packed_lens_spec = replace(
+        state.packed_lens_spec,
+        sigma_log_scatter_param_index=sigma_scatter_indices,
     )
     return state
 
@@ -5250,6 +6994,29 @@ def test_critical_arc_stage4_refreshing_surrogate_enables() -> None:
     assert evaluator.image_presence_penalty_weight == pytest.approx(0.0)
 
 
+def test_critical_arc_stage4_uses_frozen_active_scaling_without_inference_guard() -> None:
+    state = replace(
+        _stage4_state_with_independent_and_inactive_scaling(),
+        infer_active_scaling=False,
+        frozen_active_scaling_component_indices=np.asarray([1], dtype=np.int32),
+    )
+
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+        image_plane_newton_steps=0,
+    )
+
+    assert evaluator.using_frozen_active_scaling is True
+    assert evaluator.active_inference_enabled is False
+    assert evaluator.active_scaling_component_indices.tolist() == [1]
+    assert evaluator.inactive_scaling_component_indices.tolist() == [3]
+
+
 def test_refreshing_surrogate_legacy_does_not_build_flat_cache() -> None:
     state = _minimal_stage4_surrogate_state()
     evaluator = cluster_solver.ClusterJAXEvaluator(
@@ -5281,6 +7048,739 @@ def test_refreshing_surrogate_flat_builds_flat_cache() -> None:
     np.testing.assert_array_equal(
         np.asarray(evaluator.flat_surrogate_cache.inactive_alpha_x).shape,
         np.asarray(evaluator.flat_critical_arc_data.x_obs).shape,
+    )
+
+
+def _stage4_state_with_independent_and_inactive_scaling() -> BuildState:
+    state = _minimal_stage4_surrogate_state()
+    packed = state.packed_lens_spec
+    append_values = {
+        "profile_type": [cluster_solver.DP_IE_PROFILE, cluster_solver.DP_IE_PROFILE],
+        "component_family": [cluster_solver.COMPONENT_FAMILY_INDEPENDENT_FREE, cluster_solver.COMPONENT_FAMILY_SCALING],
+        "x_center_base": [1.0, -1.5],
+        "y_center_base": [1.0, 0.5],
+        "core_radius_kpc_base": [2.0, 1.0],
+        "cut_radius_kpc_base": [30.0, 15.0],
+        "v_disp_base": [150.0, 80.0],
+        "luminosity_ratio": [1.0, 0.75],
+        "sigma_ref_base": [0.0, 80.0],
+        "cut_ref_base": [0.0, 15.0],
+        "core_ref_base": [0.0, 1.0],
+        "vdslope_base": [0.0, 4.0],
+        "slope_base": [0.0, 4.0],
+        "sigma_ref_base": [120.0, 80.0],
+        "cut_ref_base": [20.0, 15.0],
+        "core_ref_base": [1.0, 1.0],
+        "vdslope_base": [1.0, 4.0],
+        "slope_base": [1.0, 4.0],
+    }
+    updates: dict[str, np.ndarray] = {}
+    for field_name in PackedLensSpec.__dataclass_fields__:
+        values = np.asarray(getattr(packed, field_name))
+        if values.size == 0:
+            continue
+        fill_value = append_values.get(field_name)
+        if fill_value is None:
+            fill_value = [-1, -1] if field_name.endswith("_param_index") else [0.0, 0.0]
+        updates[field_name] = np.concatenate([values, np.asarray(fill_value, dtype=values.dtype)])
+    updates.update(
+        {
+            "independent_branch_role": np.asarray(
+                [
+                    cluster_solver.INDEPENDENT_BRANCH_NONE,
+                    cluster_solver.INDEPENDENT_BRANCH_SCALING,
+                    cluster_solver.INDEPENDENT_BRANCH_FREE,
+                    cluster_solver.INDEPENDENT_BRANCH_NONE,
+                ],
+                dtype=np.int32,
+            ),
+            "independent_free_log_v_disp_delta_unit_param_index": np.asarray([-1, -1, 1, -1], dtype=np.int32),
+            "independent_free_log_core_radius_delta_unit_param_index": np.asarray([-1, -1, 2, -1], dtype=np.int32),
+            "independent_free_log_cut_radius_delta_unit_param_index": np.asarray([-1, -1, 3, -1], dtype=np.int32),
+            "independent_free_log_v_disp_tau_param_index": np.asarray([-1, -1, 4, -1], dtype=np.int32),
+            "independent_free_log_core_radius_tau_param_index": np.asarray([-1, -1, 5, -1], dtype=np.int32),
+            "independent_free_log_cut_radius_tau_param_index": np.asarray([-1, -1, 6, -1], dtype=np.int32),
+            "independent_magnitude_feature": np.asarray([0.0, 0.5, 0.5, 0.0], dtype=float),
+        }
+    )
+    independent_specs = [
+        ParameterSpec(
+            name="members.galaxy-a.independent_free_log_v_disp_delta_unit",
+            sample_name="members_galaxy_a_independent_free_log_v_disp_delta_unit",
+            potential_id="members",
+            profile_type=cluster_solver.DP_IE_PROFILE,
+            field="independent_free_log_v_disp_delta_unit",
+            prior_kind="normal",
+            lower=-np.inf,
+            upper=np.inf,
+            step=0.1,
+            mean=0.0,
+            std=1.0,
+            component_family="independent_scaling",
+        ),
+        ParameterSpec(
+            name="members.galaxy-a.independent_free_log_core_radius_delta_unit",
+            sample_name="members_galaxy_a_independent_free_log_core_radius_delta_unit",
+            potential_id="members",
+            profile_type=cluster_solver.DP_IE_PROFILE,
+            field="independent_free_log_core_radius_delta_unit",
+            prior_kind="normal",
+            lower=-np.inf,
+            upper=np.inf,
+            step=0.1,
+            mean=0.0,
+            std=1.0,
+            component_family="independent_scaling",
+        ),
+        ParameterSpec(
+            name="members.galaxy-a.independent_free_log_cut_radius_delta_unit",
+            sample_name="members_galaxy_a_independent_free_log_cut_radius_delta_unit",
+            potential_id="members",
+            profile_type=cluster_solver.DP_IE_PROFILE,
+            field="independent_free_log_cut_radius_delta_unit",
+            prior_kind="normal",
+            lower=-np.inf,
+            upper=np.inf,
+            step=0.1,
+            mean=0.0,
+            std=1.0,
+            component_family="independent_scaling",
+        ),
+        ParameterSpec(
+            name="members.independent_free_log_v_disp_tau",
+            sample_name="members_independent_free_log_v_disp_tau",
+            potential_id="members",
+            profile_type=cluster_solver.DP_IE_PROFILE,
+            field="independent_free_log_v_disp_tau",
+            prior_kind="normal",
+            lower=-np.inf,
+            upper=np.inf,
+            step=0.1,
+            mean=np.log(0.25),
+            std=0.5,
+            transform_kind="log_positive",
+            component_family="independent_scaling",
+            physical_lower=0.0,
+            physical_mean=0.25,
+        ),
+        ParameterSpec(
+            name="members.independent_free_log_core_radius_tau",
+            sample_name="members_independent_free_log_core_radius_tau",
+            potential_id="members",
+            profile_type=cluster_solver.DP_IE_PROFILE,
+            field="independent_free_log_core_radius_tau",
+            prior_kind="normal",
+            lower=-np.inf,
+            upper=np.inf,
+            step=0.1,
+            mean=np.log(0.25),
+            std=0.5,
+            transform_kind="log_positive",
+            component_family="independent_scaling",
+            physical_lower=0.0,
+            physical_mean=0.25,
+        ),
+        ParameterSpec(
+            name="members.independent_free_log_cut_radius_tau",
+            sample_name="members_independent_free_log_cut_radius_tau",
+            potential_id="members",
+            profile_type=cluster_solver.DP_IE_PROFILE,
+            field="independent_free_log_cut_radius_tau",
+            prior_kind="normal",
+            lower=-np.inf,
+            upper=np.inf,
+            step=0.1,
+            mean=np.log(0.25),
+            std=0.5,
+            transform_kind="log_positive",
+            component_family="independent_scaling",
+            physical_lower=0.0,
+            physical_mean=0.25,
+        ),
+    ]
+    return replace(
+        state,
+        parameter_specs=[*state.parameter_specs, *independent_specs],
+        packed_lens_spec=replace(packed, **updates),
+        lens_model_list=[*state.lens_model_list, "DPIE_NIE", "DPIE_NIE"],
+        potfiles=[{"id": "members", "mag0": 20.0}],
+        scaling_component_records=[
+            {
+                "potfile_id": "members",
+                "potfile_order": 0,
+                "component_index": 1,
+                "catalog_id": "galaxy-a",
+                "catalog_mag": 19.0,
+                "independent_magnitude_feature": 0.5,
+                "x_centre": 1.0,
+                "y_centre": 1.0,
+                "selected_independent": True,
+                "free_component_index": 2,
+            },
+            {
+                "potfile_id": "members",
+                "potfile_order": 0,
+                "component_index": 3,
+                "catalog_id": "galaxy-b",
+                "catalog_mag": 20.0,
+                "independent_magnitude_feature": 0.0,
+                "x_centre": -1.5,
+                "y_centre": 0.5,
+                "selected_independent": False,
+                "free_component_index": -1,
+            },
+        ],
+    )
+
+
+def _stage4_state_with_all_scaling_selected_independent() -> BuildState:
+    state = _stage4_state_with_independent_and_inactive_scaling()
+    records = [dict(record) for record in state.scaling_component_records]
+    for record in records:
+        record["selected_independent"] = True
+    return replace(state, scaling_component_records=records)
+
+
+def test_active_blocked_nuts_blend_scatter_stays_global() -> None:
+    state = _stage4_state_with_independent_and_inactive_scaling()
+    global_block, galaxy_blocks = cluster_solver._active_blocked_nuts_parameter_blocks(state)
+
+    assert len(galaxy_blocks) == 1
+    assert galaxy_blocks[0].indices == (3, 4, 5)
+    assert 6 in global_block.indices
+
+
+def test_active_blocked_nuts_block_library_is_seeded_and_reusable() -> None:
+    blocks = tuple(
+        cluster_solver.BlockedNUTSParameterBlock(f"galaxy_{idx}", (idx,))
+        for idx in range(6)
+    )
+
+    first = cluster_solver._active_blocked_nuts_block_library(
+        blocks,
+        block_size=2,
+        library_size=4,
+        seed=17,
+    )
+    second = cluster_solver._active_blocked_nuts_block_library(
+        blocks,
+        block_size=2,
+        library_size=4,
+        seed=17,
+    )
+    third = cluster_solver._active_blocked_nuts_block_library(
+        blocks,
+        block_size=2,
+        library_size=4,
+        seed=18,
+    )
+
+    assert [block.indices for block in first] == [block.indices for block in second]
+    assert [block.indices for block in first] != [block.indices for block in third]
+    assert all(len(block.indices) == 2 for block in first)
+
+
+def test_update_theta_from_block_samples_keeps_fixed_parameters() -> None:
+    state = _state_with_population_style_local_gate_offset()
+    block = cluster_solver.BlockedNUTSParameterBlock("active", (3, 7))
+    theta = np.arange(len(state.parameter_specs), dtype=float)
+    samples_dict = {
+        state.parameter_specs[3].sample_name: np.asarray([30.0]),
+        state.parameter_specs[7].sample_name: np.asarray([-2.5]),
+    }
+
+    updated = cluster_solver._update_theta_from_block_samples(
+        theta,
+        state.parameter_specs,
+        block,
+        samples_dict,
+    )
+
+    assert updated[3] == pytest.approx(30.0)
+    assert updated[7] == pytest.approx(-2.5)
+    fixed = np.delete(np.arange(theta.size), [3, 7])
+    np.testing.assert_allclose(updated[fixed], theta[fixed])
+
+
+def test_scalar_index_block_nuts_once_updates_only_selected_indices() -> None:
+    specs = [
+        ParameterSpec(
+            name=f"p{idx}",
+            sample_name=f"p{idx}",
+            potential_id="toy",
+            profile_type=cluster_solver.DP_IE_PROFILE,
+            field=f"p{idx}",
+            prior_kind="normal",
+            lower=-np.inf,
+            upper=np.inf,
+            step=0.1,
+            mean=0.0,
+            std=1.0,
+        )
+        for idx in range(3)
+    ]
+
+    class ToyEvaluator:
+        def _source_loglike_fn(self, theta: jnp.ndarray) -> jnp.ndarray:
+            return -0.5 * jnp.sum(jnp.square(theta))
+
+    args = SimpleNamespace(
+        target_accept=0.8,
+        max_tree_depth=2,
+        initial_step_size=0.05,
+        dense_mass=cluster_solver.NUTS_DENSE_MASS_DIAGONAL,
+        debug_timings=False,
+    )
+    theta = np.asarray([0.1, 0.2, 0.3], dtype=float)
+    block = cluster_solver.BlockedNUTSParameterBlock("active", (1,))
+    block_model = cluster_solver._scalar_index_block_posterior_model(
+        specs,
+        ToyEvaluator(),
+        len(block.indices),
+    )
+
+    updated, metrics, adapted = cluster_solver._run_scalar_index_block_nuts_once(
+        args,
+        specs,
+        block_model,
+        theta,
+        block,
+        jax.random.PRNGKey(123),
+        num_warmup=0,
+        adapt=False,
+    )
+
+    assert np.isfinite(updated).all()
+    assert np.isfinite(metrics["accept_prob"])
+    assert np.isfinite(adapted["step_size"])
+    np.testing.assert_allclose(updated[[0, 2]], theta[[0, 2]])
+
+
+def test_refreshing_surrogate_flat_keeps_independent_scaling_exact() -> None:
+    state = _stage4_state_with_independent_and_inactive_scaling()
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    reference = cluster_solver._default_theta(state.parameter_specs)
+    evaluator.refresh_surrogate(reference, reason="test")
+
+    assert evaluator.independent_scaling_component_indices.tolist() == [1]
+    assert evaluator.independent_free_component_indices.tolist() == [2]
+    assert evaluator.active_scaling_component_indices.tolist() == [1]
+    assert evaluator.inactive_scaling_component_indices.tolist() == [3]
+    assert evaluator.exact_scaling_component_indices.tolist() == [1]
+    assert evaluator.cached_scaling_component_indices.tolist() == [3]
+    assert evaluator.free_correction_scaling_component_indices.tolist() == [1]
+    assert evaluator.free_correction_free_component_indices.tolist() == [2]
+    assert evaluator.excluded_scaling_component_indices.tolist() == []
+    assert evaluator.active_component_indices.tolist() == [0, 1, 2]
+    assert evaluator.surrogate_enabled is True
+    assert evaluator.flat_surrogate_cache is not None
+
+    flat_data = evaluator.flat_critical_arc_data
+    physical = evaluator._physical_parameter_vector(jnp.asarray(reference, dtype=jnp.float64))
+    packed_state, validity = evaluator._build_flat_packed_lens_state_with_validity_from_physical(
+        physical,
+        flat_data,
+        stop_gradient=False,
+    )
+    assert bool(np.asarray(validity["is_valid"], dtype=bool))
+    inactive_beta_x, inactive_beta_y = evaluator._flat_ray_shooting_for_components(
+        flat_data.x_obs,
+        flat_data.y_obs,
+        packed_state,
+        np.asarray([3], dtype=np.int32),
+    )
+    both_beta_x, both_beta_y = evaluator._flat_ray_shooting_for_components(
+        flat_data.x_obs,
+        flat_data.y_obs,
+        packed_state,
+        np.asarray([1, 2, 3], dtype=np.int32),
+    )
+    expected_inactive_alpha_x = np.asarray(flat_data.x_obs - inactive_beta_x, dtype=float)
+    expected_inactive_alpha_y = np.asarray(flat_data.y_obs - inactive_beta_y, dtype=float)
+    both_alpha_x = np.asarray(flat_data.x_obs - both_beta_x, dtype=float)
+    both_alpha_y = np.asarray(flat_data.y_obs - both_beta_y, dtype=float)
+
+    np.testing.assert_allclose(
+        np.asarray(evaluator.flat_surrogate_cache.inactive_alpha_x),
+        expected_inactive_alpha_x,
+        rtol=1.0e-10,
+        atol=1.0e-10,
+    )
+    np.testing.assert_allclose(
+        np.asarray(evaluator.flat_surrogate_cache.inactive_alpha_y),
+        expected_inactive_alpha_y,
+        rtol=1.0e-10,
+        atol=1.0e-10,
+    )
+    assert np.max(np.abs(both_alpha_x - expected_inactive_alpha_x) + np.abs(both_alpha_y - expected_inactive_alpha_y)) > 1.0e-8
+
+
+def test_flat_packed_state_applies_log_displacement_delta_units_to_free_branch_only() -> None:
+    state = _stage4_state_with_independent_and_inactive_scaling()
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    theta = cluster_solver._default_theta(state.parameter_specs)
+    packed_spec = state.packed_lens_spec
+    free_component = 2
+    scaling_component = 1
+    inactive_component = 3
+    shifted = np.asarray(theta, dtype=float).copy()
+    for index_array in (
+        packed_spec.independent_free_log_v_disp_delta_unit_param_index,
+        packed_spec.independent_free_log_core_radius_delta_unit_param_index,
+        packed_spec.independent_free_log_cut_radius_delta_unit_param_index,
+    ):
+        shifted[int(index_array[free_component])] = 2.0
+
+    flat_data = evaluator.flat_critical_arc_data
+    physical_base = evaluator._physical_parameter_vector(jnp.asarray(theta, dtype=jnp.float64))
+    physical_shifted = evaluator._physical_parameter_vector(jnp.asarray(shifted, dtype=jnp.float64))
+    packed_base, validity_base = evaluator._build_flat_packed_lens_state_with_validity_from_physical(
+        physical_base,
+        flat_data,
+        stop_gradient=False,
+    )
+    packed_shifted, validity_shifted = evaluator._build_flat_packed_lens_state_with_validity_from_physical(
+        physical_shifted,
+        flat_data,
+        stop_gradient=False,
+    )
+    assert bool(np.asarray(validity_base["is_valid"], dtype=bool))
+    assert bool(np.asarray(validity_shifted["is_valid"], dtype=bool))
+
+    base_sigma0 = np.asarray(packed_base["sigma0"], dtype=float)
+    shifted_sigma0 = np.asarray(packed_shifted["sigma0"], dtype=float)
+    assert np.max(np.abs(shifted_sigma0[free_component] - base_sigma0[free_component])) > 1.0e-6
+    assert abs(float(packed_shifted["Ra"][free_component] - packed_base["Ra"][free_component])) > 1.0e-6
+    assert abs(float(packed_shifted["Rs"][free_component] - packed_base["Rs"][free_component])) > 1.0e-6
+    np.testing.assert_allclose(
+        shifted_sigma0[scaling_component],
+        base_sigma0[scaling_component],
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        shifted_sigma0[inactive_component],
+        base_sigma0[inactive_component],
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        np.asarray(packed_shifted["Ra"])[[scaling_component, inactive_component]],
+        np.asarray(packed_base["Ra"])[[scaling_component, inactive_component]],
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        np.asarray(packed_shifted["Rs"])[[scaling_component, inactive_component]],
+        np.asarray(packed_base["Rs"])[[scaling_component, inactive_component]],
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+    z_source = float(evaluator.traced_bin_data[0].effective_z_source)
+    packed_base_source = evaluator._build_packed_lens_state(jnp.asarray(theta, dtype=jnp.float64), z_source)
+    packed_shifted_source = evaluator._build_packed_lens_state(jnp.asarray(shifted, dtype=jnp.float64), z_source)
+    assert (
+        np.max(
+            np.abs(
+                np.asarray(packed_shifted_source["sigma0"])[free_component]
+                - np.asarray(packed_base_source["sigma0"])[free_component]
+            )
+        )
+        > 1.0e-6
+    )
+
+
+def test_topk_discovery_flat_active_scaling_galaxies_does_not_add_exact_selection() -> None:
+    state = _minimal_stage4_surrogate_state()
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT,
+        active_scaling_galaxies=[-1],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+
+    assert evaluator.active_scaling_component_indices.tolist() == []
+    assert evaluator.exact_scaling_component_indices.tolist() == []
+    assert evaluator.cached_scaling_component_indices.tolist() == evaluator.scaling_component_indices.tolist()
+    assert evaluator.inactive_scaling_component_indices.tolist() == evaluator.scaling_component_indices.tolist()
+    assert evaluator.free_correction_scaling_component_indices.tolist() == []
+    assert evaluator.free_correction_free_component_indices.tolist() == []
+    assert evaluator.excluded_scaling_component_indices.tolist() == []
+    assert evaluator.surrogate_enabled is False
+    selected_active = evaluator.scaling_rank_df.loc[
+        evaluator.scaling_rank_df["selected_active"].astype(bool),
+        "component_index",
+    ].astype(int).tolist()
+    assert selected_active == []
+    assert evaluator.scaling_rank_df["selected_independent"].astype(bool).sum() == 0
+    assert cluster_solver._active_scaling_rank_summary(evaluator) == {}
+
+
+def test_transfer_theta_and_posterior_by_sample_name_initializes_new_parameters() -> None:
+    old_specs = [
+        ParameterSpec("a", "a", "p", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0),
+        ParameterSpec("b", "b", "p", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0),
+    ]
+    new_specs = [
+        ParameterSpec("b", "b", "p", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0),
+        ParameterSpec("c", "c", "p", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=2.0, std=1.0),
+        ParameterSpec("a", "a", "p", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0),
+    ]
+    old_theta = np.asarray([1.5, -0.5], dtype=float)
+    posterior = PosteriorResults(
+        samples=np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+        log_prob=np.asarray([0.0, 1.0], dtype=float),
+        accept_prob=np.empty((0,), dtype=float),
+        diverging=np.empty((0,), dtype=bool),
+        num_steps=np.empty((0,), dtype=float),
+        warmup_steps=0,
+        sample_steps=2,
+        num_chains=0,
+    )
+
+    transferred_theta, diagnostics = cluster_solver._transfer_theta_by_sample_name(old_specs, old_theta, new_specs)
+    transferred_posterior = cluster_solver._transfer_posterior_samples_by_sample_name(posterior, old_specs, new_specs)
+
+    np.testing.assert_allclose(transferred_theta, [-0.5, 2.0, 1.5])
+    assert diagnostics["copied"] == 2
+    assert diagnostics["initialized"] == 1
+    np.testing.assert_allclose(transferred_posterior.samples, [[2.0, 2.0, 1.0], [4.0, 2.0, 3.0]])
+
+
+@pytest.mark.parametrize("sample_likelihood_mode", [SAMPLE_LIKELIHOOD_SOURCE, SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN])
+def test_topk_discovery_flat_matches_full_flat_value_and_gradient_for_all_independent(sample_likelihood_mode: str) -> None:
+    state = _stage4_state_with_all_scaling_selected_independent()
+    full = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=sample_likelihood_mode,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_UNIT,
+    )
+    topk = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT,
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=sample_likelihood_mode,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_UNIT,
+    )
+    theta = np.asarray(cluster_solver._default_theta(state.parameter_specs), dtype=float)
+    theta_jax = jnp.asarray(theta, dtype=jnp.float64)
+
+    np.testing.assert_allclose(
+        np.asarray(topk._source_loglike_fn(theta_jax)),
+        np.asarray(full._source_loglike_fn(theta_jax)),
+        rtol=1.0e-8,
+        atol=1.0e-8,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.grad(topk._source_loglike_fn)(theta_jax)),
+        np.asarray(jax.grad(full._source_loglike_fn)(theta_jax)),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+
+
+def test_topk_discovery_source_matches_full_flat_value_and_gradient() -> None:
+    state = _minimal_stage4_surrogate_state()
+    full = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_UNIT,
+    )
+    topk = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT,
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_UNIT,
+    )
+    theta = np.asarray(cluster_solver._default_theta(state.parameter_specs), dtype=float)
+    theta[0] = 1.15
+    theta_jax = jnp.asarray(theta, dtype=jnp.float64)
+
+    np.testing.assert_allclose(
+        np.asarray(topk._source_loglike_fn(theta_jax)),
+        np.asarray(full._source_loglike_fn(theta_jax)),
+        rtol=1.0e-8,
+        atol=1.0e-8,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.grad(topk._source_loglike_fn)(theta_jax)),
+        np.asarray(jax.grad(full._source_loglike_fn)(theta_jax)),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+
+
+def test_topk_discovery_local_jacobian_matches_full_flat_value_and_gradient() -> None:
+    state = _minimal_stage4_surrogate_state()
+    full = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+    )
+    topk = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT,
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+    )
+    theta = np.asarray(cluster_solver._default_theta(state.parameter_specs), dtype=float)
+    theta[0] = 1.15
+    theta_jax = jnp.asarray(theta, dtype=jnp.float64)
+
+    np.testing.assert_allclose(
+        np.asarray(topk._source_loglike_fn(theta_jax)),
+        np.asarray(full._source_loglike_fn(theta_jax)),
+        rtol=1.0e-8,
+        atol=1.0e-8,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.grad(topk._source_loglike_fn)(theta_jax)),
+        np.asarray(jax.grad(full._source_loglike_fn)(theta_jax)),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+
+
+def test_refreshing_surrogate_flat_backfills_per_bin_surrogate_cache_from_flat_refresh() -> None:
+    state = _minimal_two_bin_local_jacobian_state()
+    legacy = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    flat = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    reference = cluster_solver._default_theta(state.parameter_specs)
+    legacy.refresh_surrogate(reference, reason="test")
+    flat.refresh_surrogate(reference, reason="test")
+
+    assert flat.flat_surrogate_cache is not None
+    assert set(flat.surrogate_cache_by_z) == set(legacy.surrogate_cache_by_z)
+    for z_value, legacy_cache in legacy.surrogate_cache_by_z.items():
+        flat_cache = flat.surrogate_cache_by_z[z_value]
+        for key in (
+            "inactive_alpha_x",
+            "inactive_alpha_y",
+            "inactive_alpha_dx_dparams",
+            "inactive_alpha_dy_dparams",
+        ):
+            np.testing.assert_allclose(
+                np.asarray(getattr(flat_cache, key), dtype=float),
+                np.asarray(getattr(legacy_cache, key), dtype=float),
+                rtol=1.0e-8,
+                atol=1.0e-8,
+            )
+
+
+def _assert_cache_dicts_allclose(
+    left: dict[float, dict[str, Any]],
+    right: dict[float, dict[str, Any]],
+    keys: tuple[str, ...],
+) -> None:
+    assert set(left) == set(right)
+    for z_source in left:
+        for key in keys:
+            np.testing.assert_allclose(
+                np.asarray(left[z_source][key], dtype=float),
+                np.asarray(right[z_source][key], dtype=float),
+                rtol=1.0e-8,
+                atol=1.0e-8,
+            )
+
+
+def test_refreshing_surrogate_flat_source_metric_cache_matches_per_bin_refresh() -> None:
+    state = _minimal_two_bin_local_jacobian_state()
+    legacy = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+    )
+    flat = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+    )
+    reference = cluster_solver._default_theta(state.parameter_specs)
+    legacy.refresh_source_metric_cache(reference, reason="test")
+    flat.refresh_source_metric_cache(reference, reason="test")
+
+    _assert_cache_dicts_allclose(
+        flat.source_metric_cache_by_z,
+        legacy.source_metric_cache_by_z,
+        ("inv_abs_mu", "jac_a00", "jac_a01", "jac_a10", "jac_a11"),
+    )
+    np.testing.assert_allclose(
+        np.asarray(flat.flat_source_metric_cache.jac_a00),
+        np.concatenate([legacy.source_metric_cache_by_z[2.0]["jac_a00"], legacy.source_metric_cache_by_z[3.0]["jac_a00"]]),
+        rtol=1.0e-8,
+        atol=1.0e-8,
+    )
+
+
+def test_refreshing_surrogate_flat_scaling_scatter_cache_matches_per_bin_refresh() -> None:
+    state = _minimal_two_bin_local_jacobian_state_with_scaling_scatter()
+    legacy = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+    )
+    flat = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+    )
+    reference = cluster_solver._default_theta(state.parameter_specs)
+    legacy.refresh_scaling_scatter_cache(reference, reason="test")
+    flat.refresh_scaling_scatter_cache(reference, reason="test")
+
+    _assert_cache_dicts_allclose(
+        flat.scaling_scatter_cache_by_z,
+        legacy.scaling_scatter_cache_by_z,
+        ("sigma_x", "sigma_y", "core_x", "core_y", "cut_x", "cut_y"),
+    )
+    np.testing.assert_allclose(
+        np.asarray(flat.flat_critical_arc_data.sigma_scatter_x),
+        np.concatenate([legacy.scaling_scatter_cache_by_z[2.0]["sigma_x"], legacy.scaling_scatter_cache_by_z[3.0]["sigma_x"]]),
+        rtol=1.0e-8,
+        atol=1.0e-8,
     )
 
 
@@ -5418,8 +7918,93 @@ def test_full_flat_rejects_unsupported_likelihood_mode() -> None:
             state=_minimal_stage4_surrogate_state(include_source_positions=True),
             match_tolerance_arcsec=0.1,
             sampling_engine="full_flat",
-            sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+            sample_likelihood_mode=SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
         )
+
+
+def test_full_flat_source_matches_full_loglike_and_gradient() -> None:
+    state = _minimal_two_bin_local_jacobian_state()
+    full = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    flat = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    reference = cluster_solver._default_theta(state.parameter_specs)
+    for evaluator in (full, flat):
+        evaluator.refresh_source_metric_cache(reference, reason="test")
+    theta = jnp.asarray([1.1], dtype=jnp.float64)
+
+    full_value = full._source_loglike_fn(theta)
+    flat_value = flat._source_loglike_fn(theta)
+    full_grad = jax.grad(full._source_loglike_fn)(theta)
+    flat_grad = jax.grad(flat._source_loglike_fn)(theta)
+
+    np.testing.assert_allclose(np.asarray(flat_value), np.asarray(full_value), rtol=1.0e-8, atol=1.0e-8)
+    np.testing.assert_allclose(np.asarray(flat_grad), np.asarray(full_grad), rtol=1.0e-6, atol=1.0e-6)
+
+
+def test_full_flat_source_unit_covariance_uses_identity_metric_cache() -> None:
+    state = _minimal_two_bin_local_jacobian_state()
+    unit = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_UNIT,
+    )
+    reference = cluster_solver._default_theta(state.parameter_specs)
+
+    unit.refresh_source_metric_cache(reference, reason="test")
+
+    assert unit.source_metric_cache_by_z == {}
+    assert unit.source_metric_reference_params is not None
+    np.testing.assert_allclose(np.asarray(unit.flat_source_metric_cache.inv_abs_mu), np.ones(4), rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(np.asarray(unit.flat_source_metric_cache.jac_a00), np.ones(4), rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(np.asarray(unit.flat_source_metric_cache.jac_a01), np.zeros(4), rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(np.asarray(unit.flat_source_metric_cache.jac_a10), np.zeros(4), rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(np.asarray(unit.flat_source_metric_cache.jac_a11), np.ones(4), rtol=0.0, atol=0.0)
+
+    theta = jnp.asarray([1.1], dtype=jnp.float64)
+    value = unit._source_loglike_fn(theta)
+    grad = jax.grad(unit._source_loglike_fn)(theta)
+
+    assert np.isfinite(float(value))
+    assert np.all(np.isfinite(np.asarray(grad)))
+
+
+def test_source_unit_covariance_matches_magnification_with_unit_cache() -> None:
+    state = _minimal_two_bin_local_jacobian_state()
+    magnification = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    unit = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_UNIT,
+    )
+    reference = cluster_solver._default_theta(state.parameter_specs)
+    unit.refresh_source_metric_cache(reference, reason="test")
+    theta = jnp.asarray([1.1], dtype=jnp.float64)
+
+    magnification_value = magnification._source_loglike_fn(theta)
+    unit_value = unit._source_loglike_fn(theta)
+    magnification_grad = jax.grad(magnification._source_loglike_fn)(theta)
+    unit_grad = jax.grad(unit._source_loglike_fn)(theta)
+
+    np.testing.assert_allclose(np.asarray(unit_value), np.asarray(magnification_value), rtol=1.0e-8, atol=1.0e-8)
+    np.testing.assert_allclose(np.asarray(unit_grad), np.asarray(magnification_grad), rtol=1.0e-6, atol=1.0e-6)
 
 
 def test_full_flat_critical_arc_matches_full_direct_source_positions() -> None:
@@ -5449,6 +8034,152 @@ def test_full_flat_critical_arc_matches_full_direct_source_positions() -> None:
 
     np.testing.assert_allclose(np.asarray(flat_value), np.asarray(full_value), rtol=1.0e-8, atol=1.0e-8)
     np.testing.assert_allclose(np.asarray(flat_grad), np.asarray(full_grad), rtol=1.0e-6, atol=1.0e-6)
+
+
+def test_full_flat_combined_exact_helper_matches_separate_bulk_calls() -> None:
+    state = _minimal_stage4_surrogate_state()
+    packed = state.packed_lens_spec
+    state.packed_lens_spec = replace(
+        packed,
+        profile_type=np.asarray([cluster_solver.DP_IE_PROFILE, cluster_solver.SHEAR_PROFILE], dtype=np.int32),
+        component_family=np.asarray([0, 0], dtype=np.int32),
+        gamma1_base=np.asarray([0.0, 0.08], dtype=float),
+        gamma2_base=np.asarray([0.0, -0.03], dtype=float),
+    )
+    state.lens_model_list = ["DPIE_NIE", "SHEAR"]
+    flat = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+    )
+    theta = jnp.asarray(cluster_solver._default_theta(state.parameter_specs), dtype=jnp.float64)
+    physical_params = flat._physical_parameter_vector(theta)
+    packed_state, validity = flat._build_flat_packed_lens_state_with_validity_from_physical(
+        physical_params,
+        flat.flat_critical_arc_data,
+        stop_gradient=False,
+    )
+
+    assert bool(np.asarray(validity["is_valid"], dtype=bool))
+    beta_x, beta_y = flat._flat_ray_shooting_for_components(
+        flat.flat_critical_arc_data.x_obs,
+        flat.flat_critical_arc_data.y_obs,
+        packed_state,
+    )
+    jacobian_entries = flat._flat_lensing_jacobian_for_components(
+        flat.flat_critical_arc_data.x_obs,
+        flat.flat_critical_arc_data.y_obs,
+        packed_state,
+    )
+    combined = flat._flat_ray_shooting_and_lensing_jacobian_for_components(
+        flat.flat_critical_arc_data.x_obs,
+        flat.flat_critical_arc_data.y_obs,
+        packed_state,
+    )
+
+    for actual, expected in zip(combined, (beta_x, beta_y, *jacobian_entries), strict=True):
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1.0e-8, atol=1.0e-8)
+
+
+def test_full_flat_sparse_pair_alpha_jacobian_matches_rectangular_rows() -> None:
+    state = _minimal_stage4_surrogate_state()
+    packed = state.packed_lens_spec
+    state.packed_lens_spec = replace(
+        packed,
+        profile_type=np.asarray([cluster_solver.DP_IE_PROFILE, cluster_solver.SHEAR_PROFILE], dtype=np.int32),
+        component_family=np.asarray([0, 0], dtype=np.int32),
+        gamma1_base=np.asarray([0.0, 0.08], dtype=float),
+        gamma2_base=np.asarray([0.0, -0.03], dtype=float),
+    )
+    state.lens_model_list = ["DPIE_NIE", "SHEAR"]
+    flat = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+    )
+    theta = jnp.asarray(cluster_solver._default_theta(state.parameter_specs), dtype=jnp.float64)
+    physical_params = flat._physical_parameter_vector(theta)
+    packed_state, validity = flat._build_flat_packed_lens_state_with_validity_from_physical(
+        physical_params,
+        flat.flat_critical_arc_data,
+        stop_gradient=False,
+    )
+    assert bool(np.asarray(validity["is_valid"], dtype=bool))
+
+    pair_image_indices = np.asarray([0, 1, 0, 1], dtype=np.int32)
+    pair_component_indices = np.asarray([0, 0, 1, 1], dtype=np.int32)
+    pair_x = jnp.take(flat.flat_critical_arc_data.x_obs, jnp.asarray(pair_image_indices, dtype=jnp.int32))
+    pair_y = jnp.take(flat.flat_critical_arc_data.y_obs, jnp.asarray(pair_image_indices, dtype=jnp.int32))
+    sparse = flat._flat_component_alpha_and_jacobian_delta_for_pairs(
+        pair_x,
+        pair_y,
+        packed_state,
+        pair_component_indices,
+        pair_image_indices,
+    )
+    rectangular = flat._flat_component_alpha_and_jacobian_delta_rows_for_components(
+        flat.flat_critical_arc_data.x_obs,
+        flat.flat_critical_arc_data.y_obs,
+        packed_state,
+        np.asarray([0, 1], dtype=np.int32),
+    )
+
+    component_row = {0: 0, 1: 1}
+    for actual, rows in zip(sparse, rectangular, strict=True):
+        expected = np.asarray(
+            [
+                np.asarray(rows)[component_row[int(component)], int(image_index)]
+                for image_index, component in zip(pair_image_indices, pair_component_indices, strict=True)
+            ],
+            dtype=float,
+        )
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=1.0e-8, atol=1.0e-8)
+
+
+def test_full_flat_alpha_only_component_rows_match_alpha_jacobian_rows() -> None:
+    state = _minimal_stage4_surrogate_state()
+    packed = state.packed_lens_spec
+    state.packed_lens_spec = replace(
+        packed,
+        profile_type=np.asarray([cluster_solver.DP_IE_PROFILE, cluster_solver.SHEAR_PROFILE], dtype=np.int32),
+        component_family=np.asarray([0, 0], dtype=np.int32),
+        gamma1_base=np.asarray([0.0, 0.08], dtype=float),
+        gamma2_base=np.asarray([0.0, -0.03], dtype=float),
+    )
+    state.lens_model_list = ["DPIE_NIE", "SHEAR"]
+    flat = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    theta = jnp.asarray(cluster_solver._default_theta(state.parameter_specs), dtype=jnp.float64)
+    physical_params = flat._physical_parameter_vector(theta)
+    packed_state, validity = flat._build_flat_packed_lens_state_with_validity_from_physical(
+        physical_params,
+        flat.flat_critical_arc_data,
+        stop_gradient=False,
+    )
+    component_indices = np.asarray([0, 1], dtype=np.int32)
+
+    assert bool(np.asarray(validity["is_valid"], dtype=bool))
+    alpha_x, alpha_y = flat._flat_component_alpha_rows_for_components(
+        flat.flat_critical_arc_data.x_obs,
+        flat.flat_critical_arc_data.y_obs,
+        packed_state,
+        component_indices,
+    )
+    alpha_jac_rows = flat._flat_component_alpha_and_jacobian_delta_rows_for_components(
+        flat.flat_critical_arc_data.x_obs,
+        flat.flat_critical_arc_data.y_obs,
+        packed_state,
+        component_indices,
+    )
+
+    np.testing.assert_allclose(np.asarray(alpha_x), np.asarray(alpha_jac_rows[0]), rtol=1.0e-8, atol=1.0e-8)
+    np.testing.assert_allclose(np.asarray(alpha_y), np.asarray(alpha_jac_rows[1]), rtol=1.0e-8, atol=1.0e-8)
 
 
 def test_full_flat_local_jacobian_uses_current_exact_flat_jacobian() -> None:
@@ -5495,6 +8226,88 @@ def test_full_flat_local_jacobian_ignores_source_metric_cache() -> None:
     poisoned_value = flat._source_loglike_fn(theta)
 
     np.testing.assert_allclose(np.asarray(poisoned_value), np.asarray(reference_value), rtol=1.0e-10, atol=1.0e-10)
+
+
+def test_full_flat_source_metric_cache_matches_per_bin_refresh() -> None:
+    state = _minimal_two_bin_local_jacobian_state()
+    legacy = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+    )
+    flat = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+    )
+    reference = cluster_solver._default_theta(state.parameter_specs)
+
+    legacy.refresh_source_metric_cache(reference, reason="test")
+    flat.refresh_source_metric_cache(reference, reason="test")
+
+    _assert_cache_dicts_allclose(
+        flat.source_metric_cache_by_z,
+        legacy.source_metric_cache_by_z,
+        ("inv_abs_mu", "jac_a00", "jac_a01", "jac_a10", "jac_a11"),
+    )
+    np.testing.assert_allclose(
+        np.asarray(flat.flat_source_metric_cache.jac_a00),
+        np.concatenate([legacy.source_metric_cache_by_z[2.0]["jac_a00"], legacy.source_metric_cache_by_z[3.0]["jac_a00"]]),
+        rtol=1.0e-8,
+        atol=1.0e-8,
+    )
+
+
+def test_full_flat_local_jacobian_refreshes_metric_cache_with_unit_flag() -> None:
+    state = _minimal_two_bin_local_jacobian_state()
+    flat = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_UNIT,
+    )
+    reference = cluster_solver._default_theta(state.parameter_specs)
+
+    flat.refresh_source_metric_cache(reference, reason="test")
+
+    assert sorted(flat.source_metric_cache_by_z) == [2.0, 3.0]
+    assert np.asarray(flat.flat_source_metric_cache.inv_abs_mu).shape == (4,)
+    assert np.asarray(flat.flat_source_metric_cache.jac_a00).shape == (4,)
+
+
+def test_full_flat_scaling_scatter_cache_matches_per_bin_refresh() -> None:
+    state = _minimal_two_bin_local_jacobian_state_with_scaling_scatter()
+    legacy = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+    )
+    flat = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+    )
+    reference = cluster_solver._default_theta(state.parameter_specs)
+
+    legacy.refresh_scaling_scatter_cache(reference, reason="test")
+    flat.refresh_scaling_scatter_cache(reference, reason="test")
+
+    _assert_cache_dicts_allclose(
+        flat.scaling_scatter_cache_by_z,
+        legacy.scaling_scatter_cache_by_z,
+        ("sigma_x", "sigma_y", "core_x", "core_y", "cut_x", "cut_y"),
+    )
+    np.testing.assert_allclose(
+        np.asarray(flat.flat_critical_arc_data.sigma_scatter_x),
+        np.concatenate([legacy.scaling_scatter_cache_by_z[2.0]["sigma_x"], legacy.scaling_scatter_cache_by_z[3.0]["sigma_x"]]),
+        rtol=1.0e-8,
+        atol=1.0e-8,
+    )
 
 
 def test_lens_model_bulk_accepts_per_image_sigma0_matrix() -> None:
@@ -6060,6 +8873,8 @@ def test_solver_active_approximation_warning_reports_active_features(monkeypatch
     assert len(captured_logs) == 1
     warning = captured_logs[0]
     assert "refreshing_surrogate=active" in warning
+    assert "cached_scaling=3" in warning
+    assert "free_correction=0" in warning
     assert "z_bins=active grouped_families=2 bins=1" in warning
     assert "sample_likelihood=linearized-forward-beta-image-plane" in warning
     assert "source_position_parameterization=prior-whitened" in warning
@@ -6101,6 +8916,10 @@ def test_active_approximation_table_logs_pipe_rows(monkeypatch: pytest.MonkeyPat
     assert "| sampling_engine | refreshing_surrogate |" in table
     assert "| surrogate_enabled | yes |" in table
     assert "| active_scaling | 2/5 |" in table
+    assert "| exact_scaling | 2 |" in table
+    assert "| cached_scaling | 3 |" in table
+    assert "| free_correction_candidates | 0 |" in table
+    assert "| excluded_scaling | 0 |" in table
     assert "| inactive_scaling | 3 |" in table
     assert "| z_bins | 1 |" in table
     assert "| families | 2 |" in table
@@ -6163,6 +8982,8 @@ def test_active_approximation_table_reports_scaling_rank_and_z_bins() -> None:
     table = cluster_solver._format_active_approximation_table(evaluator)
 
     assert "| sampling_engine | refreshing_surrogate_flat |" in table
+    assert "| exact_scaling | 2 |" in table
+    assert "| cached_scaling | 3 |" in table
     assert "| active_scaling_requested_cap | 2 |" in table
     assert "| active_scaling_target_fraction | 0.995 |" in table
     assert "| active_scaling_needed_for_target | 4 |" in table
@@ -6173,6 +8994,121 @@ def test_active_approximation_table_reports_scaling_rank_and_z_bins() -> None:
     assert "| z_bin_range | 0.91-5.8 |" in table
     assert "| z_bin_values | 0.91, 1.04, 5.8 |" in table
     assert "| quick_diagnostics | yes |" in table
+
+
+def test_active_approximation_table_reports_frozen_refreshed_local_jacobian_metric() -> None:
+    evaluator = SimpleNamespace(
+        state=SimpleNamespace(family_data=[], bin_data=[], parameter_specs=[]),
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+        surrogate_enabled=True,
+        active_scaling_component_indices=np.asarray([0, 1], dtype=int),
+        inactive_scaling_component_indices=np.asarray([2, 3], dtype=int),
+        cached_scaling_component_indices=np.asarray([2, 3], dtype=int),
+        exact_scaling_component_indices=np.asarray([0, 1], dtype=int),
+        scaling_component_indices=np.asarray([0, 1, 2, 3], dtype=int),
+        free_correction_scaling_component_indices=np.asarray([], dtype=int),
+        excluded_scaling_component_indices=np.asarray([], dtype=int),
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
+        quick_diagnostics=False,
+        scaling_scatter_param_indices=np.asarray([], dtype=int),
+        source_metric_cache_by_z={0: object()},
+    )
+
+    rows = {row[0]: row[1] for row in cluster_solver._active_approximation_rows(evaluator)}
+
+    assert rows["local_jacobian_metric"] == cluster_solver.LOCAL_JACOBIAN_METRIC_FROZEN_REFRESHED
+    assert rows["source_metric_cache"] == "refreshed"
+    assert cluster_solver._local_jacobian_metric_mode(evaluator) == cluster_solver.LOCAL_JACOBIAN_METRIC_FROZEN_REFRESHED
+
+
+@pytest.mark.parametrize(
+    "sampling_engine",
+    [cluster_solver.SAMPLING_ENGINE_FULL_FLAT, cluster_solver.SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT],
+)
+def test_active_approximation_table_reports_current_exact_local_jacobian_metric(sampling_engine: str) -> None:
+    evaluator = SimpleNamespace(
+        state=SimpleNamespace(family_data=[], bin_data=[], parameter_specs=[]),
+        sampling_engine=sampling_engine,
+        surrogate_enabled=False,
+        active_scaling_component_indices=np.asarray([0, 1, 2], dtype=int),
+        inactive_scaling_component_indices=np.asarray([], dtype=int),
+        cached_scaling_component_indices=np.asarray([], dtype=int),
+        exact_scaling_component_indices=np.asarray([0, 1, 2], dtype=int),
+        scaling_component_indices=np.asarray([0, 1, 2], dtype=int),
+        free_correction_scaling_component_indices=np.asarray([], dtype=int),
+        excluded_scaling_component_indices=np.asarray([], dtype=int),
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
+        quick_diagnostics=False,
+        scaling_scatter_param_indices=np.asarray([], dtype=int),
+        source_metric_cache_by_z={},
+        topk_discovery_scaling_galaxies=10,
+    )
+
+    rows = {row[0]: row[1] for row in cluster_solver._active_approximation_rows(evaluator)}
+
+    assert rows["local_jacobian_metric"] == cluster_solver.LOCAL_JACOBIAN_METRIC_CURRENT_EXACT
+    assert cluster_solver._local_jacobian_metric_mode(evaluator) == cluster_solver.LOCAL_JACOBIAN_METRIC_CURRENT_EXACT
+
+
+def test_refreshing_surrogate_flat_local_jacobian_does_not_request_inactive_jacobian_cache() -> None:
+    assert not cluster_solver._flat_surrogate_refresh_needs_inactive_jacobian(
+        SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+    )
+
+
+def test_run_summary_stage_fit_quality_table_formats_point_arc_and_missing_sampler_metrics() -> None:
+    source_summary = {
+        "run_name": "mock/stage3_image_plane",
+        "sampler": "numpyro_nuts",
+        "sample_likelihood_mode": SAMPLE_LIKELIHOOD_SOURCE,
+        "observed_image_count": 4,
+        "point_recovered_image_count": 3,
+        "point_image_rms_arcsec": 0.42,
+        "point_image_median_residual_arcsec": 0.31,
+        "headline_chi_square": 5.0,
+        "headline_dof": 2,
+        "headline_reduced_chi_square": 2.5,
+        "accept_prob_mean": None,
+        "divergence_count": 0,
+        "max_tree_depth_saturation_fraction": None,
+        "ess_min": None,
+        "rhat_max": None,
+        "runtime_sec": 12.5,
+    }
+    source_text = cluster_solver._format_stage_fit_quality_table(source_summary)
+
+    assert source_text.startswith("[stage-fit-quality] stage3_image_plane")
+    assert "| point recovered images | 3/4 |" in source_text
+    assert "| point RMS residual arcsec | 0.42 |" in source_text
+    assert "| point median residual arcsec | 0.31 |" in source_text
+    assert "| accept probability mean | na |" in source_text
+    assert "arc-aware" not in source_text
+
+    arc_summary = {
+        **source_summary,
+        "run_name": "mock/stage4_critical_arc_mixture_image_plane",
+        "sample_likelihood_mode": SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+        "arc_aware_recovered_image_count": 4,
+        "arc_aware_arc_supported_image_count": 1,
+        "arc_aware_missing_image_count": 0,
+        "arc_aware_image_rms_arcsec": 0.33,
+        "arc_aware_image_residual_median_arcsec": 0.22,
+        "arc_aware_reduced_chi_square": 1.7,
+    }
+    arc_text = cluster_solver._format_stage_fit_quality_table(arc_summary)
+    rich_table = cluster_solver._stage_fit_quality_table(arc_summary)
+
+    assert "| arc-aware recovered images | 4/4 |" in arc_text
+    assert "| arc-supported images | 1 |" in arc_text
+    assert "| missed images | 0 |" in arc_text
+    assert "| arc-aware RMS residual arcsec | 0.33 |" in arc_text
+    assert "| arc-aware median residual arcsec | 0.22 |" in arc_text
+    assert rich_table is not None
 
 
 def test_active_scaling_fraction_status_thresholds() -> None:
@@ -6266,7 +9202,7 @@ def test_prepare_direct_evaluator_logs_approximation_table_before_refresh_and_co
 
     approximation_index = captured_events.index("[approximations]")
     assert approximation_index < captured_events.index("evaluator_summary")
-    assert approximation_index < captured_events.index("[surrogate] initializing active_scaling=1 inactive_scaling=1")
+    assert approximation_index < captured_events.index("[surrogate] initializing exact_scaling=1 cached_scaling=1 free_correction=0")
     assert approximation_index < captured_events.index("refresh_surrogate:svi_nuts_initial")
     assert approximation_index < captured_events.index("[compile] tracing first JAX likelihood evaluation")
     assert approximation_index < captured_events.index("source_loglike")
@@ -9218,7 +12154,21 @@ def test_cluster_solver_quick_diagnostics_cli(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "data/clustersim/input.par"])
     args = _parse_args()
     assert args.quick_diagnostics is False
+    assert args.exact_image_diagnostics_stage2 is False
     assert args.exact_image_diagnostics_stage3 is False
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--exact-image-diagnostics-stage2",
+        ],
+    )
+    args = _parse_args()
+    assert args.exact_image_diagnostics_stage2 is True
 
     monkeypatch.setattr(
         sys,
@@ -9245,6 +12195,21 @@ def test_cluster_solver_quick_diagnostics_cli(monkeypatch: pytest.MonkeyPatch) -
     )
     args = _parse_args()
     assert args.exact_image_diagnostics_stage3 is True
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--quick-diagnostics",
+            "--exact-image-diagnostics-stage2",
+        ],
+    )
+    args = _parse_args()
+    with pytest.raises(SystemExit, match="exact-image-diagnostics-stage2"):
+        cluster_solver._normalize_stage_fit_controls(args)
 
     monkeypatch.setattr(
         sys,
@@ -9662,34 +12627,53 @@ def test_potfile_mode9_scaling_priors_transform_bounds_to_latent_log_space() -> 
     )
     sigma_spec = specs[param_indices[0]["sigma"]]
     cut_spec = specs[param_indices[0]["cutkpc"]]
-    expected_sigma_mean, expected_sigma_std = cluster_solver._positive_lognormal_parameters(245.0, 55.0)
-    expected_cut_mean, expected_cut_std = cluster_solver._positive_lognormal_parameters(51.5, 47.5)
+    core_spec = specs[param_indices[0]["corekpc"]]
+    expected_sigma_mean, expected_sigma_std = cluster_solver._positive_lognormal_parameters(
+        cluster_solver.DEFAULT_SOLVER_POTFILE_SIGMA_REF_MEAN,
+        cluster_solver.DEFAULT_SOLVER_POTFILE_SIGMA_REF_STD,
+    )
+    expected_cut_mean, expected_cut_std = cluster_solver._positive_lognormal_parameters(
+        cluster_solver.DEFAULT_SOLVER_POTFILE_CUT_REF_MEAN_KPC,
+        cluster_solver.DEFAULT_SOLVER_POTFILE_CUT_REF_STD_KPC,
+    )
 
+    assert cluster_solver.SOLVER_POTFILE_POSITIVE_PRIOR_COORDINATE == "log_positive_latent"
     assert sigma_spec.prior_kind == "truncated_normal"
     assert sigma_spec.transform_kind == "log_positive"
-    assert sigma_spec.lower == pytest.approx(np.log(190.0))
-    assert sigma_spec.upper == pytest.approx(np.log(300.0))
+    assert sigma_spec.lower == pytest.approx(np.log(cluster_solver.DEFAULT_SOLVER_POTFILE_SIGMA_REF_LOWER))
+    assert sigma_spec.upper == pytest.approx(np.log(cluster_solver.DEFAULT_SOLVER_POTFILE_SIGMA_REF_UPPER))
     assert sigma_spec.mean == pytest.approx(expected_sigma_mean)
     assert sigma_spec.std == pytest.approx(expected_sigma_std)
-    assert sigma_spec.physical_lower == pytest.approx(190.0)
-    assert sigma_spec.physical_upper == pytest.approx(300.0)
-    assert sigma_spec.physical_mean == pytest.approx(245.0)
-    assert sigma_spec.physical_std == pytest.approx(55.0)
+    assert sigma_spec.physical_lower == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_SIGMA_REF_LOWER)
+    assert sigma_spec.physical_upper == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_SIGMA_REF_UPPER)
+    assert sigma_spec.physical_mean == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_SIGMA_REF_MEAN)
+    assert sigma_spec.physical_std == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_SIGMA_REF_STD)
 
     assert cut_spec.prior_kind == "truncated_normal"
-    assert cut_spec.transform_kind == "log_offset_positive"
-    assert cut_spec.transform_offset == pytest.approx(1.0)
-    assert cut_spec.lower == pytest.approx(np.log(4.0))
-    assert cut_spec.upper == pytest.approx(np.log(99.0))
+    assert cut_spec.transform_kind == "log_positive"
+    assert cut_spec.transform_offset == pytest.approx(0.0)
+    assert cut_spec.lower == pytest.approx(np.log(cluster_solver.DEFAULT_SOLVER_POTFILE_CUT_REF_LOWER_KPC))
+    assert cut_spec.upper == pytest.approx(np.log(cluster_solver.DEFAULT_SOLVER_POTFILE_CUT_REF_UPPER_KPC))
     assert cut_spec.mean == pytest.approx(expected_cut_mean)
     assert cut_spec.std == pytest.approx(expected_cut_std)
-    assert cut_spec.physical_lower == pytest.approx(5.0)
-    assert cut_spec.physical_upper == pytest.approx(100.0)
-    assert cut_spec.physical_mean == pytest.approx(52.5)
-    assert cut_spec.physical_std == pytest.approx(47.5)
+    assert cut_spec.physical_lower == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_CUT_REF_LOWER_KPC)
+    assert cut_spec.physical_upper == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_CUT_REF_UPPER_KPC)
+    assert cut_spec.physical_mean == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_CUT_REF_MEAN_KPC)
+    assert cut_spec.physical_std == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_CUT_REF_STD_KPC)
+
+    assert core_spec.prior_kind == "truncated_normal"
+    assert core_spec.transform_kind == "log_positive"
+    assert core_spec.lower == pytest.approx(np.log(cluster_solver.DEFAULT_SOLVER_POTFILE_CORE_REF_LOWER_KPC))
+    assert core_spec.upper == pytest.approx(np.log(cluster_solver.DEFAULT_SOLVER_POTFILE_CORE_REF_UPPER_KPC))
+    assert core_spec.mean == pytest.approx(np.log(cluster_solver.DEFAULT_SOLVER_POTFILE_CORE_REF_MEDIAN_KPC))
+    assert core_spec.std == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_CORE_REF_LOG_SIGMA)
+    assert core_spec.physical_lower == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_CORE_REF_LOWER_KPC)
+    assert core_spec.physical_upper == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_CORE_REF_UPPER_KPC)
+    assert core_spec.physical_mean == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_CORE_REF_MEDIAN_KPC)
+    assert core_spec.physical_std is None
 
 
-def test_potfile_mass_size_reparam_is_opt_in_and_preserves_public_fields() -> None:
+def test_scaling_parameter_specs_support_bergamini_ml_mode() -> None:
     potfiles = [
         {
             "id": "members",
@@ -9700,141 +12684,28 @@ def test_potfile_mass_size_reparam_is_opt_in_and_preserves_public_fields() -> No
             "cut": [9, 5.25, 4.75, 0.5, 10.0],
         }
     ]
-
-    specs_off, param_indices_off, _ = cluster_solver._build_scaling_parameter_specs(
+    default_specs, default_indices, _ = cluster_solver._build_scaling_parameter_specs(potfiles, kpc_per_arcsec=10.0)
+    bergamini_specs, bergamini_indices, _ = cluster_solver._build_scaling_parameter_specs(
         potfiles,
         kpc_per_arcsec=10.0,
-    )
-    specs_on, param_indices_on, _ = cluster_solver._build_scaling_parameter_specs(
-        potfiles,
-        kpc_per_arcsec=10.0,
-        potfile_mass_size_reparam=True,
+        scaling_relation_mode=cluster_solver.SCALING_RELATION_MODE_BERGAMINI_ML,
     )
 
-    sigma_off = specs_off[param_indices_off[0]["sigma"]]
-    cut_off = specs_off[param_indices_off[0]["cutkpc"]]
-    sigma_on = specs_on[param_indices_on[0]["sigma"]]
-    cut_on = specs_on[param_indices_on[0]["cutkpc"]]
+    assert {"vdslope", "slope"} <= {spec.field for spec in default_specs}
+    assert {"alpha_sigma", "gamma_ml"}.isdisjoint({spec.field for spec in default_specs})
+    assert {"alpha_sigma", "gamma_ml"} <= {spec.field for spec in bergamini_specs}
+    assert {"vdslope", "slope"}.isdisjoint({spec.field for spec in bergamini_specs})
 
-    assert sigma_off.sample_site_name is None
-    assert cut_off.sample_site_name is None
-    assert sigma_on.name == "members.sigma"
-    assert cut_on.name == "members.cutkpc"
-    assert sigma_on.sample_name == "members_sigma"
-    assert cut_on.sample_name == "members_cutkpc"
-    assert sigma_on.sample_site_name == cut_on.sample_site_name == "members_mass_size"
-    assert sigma_on.sample_site_index == 0
-    assert cut_on.sample_site_index == 1
-    assert sigma_on.coupled_role == cluster_solver.COUPLED_ROLE_MASS_NORM
-    assert cut_on.coupled_role == cluster_solver.COUPLED_ROLE_SIZE
-
-
-def test_potfile_mass_size_reparam_roundtrip_and_prior_jacobian() -> None:
-    specs, param_indices, _ = cluster_solver._build_scaling_parameter_specs(
-        [
-            {
-                "id": "members",
-                "type": cluster_solver.DP_IE_PROFILE,
-                "catalog_df": pd.DataFrame({"id": ["member"]}),
-                "core_arcsec": 0.1,
-                "sigma": [9, 245.0, 55.0, 190.0, 300.0],
-                "cut": [9, 5.25, 4.75, 0.5, 10.0],
-            }
-        ],
-        kpc_per_arcsec=10.0,
-        potfile_mass_size_reparam=True,
-    )
-    sigma_spec = specs[param_indices[0]["sigma"]]
-    cut_spec = specs[param_indices[0]["cutkpc"]]
-    theta = np.asarray([0.0, 0.0], dtype=float)
-
-    physical = cluster_solver._convert_theta_to_physical(theta, specs)
-    roundtrip = cluster_solver._convert_theta_to_latent(physical, specs)
-
-    mass_raw = sigma_spec.coupled_mass_center + sigma_spec.coupled_mass_scale * theta[0]
-    size_raw = sigma_spec.coupled_size_center + sigma_spec.coupled_size_scale * theta[1]
-    expected_sigma = math.exp(0.5 * (mass_raw - size_raw))
-    expected_cut = cut_spec.transform_offset + math.exp(size_raw)
-    old_prior_log_prob = (
-        cluster_solver._distribution_for_spec(sigma_spec).log_prob(jnp.asarray(math.log(expected_sigma)))
-        + cluster_solver._distribution_for_spec(cut_spec).log_prob(jnp.asarray(math.log(expected_cut - cut_spec.transform_offset)))
-    )
-    expected_jacobian = math.log(0.5 * sigma_spec.coupled_mass_scale * sigma_spec.coupled_size_scale)
-
-    np.testing.assert_allclose(physical, [expected_sigma, expected_cut])
-    np.testing.assert_allclose(roundtrip, theta)
-    assert float(cluster_solver._prior_log_prob(specs, jnp.asarray(theta, dtype=jnp.float64))) == pytest.approx(
-        float(old_prior_log_prob) + expected_jacobian
-    )
-
-
-def test_potfile_mass_size_reparam_vector_site_init_and_extraction() -> None:
-    specs, _param_indices, _ = cluster_solver._build_scaling_parameter_specs(
-        [
-            {
-                "id": "members",
-                "type": cluster_solver.DP_IE_PROFILE,
-                "catalog_df": pd.DataFrame({"id": ["member"]}),
-                "core_arcsec": 0.1,
-                "sigma": [1, 190.0, 300.0],
-                "cut": [1, 0.5, 10.0],
-            }
-        ],
-        kpc_per_arcsec=10.0,
-        potfile_mass_size_reparam=True,
-    )
-    site_name = specs[0].sample_site_name
-    samples_dict = {site_name: np.asarray([[[0.1, -0.2], [0.3, -0.4]]], dtype=float)}
-    seed = ChainSeed(values=np.asarray([0.1, -0.2], dtype=float), source_label="seed")
-
-    trace = cluster_solver.numpyro.handlers.trace(
-        cluster_solver.numpyro.handlers.seed(cluster_solver._sample_site_model(specs), jax.random.PRNGKey(11))
-    ).get_trace()
-    init_params = cluster_solver._seed_values_to_init_params(specs, [seed])
-    extracted = cluster_solver._extract_grouped_samples(samples_dict, specs, thin=1)
-
-    assert np.asarray(trace[site_name]["value"]).shape == (2,)
-    assert list(init_params) == [site_name]
-    assert np.asarray(init_params[site_name]).shape == (2,)
-    np.testing.assert_allclose(extracted, np.asarray([[[0.1, -0.2], [0.3, -0.4]]], dtype=float))
-
-
-def test_svi_initial_value_dict_preserves_potfile_mass_size_reparam_vector_coordinates() -> None:
-    specs, _param_indices, _ = cluster_solver._build_scaling_parameter_specs(
-        [
-            {
-                "id": "members",
-                "type": cluster_solver.DP_IE_PROFILE,
-                "catalog_df": pd.DataFrame({"id": ["member"]}),
-                "core_arcsec": 0.1,
-                "sigma": [9, 245.0, 55.0, 190.0, 300.0],
-                "cut": [9, 5.25, 4.75, 0.5, 10.0],
-            }
-        ],
-        kpc_per_arcsec=10.0,
-        potfile_mass_size_reparam=True,
-    )
-    site_name = specs[0].sample_site_name
-
-    payload = cluster_solver._svi_initial_value_dict(
-        specs,
-        {
-            specs[0].sample_name: 0.0,
-            specs[1].sample_name: 0.0,
-        },
-    )
-    assert payload is not None
-    assert site_name is not None
-
-    unconstrained = cluster_solver.unconstrain_fn(
-        cluster_solver._sample_site_model(specs),
-        model_args=(),
-        model_kwargs={},
-        params=payload,
-    )
-
-    np.testing.assert_allclose(np.asarray(payload[site_name], dtype=float), [0.0, 0.0])
-    assert np.all(np.isfinite(np.asarray(unconstrained[site_name], dtype=float)))
+    alpha_spec = bergamini_specs[bergamini_indices[0]["alpha_sigma"]]
+    gamma_spec = bergamini_specs[bergamini_indices[0]["gamma_ml"]]
+    assert alpha_spec.mean == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN)
+    assert alpha_spec.std == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD)
+    assert alpha_spec.lower == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER)
+    assert alpha_spec.upper == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER)
+    assert gamma_spec.mean == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN)
+    assert gamma_spec.std == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD)
+    assert gamma_spec.lower == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER)
+    assert gamma_spec.upper == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER)
 
 
 def _log_uniform_image_plane_scatter_spec(floor_arcsec: float = 0.1, upper_arcsec: float = 0.5) -> ParameterSpec:
@@ -11100,6 +13971,378 @@ def test_run_svi_fit_logs_bounded_refresh_deltas(monkeypatch: pytest.MonkeyPatch
     assert all("probes=" not in message and "arrays=" not in message and "mb=" not in message for message in refresh_logs)
 
 
+def test_run_svi_fit_topk_discovery_does_not_rebuild_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specs = [
+        ParameterSpec("halo.x", "halo_x", "halo", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0)
+    ]
+    centers = [np.asarray([0.2], dtype=float), np.asarray([0.4], dtype=float)]
+
+    class FakeGuide:
+        def __init__(self, center: np.ndarray) -> None:
+            self.center = np.asarray(center, dtype=float)
+
+        def median(self, _params: dict[str, Any]) -> dict[str, float]:
+            return {"halo_x": float(self.center[0])}
+
+        def sample_posterior(self, _key: Any, _params: dict[str, Any], sample_shape: tuple[int, ...]):
+            return {"halo_x": jnp.asarray(np.full(sample_shape, self.center[0], dtype=float))}
+
+    class FakeSVI:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def run(self, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(state=object(), losses=np.asarray([1.0], dtype=float))
+
+        def get_params(self, _state: object) -> dict[str, Any]:
+            return {}
+
+    class FakeEvaluator:
+        surrogate_enabled = False
+        scaling_component_indices = np.asarray([3, 4], dtype=np.int32)
+
+        def __init__(self) -> None:
+            self.timing_totals: dict[str, float] = {}
+            self.surrogate_cache_by_z: dict[float, Any] = {}
+            self.scaling_scatter_cache_by_z: dict[float, Any] = {}
+            self.source_metric_cache_by_z: dict[float, Any] = {}
+            self.surrogate_reference_params = np.asarray([0.0], dtype=float)
+            self.scaling_scatter_reference_params = np.asarray([0.0], dtype=float)
+            self.source_metric_reference_params = np.asarray([0.0], dtype=float)
+
+        def refresh_scaling_scatter_cache(self, params: np.ndarray, reason: str = "manual") -> None:
+            del reason
+            self.scaling_scatter_reference_params = np.asarray(params, dtype=float).copy()
+
+        def refresh_source_metric_cache(self, params: np.ndarray, reason: str = "manual") -> None:
+            del reason
+            self.source_metric_reference_params = np.asarray(params, dtype=float).copy()
+
+    def fake_make_guide(_sample_model: object, _parameter_specs: list[ParameterSpec], _init_values=None) -> FakeGuide:
+        return FakeGuide(centers.pop(0))
+
+    monkeypatch.setattr(cluster_solver, "_make_auto_normal_guide", fake_make_guide)
+    monkeypatch.setattr(cluster_solver, "SVI", FakeSVI)
+    monkeypatch.setattr(cluster_solver, "_run_logged_phase", lambda _args, _phase_name, fn, **_kwargs: fn())
+    monkeypatch.setattr(cluster_solver, "_posterior_logprob_matrix", lambda _specs, _evaluator, samples: np.zeros(samples.shape[0]))
+    monkeypatch.setattr(cluster_solver, "_log_posterior_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_maybe_clear_jax_caches_after_svi_refresh", lambda _args, _reason: False)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_topk_discovery_union_from_evaluator",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Top-K discovery should not run during SVI")),
+    )
+    monkeypatch.setattr(
+        cluster_solver,
+        "_rebuild_topk_discovery_state_from_union",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("SVI should not rebuild candidates")),
+    )
+
+    args = argparse.Namespace(
+        svi_steps=2,
+        refresh_every=1,
+        svi_learning_rate=0.1,
+        seed=11,
+        nuts_init_boundary_frac=0.0,
+        samples=1,
+        chains=1,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT,
+    )
+    state = SimpleNamespace(
+        parameter_specs=specs,
+        svi_init_values=None,
+        scaling_component_records=[
+            {"component_index": 3, "selected_independent": False},
+            {"component_index": 4, "selected_independent": False},
+        ],
+    )
+
+    best_fit, _posterior, diagnostics = cluster_solver._run_svi_fit(args, state, FakeEvaluator(), object())
+
+    assert best_fit.tolist() == pytest.approx([0.4])
+    assert diagnostics["topk_discovery_svi_exact"] is True
+    assert diagnostics["topk_discovery_svi_independent_candidates"] == 0
+    assert diagnostics["topk_discovery_svi_rebuild_count"] == 0
+
+
+def test_topk_discovery_final_diagnostic_messages_include_counts() -> None:
+    union_diag = {
+        "k": 5,
+        "candidate_galaxies": 200,
+        "n_images": 42,
+        "pairs": 210,
+        "exact_unique": 31,
+        "count": 29,
+        "score_fraction": 0.87,
+    }
+    svi_final_message = cluster_solver._topk_discovery_svi_final_log_message(
+        union_diag,
+        final_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+        final_polish_steps=2000,
+    )
+
+    assert "[topk-discovery:svi-final]" in svi_final_message
+    assert "k=5" in svi_final_message
+    assert "candidate_galaxies=200" in svi_final_message
+    assert "images=42" in svi_final_message
+    assert "pairs=210" in svi_final_message
+    assert "unique_topk=31" in svi_final_message
+    assert "independent_candidates=29" in svi_final_message
+    assert "score_fraction=0.87" in svi_final_message
+    assert "final_engine=refreshing_surrogate_flat" in svi_final_message
+    assert "final_svi_polish_steps=2000" in svi_final_message
+
+    counts = cluster_solver._topk_discovery_final_model_counts(
+        SimpleNamespace(
+            active_scaling_component_indices=np.arange(29, dtype=np.int32),
+            exact_scaling_component_indices=np.arange(29, dtype=np.int32),
+            cached_scaling_component_indices=np.arange(171, dtype=np.int32),
+            independent_scaling_component_indices=np.arange(29, dtype=np.int32),
+            free_correction_scaling_component_indices=np.arange(29, dtype=np.int32),
+            large_component_indices=np.arange(2, dtype=np.int32),
+            scaling_component_indices=np.arange(200, dtype=np.int32),
+        )
+    )
+    final_model_message = cluster_solver._topk_discovery_final_model_log_message(
+        counts,
+        old_parameter_count=8,
+        new_parameter_count=95,
+    )
+
+    assert "[topk-discovery:final-model]" in final_model_message
+    assert "active_scaling=29" in final_model_message
+    assert "exact_scaling=29" in final_model_message
+    assert "cached_scaling=171" in final_model_message
+    assert "independent_scaling=29" in final_model_message
+    assert "free_correction_candidates=29" in final_model_message
+    assert "large_exact=2" in final_model_message
+    assert "total_scaling=200" in final_model_message
+    assert "old_parameters=8" in final_model_message
+    assert "new_parameters=95" in final_model_message
+    diagnostics = cluster_solver._topk_discovery_svi_final_diagnostics(
+        {**union_diag, "k_valid": 5},
+        {"count": 29},
+        counts,
+        final_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+        final_polish_steps=2000,
+    )
+    assert diagnostics["topk_discovery_svi_final_independent_candidates"] == 29
+    assert diagnostics["topk_discovery_svi_final_pairs"] == 210
+    assert diagnostics["topk_discovery_svi_final_candidate_galaxies"] == 200
+    assert diagnostics["topk_discovery_svi_final_images"] == 42
+    assert diagnostics["topk_discovery_svi_final_engine"] == "refreshing_surrogate_flat"
+    assert diagnostics["topk_discovery_final_model_cached_scaling"] == 171
+
+
+def test_topk_discovery_final_svi_polish_updates_center_and_posterior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specs = [
+        ParameterSpec("halo.x", "halo_x", "halo", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0),
+        ParameterSpec("halo.y", "halo_y", "halo", 0, "y", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0),
+    ]
+
+    class FakeGuide:
+        def median(self, _params: dict[str, Any]) -> dict[str, float]:
+            return {"halo_x": 0.25, "halo_y": -0.5}
+
+        def sample_posterior(self, _key: Any, _params: dict[str, Any], sample_shape: tuple[int, ...]):
+            return {
+                "halo_x": jnp.asarray(np.full(sample_shape, 0.25, dtype=float)),
+                "halo_y": jnp.asarray(np.full(sample_shape, -0.5, dtype=float)),
+            }
+
+    class FakeSVI:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def run(self, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(state=object(), losses=np.asarray([3.0, 1.5], dtype=float))
+
+        def get_params(self, _state: object) -> dict[str, Any]:
+            return {}
+
+    init_values_seen: list[dict[str, float] | None] = []
+
+    def fake_make_guide(
+        _sample_model: object,
+        _parameter_specs: list[ParameterSpec],
+        init_values: dict[str, float] | None = None,
+    ) -> FakeGuide:
+        init_values_seen.append(None if init_values is None else dict(init_values))
+        return FakeGuide()
+
+    monkeypatch.setattr(cluster_solver, "_make_auto_normal_guide", fake_make_guide)
+    monkeypatch.setattr(cluster_solver, "SVI", FakeSVI)
+    monkeypatch.setattr(cluster_solver, "_run_logged_phase", lambda _args, _phase_name, fn, **_kwargs: fn())
+    monkeypatch.setattr(cluster_solver, "_posterior_logprob_matrix", lambda _specs, _evaluator, samples: np.zeros(samples.shape[0]))
+    monkeypatch.setattr(cluster_solver, "_log", lambda *_args, **_kwargs: None)
+    args = argparse.Namespace(
+        nuts_init_boundary_frac=0.0,
+        svi_learning_rate=0.05,
+        seed=7,
+        samples=2,
+        chains=1,
+    )
+    state = SimpleNamespace(parameter_specs=specs)
+
+    theta, posterior, diagnostics = cluster_solver._run_topk_discovery_final_svi_polish(
+        args,
+        state,
+        object(),
+        object(),
+        np.asarray([0.0, 0.0], dtype=float),
+        steps=5,
+    )
+
+    np.testing.assert_allclose(theta, np.asarray([0.25, -0.5], dtype=float))
+    assert posterior.samples.shape == (2, 2)
+    assert posterior.sampler == "svi_polish"
+    assert diagnostics["topk_discovery_final_svi_polish_steps"] == 5
+    assert diagnostics["topk_discovery_final_svi_polish_final_loss"] == pytest.approx(1.5)
+    assert diagnostics["topk_discovery_final_svi_polish_center_shift"] == pytest.approx(math.hypot(0.25, 0.5))
+    assert init_values_seen == [{"halo_x": 0.0, "halo_y": 0.0}]
+
+
+def test_run_svi_fit_population_active_scaling_keeps_last_active_inference_cache_for_freeze(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specs = _svi_health_specs()
+    logs: list[str] = []
+
+    class FakeGuide:
+        def __init__(self, center: np.ndarray) -> None:
+            self.center = np.asarray(center, dtype=float)
+
+        def median(self, _params: dict[str, Any]) -> dict[str, float]:
+            return {spec.sample_name: float(self.center[index]) for index, spec in enumerate(specs)}
+
+        def sample_posterior(self, _key: Any, _params: dict[str, Any], sample_shape: tuple[int, ...]):
+            return {
+                spec.sample_name: jnp.asarray(np.full(sample_shape, self.center[index], dtype=float))
+                for index, spec in enumerate(specs)
+            }
+
+    class FakeSVI:
+        run_count = 0
+
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def run(self, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
+            FakeSVI.run_count += 1
+            return SimpleNamespace(state=object(), losses=np.asarray([10.0 - FakeSVI.run_count], dtype=float))
+
+        def get_params(self, _state: object) -> dict[str, Any]:
+            return {}
+
+    class FakeEvaluator:
+        surrogate_enabled = False
+        active_inference_enabled = True
+
+        def __init__(self, active_scaling_inference_likelihood: str) -> None:
+            self.active_scaling_inference_likelihood = str(active_scaling_inference_likelihood)
+            self.timing_totals: dict[str, float] = {}
+            self.active_refresh_reasons: list[str] = []
+            self.active_inference_reference_params = np.asarray([-9.0, -9.0], dtype=float)
+            self.scaling_scatter_reference_params = np.asarray([0.0, 0.0], dtype=float)
+            self.source_metric_reference_params = np.asarray([0.0, 0.0], dtype=float)
+            self._set_caches(np.asarray([0.0, 0.0], dtype=float))
+
+        def _set_caches(self, params: np.ndarray) -> None:
+            base = float(np.sum(params))
+            values = np.asarray([base, base + 1.0], dtype=float)
+            self.surrogate_cache_by_z = {}
+            self.scaling_scatter_cache_by_z = {1.0: {"sigma": values}}
+            self.source_metric_cache_by_z = {1.0: {"metric": values + 2.0}}
+
+        def refresh_active_inference_cache(self, params: np.ndarray, reason: str = "manual") -> None:
+            self.active_refresh_reasons.append(str(reason))
+            self.active_inference_reference_params = np.asarray(params, dtype=float).copy()
+
+        def refresh_scaling_scatter_cache(self, params: np.ndarray, reason: str = "manual") -> None:
+            del reason
+            self.scaling_scatter_reference_params = np.asarray(params, dtype=float).copy()
+            self._set_caches(self.scaling_scatter_reference_params)
+
+        def refresh_source_metric_cache(self, params: np.ndarray, reason: str = "manual") -> None:
+            del reason
+            self.source_metric_reference_params = np.asarray(params, dtype=float).copy()
+            self._set_caches(self.source_metric_reference_params)
+
+    monkeypatch.setattr(cluster_solver, "SVI", FakeSVI)
+    monkeypatch.setattr(cluster_solver, "_run_logged_phase", lambda _args, _phase_name, fn, **_kwargs: fn())
+    monkeypatch.setattr(cluster_solver, "_posterior_logprob_matrix", lambda _specs, _evaluator, samples: np.zeros(samples.shape[0]))
+    monkeypatch.setattr(cluster_solver, "_log_posterior_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log", lambda _args, message, **_kwargs: logs.append(str(message)))
+    monkeypatch.setattr(cluster_solver, "_maybe_clear_jax_caches_after_svi_refresh", lambda _args, _reason: False)
+
+    def run_case(
+        likelihood: str,
+        centers: list[np.ndarray],
+        *,
+        refresh_every: int,
+    ) -> tuple[FakeEvaluator, np.ndarray, dict[str, Any]]:
+        queued_centers = [np.asarray(center, dtype=float) for center in centers]
+        FakeSVI.run_count = 0
+
+        def fake_make_guide(_sample_model: object, _parameter_specs: list[ParameterSpec], _init_values=None) -> FakeGuide:
+            return FakeGuide(queued_centers.pop(0))
+
+        monkeypatch.setattr(cluster_solver, "_make_auto_normal_guide", fake_make_guide)
+        evaluator = FakeEvaluator(likelihood)
+        args = argparse.Namespace(
+            svi_steps=len(centers),
+            refresh_every=refresh_every,
+            svi_learning_rate=0.1,
+            seed=11,
+            nuts_init_boundary_frac=0.0,
+            samples=1,
+            chains=1,
+        )
+        state = SimpleNamespace(
+            parameter_specs=specs,
+            svi_init_values=None,
+        )
+        best_fit, _posterior, diagnostics = cluster_solver._run_svi_fit(args, state, evaluator, object())
+        assert not queued_centers
+        return evaluator, best_fit, diagnostics
+
+    population_no_refresh, best_fit, diagnostics = run_case(
+        cluster_solver.ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION,
+        [np.asarray([1.0, -1.0], dtype=float)],
+        refresh_every=1,
+    )
+    assert best_fit.tolist() == pytest.approx([1.0, -1.0])
+    assert population_no_refresh.active_refresh_reasons == []
+    assert population_no_refresh.active_inference_reference_params.tolist() == pytest.approx([-9.0, -9.0])
+    assert diagnostics["svi_active_inference_final_refresh_skipped"] is True
+
+    population_blocked, best_fit, diagnostics = run_case(
+        cluster_solver.ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION,
+        [np.asarray([1.0, -1.0], dtype=float), np.asarray([2.0, -2.0], dtype=float)],
+        refresh_every=1,
+    )
+    assert best_fit.tolist() == pytest.approx([2.0, -2.0])
+    assert population_blocked.active_refresh_reasons == ["svi_block_1"]
+    assert population_blocked.active_inference_reference_params.tolist() == pytest.approx([1.0, -1.0])
+    assert diagnostics["svi_active_inference_final_refresh_skipped"] is True
+
+    blend, best_fit, diagnostics = run_case(
+        cluster_solver.ACTIVE_SCALING_INFERENCE_LIKELIHOOD_BLEND,
+        [np.asarray([1.0, -1.0], dtype=float)],
+        refresh_every=1,
+    )
+    assert best_fit.tolist() == pytest.approx([1.0, -1.0])
+    assert blend.active_refresh_reasons == ["svi_final"]
+    assert blend.active_inference_reference_params.tolist() == pytest.approx([1.0, -1.0])
+    assert diagnostics["svi_active_inference_final_refresh_skipped"] is False
+    assert any("skipped svi_final active cache refresh" in message for message in logs)
+
+
 def test_cluster_solver_rejects_removed_profile_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     for flag, value in (("--profile-variant", "original"), ("--compact-skip-factor", "1.0")):
         monkeypatch.setattr(
@@ -11247,6 +14490,37 @@ def test_cluster_solver_accepts_start_at_stage3_for_local_jacobian(monkeypatch: 
     assert controls["stage3"].samples == 20
 
 
+def test_cluster_solver_accepts_start_at_stage2(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--start-at-stage2",
+            "--fit-method",
+            "svi+nuts",
+            "--svi-steps",
+            "1000",
+            "--warmup",
+            "200",
+            "--samples",
+            "50",
+        ],
+    )
+
+    args = _parse_args()
+    controls = _normalize_stage_fit_controls(args)
+
+    assert args.start_at_stage2 is True
+    assert args.start_at_stage3 is False
+    assert controls["stage2"].fit_method == "svi+nuts"
+    assert controls["stage2"].svi_steps == 1000
+    assert controls["stage2"].warmup == 200
+    assert controls["stage2"].samples == 50
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [
@@ -11275,6 +14549,40 @@ def test_cluster_solver_rejects_invalid_start_at_stage3_controls(
         svi_steps=[1000, 400],
         warmup=[200, 0],
         samples=[50, 20],
+    )
+    for key, value in updates.items():
+        setattr(args, key, value)
+
+    with pytest.raises(SystemExit, match=message):
+        _normalize_stage_fit_controls(args)
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"fit_mode": "joint"}, "fit-mode sequential"),
+        ({"start_at_stage3": True}, "start-at-stage3"),
+        ({"fit_method": "nuts"}, "fit-method svi or svi\\+nuts"),
+        ({"fit_method": "smc"}, "fit-method svi or svi\\+nuts"),
+        ({"fit_method": "mchmc"}, "fit-method svi or svi\\+nuts"),
+    ],
+)
+def test_cluster_solver_rejects_invalid_start_at_stage2_controls(
+    updates: dict[str, Any],
+    message: str,
+) -> None:
+    args = argparse.Namespace(
+        fit_mode=cluster_solver.FIT_MODE_SEQUENTIAL,
+        image_plane_mode=IMAGE_PLANE_MODE_NONE,
+        stage3_image_plane_mode=cluster_solver.STAGE3_IMAGE_PLANE_MODE_AUTO,
+        start_at_stage2=True,
+        start_at_stage3=False,
+        skip_stage3_image_plane_local_jacobian=False,
+        resume=False,
+        fit_method="svi+nuts",
+        svi_steps=1000,
+        warmup=200,
+        samples=50,
     )
     for key, value in updates.items():
         setattr(args, key, value)
@@ -12235,6 +15543,162 @@ def test_run_inference_direct_nuts_uses_state_init_without_svi(
     assert "post_nuts" in evaluator.refresh_reasons
 
 
+def test_run_inference_topk_final_rebuild_logs_active_table_with_current_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    specs = [
+        ParameterSpec("halo.x", "halo_x", "halo", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0)
+    ]
+    state = SimpleNamespace(
+        run_name="stage3_image_plane",
+        par_path="data/clustersim/input.par",
+        parameter_specs=specs,
+        family_data=[],
+        bin_data=[],
+        svi_init_values=None,
+    )
+
+    class FakeEvaluator:
+        def __init__(self, label: str, *, sampling_engine: str) -> None:
+            self.label = label
+            self.state = state
+            self.surrogate_enabled = sampling_engine == cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT
+            self.sampling_engine = sampling_engine
+            self.timing_totals = {"validation_runtime": 0.0}
+            self.refresh_reasons: list[str] = []
+            self.active_inference_enabled = False
+            self.using_frozen_active_scaling = False
+            self.large_component_indices = np.asarray([0], dtype=np.int32)
+            self.scaling_component_indices = np.asarray([1, 2, 3], dtype=np.int32)
+            self.active_scaling_component_indices = np.asarray([1], dtype=np.int32)
+            self.exact_scaling_component_indices = np.asarray([1], dtype=np.int32)
+            self.cached_scaling_component_indices = np.asarray([2, 3], dtype=np.int32)
+            self.inactive_scaling_component_indices = np.asarray([2, 3], dtype=np.int32)
+            self.independent_scaling_component_indices = np.asarray([1], dtype=np.int32)
+            self.free_correction_scaling_component_indices = np.asarray([1], dtype=np.int32)
+            self.excluded_scaling_component_indices = np.asarray([], dtype=np.int32)
+            self.active_scaling_selection = "fixed"
+            self.topk_discovery_scaling_galaxies = 1
+            self.quick_diagnostics = True
+            self.sample_likelihood_mode = cluster_solver.SAMPLE_LIKELIHOOD_SOURCE
+            self.source_plane_covariance_mode = cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION
+            self.source_metric_cache_by_z: dict[float, Any] = {}
+            self.scaling_scatter_param_indices = np.asarray([], dtype=np.int32)
+
+        def refresh_surrogate(self, _theta: np.ndarray, reason: str) -> None:
+            self.refresh_reasons.append(f"surrogate:{reason}")
+
+        def refresh_scaling_scatter_cache(self, _theta: np.ndarray, reason: str) -> None:
+            self.refresh_reasons.append(f"scatter:{reason}")
+
+        def refresh_source_metric_cache(self, _theta: np.ndarray, reason: str) -> None:
+            self.refresh_reasons.append(f"source:{reason}")
+
+        def release_runtime_caches(self) -> None:
+            self.refresh_reasons.append("released")
+
+    initial_evaluator = FakeEvaluator("initial", sampling_engine=cluster_solver.SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT)
+    final_evaluator = FakeEvaluator("final", sampling_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT)
+    logs: list[str] = []
+    active_table_calls: list[str] = []
+
+    svi_posterior = PosteriorResults(
+        samples=np.asarray([[0.1]], dtype=float),
+        log_prob=np.asarray([1.0], dtype=float),
+        accept_prob=np.asarray([], dtype=float),
+        diverging=np.asarray([], dtype=bool),
+        num_steps=np.asarray([], dtype=float),
+        warmup_steps=0,
+        sample_steps=1,
+        num_chains=1,
+        init_diagnostics={},
+        grouped_samples=np.asarray([[[0.1]]], dtype=float),
+        grouped_log_prob=np.asarray([[1.0]], dtype=float),
+        sampler="svi",
+    )
+    nuts_posterior = PosteriorResults(
+        samples=np.asarray([[0.2]], dtype=float),
+        log_prob=np.asarray([2.0], dtype=float),
+        accept_prob=np.asarray([0.9], dtype=float),
+        diverging=np.asarray([False], dtype=bool),
+        num_steps=np.asarray([3.0], dtype=float),
+        warmup_steps=0,
+        sample_steps=1,
+        num_chains=1,
+        init_diagnostics={},
+        grouped_samples=np.asarray([[[0.2]]], dtype=float),
+        grouped_log_prob=np.asarray([[2.0]], dtype=float),
+        sampler="numpyro_nuts",
+    )
+
+    def fake_run_svi_fit(_args, _state, _evaluator, sample_model):
+        return cluster_solver._SviFitResult(
+            best_fit=np.asarray([0.1], dtype=float),
+            posterior=svi_posterior,
+            diagnostics={"svi_final_elbo_loss": 3.0, "svi_block_count": 1},
+            state=state,
+            evaluator=initial_evaluator,
+            sample_model=sample_model,
+        )
+
+    def fake_rebuild_topk(_args, _state, _best_fit, _final_union, *, reason: str):
+        assert reason == "topk_discovery_final"
+        return (
+            state,
+            final_evaluator,
+            object(),
+            np.asarray([0.15], dtype=float),
+            {"count": 1, "added": 1, "removed": 0, "retained": 0},
+        )
+
+    monkeypatch.setattr(cluster_solver, "_configure_debug_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log", lambda _args, message, **_kwargs: logs.append(str(message)))
+    monkeypatch.setattr(cluster_solver, "_prepare_direct_evaluator", lambda _args, _state: (initial_evaluator, np.zeros(1)))
+    monkeypatch.setattr(cluster_solver, "_posterior_model", lambda _specs, _evaluator: object())
+    monkeypatch.setattr(cluster_solver, "_run_svi_fit", fake_run_svi_fit)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_topk_discovery_union_from_evaluator",
+        lambda *_args, **_kwargs: ({0: {0}}, {"k": 1, "k_valid": 1, "candidate_galaxies": 3, "n_images": 2, "pairs": 2, "exact_unique": 1, "count": 1, "score_fraction": 0.9}),
+    )
+    monkeypatch.setattr(cluster_solver, "_rebuild_topk_discovery_state_from_union", fake_rebuild_topk)
+    monkeypatch.setattr(cluster_solver, "_transfer_posterior_samples_by_sample_name", lambda posterior, *_args: posterior)
+    monkeypatch.setattr(cluster_solver, "_svi_refresh_evaluator_snapshot", lambda _evaluator: {})
+    monkeypatch.setattr(cluster_solver, "_svi_refresh_status_log_payload", lambda *_args, **_kwargs: ("[svi] refresh mocked", None))
+    monkeypatch.setattr(cluster_solver, "_prepare_svi_health_for_nuts", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cluster_solver, "_run_repeated_nuts_sampling", lambda *_args, **_kwargs: (nuts_posterior, np.asarray([0.2], dtype=float)))
+    monkeypatch.setattr(cluster_solver, "_max_likelihood_best_fit_from_posterior", lambda _args, _evaluator, _posterior, fallback: np.asarray(fallback, dtype=float))
+    monkeypatch.setattr(
+        cluster_solver,
+        "_save_inference_checkpoint",
+        lambda _args, _state, _evaluator, run_dir, best_fit, posterior: (Path(run_dir) / "artifacts", np.asarray(best_fit, dtype=float), posterior),
+    )
+    monkeypatch.setattr(cluster_solver, "_output_evaluator_for_validation", lambda _args, _state, evaluator, _best_fit: evaluator)
+    monkeypatch.setattr(cluster_solver, "_approximate_evaluation", lambda *_args, **_kwargs: EvaluationResult(loglike=0.0, family_predictions={}))
+    monkeypatch.setattr(cluster_solver, "_write_truth_validation_outputs", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log_posterior_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log_active_approximation_table", lambda _args, evaluator: active_table_calls.append(evaluator.label))
+
+    args = argparse.Namespace(
+        fit_method=cluster_solver.FIT_METHOD_SVI_NUTS,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT,
+        topk_discovery_final_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+        topk_discovery_final_svi_polish_steps=0,
+        output_dir=str(tmp_path),
+        skip_validation=True,
+        quick_diagnostics=False,
+        skip_plots=True,
+        quiet=True,
+    )
+
+    cluster_solver._run_inference(args, state, tmp_path / state.run_name)
+
+    assert any(message.startswith("[topk-discovery:final-model]") for message in logs)
+    assert "final" in active_table_calls
+    assert "surrogate:pre_nuts_topk_discovery_final_rebuilt" in final_evaluator.refresh_reasons
+
+
 @pytest.mark.parametrize("fit_method", [cluster_solver.FIT_METHOD_MCHMC, cluster_solver.FIT_METHOD_MCLMC])
 def test_run_inference_microcanonical_uses_state_init_without_svi(
     monkeypatch: pytest.MonkeyPatch,
@@ -13106,56 +16570,6 @@ def test_validation_accepts_microcanonical_samplers_for_all_sampled_stages() -> 
     assert controls["stage4"].warmup == 40
 
 
-@pytest.mark.parametrize(
-    "extra_args",
-    [
-        [
-            "--image-plane-mode",
-            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
-        ],
-        [
-            "--image-plane-mode",
-            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
-            "--fit-method",
-            "svi+nuts",
-            "svi+nuts",
-            "smc",
-        ],
-        [
-            "--image-plane-mode",
-            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
-            "--fit-method",
-            "svi+nuts",
-            "svi+nuts",
-            "mclmc",
-        ],
-        [
-            "--fit-method",
-            "mchmc",
-        ],
-    ],
-)
-def test_cluster_solver_rejects_potfile_mass_size_reparam_unsupported_sampler_paths(
-    monkeypatch: pytest.MonkeyPatch,
-    extra_args: list[str],
-) -> None:
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "cluster_solver",
-            "--par-path",
-            "data/clustersim/input.par",
-            "--potfile-mass-size-reparam",
-            *extra_args,
-        ],
-    )
-
-    args = _parse_args()
-    with pytest.raises(SystemExit, match="potfile-mass-size-reparam"):
-        _normalize_stage_fit_controls(args)
-
-
 def test_cluster_solver_rejects_unavailable_explicit_gpu_device(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cluster_solver.jax, "devices", lambda kind=None: [] if kind == "gpu" else [object()])
     with pytest.raises(ValueError, match="--smc-device=gpu"):
@@ -13712,6 +17126,94 @@ def test_cluster_solver_accepts_refreshing_surrogate_flat_sampling_engine(monkey
     assert args.sampling_engine == "refreshing_surrogate_flat"
 
 
+def test_cluster_solver_accepts_topk_discovery_flat_sampling_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--sampling-engine",
+            "topk_discovery_flat",
+            "--topk-discovery-scaling-galaxies",
+            "7",
+            "--topk-discovery-score",
+            "alpha_jacobian",
+            "--topk-discovery-jacobian-weight",
+            "0.5",
+            "--topk-discovery-final-engine",
+            "refreshing_surrogate_flat",
+            "--topk-discovery-final-svi-polish-steps",
+            "500",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.sampling_engine == "topk_discovery_flat"
+    assert args.topk_discovery_scaling_galaxies == 7
+    assert args.topk_discovery_score == "alpha_jacobian"
+    assert args.topk_discovery_jacobian_weight == 0.5
+    assert args.topk_discovery_final_engine == "refreshing_surrogate_flat"
+    assert args.topk_discovery_final_svi_polish_steps == 500
+
+
+def test_cluster_solver_rejects_removed_local_topk_surrogate_flat(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--sampling-engine",
+            "local_topk_surrogate_flat",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+
+def test_cluster_solver_rejects_removed_local_topk_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--local-topk-scaling-galaxies",
+            "10",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+
+def test_cluster_solver_rejects_negative_topk_discovery_final_svi_polish_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--sampling-engine",
+            "topk_discovery_flat",
+            "--topk-discovery-final-svi-polish-steps",
+            "-1",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+
 def test_cluster_solver_evidence_ns_rejects_active_subset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         sys,
@@ -13827,6 +17329,7 @@ def test_cluster_solver_accepts_two_value_fit_controls_for_local_jacobian(monkey
         "warmup": 2000,
         "samples": 250,
         "max_tree_depth": 9,
+        "sampling_refresh_runs": 1,
     }
     assert controls["stage3"].to_json() == {
         "fit_method": "svi",
@@ -13834,6 +17337,7 @@ def test_cluster_solver_accepts_two_value_fit_controls_for_local_jacobian(monkey
         "warmup": 0,
         "samples": 100,
         "max_tree_depth": 7,
+        "sampling_refresh_runs": 1,
     }
     assert controls["stage4"].to_json() == {
         "fit_method": "svi",
@@ -13841,6 +17345,7 @@ def test_cluster_solver_accepts_two_value_fit_controls_for_local_jacobian(monkey
         "warmup": 0,
         "samples": 100,
         "max_tree_depth": 7,
+        "sampling_refresh_runs": 1,
     }
 
 
@@ -13896,6 +17401,7 @@ def test_stage_fit_controls_scalar_values_apply_to_stage2_and_stage3() -> None:
         "svi_steps": 1500,
         "warmup": 2000,
         "samples": 250,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 9,
     }
     assert controls["stage3"].to_json() == {
@@ -13903,6 +17409,7 @@ def test_stage_fit_controls_scalar_values_apply_to_stage2_and_stage3() -> None:
         "svi_steps": 1500,
         "warmup": 2000,
         "samples": 250,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 9,
     }
     assert controls["stage4"].to_json() == {
@@ -13910,6 +17417,7 @@ def test_stage_fit_controls_scalar_values_apply_to_stage2_and_stage3() -> None:
         "svi_steps": 1500,
         "warmup": 2000,
         "samples": 250,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 9,
     }
 
@@ -13932,6 +17440,7 @@ def test_stage_fit_controls_two_values_map_to_stage2_and_stage3() -> None:
         "svi_steps": 1500,
         "warmup": 2000,
         "samples": 250,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 9,
     }
     assert controls["stage3"].to_json() == {
@@ -13939,6 +17448,7 @@ def test_stage_fit_controls_two_values_map_to_stage2_and_stage3() -> None:
         "svi_steps": 400,
         "warmup": 0,
         "samples": 100,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 7,
     }
     assert controls["stage4"].to_json() == {
@@ -13946,6 +17456,7 @@ def test_stage_fit_controls_two_values_map_to_stage2_and_stage3() -> None:
         "svi_steps": 400,
         "warmup": 0,
         "samples": 100,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 7,
     }
 
@@ -13968,6 +17479,7 @@ def test_stage_fit_controls_three_values_map_to_stage4() -> None:
         "svi_steps": 1500,
         "warmup": 2000,
         "samples": 250,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 10,
     }
     assert controls["stage3"].to_json() == {
@@ -13975,6 +17487,7 @@ def test_stage_fit_controls_three_values_map_to_stage4() -> None:
         "svi_steps": 1000,
         "warmup": 1000,
         "samples": 100,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 8,
     }
     assert controls["stage4"].to_json() == {
@@ -13982,6 +17495,7 @@ def test_stage_fit_controls_three_values_map_to_stage4() -> None:
         "svi_steps": 200,
         "warmup": 0,
         "samples": 20,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 6,
     }
 
@@ -14020,6 +17534,7 @@ def test_stage_fit_controls_linearized_stage4_skipped_stage3_uses_stage4_values(
         "svi_steps": 1500,
         "warmup": 2000,
         "samples": 250,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 10,
     }
     assert controls["stage4"].to_json() == {
@@ -14027,6 +17542,7 @@ def test_stage_fit_controls_linearized_stage4_skipped_stage3_uses_stage4_values(
         "svi_steps": 200,
         "warmup": 0,
         "samples": 20,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 6,
     }
 
@@ -14120,6 +17636,7 @@ def test_stage_fit_controls_two_values_map_to_stage4_when_stage3_skipped() -> No
         "svi_steps": 1500,
         "warmup": 2000,
         "samples": 250,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 9,
     }
     assert controls["stage4"].to_json() == {
@@ -14127,6 +17644,7 @@ def test_stage_fit_controls_two_values_map_to_stage4_when_stage3_skipped() -> No
         "svi_steps": 200,
         "warmup": 0,
         "samples": 20,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 5,
     }
 
@@ -14269,6 +17787,7 @@ def test_stage_fit_controls_accept_unlimited_ns_max_samples() -> None:
         "svi_steps": 0,
         "warmup": 0,
         "samples": 0,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 10,
     }
 
@@ -14472,6 +17991,32 @@ def test_validation_stage_fit_controls_accept_start_at_stage3() -> None:
     }
 
 
+def test_validation_stage_fit_controls_accept_start_at_stage2() -> None:
+    args = argparse.Namespace(
+        solver_fit_mode=validation.SOLVER_FIT_MODE_SEQUENTIAL,
+        fit_method="svi+nuts",
+        svi_steps=1200,
+        warmup=1000,
+        samples=250,
+        max_tree_depth=8,
+        image_plane_mode=IMAGE_PLANE_MODE_NONE,
+        start_at_stage2=True,
+        start_at_stage3=False,
+        skip_stage3_image_plane_local_jacobian=False,
+        resume=False,
+    )
+
+    controls = _normalize_validation_stage_fit_controls(args)
+
+    assert controls["stage2"].to_json() == {
+        "fit_method": "svi+nuts",
+        "svi_steps": 1200,
+        "warmup": 1000,
+        "samples": 250,
+        "max_tree_depth": 8,
+    }
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [
@@ -14502,6 +18047,42 @@ def test_validation_stage_fit_controls_reject_invalid_start_at_stage3_controls(
         max_tree_depth=[8, 6],
         image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
         start_at_stage3=True,
+        skip_stage3_image_plane_local_jacobian=False,
+        resume=False,
+    )
+    payload.update(updates)
+
+    with pytest.raises(SystemExit, match=message):
+        _normalize_validation_stage_fit_controls(argparse.Namespace(**payload))
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        (
+            {"solver_fit_mode": validation.SOLVER_FIT_MODE_EVIDENCE_NS},
+            "solver-fit-mode sequential",
+        ),
+        ({"start_at_stage3": True}, "start-at-stage3"),
+        ({"fit_method": "nuts"}, "fit-method svi or svi\\+nuts"),
+        ({"fit_method": "smc"}, "fit-method svi or svi\\+nuts"),
+        ({"fit_method": "mclmc"}, "fit-method svi or svi\\+nuts"),
+    ],
+)
+def test_validation_stage_fit_controls_reject_invalid_start_at_stage2_controls(
+    updates: dict[str, Any],
+    message: str,
+) -> None:
+    payload = dict(
+        solver_fit_mode=validation.SOLVER_FIT_MODE_SEQUENTIAL,
+        fit_method="svi+nuts",
+        svi_steps=1200,
+        warmup=1000,
+        samples=250,
+        max_tree_depth=8,
+        image_plane_mode=IMAGE_PLANE_MODE_NONE,
+        start_at_stage2=True,
+        start_at_stage3=False,
         skip_stage3_image_plane_local_jacobian=False,
         resume=False,
     )
@@ -15242,6 +18823,19 @@ def test_validation_parser_accepts_start_at_stage3() -> None:
     assert args.start_at_stage3 is True
 
 
+def test_validation_parser_accepts_start_at_stage2() -> None:
+    args = validation._build_parser().parse_args(["--start-at-stage2"])
+
+    assert args.start_at_stage2 is True
+    assert args.start_at_stage3 is False
+
+
+def test_validation_parser_accepts_source_plane_covariance_mode() -> None:
+    args = validation._build_parser().parse_args(["--source-plane-covariance-mode", "unit"])
+
+    assert args.source_plane_covariance_mode == "unit"
+
+
 def test_validation_parser_rejects_marginal_image_plane_mode() -> None:
     with pytest.raises(SystemExit):
         validation._build_parser().parse_args(
@@ -15519,6 +19113,8 @@ def test_run_xsh_critical_arc_mode_selects_new_image_plane_mode() -> None:
     assert '"--exact-image-precision-limit", 1.0e-2' in text
     assert '"--exact-image-num-iter-max", 20' in text
     assert '"--match-tolerance-arcsec", 2.0' in text
+    assert 'source_plane_covariance_mode = "unit"' in text
+    assert '"--source-plane-covariance-mode", source_plane_covariance_mode' in text
     assert '"kappa_true_fits": "data/ff_sims/ares/kappa_z9_0.fits"' in text
     assert '"kappa_true_fits": "data/ff_sims/hera/kappa_z9_0.fits"' in text
     assert '"gammax_true_fits": "data/ff_sims/ares/gammax_z9_0.fits"' in text
@@ -15576,14 +19172,24 @@ def test_validation_parser_accepts_evidence_ns_controls() -> None:
 def test_validation_parser_accepts_posterior_diagnostic_mode() -> None:
     defaults = validation._build_parser().parse_args([])
     args = validation._build_parser().parse_args(["--posterior-diagnostic-mode", "approximate", "--quick-diagnostics"])
-    exact_args = validation._build_parser().parse_args(["--exact-image-diagnostics-stage3"])
+    exact_stage2_args = validation._build_parser().parse_args(["--exact-image-diagnostics-stage2"])
+    exact_stage3_args = validation._build_parser().parse_args(["--exact-image-diagnostics-stage3"])
 
     assert defaults.posterior_diagnostic_mode == validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT
     assert defaults.quick_diagnostics is False
+    assert defaults.exact_image_diagnostics_stage2 is False
     assert defaults.exact_image_diagnostics_stage3 is False
     assert args.posterior_diagnostic_mode == validation.POSTERIOR_DIAGNOSTIC_MODE_APPROXIMATE
     assert args.quick_diagnostics is True
-    assert exact_args.exact_image_diagnostics_stage3 is True
+    assert exact_stage2_args.exact_image_diagnostics_stage2 is True
+    assert exact_stage3_args.exact_image_diagnostics_stage3 is True
+
+
+def test_validation_rejects_quick_and_exact_stage2_diagnostics() -> None:
+    args = validation._build_parser().parse_args(["--quick-diagnostics", "--exact-image-diagnostics-stage2"])
+
+    with pytest.raises(SystemExit, match="exact-image-diagnostics-stage2"):
+        validation._validate_validation_args(args)
 
 
 def test_validation_rejects_quick_and_exact_stage3_diagnostics() -> None:
@@ -15707,6 +19313,68 @@ def test_validation_parser_accepts_refreshing_surrogate_flat_sampling_engine() -
     args = validation._build_parser().parse_args(["--sampling-engine", "refreshing_surrogate_flat"])
 
     assert args.sampling_engine == "refreshing_surrogate_flat"
+
+
+def test_validation_parser_accepts_topk_discovery_flat_sampling_engine() -> None:
+    args = validation._build_parser().parse_args(
+        [
+            "--sampling-engine",
+            "topk_discovery_flat",
+            "--topk-discovery-scaling-galaxies",
+            "11",
+            "--topk-discovery-jacobian-weight",
+            "2.0",
+            "--topk-discovery-final-engine",
+            "full_flat",
+            "--topk-discovery-final-svi-polish-steps",
+            "250",
+        ]
+    )
+
+    assert args.sampling_engine == "topk_discovery_flat"
+    assert args.topk_discovery_scaling_galaxies == 11
+    assert args.topk_discovery_score == "alpha_jacobian"
+    assert args.topk_discovery_jacobian_weight == 2.0
+    assert args.topk_discovery_final_engine == "full_flat"
+    assert args.topk_discovery_final_svi_polish_steps == 250
+
+
+def test_validation_parser_rejects_removed_local_topk_surrogate_flat() -> None:
+    with pytest.raises(SystemExit):
+        validation._build_parser().parse_args(["--sampling-engine", "local_topk_surrogate_flat"])
+
+
+def test_validation_parser_rejects_negative_topk_discovery_final_svi_polish_steps() -> None:
+    with pytest.raises(SystemExit):
+        validation._build_parser().parse_args(["--topk-discovery-final-svi-polish-steps", "-1"])
+
+
+def test_validation_parser_accepts_active_scaling_inference_controls() -> None:
+    args = validation._build_parser().parse_args(
+        [
+            "--infer-active-scaling",
+            "--active-scaling-prior-prob",
+            "0.35",
+            "--active-scaling-logit-prior-sigma",
+            "2.0",
+            "--active-scaling-mag-slope-prior-sigma",
+            "1.25",
+            "--active-scaling-local-logit-prior-sigma",
+            "0.8",
+            "--active-scaling-freeze-threshold",
+            "0.6",
+            "--active-scaling-inference-likelihood",
+            "blend",
+        ]
+    )
+
+    assert args.infer_active_scaling is True
+    assert args.active_scaling_inference_likelihood == "blend"
+    assert args.active_scaling_prior_prob == pytest.approx(0.35)
+    assert args.active_scaling_logit_prior_sigma == pytest.approx(2.0)
+    assert args.active_scaling_mag_slope_prior_sigma == pytest.approx(1.25)
+    assert args.active_scaling_local_logit_prior_sigma == pytest.approx(0.8)
+    assert args.active_scaling_freeze_threshold == pytest.approx(0.6)
 
 
 def test_validation_parser_uses_primary_and_subhalo_family_counts() -> None:
@@ -15900,6 +19568,144 @@ def test_cluster_solver_parser_accepts_jax_device_flags(monkeypatch: pytest.Monk
 
     assert args.jax_default_device == "cpu"
     assert args.smc_device == "gpu"
+
+
+def test_cluster_solver_parser_accepts_source_plane_covariance_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--source-plane-covariance-mode",
+            "unit",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.source_plane_covariance_mode == "unit"
+
+
+def test_cluster_solver_parser_rejects_independent_scaling_galaxy_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--independent-scaling-galaxies",
+            "3",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+
+def test_cluster_solver_parser_accepts_independent_scaling_log_displacement_hyperparameters(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+                "cluster_solver",
+                "--par-path",
+                "data/clustersim/input.par",
+                "--independent-scaling-free-log-vdisp-tau-prior-median",
+                "0.22",
+                "--independent-scaling-free-log-core-tau-prior-median",
+                "0.33",
+                "--independent-scaling-free-log-cut-tau-prior-median",
+                "0.44",
+                "--independent-scaling-free-log-tau-prior-sigma",
+                "0.55",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.independent_scaling_free_log_vdisp_tau_prior_median == pytest.approx(0.22)
+    assert args.independent_scaling_free_log_core_tau_prior_median == pytest.approx(0.33)
+    assert args.independent_scaling_free_log_cut_tau_prior_median == pytest.approx(0.44)
+    assert args.independent_scaling_free_log_tau_prior_sigma == pytest.approx(0.55)
+
+
+def test_cluster_solver_parser_accepts_active_scaling_inference_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--infer-active-scaling",
+            "--active-scaling-prior-prob",
+            "0.35",
+            "--active-scaling-logit-prior-sigma",
+            "2.0",
+            "--active-scaling-mag-slope-prior-sigma",
+            "1.25",
+            "--active-scaling-local-logit-prior-sigma",
+            "0.8",
+            "--active-scaling-freeze-threshold",
+            "0.6",
+            "--active-scaling-inference-likelihood",
+            "blend",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.infer_active_scaling is True
+    assert args.active_scaling_inference_likelihood == "blend"
+    assert args.active_scaling_prior_prob == pytest.approx(0.35)
+    assert args.active_scaling_logit_prior_sigma == pytest.approx(2.0)
+    assert args.active_scaling_mag_slope_prior_sigma == pytest.approx(1.25)
+    assert args.active_scaling_local_logit_prior_sigma == pytest.approx(0.8)
+    assert args.active_scaling_freeze_threshold == pytest.approx(0.6)
+
+
+def test_validation_parser_rejects_independent_scaling_galaxy_count() -> None:
+    with pytest.raises(SystemExit):
+        validation._build_parser().parse_args(["--independent-scaling-galaxies", "3"])
+
+
+def test_validation_parser_accepts_independent_scaling_log_displacement_hyperparameters() -> None:
+    args = validation._build_parser().parse_args(
+        [
+            "--independent-scaling-free-log-vdisp-tau-prior-median",
+            "0.22",
+            "--independent-scaling-free-log-core-tau-prior-median",
+            "0.33",
+            "--independent-scaling-free-log-cut-tau-prior-median",
+            "0.44",
+            "--independent-scaling-free-log-tau-prior-sigma",
+            "0.55",
+        ]
+    )
+
+    assert args.independent_scaling_free_log_vdisp_tau_prior_median == pytest.approx(0.22)
+    assert args.independent_scaling_free_log_core_tau_prior_median == pytest.approx(0.33)
+    assert args.independent_scaling_free_log_cut_tau_prior_median == pytest.approx(0.44)
+    assert args.independent_scaling_free_log_tau_prior_sigma == pytest.approx(0.55)
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--independent-scaling-free-log-vdisp-tau-prior-median",
+        "--independent-scaling-free-log-core-tau-prior-median",
+        "--independent-scaling-free-log-cut-tau-prior-median",
+        "--independent-scaling-free-log-tau-prior-sigma",
+    ],
+)
+def test_validation_parser_rejects_invalid_independent_scaling_log_displacement_priors(option: str) -> None:
+    args = validation._build_parser().parse_args([option, "0"])
+
+    with pytest.raises(SystemExit):
+        validation._validate_validation_args(args)
 
 
 def test_cluster_solver_rejects_resume_fast_outside_sequential() -> None:
@@ -16105,6 +19911,7 @@ def _validation_solver_args(**updates) -> argparse.Namespace:
         solver_fit_mode="sequential",
         fit_method="svi+nuts",
         image_plane_mode=IMAGE_PLANE_MODE_NONE,
+        start_at_stage2=False,
         start_at_stage3=False,
         skip_stage3_image_plane_local_jacobian=False,
         image_plane_newton_steps=0,
@@ -16161,6 +19968,7 @@ def _validation_solver_args(**updates) -> argparse.Namespace:
         ns_dlogz=1.0e-4,
         sampling_engine="refreshing_surrogate",
         source_plane_covariance_floor=1.0e-6,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
         z_bin_efficiency_tol=0.01,
         exact_image_min_distance_arcsec=validation.DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC,
         exact_image_precision_limit=validation.DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
@@ -16170,6 +19978,24 @@ def _validation_solver_args(**updates) -> argparse.Namespace:
         active_scaling_cumulative_fraction=0.995,
         active_scaling_min=4,
         active_scaling_galaxies=None,
+        infer_active_scaling=False,
+        active_scaling_prior_prob=None,
+        active_scaling_logit_prior_sigma=cluster_solver.DEFAULT_ACTIVE_SCALING_LOGIT_PRIOR_SIGMA,
+        active_scaling_mag_slope_prior_sigma=cluster_solver.DEFAULT_ACTIVE_SCALING_MAG_SLOPE_PRIOR_SIGMA,
+        active_scaling_local_logit_prior_sigma=cluster_solver.DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA,
+        active_scaling_freeze_threshold=cluster_solver.DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD,
+        independent_scaling_free_log_vdisp_tau_prior_median=(
+            cluster_solver.DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN
+        ),
+        independent_scaling_free_log_core_tau_prior_median=(
+            cluster_solver.DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN
+        ),
+        independent_scaling_free_log_cut_tau_prior_median=(
+            cluster_solver.DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN
+        ),
+        independent_scaling_free_log_tau_prior_sigma=(
+            cluster_solver.DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA
+        ),
         fit_scaling_scatter=False,
         n_primary_families=1,
         n_subhalo_families=0,
@@ -16202,6 +20028,7 @@ def _validation_solver_args(**updates) -> argparse.Namespace:
         max_tree_depth=8,
         skip_plots=True,
         quick_diagnostics=False,
+        exact_image_diagnostics_stage2=False,
         exact_image_diagnostics_stage3=False,
         quiet=False,
         resume=False,
@@ -16265,15 +20092,11 @@ def test_validation_parser_parses_dense_mass_choices() -> None:
             parser.parse_args(invalid_args)
 
 
-def test_validation_parser_accepts_potfile_mass_size_reparam_flag() -> None:
+def test_validation_parser_rejects_removed_potfile_mass_size_reparam_flag() -> None:
     parser = validation._build_parser()
 
-    default_args = parser.parse_args([])
-    assert default_args.potfile_mass_size_reparam is False
-
-    reparam_args = parser.parse_args(["--potfile-mass-size-reparam"])
-    validation._validate_validation_args(reparam_args)
-    assert reparam_args.potfile_mass_size_reparam is True
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--potfile-mass-size-reparam"])
 
 
 def test_validation_parser_accepts_and_validates_fixed_image_sigma_int() -> None:
@@ -16442,7 +20265,6 @@ def test_validation_run_cluster_solver_forwards_scalar_stage_controls(monkeypatc
     assert _option_values(cmd, "--dense-mass") == ["structured"]
     assert "--no-dense-mass" not in cmd
     assert "--dense-mass-structure" not in cmd
-    assert "--potfile-mass-size-reparam" not in cmd
     assert "--ns-num-live-points" not in cmd
     assert "--ns-max-samples" not in cmd
     assert "--ns-dlogz" not in cmd
@@ -16457,6 +20279,7 @@ def test_validation_run_cluster_solver_forwards_scalar_stage_controls(monkeypatc
     assert _option_values(cmd, "--image-plane-newton-steps") == ["0"]
     assert _option_values(cmd, "--linearized-beta-prior-sigma-arcsec") == ["2.0"]
     assert _option_values(cmd, "--source-position-parameterization") == ["prior-whitened"]
+    assert _option_values(cmd, "--source-plane-covariance-mode") == ["magnification"]
     assert _option_values(cmd, "--image-plane-scatter-upper-arcsec") == ["2.0"]
     assert _option_values(cmd, "--image-plane-scatter-floor-arcsec") == ["0.001"]
     assert _option_values(cmd, "--image-plane-scatter-prior") == ["log-uniform"]
@@ -16465,6 +20288,29 @@ def test_validation_run_cluster_solver_forwards_scalar_stage_controls(monkeypatc
     assert _option_values(cmd, "--exact-image-min-distance-arcsec") == ["0.2"]
     assert _option_values(cmd, "--exact-image-precision-limit") == ["1e-08"]
     assert _option_values(cmd, "--exact-image-num-iter-max") == ["200"]
+    assert "--independent-scaling-galaxies" not in cmd
+    for removed_option in (
+        "--independent-scaling-prior-prob",
+        "--independent-scaling-logit-prior-sigma",
+        "--independent-scaling-mag-slope-prior-sigma",
+        "--independent-scaling-local-logit-prior-sigma",
+        "--stage2-independent-scaling-likelihood",
+        "--stage3-independent-scaling-likelihood",
+        "--independent-scaling-population-delta-clip",
+        "--independent-scaling-free-vdisp-bounds",
+        "--independent-scaling-free-core-kpc-bounds",
+        "--independent-scaling-free-cut-kpc-bounds",
+        "--independent-scaling-free-prior",
+        "--independent-scaling-free-hyper-offsets",
+        "--independent-scaling-free-hyper-log-scatter-prior-median",
+        "--independent-scaling-free-hyper-log-scatter-prior-sigma",
+        "--independent-scaling-free-hyper-offset-prior-sigma",
+    ):
+        assert removed_option not in cmd
+    assert _option_values(cmd, "--independent-scaling-free-log-vdisp-tau-prior-median") == ["0.2"]
+    assert _option_values(cmd, "--independent-scaling-free-log-core-tau-prior-median") == ["0.3"]
+    assert _option_values(cmd, "--independent-scaling-free-log-cut-tau-prior-median") == ["0.3"]
+    assert _option_values(cmd, "--independent-scaling-free-log-tau-prior-sigma") == ["0.4"]
     assert "--microcanonical-diagonal-preconditioning" in cmd
     assert _option_values(cmd, "--microcanonical-tune-frac1") == ["0.1"]
     assert _option_values(cmd, "--microcanonical-tune-frac2") == ["0.1"]
@@ -16485,6 +20331,68 @@ def test_validation_run_cluster_solver_forwards_scalar_stage_controls(monkeypatc
     assert run_dir == tmp_path / "solver" / "fit" / "stage2_joint"
 
 
+def test_validation_run_cluster_solver_forwards_independent_scaling_hyperparameters(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, cwd, check):
+        del cwd
+        captured["cmd"] = list(cmd)
+        assert check is True
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(validation.subprocess, "run", fake_run)
+    args = _validation_solver_args(
+        infer_active_scaling=True,
+        active_scaling_inference_likelihood="blend",
+        active_scaling_prior_prob=0.35,
+        active_scaling_logit_prior_sigma=2.1,
+        active_scaling_mag_slope_prior_sigma=1.4,
+        active_scaling_local_logit_prior_sigma=0.9,
+        active_scaling_freeze_threshold=0.6,
+        independent_scaling_free_log_vdisp_tau_prior_median=0.22,
+        independent_scaling_free_log_core_tau_prior_median=0.33,
+        independent_scaling_free_log_cut_tau_prior_median=0.44,
+        independent_scaling_free_log_tau_prior_sigma=0.55,
+    )
+
+    validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
+    cmd = captured["cmd"]
+
+    assert "--independent-scaling-galaxies" not in cmd
+    assert "--infer-active-scaling" in cmd
+    assert _option_values(cmd, "--active-scaling-inference-likelihood") == ["blend"]
+    assert _option_values(cmd, "--active-scaling-prior-prob") == ["0.35"]
+    assert _option_values(cmd, "--active-scaling-logit-prior-sigma") == ["2.1"]
+    assert _option_values(cmd, "--active-scaling-mag-slope-prior-sigma") == ["1.4"]
+    assert _option_values(cmd, "--active-scaling-local-logit-prior-sigma") == ["0.9"]
+    assert _option_values(cmd, "--active-scaling-freeze-threshold") == ["0.6"]
+    for removed_option in (
+        "--independent-scaling-prior-prob",
+        "--independent-scaling-logit-prior-sigma",
+        "--independent-scaling-mag-slope-prior-sigma",
+        "--independent-scaling-local-logit-prior-sigma",
+        "--stage2-independent-scaling-likelihood",
+        "--stage3-independent-scaling-likelihood",
+        "--independent-scaling-population-delta-clip",
+        "--independent-scaling-free-vdisp-bounds",
+        "--independent-scaling-free-core-kpc-bounds",
+        "--independent-scaling-free-cut-kpc-bounds",
+        "--independent-scaling-free-prior",
+        "--independent-scaling-free-hyper-offsets",
+        "--independent-scaling-free-hyper-log-scatter-prior-median",
+        "--independent-scaling-free-hyper-log-scatter-prior-sigma",
+        "--independent-scaling-free-hyper-offset-prior-sigma",
+    ):
+        assert removed_option not in cmd
+    assert _option_values(cmd, "--independent-scaling-free-log-vdisp-tau-prior-median") == ["0.22"]
+    assert _option_values(cmd, "--independent-scaling-free-log-core-tau-prior-median") == ["0.33"]
+    assert _option_values(cmd, "--independent-scaling-free-log-cut-tau-prior-median") == ["0.44"]
+    assert _option_values(cmd, "--independent-scaling-free-log-tau-prior-sigma") == ["0.55"]
+
+
 def test_validation_run_cluster_solver_forwards_fixed_image_sigma_int(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -16502,6 +20410,26 @@ def test_validation_run_cluster_solver_forwards_fixed_image_sigma_int(
     validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
 
     assert _option_values(captured["cmd"], "--fix-image-sigma-int-arcsec") == ["0.35"]
+
+
+def test_validation_run_cluster_solver_forwards_source_plane_covariance_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, cwd, check):
+        del cwd
+        captured["cmd"] = list(cmd)
+        assert check is True
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(validation.subprocess, "run", fake_run)
+    args = _validation_solver_args(source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_UNIT)
+
+    validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
+
+    assert _option_values(captured["cmd"], "--source-plane-covariance-mode") == ["unit"]
 
 
 def test_validation_run_cluster_solver_forwards_diagonal_dense_mass(
@@ -16543,25 +20471,6 @@ def test_validation_run_cluster_solver_forwards_full_dense_mass(
 
     assert _option_values(captured["cmd"], "--dense-mass") == ["full"]
     assert "--dense-mass-structure" not in captured["cmd"]
-
-
-def test_validation_run_cluster_solver_forwards_potfile_mass_size_reparam(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    captured: dict[str, list[str]] = {}
-
-    def fake_run(cmd, cwd, check):
-        captured["cmd"] = list(cmd)
-        assert check is True
-        return subprocess.CompletedProcess(cmd, 0)
-
-    monkeypatch.setattr(validation.subprocess, "run", fake_run)
-    args = _validation_solver_args(potfile_mass_size_reparam=True)
-
-    validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
-
-    assert "--potfile-mass-size-reparam" in captured["cmd"]
 
 
 def test_validation_run_cluster_solver_does_not_forward_fit_quality_workers(
@@ -16935,6 +20844,34 @@ def test_validation_run_cluster_solver_forwards_start_at_stage3_flag(
     assert run_dir == tmp_path / "solver" / "fit" / "stage3_image_plane"
 
 
+def test_validation_run_cluster_solver_forwards_start_at_stage2_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, cwd, check):
+        captured["cmd"] = list(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(validation.subprocess, "run", fake_run)
+    args = _validation_solver_args(
+        fit_method="svi+nuts",
+        image_plane_mode=IMAGE_PLANE_MODE_NONE,
+        start_at_stage2=True,
+        svi_steps=1000,
+        warmup=1000,
+        samples=250,
+    )
+
+    run_dir = validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
+    cmd = captured["cmd"]
+
+    assert "--start-at-stage2" in cmd
+    assert "--start-at-stage3" not in cmd
+    assert run_dir == tmp_path / "solver" / "fit" / "stage2_joint"
+
+
 def test_validation_run_cluster_solver_forwards_resume_flag(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured: dict[str, list[str]] = {}
 
@@ -17188,6 +21125,25 @@ def test_validation_run_cluster_solver_forwards_exact_image_diagnostics_stage3(
     validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
 
     assert "--exact-image-diagnostics-stage3" in captured["cmd"]
+    assert "--quick-diagnostics" not in captured["cmd"]
+
+
+def test_validation_run_cluster_solver_forwards_exact_image_diagnostics_stage2(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, cwd, check):
+        captured["cmd"] = list(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(validation.subprocess, "run", fake_run)
+    args = _validation_solver_args(exact_image_diagnostics_stage2=True)
+
+    validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
+
+    assert "--exact-image-diagnostics-stage2" in captured["cmd"]
     assert "--quick-diagnostics" not in captured["cmd"]
 
 
@@ -17650,10 +21606,10 @@ def test_solver_sequential_run_summary_txt_aggregates_existing_stages(tmp_path: 
         tables_dir.mkdir(parents=True)
         (tables_dir / "run_summary.json").write_text(
             json.dumps(
-                {
-                    "fit_method": "svi+nuts",
-                    "sample_likelihood_mode": "source",
-                    "sampler": "numpyro_nuts",
+                    {
+                        "fit_method": "svi+nuts",
+                        "sample_likelihood_mode": SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+                        "sampler": "numpyro_nuts",
                     "n_families": 2,
                     "n_images": 6,
                     "headline_chi_square": headline_chi_square,
@@ -18713,6 +22669,10 @@ def test_plot_bundle_round_trips_ns_diagnostics(tmp_path: Path) -> None:
     path = tmp_path / "plot_bundle.h5"
 
     cluster_solver._save_plot_bundle_h5(path, state, argparse.Namespace(foo="bar"), np.empty((0,), dtype=float), results)
+    with cluster_solver.h5py.File(path, "r") as handle:
+        state_meta = json.loads(handle["state"]["build_state_meta_json"][()].decode("utf-8"))
+    assert state_meta["solver_potfile_positive_prior_coordinate"] == cluster_solver.SOLVER_POTFILE_POSITIVE_PRIOR_COORDINATE
+    assert "log-positive latent priors" in state_meta["solver_potfile_positive_prior_note"]
     loaded_state, _args, arrays, _init_diag = cluster_solver._rebuild_state_from_h5(path)
 
     assert loaded_state.previous_stage_best_values == {"halo_v_disp": 1100.0}
@@ -18723,6 +22683,7 @@ def test_plot_bundle_round_trips_ns_diagnostics(tmp_path: Path) -> None:
     np.testing.assert_allclose(arrays["move_acceptance_history"], [0.8, 0.7])
     np.testing.assert_allclose(arrays["ns_diagnostics"]["log_L_samples"], [-5.0, -4.0, -3.0])
     assert "samples" not in arrays["ns_diagnostics"]
+
 
 
 def test_plot_bundle_missing_direct_e1e2_fields_requires_stage1_rerun(tmp_path: Path) -> None:
@@ -21418,6 +25379,171 @@ def test_sequential_skips_stage3_when_image_plane_mode_none(monkeypatch: pytest.
     assert "stage3=disabled" in str(banners[0][1])
 
 
+def test_sequential_start_at_stage2_runs_stage2_without_stage1_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, Stage1PriorSummary | None, dict[str, float] | None, str]] = []
+
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        stage1_prior_summary=None,
+        previous_stage_best_values=None,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        **_kwargs,
+    ):
+        calls.append((fit_mode, run_name, stage1_prior_summary, previous_stage_best_values, sample_likelihood_mode))
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: (_ for _ in ()).throw(AssertionError("stage1 summary should not be loaded")),
+    )
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method="svi+nuts",
+        warmup=2000,
+        samples=250,
+        image_plane_mode=IMAGE_PLANE_MODE_NONE,
+        fit_mode="sequential",
+        quick_diagnostics=False,
+        start_at_stage2=True,
+        start_at_stage3=False,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert calls == [("joint", "fit/stage2_joint", None, None, SAMPLE_LIKELIHOOD_SOURCE)]
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["start_at_stage2"] is True
+    assert summary["start_at_stage3"] is False
+    assert "stage1_run_dir" not in summary
+    assert summary["stage2_run_dir"].endswith("stage2_joint")
+    assert "stage3_run_dir" not in summary
+
+
+def test_sequential_start_at_stage2_keeps_full_flat_source_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, str]] = []
+
+    def fake_run_single_stage(
+        args,
+        _fit_mode,
+        run_name,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        **_kwargs,
+    ):
+        calls.append((run_name, str(getattr(args, "sampling_engine", "")), sample_likelihood_mode))
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: (_ for _ in ()).throw(AssertionError("stage1 summary should not be loaded")),
+    )
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method="svi+nuts",
+        warmup=2000,
+        samples=250,
+        image_plane_mode=IMAGE_PLANE_MODE_NONE,
+        fit_mode="sequential",
+        sampling_engine="full_flat",
+        quick_diagnostics=False,
+        start_at_stage2=True,
+        start_at_stage3=False,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert calls == [("fit/stage2_joint", "full_flat", SAMPLE_LIKELIHOOD_SOURCE)]
+
+
+def test_sequential_start_at_stage2_then_stage3_uses_stage2_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, Stage1PriorSummary | None, dict[str, float] | None, dict[str, float] | None, str]] = []
+    stage2_best = {"halo_v_disp": 1000.0}
+
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        stage1_prior_summary=None,
+        previous_stage_best_values=None,
+        svi_init_physical_values=None,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        **_kwargs,
+    ):
+        calls.append(
+            (
+                fit_mode,
+                run_name,
+                stage1_prior_summary,
+                previous_stage_best_values,
+                svi_init_physical_values,
+                sample_likelihood_mode,
+            )
+        )
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: (_ for _ in ()).throw(AssertionError("stage1 summary should not be loaded")),
+    )
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: stage2_best)
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi"],
+        svi_steps=[1000, 400],
+        warmup=[2000, 0],
+        samples=[250, 100],
+        image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+        fit_mode="sequential",
+        quick_diagnostics=False,
+        start_at_stage2=True,
+        start_at_stage3=False,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert calls == [
+        ("joint", "fit/stage2_joint", None, None, None, SAMPLE_LIKELIHOOD_SOURCE),
+        (
+            "joint",
+            "fit/stage3_image_plane",
+            None,
+            stage2_best,
+            stage2_best,
+            SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+        ),
+    ]
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["start_at_stage2"] is True
+    assert "stage1_run_dir" not in summary
+    assert summary["stage2_run_dir"].endswith("stage2_joint")
+    assert summary["stage3_run_dir"].endswith("stage3_image_plane")
+
+
 def test_sequential_fit_cosmology_applies_only_to_image_plane_local_jacobian_stage(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -21566,6 +25692,7 @@ def test_sequential_applies_stage_max_tree_depth_controls(
         return tmp_path / run_name
 
     monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_run_single_stage_in_fresh_process", fake_run_single_stage)
     monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         cluster_solver,
@@ -21585,6 +25712,7 @@ def test_sequential_applies_stage_max_tree_depth_controls(
         image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
         skip_stage3_image_plane_local_jacobian=False,
         fit_mode="sequential",
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_FULL,
     )
 
     cluster_solver._run_sequential(args)
@@ -21599,6 +25727,186 @@ def test_sequential_applies_stage_max_tree_depth_controls(
     assert summary["stage_fit_controls"]["stage2"]["max_tree_depth"] == 10
     assert summary["stage_fit_controls"]["stage3"]["max_tree_depth"] == 8
     assert summary["stage_fit_controls"]["stage4"]["max_tree_depth"] == 6
+
+
+def test_sequential_applies_stage_sampling_refresh_runs_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, int]] = []
+
+    def fake_run_single_stage(args, _fit_mode, run_name, **_kwargs):
+        calls.append((run_name, int(args.sampling_refresh_runs)))
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_run_single_stage_in_fresh_process", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={}, means={}, stds={}),
+    )
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {})
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {})
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts", "nuts"],
+        warmup=[10, 10, 1],
+        samples=[5, 5, 3],
+        sampling_refresh_runs=[2, 3, 4],
+        image_plane_mode=IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
+        skip_stage3_image_plane_local_jacobian=False,
+        fit_mode="sequential",
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_FULL,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert calls == [
+        ("fit/stage1_large_only", 1),
+        ("fit/stage2_joint", 2),
+        ("fit/stage3_image_plane", 3),
+        ("fit/stage4_linearized_image_plane", 4),
+    ]
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["stage_fit_controls"]["stage2"]["sampling_refresh_runs"] == 2
+    assert summary["stage_fit_controls"]["stage3"]["sampling_refresh_runs"] == 3
+    assert summary["stage_fit_controls"]["stage4"]["sampling_refresh_runs"] == 4
+
+
+def test_sampling_refresh_runs_rejects_non_positive_values() -> None:
+    args = argparse.Namespace(
+        fit_mode="sequential",
+        fit_method="svi+nuts",
+        warmup=[10],
+        samples=[5],
+        sampling_refresh_runs=[0],
+        image_plane_mode=IMAGE_PLANE_MODE_NONE,
+    )
+
+    with pytest.raises(SystemExit, match="--sampling-refresh-runs values must be positive"):
+        cluster_solver._normalize_stage_fit_controls(args)
+
+
+def test_sampling_refresh_runs_rejects_unsupported_sampler() -> None:
+    args = argparse.Namespace(
+        fit_mode="sequential",
+        fit_method="svi",
+        warmup=[0],
+        samples=[5],
+        sampling_refresh_runs=[2],
+        image_plane_mode=IMAGE_PLANE_MODE_NONE,
+    )
+
+    with pytest.raises(SystemExit, match="supported only for --fit-method nuts or svi\\+nuts"):
+        cluster_solver._normalize_stage_fit_controls(args)
+
+
+def test_repeated_nuts_sampling_refreshes_caches_and_offsets_seeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeEvaluator:
+        surrogate_enabled = True
+
+        def __init__(self) -> None:
+            self.surrogate_reference_params = np.asarray([0.0], dtype=float)
+            self.scaling_scatter_reference_params = np.asarray([0.0], dtype=float)
+            self.source_metric_reference_params = np.asarray([0.0], dtype=float)
+            self.surrogate_cache_by_z = {0.0: {"value": np.asarray([0.0], dtype=float)}}
+            self.scaling_scatter_cache_by_z = {0.0: {"value": np.asarray([0.0], dtype=float)}}
+            self.source_metric_cache_by_z = {0.0: {"value": np.asarray([0.0], dtype=float)}}
+            self.refresh_calls: list[tuple[str, str, float]] = []
+
+        def _refresh(self, label: str, theta: np.ndarray, reason: str) -> None:
+            value = float(np.asarray(theta, dtype=float)[0])
+            self.refresh_calls.append((label, reason, value))
+            setattr(self, f"{label}_reference_params", np.asarray([value], dtype=float))
+            getattr(self, f"{label}_cache_by_z")[0.0]["value"] = np.asarray([value], dtype=float)
+
+        def refresh_surrogate(self, theta: np.ndarray, *, reason: str) -> None:
+            self._refresh("surrogate", theta, reason)
+
+        def refresh_scaling_scatter_cache(self, theta: np.ndarray, *, reason: str) -> None:
+            self._refresh("scaling_scatter", theta, reason)
+
+        def refresh_source_metric_cache(self, theta: np.ndarray, *, reason: str) -> None:
+            self._refresh("source_metric", theta, reason)
+
+        def source_loglike(self, theta: np.ndarray) -> float:
+            return -float(np.asarray(theta, dtype=float)[0])
+
+    args = argparse.Namespace(
+        sampling_refresh_runs=2,
+        seed=11,
+        quiet=True,
+    )
+    state = SimpleNamespace(parameter_specs=[])
+    evaluator = FakeEvaluator()
+    init_references: list[float] = []
+    sampler_seeds: list[int] = []
+
+    def fake_nuts_initialization_from_reference(run_args, _parameter_specs, reference_theta):
+        init_references.append(float(np.asarray(reference_theta, dtype=float)[0]))
+        return cluster_solver.NUTSInitialization(
+            init_params={},
+            chain_seeds=[cluster_solver.ChainSeed(values=np.asarray(reference_theta, dtype=float), source_label="test")],
+            diagnostics={
+                "strategy_requested": cluster_solver.FIT_METHOD_NUTS,
+                "strategy_used": "previous_stage",
+                "svi_used": False,
+                "distinct_chain_seeds": 1,
+            },
+            reference_theta=np.asarray(reference_theta, dtype=float),
+        )
+
+    def fake_run_numpyro_nuts_sampler(run_args, _state, _evaluator, _sample_model, _nuts_init):
+        sampler_seeds.append(int(run_args.seed))
+        run_index = len(sampler_seeds)
+        samples = np.asarray(
+            [[float(run_index), -float(run_index)], [float(run_index + 10), float(run_index + 20)]],
+            dtype=float,
+        )
+        log_prob = np.asarray([0.0, float(run_index)], dtype=float)
+        return cluster_solver.PosteriorResults(
+            samples=samples,
+            log_prob=log_prob,
+            accept_prob=np.ones(2, dtype=float),
+            diverging=np.zeros(2, dtype=bool),
+            num_steps=np.ones(2, dtype=float),
+            warmup_steps=0,
+            sample_steps=2,
+            num_chains=1,
+            init_diagnostics=dict(_nuts_init.diagnostics),
+            grouped_samples=samples.reshape(1, 2, 2),
+            grouped_log_prob=log_prob.reshape(1, 2),
+            sampler="numpyro_nuts",
+        )
+
+    monkeypatch.setattr(cluster_solver, "_nuts_initialization_from_reference", fake_nuts_initialization_from_reference)
+    monkeypatch.setattr(cluster_solver, "_run_numpyro_nuts_sampler", fake_run_numpyro_nuts_sampler)
+
+    posterior, best_fit = cluster_solver._run_repeated_nuts_sampling(
+        args,
+        state,  # type: ignore[arg-type]
+        evaluator,  # type: ignore[arg-type]
+        sample_model=None,
+        initial_best_fit=np.asarray([0.0, 0.0], dtype=float),
+    )
+
+    assert sampler_seeds == [11, 1000014]
+    assert init_references == [0.0, 11.0]
+    np.testing.assert_allclose(best_fit, [12.0, 22.0])
+    assert ("surrogate", "sampling_refresh_run_2", 11.0) in evaluator.refresh_calls
+    assert ("scaling_scatter", "sampling_refresh_run_2", 11.0) in evaluator.refresh_calls
+    assert ("source_metric", "sampling_refresh_run_2", 11.0) in evaluator.refresh_calls
+    assert posterior.init_diagnostics["sampling_refresh_runs_requested"] == 2
+    assert posterior.init_diagnostics["sampling_refresh_runs_completed"] == 2
+    assert posterior.init_diagnostics["sampling_refresh_cache_refresh_count"] == 1
+    assert posterior.init_diagnostics["sampling_refresh_per_run_best_log_prob"] == [1.0, 2.0]
+    assert posterior.init_diagnostics["sampling_refresh_per_run_seed"] == [11, 1000014]
 
 
 def test_sequential_without_fit_cosmology_leaves_local_jacobian_stages_fixed(
@@ -22306,6 +26614,76 @@ def test_rerender_plots_exact_image_diagnostics_stage3_overrides_saved_quick(
     assert plot_quick == [False]
 
 
+def test_rerender_plots_exact_image_diagnostics_stage2_overrides_saved_quick(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    plot_quick: list[bool] = []
+
+    class FakeEvaluator:
+        def __init__(self, *args: Any, quick_diagnostics: bool = False, **_kwargs: Any) -> None:
+            self.quick_diagnostics = bool(quick_diagnostics)
+            self.surrogate_enabled = False
+            self.timing_totals = {"plot_runtime": 0.0}
+
+        def reported_physical_to_latent_parameter_vector(self, values: np.ndarray) -> np.ndarray:
+            return np.asarray(values, dtype=float)
+
+        def refresh_surrogate(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def refresh_scaling_scatter_cache(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def refresh_source_metric_cache(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def evaluate(self, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
+            calls.append("exact")
+            return SimpleNamespace(loglike=0.0)
+
+    state = SimpleNamespace(parameter_specs=[], fit_mode="joint")
+    arrays = {
+        "best_fit": np.empty((0,), dtype=float),
+        "samples": np.empty((0, 0), dtype=float),
+        "log_prob": np.empty((0,), dtype=float),
+        "accept_prob": np.empty((0,), dtype=float),
+        "diverging": np.empty((0,), dtype=bool),
+        "num_steps": np.empty((0,), dtype=float),
+    }
+    saved_args = {"quick_diagnostics": True, "warmup": 0, "samples": 0, "chains": 1}
+
+    monkeypatch.setattr(cluster_solver, "_configure_debug_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_run_logged_phase", lambda _args, _phase_name, fn, **_kwargs: fn())
+    monkeypatch.setattr(cluster_solver, "_load_artifacts", lambda _artifacts_dir: (state, saved_args, arrays, {}))
+    monkeypatch.setattr(cluster_solver, "_log_state_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_maybe_convert_loaded_posterior_arrays_to_physical", lambda arrays, *_args: (arrays, False))
+    monkeypatch.setattr(cluster_solver, "ClusterJAXEvaluator", FakeEvaluator)
+    monkeypatch.setattr(cluster_solver, "_log_solver_active_approximation_warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_approximate_evaluation",
+        lambda *_args, **_kwargs: calls.append("approx") or SimpleNamespace(loglike=0.0),
+    )
+    monkeypatch.setattr(
+        cluster_solver,
+        "_generate_plots_and_tables",
+        lambda **kwargs: plot_quick.append(bool(getattr(kwargs["args"], "quick_diagnostics", False))),
+    )
+
+    cluster_solver._rerender_plots(
+        argparse.Namespace(quick_diagnostics=False, exact_image_diagnostics_stage2=True),
+        tmp_path / "fit" / "stage2_joint",
+        exact_diagnostics_stage="stage3_image_plane",
+    )
+
+    assert calls == ["exact"]
+    assert plot_quick == [False]
+
+
 def test_rerender_plots_current_default_exact_controls_override_saved_args(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -22578,6 +26956,46 @@ def test_sequential_forces_quick_diagnostics_until_stage4(
     ]
 
 
+def test_sequential_exact_image_diagnostics_stage2_keeps_stage2_exact_before_stage3(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, bool]] = []
+
+    def fake_run_single_stage(args, _fit_mode, run_name, **_kwargs):
+        calls.append((run_name, bool(getattr(args, "quick_diagnostics", False))))
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: Stage1PriorSummary(map_values={}, means={}, stds={}),
+    )
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {})
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi"],
+        warmup=[2000, 100],
+        samples=[250, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
+        fit_mode="sequential",
+        quick_diagnostics=False,
+        exact_image_diagnostics_stage2=True,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert calls == [
+        ("fit/stage1_large_only", True),
+        ("fit/stage2_joint", False),
+        ("fit/stage3_image_plane", False),
+    ]
+
+
 def test_sequential_exact_image_diagnostics_stage3_keeps_stage3_exact(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -22724,9 +27142,30 @@ def test_sequential_adds_local_jacobian_stage3(monkeypatch: pytest.MonkeyPatch, 
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
     assert summary["resume_mode"] == "none"
     assert summary["stage_fit_controls"] == {
-        "stage2": {"fit_method": "svi+nuts", "svi_steps": 2000, "warmup": 2000, "samples": 250, "max_tree_depth": 10},
-        "stage3": {"fit_method": "svi", "svi_steps": 2000, "warmup": 0, "samples": 100, "max_tree_depth": 10},
-        "stage4": {"fit_method": "svi", "svi_steps": 2000, "warmup": 0, "samples": 100, "max_tree_depth": 10},
+        "stage2": {
+            "fit_method": "svi+nuts",
+            "svi_steps": 2000,
+            "warmup": 2000,
+            "samples": 250,
+            "sampling_refresh_runs": 1,
+            "max_tree_depth": 10,
+        },
+        "stage3": {
+            "fit_method": "svi",
+            "svi_steps": 2000,
+            "warmup": 0,
+            "samples": 100,
+            "sampling_refresh_runs": 1,
+            "max_tree_depth": 10,
+        },
+        "stage4": {
+            "fit_method": "svi",
+            "svi_steps": 2000,
+            "warmup": 0,
+            "samples": 100,
+            "sampling_refresh_runs": 1,
+            "max_tree_depth": 10,
+        },
     }
 
 
@@ -23400,6 +27839,7 @@ def test_sequential_forward_metric_image_plane_runs_as_stage4_with_cosmology(
         "svi_steps": 2000,
         "warmup": 0,
         "samples": 20,
+        "sampling_refresh_runs": 1,
         "max_tree_depth": 10,
     }
 
@@ -23641,6 +28081,92 @@ def test_sequential_critical_arc_mixture_image_plane_runs_as_stage4(
     assert summary["image_plane_mode"] == IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
     assert summary["critical_arc_critical_direction_sigma_arcsec"] == pytest.approx(4.5)
     assert summary["critical_arc_lm_trust_radius_arcsec"] == pytest.approx(18.0)
+
+
+def test_sequential_stage4_uses_stage3_frozen_active_split_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, bool, Path | None, bool, str]] = []
+
+    def fake_run_single_stage(
+        args,
+        fit_mode,
+        run_name,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        frozen_active_scaling_source_run_dir=None,
+        require_frozen_active_scaling=False,
+        **_kwargs,
+    ):
+        del fit_mode
+        calls.append(
+            (
+                run_name,
+                bool(getattr(args, "infer_active_scaling", False)),
+                None if frozen_active_scaling_source_run_dir is None else Path(frozen_active_scaling_source_run_dir),
+                bool(require_frozen_active_scaling),
+                sample_likelihood_mode,
+            )
+        )
+        return tmp_path / run_name
+
+    def fake_best_fit(artifacts_dir: Path) -> dict[str, float]:
+        assert str(artifacts_dir).endswith("stage3_image_plane/artifacts")
+        return {"halo_v_disp": 1200.0}
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: (_ for _ in ()).throw(AssertionError("stage1 summary should not be loaded")),
+    )
+    monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", fake_best_fit)
+    monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {})
+
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method=["svi+nuts", "svi+nuts", "svi+nuts"],
+        svi_steps=[1000, 400, 200],
+        warmup=[2000, 1000, 100],
+        samples=[250, 100, 20],
+        image_plane_mode=IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        skip_stage3_image_plane_local_jacobian=False,
+        skip_critical_det_diagnostic=True,
+        fit_mode="sequential",
+        sampling_engine="refreshing_surrogate_flat",
+        stage4_sampling_engine=cluster_solver.STAGE4_SAMPLING_ENGINE_INHERIT,
+        image_plane_newton_steps=0,
+        source_position_parameterization="prior-whitened",
+        stage4_fresh_process=False,
+        start_at_stage3=True,
+        infer_active_scaling=True,
+        active_scaling_freeze_threshold=0.5,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert calls == [
+        (
+            "fit/stage3_image_plane",
+            True,
+            None,
+            False,
+            SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+        ),
+        (
+            "fit/stage4_critical_arc_mixture_image_plane",
+            False,
+            tmp_path / "fit" / "stage3_image_plane",
+            True,
+            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+        ),
+    ]
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["stage4_active_scaling_requires_previous_split"] is True
+    assert summary["stage4_active_scaling_source_run_dir"].endswith("stage3_image_plane")
 
 
 def test_sequential_stage3_critical_arc_centroid_runs_without_stage4(
@@ -24452,6 +28978,48 @@ def test_sequential_resume_fast_runs_only_stage2_from_stage1_summary(
     cluster_solver._run_sequential(args)
 
     assert calls == [("joint", "fit/stage2_joint", {"halo_v_disp": 1000.0})]
+
+
+def test_sequential_start_at_stage2_resume_fast_runs_stage2_without_stage1_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, Stage1PriorSummary | None, dict[str, float] | None]] = []
+
+    def fake_run_single_stage(args, fit_mode, run_name, stage1_prior_summary=None, previous_stage_best_values=None, **_kwargs):
+        calls.append((fit_mode, run_name, stage1_prior_summary, previous_stage_best_values))
+        return tmp_path / run_name
+
+    monkeypatch.setattr(cluster_solver, "_run_single_stage", fake_run_single_stage)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_stage1_summary",
+        lambda _artifacts_dir: (_ for _ in ()).throw(AssertionError("stage1 summary should not be loaded")),
+    )
+
+    args = argparse.Namespace(
+        run_name="fit",
+        par_path="data/clustersim/input.par",
+        output_dir=str(tmp_path),
+        fit_method="svi+nuts",
+        warmup=2000,
+        samples=250,
+        image_plane_mode=IMAGE_PLANE_MODE_NONE,
+        fit_mode="sequential",
+        resume="fast",
+        start_at_stage2=True,
+        start_at_stage3=False,
+    )
+
+    cluster_solver._run_sequential(args)
+
+    assert calls == [("joint", "fit/stage2_joint", None, None)]
+    summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["resume_mode"] == "fast"
+    assert summary["start_at_stage2"] is True
+    assert "stage1_run_dir" not in summary
+    assert summary["stage2_run_dir"].endswith("stage2_joint")
 
 
 def test_sequential_resume_fast_requires_stage1_artifacts(

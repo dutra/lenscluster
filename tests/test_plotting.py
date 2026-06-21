@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import sys
 from concurrent.futures import Future
@@ -17,11 +18,420 @@ from lenscluster.plotting import plot_path
 from lenscluster.model import PosteriorResults, ParameterSpec
 
 
+def _potfile_parameter_spec(
+    potfile_id: str,
+    field: str,
+    *,
+    component_family: str = "scaling",
+) -> ParameterSpec:
+    return ParameterSpec(
+        name=f"{potfile_id}.{field}",
+        sample_name=f"{potfile_id}_{field}",
+        potential_id=potfile_id,
+        profile_type=81,
+        field=field,
+        prior_kind="normal",
+        lower=-1.0e6,
+        upper=1.0e6,
+        step=1.0,
+        mean=0.0,
+        std=1.0,
+        component_family=component_family,
+    )
+
+
 def test_plot_path_creates_directory(tmp_path: Path) -> None:
     output = plot_path(tmp_path / "plots", "summary.png")
 
     assert output == tmp_path / "plots" / "summary.pdf"
     assert output.parent.is_dir()
+
+
+def test_active_scaling_summary_plot_writes_pdf_only(tmp_path: Path) -> None:
+    df = pd.DataFrame(
+        {
+            "potfile_id": ["members", "members"],
+            "rank": [1, 2],
+            "component_index": [1, 2],
+            "catalog_id": ["a", "b"],
+            "catalog_mag": [18.5, 21.0],
+            "x_centre": [0.0, 1.0],
+            "y_centre": [0.0, -1.0],
+            "p_active_median": [0.85, 0.15],
+            "p_active_p16": [0.75, 0.05],
+            "p_active_p84": [0.93, 0.30],
+            "frozen_active": [True, False],
+        }
+    )
+
+    plotting._plot_active_scaling_summary(tmp_path, df, freeze_threshold=0.5)
+
+    assert plotting._plot_path(tmp_path, "active_scaling_summary.pdf").is_file()
+    assert not (tmp_path / "active_scaling_summary.png").exists()
+
+
+def test_scaling_results_summary_table_lenstool_mode_reports_reference_values_and_mass() -> None:
+    specs = [
+        _potfile_parameter_spec("members", "sigma"),
+        _potfile_parameter_spec("members", "cutkpc"),
+        _potfile_parameter_spec("members", "corekpc"),
+        _potfile_parameter_spec("members", "vdslope"),
+        _potfile_parameter_spec("members", "slope"),
+        _potfile_parameter_spec("members", "sigma_log_scatter", component_family="scaling_scatter"),
+        _potfile_parameter_spec(
+            "members",
+            "independent_free_log_v_disp_tau",
+            component_family="independent_scaling",
+        ),
+    ]
+    samples = np.asarray(
+        [
+            [100.0, 30.0, 1.0, 4.0, 4.0, 0.10, 0.20],
+            [120.0, 40.0, 2.0, 4.0, 4.0, 0.20, 0.30],
+            [140.0, 50.0, 3.0, 4.0, 4.0, 0.30, 0.40],
+        ],
+        dtype=float,
+    )
+    best_fit = np.asarray([120.0, 40.0, 2.0, 4.0, 4.0, 0.2, 0.3], dtype=float)
+
+    table = plotting._scaling_results_summary_table(
+        specs,
+        samples,
+        best_fit,
+        "lenstool-denominator",
+    )
+
+    row = table.iloc[0]
+    weights = np.full(samples.shape[0], 1.0 / samples.shape[0])
+    expected_sigma_p16, expected_sigma_median, expected_sigma_p84 = plotting._weighted_quantile(
+        samples[:, 0],
+        weights,
+        [0.16, 0.5, 0.84],
+    )
+    mass = (
+        math.pi
+        * np.square(samples[:, 0])
+        * np.maximum(samples[:, 1] - samples[:, 2], 0.0)
+        / plotting.DPiE_MASS_GRAVITATIONAL_CONSTANT_KPC_KMS2_PER_MSUN
+    )
+    _mass_p16, expected_mass_median, _mass_p84 = plotting._weighted_quantile(np.log10(mass), weights, [0.16, 0.5, 0.84])
+
+    assert row["potfile_id"] == "members"
+    assert row["scaling_relation_mode"] == "lenstool-denominator"
+    assert row["vdisp_star_median"] == pytest.approx(expected_sigma_median)
+    assert row["vdisp_star_p16"] == pytest.approx(expected_sigma_p16)
+    assert row["vdisp_star_p84"] == pytest.approx(expected_sigma_p84)
+    assert row["alpha_sigma_eff_median"] == pytest.approx(0.25)
+    assert row["beta_radius_eff_median"] == pytest.approx(0.5)
+    assert row["vdslope_median"] == pytest.approx(4.0)
+    assert row["slope_median"] == pytest.approx(4.0)
+    assert row["log10_m_star_msun_median"] == pytest.approx(expected_mass_median)
+    assert row["sigma_log_scatter_median"] == pytest.approx(
+        plotting._weighted_quantile(samples[:, 5], weights, [0.5])[0]
+    )
+    assert row["free_log_v_disp_tau_median"] == pytest.approx(
+        plotting._weighted_quantile(samples[:, 6], weights, [0.5])[0]
+    )
+    assert plotting.SCALING_RESULTS_MASS_NOTE in row["m_star_definition"]
+
+
+def test_scaling_results_summary_table_bergamini_mode_reports_effective_beta() -> None:
+    specs = [
+        _potfile_parameter_spec("members", "sigma"),
+        _potfile_parameter_spec("members", "cutkpc"),
+        _potfile_parameter_spec("members", "corekpc"),
+        _potfile_parameter_spec("members", "alpha_sigma"),
+        _potfile_parameter_spec("members", "gamma_ml"),
+    ]
+    samples = np.asarray(
+        [
+            [100.0, 30.0, 1.0, 0.20, -0.10],
+            [100.0, 30.0, 1.0, 0.25, 0.00],
+            [100.0, 30.0, 1.0, 0.30, 0.20],
+        ],
+        dtype=float,
+    )
+    best_fit = np.asarray([100.0, 30.0, 1.0, 0.25, 0.0], dtype=float)
+
+    table = plotting._scaling_results_summary_table(
+        specs,
+        samples,
+        best_fit,
+        "bergamini-ml",
+    )
+
+    row = table.iloc[0]
+    beta = 1.0 + samples[:, 4] - 2.0 * samples[:, 3]
+    weights = np.full(samples.shape[0], 1.0 / samples.shape[0])
+    _beta_p16, beta_median, _beta_p84 = plotting._weighted_quantile(beta, weights, [0.16, 0.5, 0.84])
+    alpha_median = plotting._weighted_quantile(samples[:, 3], weights, [0.5])[0]
+    gamma_median = plotting._weighted_quantile(samples[:, 4], weights, [0.5])[0]
+
+    assert row["scaling_relation_mode"] == "bergamini-ml"
+    assert row["alpha_sigma_median"] == pytest.approx(alpha_median)
+    assert row["gamma_ml_median"] == pytest.approx(gamma_median)
+    assert row["alpha_sigma_eff_median"] == pytest.approx(row["alpha_sigma_median"])
+    assert row["beta_radius_eff_median"] == pytest.approx(beta_median)
+    assert np.isnan(row["vdslope_median"])
+    assert np.isnan(row["slope_median"])
+
+
+def test_scaling_results_summary_rich_table_smoke() -> None:
+    df = pd.DataFrame(
+        {
+            "potfile_id": ["members"],
+            "scaling_relation_mode": ["bergamini-ml"],
+            "vdisp_star_median": [100.0],
+            "vdisp_star_p16": [90.0],
+            "vdisp_star_p84": [110.0],
+            "rcut_star_kpc_median": [30.0],
+            "rcut_star_kpc_p16": [25.0],
+            "rcut_star_kpc_p84": [35.0],
+            "rcore_star_kpc_median": [1.0],
+            "rcore_star_kpc_p16": [0.8],
+            "rcore_star_kpc_p84": [1.2],
+            "log10_m_star_msun_median": [11.0],
+            "log10_m_star_msun_p16": [10.8],
+            "log10_m_star_msun_p84": [11.2],
+            "alpha_sigma_eff_median": [0.25],
+            "alpha_sigma_eff_p16": [0.2],
+            "alpha_sigma_eff_p84": [0.3],
+            "beta_radius_eff_median": [0.5],
+            "beta_radius_eff_p16": [0.4],
+            "beta_radius_eff_p84": [0.6],
+        }
+    )
+
+    table = plotting._build_scaling_results_rich_table(df)
+
+    assert table is not None
+
+
+def test_active_scaling_summary_population_diagnostics_write_pdf_only(tmp_path: Path) -> None:
+    df = pd.DataFrame(
+        {
+            "potfile_id": ["members", "members", "members", "cluster", "cluster", "cluster"],
+            "rank": [1, 2, 3, 1, 2, 3],
+            "component_index": [1, 2, 3, 4, 5, 6],
+            "catalog_id": ["a", "b", "c", "d", "e", "f"],
+            "catalog_mag": [18.0, 19.5, 21.0, 17.8, 20.2, 22.1],
+            "x_centre": [0.0, 1.0, -1.0, 2.0, -2.0, 0.5],
+            "y_centre": [0.0, -1.0, 1.2, -2.0, 2.0, 0.4],
+            "p_active_median": [0.96, 0.62, 0.18, 0.88, 0.42, 0.08],
+            "p_active_p16": [0.91, 0.40, 0.05, 0.77, 0.25, 0.02],
+            "p_active_p84": [0.99, 0.80, 0.36, 0.95, 0.61, 0.18],
+            "p_active_gate_median": [0.55, 0.70, 0.35, 0.48, 0.58, 0.20],
+            "p_active_membership_median": [0.96, 0.62, 0.18, 0.88, 0.42, 0.08],
+            "p_active_membership_p16": [0.91, 0.40, 0.05, 0.77, 0.25, 0.02],
+            "p_active_membership_p84": [0.99, 0.80, 0.36, 0.95, 0.61, 0.18],
+            "active_loglike_delta_median": [-5.0, -0.8, 1.5, -2.3, 0.4, 3.0],
+            "active_loglike_delta_p16": [-6.0, -1.8, 0.4, -3.4, -0.6, 2.0],
+            "active_loglike_delta_p84": [-4.0, 0.2, 2.6, -1.1, 1.4, 4.2],
+            "active_inference_likelihood": ["population"] * 6,
+            "frozen_active": [True, True, False, True, False, False],
+        }
+    )
+
+    plotting._plot_active_scaling_summary(tmp_path, df, freeze_threshold=0.5)
+
+    assert plotting._plot_path(tmp_path, "active_scaling_summary.pdf").is_file()
+    assert not (tmp_path / "active_scaling_summary.png").exists()
+
+
+def test_scaling_relation_summary_table_preserves_classes_and_free_branch() -> None:
+    scaling_rank_df = pd.DataFrame(
+        {
+            "potfile_id": ["members", "members", "members"],
+            "catalog_id": ["inactive", "active", "free"],
+            "rank": [3, 2, 1],
+            "component_index": [0, 1, 2],
+            "free_component_index": [-1, -1, 5],
+            "catalog_mag": [21.0, 20.0, 19.0],
+            "selected_active": [False, True, True],
+            "selected_independent": [False, False, True],
+        }
+    )
+    independent_df = pd.DataFrame(
+        {
+            "potfile_id": ["members"],
+            "component_index": [2],
+            "free_v_disp_median": [420.0],
+            "free_v_disp_p16": [390.0],
+            "free_v_disp_p84": [450.0],
+            "free_core_radius_kpc_median": [3.5],
+            "free_core_radius_kpc_p16": [3.0],
+            "free_core_radius_kpc_p84": [4.0],
+            "free_cut_radius_kpc_median": [80.0],
+            "free_cut_radius_kpc_p16": [70.0],
+            "free_cut_radius_kpc_p84": [90.0],
+        }
+    )
+    packed = SimpleNamespace(
+        profile_type=np.ones(3, dtype=np.int32),
+        luminosity_ratio=np.asarray([0.25, 1.0, 4.0], dtype=float),
+        sigma_ref_base=np.full(3, 300.0, dtype=float),
+        cut_ref_base=np.full(3, 50.0, dtype=float),
+        core_ref_base=np.full(3, 2.0, dtype=float),
+        vdslope_base=np.full(3, 4.0, dtype=float),
+        slope_base=np.full(3, 4.0, dtype=float),
+        sigma_ref_param_index=np.zeros(3, dtype=np.int32),
+        cut_ref_param_index=np.full(3, 1, dtype=np.int32),
+        core_ref_param_index=np.full(3, 2, dtype=np.int32),
+        vdslope_param_index=np.full(3, 3, dtype=np.int32),
+        slope_param_index=np.full(3, 4, dtype=np.int32),
+    )
+    samples = np.asarray(
+        [
+            [280.0, 45.0, 1.8, 4.0, 4.0],
+            [300.0, 50.0, 2.0, 4.0, 4.0],
+            [320.0, 55.0, 2.2, 4.0, 4.0],
+        ],
+        dtype=float,
+    )
+
+    table = plotting._scaling_relation_summary_table(
+        scaling_rank_df,
+        [SimpleNamespace()],
+        samples,
+        np.asarray([300.0, 50.0, 2.0, 4.0, 4.0], dtype=float),
+        packed,
+        independent_scaling_df=independent_df,
+    )
+
+    assert table["catalog_id"].tolist() == ["free", "active", "inactive"]
+    assert table["scaling_relation_class"].tolist() == ["free", "active", "inactive"]
+    assert np.isfinite(table["scaling_v_disp_median"].to_numpy(dtype=float)).all()
+    assert np.isfinite(table["scaling_core_radius_kpc_median"].to_numpy(dtype=float)).all()
+    assert np.isfinite(table["scaling_cut_radius_kpc_median"].to_numpy(dtype=float)).all()
+    core_by_id = table.set_index("catalog_id")["scaling_core_radius_kpc_median"].to_dict()
+    assert core_by_id["inactive"] == pytest.approx(0.95)
+    assert core_by_id["active"] == pytest.approx(1.9)
+    assert core_by_id["free"] == pytest.approx(3.8)
+    free_row = table[table["catalog_id"] == "free"].iloc[0]
+    assert free_row["free_v_disp_median"] == pytest.approx(420.0)
+    assert free_row["free_core_radius_kpc_median"] == pytest.approx(3.5)
+    assert free_row["free_cut_radius_kpc_median"] == pytest.approx(80.0)
+
+
+def test_scaling_relation_summary_plot_writes_pdf(tmp_path: Path) -> None:
+    relation_df = pd.DataFrame(
+        {
+            "potfile_id": ["members", "members", "members"],
+            "catalog_id": ["inactive", "active", "free"],
+            "rank": [3, 2, 1],
+            "component_index": [0, 1, 2],
+            "catalog_mag": [21.0, 20.0, 19.0],
+            "scaling_relation_class": ["inactive", "active", "free"],
+            "scaling_v_disp_median": [210.0, 300.0, 420.0],
+            "scaling_v_disp_p16": [190.0, 280.0, 390.0],
+            "scaling_v_disp_p84": [230.0, 320.0, 450.0],
+            "scaling_core_radius_kpc_median": [1.0, 2.0, 4.0],
+            "scaling_core_radius_kpc_p16": [0.8, 1.8, 3.6],
+            "scaling_core_radius_kpc_p84": [1.2, 2.2, 4.4],
+            "scaling_cut_radius_kpc_median": [25.0, 50.0, 100.0],
+            "scaling_cut_radius_kpc_p16": [22.0, 45.0, 90.0],
+            "scaling_cut_radius_kpc_p84": [28.0, 55.0, 110.0],
+            "free_v_disp_median": [np.nan, np.nan, 500.0],
+            "free_v_disp_p16": [np.nan, np.nan, 470.0],
+            "free_v_disp_p84": [np.nan, np.nan, 530.0],
+            "free_core_radius_kpc_median": [np.nan, np.nan, 5.0],
+            "free_core_radius_kpc_p16": [np.nan, np.nan, 4.5],
+            "free_core_radius_kpc_p84": [np.nan, np.nan, 5.5],
+            "free_cut_radius_kpc_median": [np.nan, np.nan, 120.0],
+            "free_cut_radius_kpc_p16": [np.nan, np.nan, 105.0],
+            "free_cut_radius_kpc_p84": [np.nan, np.nan, 135.0],
+        }
+    )
+
+    plotting._plot_scaling_relation_summary(tmp_path, relation_df)
+
+    assert plotting._plot_path(tmp_path, "scaling_relation_summary.pdf").is_file()
+    assert not (tmp_path / "scaling_relation_summary.png").exists()
+
+
+def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    relation_df = pd.DataFrame(
+        {
+            "potfile_id": ["members", "members", "members", "members"],
+            "catalog_id": ["inactive1", "inactive2", "active", "free"],
+            "rank": [4, 3, 2, 1],
+            "component_index": [0, 1, 2, 3],
+            "catalog_mag": [22.0, 21.0, 20.0, 19.0],
+            "scaling_relation_class": ["inactive", "inactive", "active", "free"],
+            "scaling_v_disp_median": [150.0, 210.0, 300.0, 420.0],
+            "scaling_v_disp_p16": [140.0, 190.0, 280.0, 390.0],
+            "scaling_v_disp_p84": [160.0, 230.0, 320.0, 450.0],
+            "scaling_core_radius_kpc_median": [0.7, 1.0, 2.0, 4.0],
+            "scaling_core_radius_kpc_p16": [0.6, 0.8, 1.8, 3.6],
+            "scaling_core_radius_kpc_p84": [0.8, 1.2, 2.2, 4.4],
+            "scaling_cut_radius_kpc_median": [18.0, 25.0, 50.0, 100.0],
+            "scaling_cut_radius_kpc_p16": [16.0, 22.0, 45.0, 90.0],
+            "scaling_cut_radius_kpc_p84": [20.0, 28.0, 55.0, 110.0],
+            "free_v_disp_median": [np.nan, np.nan, np.nan, 500.0],
+            "free_v_disp_p16": [np.nan, np.nan, np.nan, 470.0],
+            "free_v_disp_p84": [np.nan, np.nan, np.nan, 530.0],
+            "free_core_radius_kpc_median": [np.nan, np.nan, np.nan, 5.0],
+            "free_core_radius_kpc_p16": [np.nan, np.nan, np.nan, 4.5],
+            "free_core_radius_kpc_p84": [np.nan, np.nan, np.nan, 5.5],
+            "free_cut_radius_kpc_median": [np.nan, np.nan, np.nan, 120.0],
+            "free_cut_radius_kpc_p16": [np.nan, np.nan, np.nan, 105.0],
+            "free_cut_radius_kpc_p84": [np.nan, np.nan, np.nan, 135.0],
+        }
+    )
+    labels: list[str] = []
+    text_values: list[str] = []
+
+    class FakeAxis:
+        def errorbar(self, *_args: Any, **kwargs: Any) -> None:
+            labels.append(str(kwargs.get("label", "")))
+
+        def plot(self, *_args: Any, **kwargs: Any) -> None:
+            labels.append(str(kwargs.get("label", "")))
+
+        def text(self, *_args: Any, **_kwargs: Any) -> None:
+            text_values.append(str(_args[2]))
+
+        def set_yscale(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def invert_xaxis(self) -> None:
+            return None
+
+        def set_xlabel(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def set_ylabel(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def set_title(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def grid(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def legend(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        @property
+        def transAxes(self) -> object:
+            return object()
+
+    class FakeFigure:
+        def savefig(self, path: Path, *_args: Any, **_kwargs: Any) -> None:
+            path.write_bytes(b"%PDF-1.4\n")
+
+    fake_axes = np.asarray([[FakeAxis(), FakeAxis(), FakeAxis()]], dtype=object)
+    monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: (FakeFigure(), fake_axes))
+    monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
+
+    plotting._plot_scaling_relation_summary(tmp_path, relation_df)
+
+    assert "inactive/cached" in labels
+    assert "active exact" in labels
+    assert "free branch" in labels
+    assert "scaling relation" in labels
+    assert "free candidate, scaling branch" not in labels
+    assert text_values == ["total: 4\ninactive: 2\nactive not free: 1\nfree: 1"]
 
 
 def test_image_catalog_family_cutout_stage_eligibility(tmp_path: Path) -> None:
@@ -1702,7 +2112,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         num_chains=1,
     )
 
-    plotting._generate_plots_and_tables(
+    run_summary = plotting._generate_plots_and_tables(
         run_dir=tmp_path,
         state=state,
         evaluator=evaluator,
@@ -1719,6 +2129,8 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert (tmp_path / "tables" / "model_magnification.csv").exists()
     assert (tmp_path / "tables" / "subhalo_properties.csv").exists()
     assert (tmp_path / "tables" / "run_summary.txt").exists()
+    assert run_summary == {"ok": True}
+    assert json.loads((tmp_path / "tables" / "run_summary.json").read_text(encoding="utf-8")) == run_summary
     assert "numpyro_model" in captured_tasks
     assert "image_recovery" in captured_tasks
     assert "image_count_recovery" in captured_tasks
@@ -2213,6 +2625,8 @@ def test_run_summary_quality_metrics_from_image_fit_quality() -> None:
     assert summary["headline_missing_image_count"] == 1
     assert summary["point_recovered_image_count"] == 3
     assert summary["point_image_rms_arcsec"] == pytest.approx(math.sqrt(7.0 / 3.0))
+    assert summary["point_image_median_residual_arcsec"] == pytest.approx(math.sqrt(2.0))
+    assert summary["image_residual_median_arcsec"] == pytest.approx(math.sqrt(2.0))
     assert summary["headline_n_data"] == 6
     assert summary["headline_dof"] == 3
     assert summary["headline_reduced_chi_square"] == pytest.approx(0.07 / 3.0)
@@ -2221,6 +2635,7 @@ def test_run_summary_quality_metrics_from_image_fit_quality() -> None:
     assert summary["arc_aware_arc_supported_image_count"] == 0
     assert summary["arc_aware_recovered_image_count"] == 3
     assert summary["arc_aware_missing_image_count"] == 1
+    assert summary["arc_aware_image_residual_median_arcsec"] == pytest.approx(math.sqrt(2.0))
     assert summary["arc_aware_n_data"] == 6
     assert summary["arc_aware_dof"] == 3
     assert summary["arc_aware_reduced_chi_square"] == pytest.approx(0.07 / 3.0)
@@ -2274,6 +2689,7 @@ def test_run_summary_arc_aware_chi_square_counts_arc_supported_rows() -> None:
     assert summary["headline_reduced_chi_square"] == pytest.approx(1.25)
     assert summary["point_recovered_image_count"] == 2
     assert summary["point_image_rms_arcsec"] == pytest.approx(math.sqrt((1.0**2 + 2.0**2) / 2.0))
+    assert summary["point_image_median_residual_arcsec"] == pytest.approx(1.5)
     assert summary["headline_missing_image_count"] == 2
     assert summary["arc_aware_chi_square"] == pytest.approx(5.25)
     assert summary["arc_aware_n_data"] == 5
@@ -2283,6 +2699,7 @@ def test_run_summary_arc_aware_chi_square_counts_arc_supported_rows() -> None:
     assert summary["arc_aware_arc_supported_image_count"] == 1
     assert summary["arc_aware_recovered_image_count"] == 3
     assert summary["arc_aware_missing_image_count"] == 1
+    assert summary["arc_aware_image_residual_median_arcsec"] == pytest.approx(1.0)
     assert summary["chi_square_sigma_eff_median_arcsec"] == pytest.approx(1.0)
     assert summary["chi_square_sigma_eff_min_arcsec"] == pytest.approx(0.25)
     assert summary["chi_square_sigma_eff_max_arcsec"] == pytest.approx(4.0)
@@ -2531,6 +2948,8 @@ def test_run_summary_effective_parameter_count_does_not_double_count_explicit_so
     assert summary["sampled_non_source_position_parameters"] == 2
     assert summary["source_position_parameters"] == 4
     assert summary["n_effective_parameters"] == 6
+    assert summary["point_image_median_residual_arcsec"] is None
+    assert summary["arc_aware_image_residual_median_arcsec"] is None
 
 
 def test_image_count_recovery_table_and_plot_write_pdf(tmp_path: Path) -> None:
@@ -2705,8 +3124,10 @@ def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None
             "observed_image_count": 6,
             "point_recovered_image_count": 4,
             "point_image_rms_arcsec": 0.42,
+            "point_image_median_residual_arcsec": 0.31,
             "arc_aware_recovered_image_count": 5,
             "arc_aware_image_rms_arcsec": 0.39,
+            "arc_aware_image_residual_median_arcsec": 0.28,
             "arc_aware_arc_supported_image_count": 2,
             "arc_aware_missing_image_count": 1,
             "arc_recovery_p_arc_threshold": 0.65,
@@ -2735,9 +3156,11 @@ def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None
     assert "headline_chi_square" in text
     assert "arc_aware_chi_square" in text
     assert "point image RMS arcsec" in text
+    assert "point median residual arcsec" in text
     assert "point recovered images" in text
     assert "4/6" in text
     assert "arc-aware image RMS arcsec" in text
+    assert "arc-aware median residual arcsec" in text
     assert "arc-aware recovered images" in text
     assert "5/6" in text
     assert "total image-plane sigma" in text
@@ -2777,9 +3200,11 @@ def test_format_run_summary_text_omits_arc_aware_metrics_for_noncritical_mode() 
             "observed_image_count": 3,
             "point_recovered_image_count": 2,
             "point_image_rms_arcsec": 0.4,
+            "point_image_median_residual_arcsec": 0.3,
             "arc_aware_chi_square": 1.0,
             "arc_aware_recovered_image_count": 3,
             "arc_aware_image_rms_arcsec": 0.1,
+            "arc_aware_image_residual_median_arcsec": 0.08,
             "arc_aware_arc_supported_image_count": 1,
             "arc_aware_missing_image_count": 0,
             "arc_aware_chi_square_red1_total_sigma_arcsec": 0.2,
@@ -2791,9 +3216,11 @@ def test_format_run_summary_text_omits_arc_aware_metrics_for_noncritical_mode() 
 
     assert "headline_chi_square" in text
     assert "point image RMS arcsec" in text
+    assert "point median residual arcsec" in text
     assert "point recovered images" in text
     assert "arc_aware_chi_square" not in text
     assert "arc-aware image RMS arcsec" not in text
+    assert "arc-aware median residual arcsec" not in text
     assert "arc-aware recovered images" not in text
     assert "arc-aware red1" not in text
     assert "N_arc_supported" not in text
@@ -2808,9 +3235,11 @@ def test_format_sequential_run_summary_text_gates_arc_aware_columns() -> None:
                 "sample_likelihood_mode": "source",
                 "headline_chi_square": 5.0,
                 "point_image_rms_arcsec": 0.6,
+                "point_image_median_residual_arcsec": 0.4,
                 "point_recovered_image_count": 3,
                 "arc_aware_chi_square": 1.0,
                 "arc_aware_image_rms_arcsec": 0.2,
+                "arc_aware_image_residual_median_arcsec": 0.1,
             }
         ],
         run_name="mock",
@@ -2818,7 +3247,9 @@ def test_format_sequential_run_summary_text_gates_arc_aware_columns() -> None:
     )
 
     assert "point_RMS" in source_only
+    assert "point_med" in source_only
     assert "arc_RMS" not in source_only
+    assert "arc_med" not in source_only
     assert "arc_chi2" not in source_only
     assert "0.2" not in source_only
 
@@ -2829,15 +3260,18 @@ def test_format_sequential_run_summary_text_gates_arc_aware_columns() -> None:
                 "sample_likelihood_mode": "source",
                 "headline_chi_square": 5.0,
                 "point_image_rms_arcsec": 0.6,
+                "point_image_median_residual_arcsec": 0.4,
                 "point_recovered_image_count": 3,
                 "arc_aware_chi_square": 99.0,
                 "arc_aware_image_rms_arcsec": 9.9,
+                "arc_aware_image_residual_median_arcsec": 8.8,
             },
             {
                 "stage": "stage4",
                 "sample_likelihood_mode": "critical-arc-mixture-image-plane",
                 "headline_chi_square": 4.0,
                 "point_image_rms_arcsec": 0.5,
+                "point_image_median_residual_arcsec": 0.25,
                 "point_recovered_image_count": 2,
                 "arc_aware_chi_square": 3.0,
                 "arc_aware_dof": 2,
@@ -2846,6 +3280,7 @@ def test_format_sequential_run_summary_text_gates_arc_aware_columns() -> None:
                 "arc_aware_recovered_image_count": 3,
                 "arc_aware_missing_image_count": 0,
                 "arc_aware_image_rms_arcsec": 0.3,
+                "arc_aware_image_residual_median_arcsec": 0.2,
             },
         ],
         run_name="mock",
@@ -2853,8 +3288,11 @@ def test_format_sequential_run_summary_text_gates_arc_aware_columns() -> None:
     )
 
     assert "arc_RMS" in mixed
+    assert "arc_med" in mixed
     assert "0.3" in mixed
+    assert "0.2" in mixed
     assert "9.9" not in mixed
+    assert "8.8" not in mixed
     assert "99" not in mixed
 
 
@@ -4547,9 +4985,13 @@ def test_plot_image_residual_histogram_reports_point_and_arc_aware_rms(
     expected_arc_rms = float(np.sqrt(np.mean(np.square(np.asarray([0.04, 0.20, 9.0])))))
     assert captured["vertical_lines"][0][0] == pytest.approx(expected_point_rms)
     assert captured["vertical_lines"][1][0] == pytest.approx(expected_arc_rms)
+    assert "median=4.52" in captured["histograms"][0]["kwargs"]["label"]
+    assert "median=0.2" in captured["histograms"][1]["kwargs"]["label"]
     assert any(
-        "Image RMS" in text
+        "Image residuals" in text
         and "point:" in text
+        and "RMS" in text
+        and "median" in text
         and "(2/4)" in text
         and "arc-aware:" in text
         and "(3/4)" in text

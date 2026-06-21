@@ -9,6 +9,7 @@ import re
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -53,6 +54,7 @@ from .model import BuildState, EvaluationResult, ParameterSpec, PosteriorResults
 from .model import convert_theta_to_latent as _convert_theta_to_latent
 from .model import display_lower as _display_lower
 from .model import display_upper as _display_upper
+from .utils import Table as _RichTable
 from .utils import jax_cpu_worker_count
 from .utils import log_message as _log
 from .utils import run_logged_phase as _run_logged_phase
@@ -108,6 +110,11 @@ CRITICAL_ARC_SINGULAR_THRESHOLD_SAMPLE_NAME = "critical_arc_singular_threshold"
 CRITICAL_ARC_SINGULAR_SOFTNESS_SAMPLE_NAME = "critical_arc_singular_softness"
 CRITICAL_ARC_LOG_S_MIN_FLOOR = 1.0e-12
 SUBHALO_TOTAL_MASS_RADIUS_FACTOR = 1.0e6
+DPiE_MASS_GRAVITATIONAL_CONSTANT_KPC_KMS2_PER_MSUN = 4.30091e-6
+SCALING_RESULTS_MASS_NOTE = (
+    "M* = pi * vdisp*^2 * max(rcut* - rcore*, 0) / G, "
+    "with G = 4.30091e-6 kpc (km/s)^2 Msun^-1"
+)
 NUMPYRO_MODEL_PLOT_FILENAME = "numpyro_model.pdf"
 NUMPYRO_MODEL_DEFAULT_LIKELIHOOD_MODE = "source"
 NUMPYRO_MODEL_ROLE_PRIORITY = (
@@ -116,6 +123,9 @@ NUMPYRO_MODEL_ROLE_PRIORITY = (
     "source_scatter",
     "source_position",
     "cosmology",
+    "active_scaling_gate",
+    "independent_scaling_gate",
+    "independent_scaling",
     "scaling_scatter",
     "scaling",
     "large",
@@ -156,6 +166,27 @@ NUMPYRO_MODEL_ROLE_STYLE = {
         "fill": "#EEF2FF",
         "line": "#3F51B5",
         "font": "#1A237E",
+    },
+    "independent_scaling": {
+        "title": "Independent members",
+        "detail": "free member-galaxy branches",
+        "fill": "#E8F0F2",
+        "line": "#546E7A",
+        "font": "#263238",
+    },
+    "active_scaling_gate": {
+        "title": "Active member gate",
+        "detail": "SVI exact/cached split",
+        "fill": "#E9F3FB",
+        "line": "#1E6A9E",
+        "font": "#123B55",
+    },
+    "independent_scaling_gate": {
+        "title": "Member mixture gate",
+        "detail": "magnitude population weights",
+        "fill": "#EAF4EF",
+        "line": "#2E7D59",
+        "font": "#17412E",
     },
     "scaling_scatter": {
         "title": "Scaling-law scatter",
@@ -638,6 +669,272 @@ def _write_potfile_summary_txt(tables_dir: Path, summary_df: pd.DataFrame) -> No
     (tables_dir / "potfile_summary.txt").write_text(content, encoding="utf-8")
 
 
+def _scaling_results_summary_table(
+    parameter_specs: list[ParameterSpec],
+    samples: np.ndarray,
+    best_fit: np.ndarray,
+    scaling_relation_mode: str,
+    sample_weights: np.ndarray | None = None,
+) -> pd.DataFrame:
+    columns = [
+        "potfile_id",
+        "scaling_relation_mode",
+        "vdisp_star_median",
+        "vdisp_star_p16",
+        "vdisp_star_p84",
+        "vdisp_star_map",
+        "rcut_star_kpc_median",
+        "rcut_star_kpc_p16",
+        "rcut_star_kpc_p84",
+        "rcut_star_kpc_map",
+        "rcore_star_kpc_median",
+        "rcore_star_kpc_p16",
+        "rcore_star_kpc_p84",
+        "rcore_star_kpc_map",
+        "log10_m_star_msun_median",
+        "log10_m_star_msun_p16",
+        "log10_m_star_msun_p84",
+        "log10_m_star_msun_map",
+        "alpha_sigma_eff_median",
+        "alpha_sigma_eff_p16",
+        "alpha_sigma_eff_p84",
+        "alpha_sigma_eff_map",
+        "beta_radius_eff_median",
+        "beta_radius_eff_p16",
+        "beta_radius_eff_p84",
+        "beta_radius_eff_map",
+        "vdslope_median",
+        "vdslope_p16",
+        "vdslope_p84",
+        "vdslope_map",
+        "slope_median",
+        "slope_p16",
+        "slope_p84",
+        "slope_map",
+        "alpha_sigma_median",
+        "alpha_sigma_p16",
+        "alpha_sigma_p84",
+        "alpha_sigma_map",
+        "gamma_ml_median",
+        "gamma_ml_p16",
+        "gamma_ml_p84",
+        "gamma_ml_map",
+        "sigma_log_scatter_median",
+        "sigma_log_scatter_p16",
+        "sigma_log_scatter_p84",
+        "core_log_scatter_median",
+        "core_log_scatter_p16",
+        "core_log_scatter_p84",
+        "cut_log_scatter_median",
+        "cut_log_scatter_p16",
+        "cut_log_scatter_p84",
+        "free_log_v_disp_tau_median",
+        "free_log_v_disp_tau_p16",
+        "free_log_v_disp_tau_p84",
+        "free_log_core_radius_tau_median",
+        "free_log_core_radius_tau_p16",
+        "free_log_core_radius_tau_p84",
+        "free_log_cut_radius_tau_median",
+        "free_log_cut_radius_tau_p16",
+        "free_log_cut_radius_tau_p84",
+        "m_star_definition",
+    ]
+    sample_array = np.asarray(samples, dtype=float)
+    best_fit_array = np.asarray(best_fit, dtype=float).reshape(-1)
+    if (
+        not parameter_specs
+        or sample_array.ndim != 2
+        or sample_array.shape[0] == 0
+        or sample_array.shape[1] == 0
+    ):
+        return pd.DataFrame(columns=columns)
+    weights = _normalized_weights(sample_weights, sample_array.shape[0])
+    specs_by_potfile: dict[str, dict[str, int]] = {}
+    for idx, spec in enumerate(parameter_specs):
+        if str(getattr(spec, "component_family", "")) not in {"scaling", "scaling_scatter", "independent_scaling"}:
+            continue
+        potfile_id = str(getattr(spec, "potential_id", ""))
+        if not potfile_id:
+            continue
+        specs_by_potfile.setdefault(potfile_id, {})[str(getattr(spec, "field", ""))] = idx
+
+    def _values(index: int | None) -> np.ndarray | None:
+        if index is None or index < 0 or index >= sample_array.shape[1]:
+            return None
+        return np.asarray(sample_array[:, index], dtype=float)
+
+    def _map(index: int | None) -> float:
+        if index is None or index < 0 or index >= best_fit_array.size:
+            return float("nan")
+        return float(best_fit_array[index])
+
+    def _add_summary(row: dict[str, Any], prefix: str, values: np.ndarray | None, map_value: float | None = None) -> None:
+        if values is None:
+            row[f"{prefix}_median"] = float("nan")
+            row[f"{prefix}_p16"] = float("nan")
+            row[f"{prefix}_p84"] = float("nan")
+            if map_value is not None:
+                row[f"{prefix}_map"] = float("nan")
+            return
+        summary = _finite_weighted_summary(np.asarray(values, dtype=float), weights)
+        row[f"{prefix}_median"] = summary["median"]
+        row[f"{prefix}_p16"] = summary["p16"]
+        row[f"{prefix}_p84"] = summary["p84"]
+        if map_value is not None:
+            row[f"{prefix}_map"] = float(map_value) if np.isfinite(float(map_value)) else float("nan")
+
+    rows: list[dict[str, Any]] = []
+    mode = str(scaling_relation_mode or "lenstool-denominator")
+    for potfile_id in sorted(specs_by_potfile):
+        field_index = specs_by_potfile[potfile_id]
+        sigma = _values(field_index.get("sigma"))
+        cut = _values(field_index.get("cutkpc"))
+        core = _values(field_index.get("corekpc"))
+        if sigma is None and cut is None and core is None:
+            continue
+        row: dict[str, Any] = {
+            "potfile_id": potfile_id,
+            "scaling_relation_mode": mode,
+            "m_star_definition": SCALING_RESULTS_MASS_NOTE,
+        }
+        _add_summary(row, "vdisp_star", sigma, _map(field_index.get("sigma")))
+        _add_summary(row, "rcut_star_kpc", cut, _map(field_index.get("cutkpc")))
+        _add_summary(row, "rcore_star_kpc", core, _map(field_index.get("corekpc")))
+        if sigma is not None and cut is not None and core is not None:
+            mass = (
+                math.pi
+                * np.square(sigma)
+                * np.maximum(cut - core, 0.0)
+                / DPiE_MASS_GRAVITATIONAL_CONSTANT_KPC_KMS2_PER_MSUN
+            )
+            with np.errstate(divide="ignore", invalid="ignore"):
+                log_mass = np.where(mass > 0.0, np.log10(mass), np.nan)
+            sigma_map = _map(field_index.get("sigma"))
+            cut_map = _map(field_index.get("cutkpc"))
+            core_map = _map(field_index.get("corekpc"))
+            mass_map = (
+                math.pi
+                * sigma_map * sigma_map
+                * max(cut_map - core_map, 0.0)
+                / DPiE_MASS_GRAVITATIONAL_CONSTANT_KPC_KMS2_PER_MSUN
+            )
+            log_mass_map = math.log10(mass_map) if mass_map > 0.0 and np.isfinite(mass_map) else float("nan")
+            _add_summary(row, "log10_m_star_msun", log_mass, log_mass_map)
+        else:
+            _add_summary(row, "log10_m_star_msun", None, float("nan"))
+
+        vdslope = _values(field_index.get("vdslope"))
+        slope = _values(field_index.get("slope"))
+        alpha_sigma = _values(field_index.get("alpha_sigma"))
+        gamma_ml = _values(field_index.get("gamma_ml"))
+        if alpha_sigma is not None and gamma_ml is not None:
+            beta_radius = 1.0 + gamma_ml - 2.0 * alpha_sigma
+            alpha_map = _map(field_index.get("alpha_sigma"))
+            gamma_map = _map(field_index.get("gamma_ml"))
+            _add_summary(row, "alpha_sigma_eff", alpha_sigma, alpha_map)
+            _add_summary(row, "beta_radius_eff", beta_radius, 1.0 + gamma_map - 2.0 * alpha_map)
+        elif vdslope is not None and slope is not None:
+            safe_vdslope = np.where(np.abs(vdslope) < 1.0e-12, np.nan, vdslope)
+            safe_slope = np.where(np.abs(slope) < 1.0e-12, np.nan, slope)
+            vdslope_map = _map(field_index.get("vdslope"))
+            slope_map = _map(field_index.get("slope"))
+            _add_summary(
+                row,
+                "alpha_sigma_eff",
+                1.0 / safe_vdslope,
+                1.0 / vdslope_map if abs(vdslope_map) >= 1.0e-12 else float("nan"),
+            )
+            _add_summary(
+                row,
+                "beta_radius_eff",
+                2.0 / safe_slope,
+                2.0 / slope_map if abs(slope_map) >= 1.0e-12 else float("nan"),
+            )
+        else:
+            _add_summary(row, "alpha_sigma_eff", None, float("nan"))
+            _add_summary(row, "beta_radius_eff", None, float("nan"))
+
+        for field in ("vdslope", "slope", "alpha_sigma", "gamma_ml"):
+            _add_summary(row, field, _values(field_index.get(field)), _map(field_index.get(field)))
+        for prefix, field in (
+            ("sigma_log_scatter", "sigma_log_scatter"),
+            ("core_log_scatter", "core_log_scatter"),
+            ("cut_log_scatter", "cut_log_scatter"),
+            ("free_log_v_disp_tau", "independent_free_log_v_disp_tau"),
+            ("free_log_core_radius_tau", "independent_free_log_core_radius_tau"),
+            ("free_log_cut_radius_tau", "independent_free_log_cut_radius_tau"),
+        ):
+            _add_summary(row, prefix, _values(field_index.get(field)))
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows).reindex(columns=columns)
+
+
+def _interval_text(row: pd.Series, prefix: str, *, precision: int = 3) -> str:
+    median = row.get(f"{prefix}_median", np.nan)
+    p16 = row.get(f"{prefix}_p16", np.nan)
+    p84 = row.get(f"{prefix}_p84", np.nan)
+    if not (np.isfinite(median) and np.isfinite(p16) and np.isfinite(p84)):
+        return "na"
+    return f"{float(median):.{precision}g} -{float(median - p16):.{precision}g}/+{float(p84 - median):.{precision}g}"
+
+
+def _build_scaling_results_rich_table(summary_df: pd.DataFrame) -> Any:
+    table = _RichTable(
+        title=f"Scaling Relation Results ({SCALING_RESULTS_MASS_NOTE})",
+        show_lines=False,
+    )
+    columns = [
+        ("potfile", "potfile_id"),
+        ("mode", "scaling_relation_mode"),
+        ("vdisp* [km/s]", "vdisp_star"),
+        ("rcut* [kpc]", "rcut_star_kpc"),
+        ("rcore* [kpc]", "rcore_star_kpc"),
+        ("log10 M* [Msun]", "log10_m_star_msun"),
+        ("alpha_eff", "alpha_sigma_eff"),
+        ("beta_eff", "beta_radius_eff"),
+        ("vdslope", "vdslope"),
+        ("slope", "slope"),
+        ("alpha_sigma", "alpha_sigma"),
+        ("gamma_ml", "gamma_ml"),
+        ("sigma scatter", "sigma_log_scatter"),
+        ("core scatter", "core_log_scatter"),
+        ("cut scatter", "cut_log_scatter"),
+        ("tau_v", "free_log_v_disp_tau"),
+        ("tau_core", "free_log_core_radius_tau"),
+        ("tau_cut", "free_log_cut_radius_tau"),
+    ]
+    for header, _prefix in columns:
+        table.add_column(header)
+    if summary_df.empty:
+        table.add_row("no scaling relation parameters", *[""] * (len(columns) - 1))
+        return table
+    for row in summary_df.itertuples(index=False):
+        row_series = pd.Series(row._asdict())
+        table.add_row(
+            str(row_series.get("potfile_id", "")),
+            str(row_series.get("scaling_relation_mode", "")),
+            _interval_text(row_series, "vdisp_star"),
+            _interval_text(row_series, "rcut_star_kpc"),
+            _interval_text(row_series, "rcore_star_kpc"),
+            _interval_text(row_series, "log10_m_star_msun"),
+            _interval_text(row_series, "alpha_sigma_eff"),
+            _interval_text(row_series, "beta_radius_eff"),
+            _interval_text(row_series, "vdslope"),
+            _interval_text(row_series, "slope"),
+            _interval_text(row_series, "alpha_sigma"),
+            _interval_text(row_series, "gamma_ml"),
+            _interval_text(row_series, "sigma_log_scatter"),
+            _interval_text(row_series, "core_log_scatter"),
+            _interval_text(row_series, "cut_log_scatter"),
+            _interval_text(row_series, "free_log_v_disp_tau"),
+            _interval_text(row_series, "free_log_core_radius_tau"),
+            _interval_text(row_series, "free_log_cut_radius_tau"),
+        )
+    return table
+
+
 def _potfile_constraint_diagnostics_table(
     parameter_specs: list[ParameterSpec],
     samples: np.ndarray,
@@ -742,6 +1039,1672 @@ def _potfile_constraint_diagnostics_table(
             }
         )
     return pd.DataFrame(rows).sort_values(["potfile_id", "parameter"]).reset_index(drop=True)
+
+
+def _sigmoid_np(values: np.ndarray | float) -> np.ndarray:
+    values_array = np.asarray(values, dtype=float)
+    clipped = np.clip(values_array, -60.0, 60.0)
+    return 1.0 / (1.0 + np.exp(-clipped))
+
+
+_INDEPENDENT_GATE_GH_NODES, _INDEPENDENT_GATE_GH_WEIGHTS = np.polynomial.hermite.hermgauss(15)
+_INDEPENDENT_GATE_GH_NORMAL_WEIGHTS = _INDEPENDENT_GATE_GH_WEIGHTS / math.sqrt(math.pi)
+
+
+def _logistic_normal_sigmoid_expectation_np(logits: np.ndarray, sigma: np.ndarray) -> np.ndarray:
+    logit_array = np.asarray(logits, dtype=float)
+    sigma_array = np.asarray(sigma, dtype=float)
+    shifted = logit_array[..., None] + math.sqrt(2.0) * sigma_array[..., None] * _INDEPENDENT_GATE_GH_NODES
+    return np.sum(_sigmoid_np(shifted) * _INDEPENDENT_GATE_GH_NORMAL_WEIGHTS, axis=-1)
+
+
+def _finite_weighted_summary(values: np.ndarray, weights: np.ndarray) -> dict[str, float]:
+    value_array = np.asarray(values, dtype=float).reshape(-1)
+    weight_array = np.asarray(weights, dtype=float).reshape(-1)
+    finite = np.isfinite(value_array) & np.isfinite(weight_array) & (weight_array >= 0.0)
+    if value_array.size == 0 or weight_array.size != value_array.size or not np.any(finite):
+        return {"mean": float("nan"), "median": float("nan"), "p16": float("nan"), "p84": float("nan")}
+    finite_values = value_array[finite]
+    finite_weights = weight_array[finite]
+    total = float(np.sum(finite_weights))
+    if total <= 0.0:
+        finite_weights = np.full(finite_values.size, 1.0 / float(finite_values.size), dtype=float)
+    else:
+        finite_weights = finite_weights / total
+    q16, q50, q84 = _weighted_quantile(finite_values, finite_weights, [0.16, 0.50, 0.84])
+    return {
+        "mean": float(np.average(finite_values, weights=finite_weights)),
+        "median": float(q50),
+        "p16": float(q16),
+        "p84": float(q84),
+    }
+
+
+def _finite_weighted_quantiles(values: np.ndarray, weights: np.ndarray, quantiles: Sequence[float]) -> np.ndarray:
+    value_array = np.asarray(values, dtype=float).reshape(-1)
+    weight_array = np.asarray(weights, dtype=float).reshape(-1)
+    quantile_values = list(quantiles)
+    finite = np.isfinite(value_array) & np.isfinite(weight_array) & (weight_array >= 0.0)
+    if value_array.size == 0 or weight_array.size != value_array.size or not np.any(finite):
+        return np.full(len(quantile_values), np.nan, dtype=float)
+    finite_values = value_array[finite]
+    finite_weights = weight_array[finite]
+    total = float(np.sum(finite_weights))
+    if total <= 0.0:
+        finite_weights = np.full(finite_values.size, 1.0 / float(finite_values.size), dtype=float)
+    else:
+        finite_weights = finite_weights / total
+    return _weighted_quantile(finite_values, finite_weights, quantile_values)
+
+
+def _component_array_from_packed(
+    packed_lens_spec: Any,
+    field_name: str,
+    n_components: int,
+    *,
+    dtype: Any,
+    fill_value: float | int,
+) -> np.ndarray:
+    values = np.asarray(getattr(packed_lens_spec, field_name, []), dtype=dtype).reshape(-1)
+    if values.size == n_components:
+        return values
+    if values.size == 0:
+        return np.full(n_components, fill_value, dtype=dtype)
+    raise ValueError(
+        f"PackedLensSpec.{field_name} length {values.size} does not match component count {n_components}."
+    )
+
+
+def _active_scaling_diagnostics_table(
+    parameter_specs: list[ParameterSpec],
+    samples: np.ndarray,
+    best_fit: np.ndarray,
+    scaling_rank_df: pd.DataFrame,
+    packed_lens_spec: Any,
+    *,
+    freeze_threshold: float = 0.5,
+    sample_weights: np.ndarray | None = None,
+    active_population_diagnostics: dict[str, Any] | None = None,
+    active_inference_likelihood: str = "blend",
+) -> pd.DataFrame:
+    columns = [
+        "potfile_id",
+        "potfile_order",
+        "catalog_id",
+        "catalog_row_index",
+        "rank",
+        "component_index",
+        "catalog_mag",
+        "active_magnitude_feature",
+        "importance",
+        "min_distance_arcsec",
+        "x_centre",
+        "y_centre",
+        "active_gate_intercept_parameter_index",
+        "active_gate_mag_slope_parameter_index",
+        "active_gate_logit_offset_parameter_index",
+        "active_gate_intercept_prior_kind",
+        "active_gate_intercept_prior_lower",
+        "active_gate_intercept_prior_upper",
+        "active_gate_intercept_prior_mean",
+        "active_gate_intercept_prior_std",
+        "active_gate_mag_slope_prior_kind",
+        "active_gate_mag_slope_prior_lower",
+        "active_gate_mag_slope_prior_upper",
+        "active_gate_mag_slope_prior_mean",
+        "active_gate_mag_slope_prior_std",
+        "p_active_gate_mean",
+        "p_active_gate_median",
+        "p_active_gate_p16",
+        "p_active_gate_p84",
+        "p_active_gate_map",
+        "p_active_membership_mean",
+        "p_active_membership_median",
+        "p_active_membership_p16",
+        "p_active_membership_p84",
+        "p_active_membership_map",
+        "active_loglike_delta_mean",
+        "active_loglike_delta_median",
+        "active_loglike_delta_p16",
+        "active_loglike_delta_p84",
+        "active_loglike_delta_map",
+        "p_active_mean",
+        "p_active_median",
+        "p_active_p16",
+        "p_active_p84",
+        "p_active_map",
+        "frozen_active",
+        "active_inference_likelihood",
+    ]
+    sample_array = np.asarray(samples, dtype=float)
+    best_fit_array = np.asarray(best_fit, dtype=float).reshape(-1)
+    if (
+        not parameter_specs
+        or scaling_rank_df.empty
+        or sample_array.ndim != 2
+        or sample_array.shape[0] == 0
+        or sample_array.shape[1] == 0
+    ):
+        return pd.DataFrame(columns=columns)
+    n_components = int(np.asarray(getattr(packed_lens_spec, "profile_type", []), dtype=np.int32).size)
+    if n_components <= 0:
+        return pd.DataFrame(columns=columns)
+    intercept_indices = _component_array_from_packed(
+        packed_lens_spec,
+        "active_gate_intercept_param_index",
+        n_components,
+        dtype=np.int32,
+        fill_value=-1,
+    )
+    slope_indices = _component_array_from_packed(
+        packed_lens_spec,
+        "active_gate_mag_slope_param_index",
+        n_components,
+        dtype=np.int32,
+        fill_value=-1,
+    )
+    offset_indices = _component_array_from_packed(
+        packed_lens_spec,
+        "active_gate_logit_offset_param_index",
+        n_components,
+        dtype=np.int32,
+        fill_value=-1,
+    )
+    magnitude_features = _component_array_from_packed(
+        packed_lens_spec,
+        "active_magnitude_feature",
+        n_components,
+        dtype=float,
+        fill_value=0.0,
+    )
+    weights = _normalized_weights(sample_weights, sample_array.shape[0])
+    threshold = float(freeze_threshold)
+    population_mode = str(active_inference_likelihood) == "population"
+    population_by_component: dict[int, int] = {}
+    population_membership_samples = None
+    population_gate_samples = None
+    population_delta_samples = None
+    population_membership_map = None
+    population_gate_map = None
+    population_delta_map = None
+    if isinstance(active_population_diagnostics, dict):
+        component_values = np.asarray(active_population_diagnostics.get("component_indices", []), dtype=np.int32).reshape(-1)
+        population_by_component = {int(component_index): idx for idx, component_index in enumerate(component_values.tolist())}
+        population_membership_samples = np.asarray(
+            active_population_diagnostics.get("membership_samples", []),
+            dtype=float,
+        )
+        population_gate_samples = np.asarray(active_population_diagnostics.get("gate_samples", []), dtype=float)
+        population_delta_samples = np.asarray(active_population_diagnostics.get("delta_samples", []), dtype=float)
+        if "membership_map" in active_population_diagnostics:
+            population_membership_map = np.asarray(active_population_diagnostics.get("membership_map"), dtype=float)
+        if "gate_map" in active_population_diagnostics:
+            population_gate_map = np.asarray(active_population_diagnostics.get("gate_map"), dtype=float)
+        if "delta_map" in active_population_diagnostics:
+            population_delta_map = np.asarray(active_population_diagnostics.get("delta_map"), dtype=float)
+
+    def _prior_metadata(prefix: str, param_index: int) -> dict[str, Any]:
+        if param_index < 0 or param_index >= len(parameter_specs):
+            return {
+                f"{prefix}_prior_kind": "",
+                f"{prefix}_prior_lower": float("nan"),
+                f"{prefix}_prior_upper": float("nan"),
+                f"{prefix}_prior_mean": float("nan"),
+                f"{prefix}_prior_std": float("nan"),
+            }
+        spec = parameter_specs[int(param_index)]
+        mean = getattr(spec, "mean", None)
+        std = getattr(spec, "std", None)
+        return {
+            f"{prefix}_prior_kind": str(getattr(spec, "prior_kind", "")),
+            f"{prefix}_prior_lower": float(getattr(spec, "lower", float("nan"))),
+            f"{prefix}_prior_upper": float(getattr(spec, "upper", float("nan"))),
+            f"{prefix}_prior_mean": float(mean) if mean is not None else float("nan"),
+            f"{prefix}_prior_std": float(std) if std is not None else float("nan"),
+        }
+
+    rows: list[dict[str, Any]] = []
+    for row in scaling_rank_df.itertuples(index=False):
+        component_index = int(getattr(row, "component_index", -1))
+        if component_index < 0 or component_index >= n_components:
+            continue
+        intercept_idx = int(intercept_indices[component_index])
+        slope_idx = int(slope_indices[component_index])
+        offset_idx = int(offset_indices[component_index])
+        if (
+            intercept_idx < 0
+            or slope_idx < 0
+            or offset_idx < 0
+            or intercept_idx >= sample_array.shape[1]
+            or slope_idx >= sample_array.shape[1]
+            or offset_idx >= sample_array.shape[1]
+        ):
+            continue
+        feature = float(magnitude_features[component_index])
+        logits = sample_array[:, intercept_idx] + sample_array[:, slope_idx] * feature + sample_array[:, offset_idx]
+        gate_values = _sigmoid_np(logits)
+        gate_summary = _finite_weighted_summary(gate_values, weights)
+        gate_map = (
+            float(
+                _sigmoid_np(
+                    best_fit_array[intercept_idx]
+                    + best_fit_array[slope_idx] * feature
+                    + best_fit_array[offset_idx]
+                )
+            )
+            if max(intercept_idx, slope_idx, offset_idx) < best_fit_array.size
+            else float("nan")
+        )
+        membership_values = gate_values
+        membership_map = gate_map
+        delta_values = np.full(sample_array.shape[0], np.nan, dtype=float)
+        delta_map = float("nan")
+        population_idx = population_by_component.get(int(component_index))
+        if population_mode and population_idx is not None:
+            if (
+                population_membership_samples is not None
+                and population_membership_samples.ndim == 2
+                and population_membership_samples.shape[0] == sample_array.shape[0]
+                and population_idx < population_membership_samples.shape[1]
+            ):
+                membership_values = population_membership_samples[:, population_idx]
+            if (
+                population_gate_samples is not None
+                and population_gate_samples.ndim == 2
+                and population_gate_samples.shape[0] == sample_array.shape[0]
+                and population_idx < population_gate_samples.shape[1]
+            ):
+                gate_values = population_gate_samples[:, population_idx]
+                gate_summary = _finite_weighted_summary(gate_values, weights)
+            if (
+                population_delta_samples is not None
+                and population_delta_samples.ndim == 2
+                and population_delta_samples.shape[0] == sample_array.shape[0]
+                and population_idx < population_delta_samples.shape[1]
+            ):
+                delta_values = population_delta_samples[:, population_idx]
+            if population_membership_map is not None and population_idx < population_membership_map.size:
+                membership_map = float(population_membership_map[population_idx])
+            if population_gate_map is not None and population_idx < population_gate_map.size:
+                gate_map = float(population_gate_map[population_idx])
+            if population_delta_map is not None and population_idx < population_delta_map.size:
+                delta_map = float(population_delta_map[population_idx])
+        membership_summary = _finite_weighted_summary(membership_values, weights)
+        delta_summary = _finite_weighted_summary(delta_values, weights)
+        p_median = float(membership_summary["median"])
+        rows.append(
+            {
+                "potfile_id": str(getattr(row, "potfile_id", "")),
+                "potfile_order": int(getattr(row, "potfile_order", -1)),
+                "catalog_id": str(getattr(row, "catalog_id", "")),
+                "catalog_row_index": int(getattr(row, "catalog_row_index", getattr(row, "row_index", -1))),
+                "rank": int(getattr(row, "rank", -1)),
+                "component_index": int(component_index),
+                "catalog_mag": float(getattr(row, "catalog_mag", np.nan)),
+                "active_magnitude_feature": feature,
+                "importance": float(getattr(row, "importance", np.nan)),
+                "min_distance_arcsec": float(getattr(row, "min_distance_arcsec", np.nan)),
+                "x_centre": float(getattr(row, "x_centre", np.nan)),
+                "y_centre": float(getattr(row, "y_centre", np.nan)),
+                "active_gate_intercept_parameter_index": int(intercept_idx),
+                "active_gate_mag_slope_parameter_index": int(slope_idx),
+                "active_gate_logit_offset_parameter_index": int(offset_idx),
+                **_prior_metadata("active_gate_intercept", int(intercept_idx)),
+                **_prior_metadata("active_gate_mag_slope", int(slope_idx)),
+                "p_active_gate_mean": gate_summary["mean"],
+                "p_active_gate_median": gate_summary["median"],
+                "p_active_gate_p16": gate_summary["p16"],
+                "p_active_gate_p84": gate_summary["p84"],
+                "p_active_gate_map": gate_map,
+                "p_active_membership_mean": membership_summary["mean"],
+                "p_active_membership_median": membership_summary["median"],
+                "p_active_membership_p16": membership_summary["p16"],
+                "p_active_membership_p84": membership_summary["p84"],
+                "p_active_membership_map": membership_map,
+                "active_loglike_delta_mean": delta_summary["mean"],
+                "active_loglike_delta_median": delta_summary["median"],
+                "active_loglike_delta_p16": delta_summary["p16"],
+                "active_loglike_delta_p84": delta_summary["p84"],
+                "active_loglike_delta_map": delta_map,
+                "p_active_mean": membership_summary["mean"],
+                "p_active_median": p_median,
+                "p_active_p16": membership_summary["p16"],
+                "p_active_p84": membership_summary["p84"],
+                "p_active_map": membership_map,
+                "frozen_active": bool(np.isfinite(p_median) and p_median >= threshold),
+                "active_inference_likelihood": str(active_inference_likelihood),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns).sort_values(["potfile_id", "rank"]).reset_index(drop=True)
+
+
+def _prior_center_for_spec(spec: ParameterSpec) -> float | None:
+    prior_kind = str(getattr(spec, "prior_kind", ""))
+    if prior_kind in {"normal", "truncated_normal"}:
+        mean = getattr(spec, "mean", None)
+        if mean is None or not np.isfinite(float(mean)):
+            return None
+        return float(mean)
+    if prior_kind == "uniform":
+        lower = float(getattr(spec, "lower", np.nan))
+        upper = float(getattr(spec, "upper", np.nan))
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+            return None
+        return float(0.5 * (lower + upper))
+    return None
+
+
+def _prior_draws_for_spec(spec: ParameterSpec, rng: np.random.Generator, n_draws: int) -> np.ndarray | None:
+    prior_kind = str(getattr(spec, "prior_kind", ""))
+    if n_draws <= 0:
+        return None
+    if prior_kind == "normal":
+        mean = getattr(spec, "mean", None)
+        std = getattr(spec, "std", None)
+        if mean is None or std is None or not np.isfinite(float(std)) or float(std) <= 0.0:
+            return None
+        return rng.normal(float(mean), float(std), size=int(n_draws))
+    if prior_kind == "truncated_normal":
+        mean = getattr(spec, "mean", None)
+        std = getattr(spec, "std", None)
+        if mean is None or std is None or not np.isfinite(float(std)) or float(std) <= 0.0:
+            return None
+        lower = float(getattr(spec, "lower", -np.inf))
+        upper = float(getattr(spec, "upper", np.inf))
+        low_cdf = 0.0 if not np.isfinite(lower) else float(norm.cdf((lower - float(mean)) / float(std)))
+        high_cdf = 1.0 if not np.isfinite(upper) else float(norm.cdf((upper - float(mean)) / float(std)))
+        if not np.isfinite(low_cdf) or not np.isfinite(high_cdf) or high_cdf <= low_cdf:
+            return None
+        u = rng.uniform(low_cdf, high_cdf, size=int(n_draws))
+        u = np.clip(u, np.nextafter(0.0, 1.0), np.nextafter(1.0, 0.0))
+        return float(mean) + float(std) * norm.ppf(u)
+    if prior_kind == "uniform":
+        lower = float(getattr(spec, "lower", np.nan))
+        upper = float(getattr(spec, "upper", np.nan))
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+            return None
+        return rng.uniform(lower, upper, size=int(n_draws))
+    return None
+
+
+def _gate_parameter_indices(
+    gate_df: pd.DataFrame,
+    *,
+    intercept_column: str,
+    slope_column: str,
+) -> tuple[int, int] | None:
+    if gate_df.empty or intercept_column not in gate_df or slope_column not in gate_df:
+        return None
+    intercept_values = pd.to_numeric(gate_df.get(intercept_column), errors="coerce").dropna().astype(int)
+    slope_values = pd.to_numeric(gate_df.get(slope_column), errors="coerce").dropna().astype(int)
+    intercept_values = intercept_values[intercept_values >= 0]
+    slope_values = slope_values[slope_values >= 0]
+    if intercept_values.empty or slope_values.empty:
+        return None
+    return int(intercept_values.iloc[0]), int(slope_values.iloc[0])
+
+
+def _role_name_from_parameter_index_column(column_name: str) -> str:
+    suffix = "_parameter_index"
+    return str(column_name[: -len(suffix)] if column_name.endswith(suffix) else column_name)
+
+
+def _first_string_value(frame: pd.DataFrame, column_name: str) -> str | None:
+    if frame.empty or column_name not in frame:
+        return None
+    values = frame[column_name].dropna()
+    if values.empty:
+        return None
+    value = str(values.iloc[0]).strip()
+    return value or None
+
+
+def _first_float_value(frame: pd.DataFrame, column_name: str) -> float | None:
+    if frame.empty or column_name not in frame:
+        return None
+    values = pd.to_numeric(frame[column_name], errors="coerce").dropna()
+    if values.empty:
+        return None
+    return float(values.iloc[0])
+
+
+def _prior_spec_from_metadata(frame: pd.DataFrame, role_name: str) -> Any | None:
+    prior_kind = _first_string_value(frame, f"{role_name}_prior_kind")
+    if prior_kind is None:
+        return None
+    lower = _first_float_value(frame, f"{role_name}_prior_lower")
+    upper = _first_float_value(frame, f"{role_name}_prior_upper")
+    mean = _first_float_value(frame, f"{role_name}_prior_mean")
+    std = _first_float_value(frame, f"{role_name}_prior_std")
+    return SimpleNamespace(
+        prior_kind=prior_kind,
+        lower=float("-inf") if lower is None else float(lower),
+        upper=float("inf") if upper is None else float(upper),
+        mean=mean,
+        std=std,
+    )
+
+
+def _magnitude_feature_grid(
+    feature_df: pd.DataFrame,
+    *,
+    feature_column: str,
+    n_grid: int = 160,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if feature_df.empty or "catalog_mag" not in feature_df or feature_column not in feature_df:
+        return None
+    mag_values = pd.to_numeric(feature_df.get("catalog_mag"), errors="coerce").to_numpy(dtype=float)
+    feature_values = pd.to_numeric(feature_df.get(feature_column), errors="coerce").to_numpy(dtype=float)
+    finite = np.isfinite(mag_values) & np.isfinite(feature_values)
+    if np.sum(finite) < 2:
+        return None
+    mag_min = float(np.nanmin(mag_values[finite]))
+    mag_max = float(np.nanmax(mag_values[finite]))
+    if not np.isfinite(mag_min) or not np.isfinite(mag_max) or mag_min == mag_max:
+        return None
+    coeff = np.polyfit(mag_values[finite], feature_values[finite], deg=1)
+    mag_grid = np.linspace(mag_min, mag_max, int(n_grid))
+    feature_grid = coeff[0] * mag_grid + coeff[1]
+    return mag_grid, feature_grid
+
+
+def _gate_prior_sigmoid_curve(
+    feature_df: pd.DataFrame,
+    gate_df: pd.DataFrame,
+    parameter_specs: list[ParameterSpec] | None,
+    *,
+    intercept_column: str,
+    slope_column: str,
+    feature_column: str,
+    n_draws: int = 512,
+) -> dict[str, np.ndarray] | None:
+    indices = _gate_parameter_indices(gate_df, intercept_column=intercept_column, slope_column=slope_column)
+    grid = _magnitude_feature_grid(feature_df, feature_column=feature_column)
+    if grid is None:
+        return None
+    mag_grid, feature_grid = grid
+    intercept_spec = None
+    slope_spec = None
+    intercept_seed = 0
+    slope_seed = 0
+    if indices is not None:
+        intercept_idx, slope_idx = indices
+        intercept_seed = int(intercept_idx)
+        slope_seed = int(slope_idx)
+        if parameter_specs and 0 <= intercept_idx < len(parameter_specs) and 0 <= slope_idx < len(parameter_specs):
+            intercept_spec = parameter_specs[intercept_idx]
+            slope_spec = parameter_specs[slope_idx]
+    if intercept_spec is None:
+        intercept_spec = _prior_spec_from_metadata(gate_df, _role_name_from_parameter_index_column(intercept_column))
+    if slope_spec is None:
+        slope_spec = _prior_spec_from_metadata(gate_df, _role_name_from_parameter_index_column(slope_column))
+    if intercept_spec is None or slope_spec is None:
+        return None
+    intercept_center = _prior_center_for_spec(intercept_spec)
+    slope_center = _prior_center_for_spec(slope_spec)
+    if intercept_center is None or slope_center is None:
+        return None
+    center = _sigmoid_np(intercept_center + slope_center * feature_grid)
+    rng = np.random.default_rng(71423 + 31 * int(intercept_seed) + 997 * int(slope_seed))
+    intercept_draws = _prior_draws_for_spec(intercept_spec, rng, n_draws)
+    slope_draws = _prior_draws_for_spec(slope_spec, rng, n_draws)
+    if intercept_draws is None or slope_draws is None:
+        return {"mag": mag_grid, "center": center}
+    logits = intercept_draws[:, None] + slope_draws[:, None] * feature_grid[None, :]
+    p_grid = _sigmoid_np(logits)
+    return {
+        "mag": mag_grid,
+        "center": center,
+        "p16": np.nanquantile(p_grid, 0.16, axis=0),
+        "p84": np.nanquantile(p_grid, 0.84, axis=0),
+    }
+
+
+def _draw_gate_prior_sigmoid(
+    ax: Any,
+    feature_df: pd.DataFrame,
+    gate_df: pd.DataFrame,
+    parameter_specs: list[ParameterSpec] | None,
+    *,
+    intercept_column: str,
+    slope_column: str,
+    feature_column: str,
+    show_label: bool = True,
+) -> bool:
+    curve = _gate_prior_sigmoid_curve(
+        feature_df,
+        gate_df,
+        parameter_specs,
+        intercept_column=intercept_column,
+        slope_column=slope_column,
+        feature_column=feature_column,
+    )
+    if curve is None:
+        return False
+    order = np.argsort(curve["mag"])
+    label_suffix = "" if show_label else "_nolegend_"
+    if "p16" in curve and "p84" in curve:
+        ax.fill_between(
+            curve["mag"][order],
+            curve["p16"][order],
+            curve["p84"][order],
+            color="tab:orange",
+            alpha=0.14,
+            linewidth=0.0,
+            label="prior 16-84%" if show_label else label_suffix,
+        )
+    ax.plot(
+        curve["mag"][order],
+        curve["center"][order],
+        color="tab:orange",
+        linestyle="--",
+        linewidth=1.2,
+        label="prior center" if show_label else label_suffix,
+    )
+    return True
+
+
+def _active_population_finite_frame(df: pd.DataFrame, numeric_columns: Sequence[str]) -> pd.DataFrame | None:
+    if any(column not in df.columns for column in numeric_columns):
+        return None
+    frame = df.copy()
+    mask = np.ones(len(frame), dtype=bool)
+    for column in numeric_columns:
+        values = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+        frame[column] = values
+        mask &= np.isfinite(values)
+    finite = frame.loc[mask].copy()
+    if finite.empty:
+        return None
+    finite["frozen_active"] = finite.get("frozen_active", pd.Series(False, index=finite.index)).astype(bool)
+    return finite
+
+
+def _scatter_active_population_status(
+    ax: Any,
+    frame: pd.DataFrame,
+    x_column: str,
+    y_column: str,
+    *,
+    active_label: str = "frozen active",
+    inactive_label: str = "frozen inactive",
+    alpha: float = 0.82,
+) -> None:
+    active = frame[frame["frozen_active"]]
+    inactive = frame[~frame["frozen_active"]]
+    if not inactive.empty:
+        ax.scatter(
+            inactive[x_column],
+            inactive[y_column],
+            s=28,
+            c="0.58",
+            alpha=alpha,
+            label=inactive_label,
+        )
+    if not active.empty:
+        ax.scatter(
+            active[x_column],
+            active[y_column],
+            s=34,
+            c="tab:blue",
+            edgecolors="black",
+            linewidths=0.4,
+            alpha=alpha,
+            label=active_label,
+        )
+
+
+def _add_active_population_mixture_page2(pdf: PdfPages, df: pd.DataFrame, threshold: float) -> None:
+    numeric_columns = [
+        "p_active_gate_median",
+        "p_active_membership_median",
+        "active_loglike_delta_median",
+    ]
+    finite = _active_population_finite_frame(df, numeric_columns)
+    if finite is None:
+        return
+    fig, axes = plt.subplots(2, 2, figsize=(12.0, 8.5), constrained_layout=True)
+    ax_gate, ax_delta_membership, ax_delta_rank, ax_hist = axes.reshape(-1)
+
+    _scatter_active_population_status(
+        ax_gate,
+        finite,
+        "p_active_gate_median",
+        "p_active_membership_median",
+    )
+    ax_gate.plot([0.0, 1.0], [0.0, 1.0], color="black", linestyle="--", linewidth=1.0, label="y=x")
+    ax_gate.axhline(threshold, color="black", linestyle=":", linewidth=1.0)
+    ax_gate.axvline(threshold, color="black", linestyle=":", linewidth=1.0)
+    ax_gate.set_xlim(-0.05, 1.05)
+    ax_gate.set_ylim(-0.05, 1.05)
+    ax_gate.set_title("Membership vs raw gate")
+    ax_gate.set_xlabel("raw sigmoid gate median")
+    ax_gate.set_ylabel("membership median")
+    ax_gate.legend(loc="best", fontsize=8)
+
+    _scatter_active_population_status(
+        ax_delta_membership,
+        finite,
+        "active_loglike_delta_median",
+        "p_active_membership_median",
+    )
+    ax_delta_membership.axvline(0.0, color="black", linestyle="--", linewidth=1.0)
+    ax_delta_membership.axhline(threshold, color="black", linestyle=":", linewidth=1.0)
+    ax_delta_membership.set_ylim(-0.05, 1.05)
+    ax_delta_membership.set_title("Membership vs inactive likelihood delta")
+    ax_delta_membership.set_xlabel(r"$\Delta \log L = \log L_{\rm inactive} - \log L_{\rm exact}$")
+    ax_delta_membership.set_ylabel("membership median")
+    ax_delta_membership.text(
+        0.02,
+        0.02,
+        "negative delta favors active",
+        transform=ax_delta_membership.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=8,
+        color="0.35",
+    )
+    ax_delta_membership.legend(loc="best", fontsize=8)
+
+    rank_frame = _active_population_finite_frame(
+        finite,
+        ["active_loglike_delta_median", "rank"] if "rank" in finite.columns else ["active_loglike_delta_median"],
+    )
+    mag_frame = _active_population_finite_frame(
+        finite,
+        ["active_loglike_delta_median", "catalog_mag"]
+        if "catalog_mag" in finite.columns
+        else ["active_loglike_delta_median"],
+    )
+    if rank_frame is not None and "rank" in rank_frame.columns:
+        _scatter_active_population_status(ax_delta_rank, rank_frame, "rank", "active_loglike_delta_median")
+        ax_delta_rank.set_xlabel("importance rank")
+        ax_delta_rank.set_title("Inactive likelihood delta vs rank")
+    elif mag_frame is not None and "catalog_mag" in mag_frame.columns:
+        _scatter_active_population_status(ax_delta_rank, mag_frame, "catalog_mag", "active_loglike_delta_median")
+        ax_delta_rank.invert_xaxis()
+        ax_delta_rank.set_xlabel("catalog magnitude")
+        ax_delta_rank.set_title("Inactive likelihood delta vs magnitude")
+    else:
+        ax_delta_rank.text(
+            0.5,
+            0.5,
+            "rank/magnitude unavailable",
+            transform=ax_delta_rank.transAxes,
+            ha="center",
+            va="center",
+        )
+        ax_delta_rank.set_title("Inactive likelihood delta")
+    ax_delta_rank.axhline(0.0, color="black", linestyle="--", linewidth=1.0)
+    ax_delta_rank.set_ylabel(r"$\Delta \log L$")
+    handles, labels = ax_delta_rank.get_legend_handles_labels()
+    if handles and labels:
+        ax_delta_rank.legend(loc="best", fontsize=8)
+
+    active_delta = finite.loc[finite["frozen_active"], "active_loglike_delta_median"].to_numpy(dtype=float)
+    inactive_delta = finite.loc[~finite["frozen_active"], "active_loglike_delta_median"].to_numpy(dtype=float)
+    all_delta = finite["active_loglike_delta_median"].to_numpy(dtype=float)
+    if all_delta.size <= 1 or np.nanmin(all_delta) == np.nanmax(all_delta):
+        bins = 10
+    else:
+        bins = np.histogram_bin_edges(all_delta, bins="auto")
+    ax_hist.hist(inactive_delta, bins=bins, color="0.65", alpha=0.75, label="frozen inactive")
+    ax_hist.hist(active_delta, bins=bins, color="tab:blue", alpha=0.65, label="frozen active")
+    ax_hist.axvline(0.0, color="black", linestyle="--", linewidth=1.0)
+    ax_hist.set_title("Inactive likelihood delta histogram")
+    ax_hist.set_xlabel(r"$\Delta \log L$")
+    ax_hist.set_ylabel("galaxies")
+    ax_hist.legend(loc="best", fontsize=8)
+
+    fig.suptitle("Population active mixture diagnostics", fontsize=13)
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _add_active_population_mixture_page3(pdf: PdfPages, df: pd.DataFrame, threshold: float) -> None:
+    numeric_columns = [
+        "p_active_gate_median",
+        "p_active_membership_median",
+        "p_active_membership_p16",
+        "p_active_membership_p84",
+        "active_loglike_delta_median",
+        "active_loglike_delta_p16",
+        "active_loglike_delta_p84",
+    ]
+    finite = _active_population_finite_frame(df, numeric_columns)
+    if finite is None:
+        return
+    finite["membership_width"] = np.maximum(
+        0.0,
+        finite["p_active_membership_p84"] - finite["p_active_membership_p16"],
+    )
+    finite["delta_width"] = np.maximum(
+        0.0,
+        finite["active_loglike_delta_p84"] - finite["active_loglike_delta_p16"],
+    )
+    fig, axes = plt.subplots(2, 2, figsize=(12.0, 8.5), constrained_layout=True)
+    ax_membership_width, ax_delta_width, ax_gate_delta, ax_text = axes.reshape(-1)
+
+    _scatter_active_population_status(
+        ax_membership_width,
+        finite,
+        "p_active_membership_median",
+        "membership_width",
+    )
+    ax_membership_width.axvline(threshold, color="black", linestyle=":", linewidth=1.0)
+    ax_membership_width.set_xlim(-0.05, 1.05)
+    ax_membership_width.set_title("Membership uncertainty")
+    ax_membership_width.set_xlabel("membership median")
+    ax_membership_width.set_ylabel("p84 - p16")
+    ax_membership_width.legend(loc="best", fontsize=8)
+
+    _scatter_active_population_status(
+        ax_delta_width,
+        finite,
+        "active_loglike_delta_median",
+        "delta_width",
+    )
+    ax_delta_width.axvline(0.0, color="black", linestyle="--", linewidth=1.0)
+    ax_delta_width.set_title("Likelihood-delta uncertainty")
+    ax_delta_width.set_xlabel(r"$\Delta \log L$ median")
+    ax_delta_width.set_ylabel("p84 - p16")
+    ax_delta_width.legend(loc="best", fontsize=8)
+
+    sc = ax_gate_delta.scatter(
+        finite["active_loglike_delta_median"],
+        finite["p_active_gate_median"],
+        c=finite["p_active_membership_median"],
+        cmap="viridis",
+        norm=Normalize(vmin=0.0, vmax=1.0),
+        s=34,
+        edgecolors=np.where(finite["frozen_active"].to_numpy(dtype=bool), "black", "none"),
+        linewidths=np.where(finite["frozen_active"].to_numpy(dtype=bool), 0.45, 0.0),
+        alpha=0.86,
+    )
+    ax_gate_delta.axvline(0.0, color="black", linestyle="--", linewidth=1.0)
+    ax_gate_delta.axhline(threshold, color="black", linestyle=":", linewidth=1.0)
+    ax_gate_delta.set_ylim(-0.05, 1.05)
+    ax_gate_delta.set_title("Gate vs inactive likelihood delta")
+    ax_gate_delta.set_xlabel(r"$\Delta \log L$ median")
+    ax_gate_delta.set_ylabel("raw sigmoid gate median")
+    fig.colorbar(sc, ax=ax_gate_delta, label="membership median", fraction=0.045, pad=0.02)
+
+    total = int(len(finite))
+    frozen_active = int(finite["frozen_active"].sum())
+    frozen_inactive = total - frozen_active
+    gate_active = int((finite["p_active_gate_median"] >= threshold).sum())
+    membership_active = int((finite["p_active_membership_median"] >= threshold).sum())
+    summary_rows = [
+        ("total candidates", f"{total:d}"),
+        ("frozen active", f"{frozen_active:d}"),
+        ("frozen inactive", f"{frozen_inactive:d}"),
+        ("gate >= threshold", f"{gate_active:d}"),
+        ("membership >= threshold", f"{membership_active:d}"),
+        ("median gate", f"{np.nanmedian(finite['p_active_gate_median']):.3g}"),
+        ("median membership", f"{np.nanmedian(finite['p_active_membership_median']):.3g}"),
+        ("median delta", f"{np.nanmedian(finite['active_loglike_delta_median']):.3g}"),
+    ]
+    ax_text.axis("off")
+    ax_text.set_title("Decision summary")
+    row_text = "\n".join(f"{name:<24} {value:>10}" for name, value in summary_rows)
+    ax_text.text(
+        0.02,
+        0.95,
+        row_text,
+        transform=ax_text.transAxes,
+        ha="left",
+        va="top",
+        family="monospace",
+        fontsize=10,
+        linespacing=1.5,
+    )
+    ax_text.text(
+        0.02,
+        0.08,
+        "Membership is the posterior active probability used for freeze decisions.",
+        transform=ax_text.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=8,
+        color="0.35",
+        wrap=True,
+    )
+
+    fig.suptitle("Population active mixture uncertainty and decisions", fontsize=13)
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_active_scaling_summary(
+    plot_dir: Path,
+    active_scaling_df: pd.DataFrame,
+    *,
+    parameter_specs: list[ParameterSpec] | None = None,
+    freeze_threshold: float = 0.5,
+) -> None:
+    pdf_path = _plot_path(plot_dir, "active_scaling_summary.pdf")
+    if active_scaling_df.empty:
+        _write_placeholder_plot(pdf_path, "SVI active-scaling summary", "No SVI active-gate diagnostics are available.")
+        return
+    df = active_scaling_df.copy()
+    df["potfile_id"] = df["potfile_id"].astype(str)
+    df["frozen_active"] = df["frozen_active"].astype(bool)
+    likelihood_values = (
+        set(str(value) for value in df.get("active_inference_likelihood", pd.Series(dtype=object)).dropna().unique())
+        if "active_inference_likelihood" in df
+        else set()
+    )
+    population_mode = any(value.startswith("population") for value in likelihood_values)
+    probability_label = "median active membership" if population_mode else "median p_active"
+    posterior_label = "posterior active membership" if population_mode else "posterior p_active"
+    threshold = float(freeze_threshold)
+    fig, axes = plt.subplots(2, 2, figsize=(12.0, 8.5), constrained_layout=True)
+    ax_map, ax_mag, ax_rank, ax_counts = axes.reshape(-1)
+
+    norm = Normalize(vmin=0.0, vmax=1.0)
+    finite_xy = np.isfinite(df["x_centre"].to_numpy(dtype=float)) & np.isfinite(df["y_centre"].to_numpy(dtype=float))
+    finite_p = np.isfinite(df["p_active_median"].to_numpy(dtype=float))
+    finite_map = df[finite_xy & finite_p]
+    missing_map = df[finite_xy & ~finite_p]
+    if finite_map.empty:
+        ax_map.text(0.5, 0.5, "sky map unavailable", transform=ax_map.transAxes, ha="center", va="center")
+    else:
+        frozen = finite_map[finite_map["frozen_active"]]
+        inactive = finite_map[~finite_map["frozen_active"]]
+        mappable = ax_map.scatter(
+            inactive["x_centre"],
+            inactive["y_centre"],
+            c=inactive["p_active_median"],
+            cmap="viridis",
+            norm=norm,
+            s=34,
+            marker="o",
+            edgecolors="none",
+            alpha=0.85,
+            label="frozen inactive",
+        )
+        if not frozen.empty:
+            mappable = ax_map.scatter(
+                frozen["x_centre"],
+                frozen["y_centre"],
+                c=frozen["p_active_median"],
+                cmap="viridis",
+                norm=norm,
+                s=52,
+                marker="^",
+                edgecolors="black",
+                linewidths=0.5,
+                alpha=0.95,
+                label="frozen active",
+            )
+        fig.colorbar(mappable, ax=ax_map, label=probability_label, fraction=0.045, pad=0.02)
+    if not missing_map.empty:
+        ax_map.scatter(
+            missing_map["x_centre"],
+            missing_map["y_centre"],
+            s=24,
+            facecolors="white",
+            edgecolors="0.35",
+            linewidths=0.7,
+            label="p_active unavailable",
+        )
+    ax_map.set_title("Sky map")
+    ax_map.set_xlabel("x [arcsec]")
+    ax_map.set_ylabel("y [arcsec]")
+    ax_map.set_aspect("equal", adjustable="datalim")
+    ax_map.legend(loc="best", fontsize=8)
+
+    finite_mag = df[
+        np.isfinite(df["catalog_mag"].to_numpy(dtype=float))
+        & np.isfinite(df["p_active_median"].to_numpy(dtype=float))
+    ]
+    if finite_mag.empty:
+        ax_mag.text(0.5, 0.5, "p_active by magnitude unavailable", transform=ax_mag.transAxes, ha="center", va="center")
+    else:
+        prior_label_shown = False
+        for _potfile_id, pot_df in finite_mag.groupby("potfile_id", sort=False):
+            prior_label_shown = _draw_gate_prior_sigmoid(
+                ax_mag,
+                pot_df,
+                pot_df,
+                parameter_specs,
+                intercept_column="active_gate_intercept_parameter_index",
+                slope_column="active_gate_mag_slope_parameter_index",
+                feature_column="active_magnitude_feature",
+                show_label=not prior_label_shown,
+            ) or prior_label_shown
+        colors = np.where(finite_mag["frozen_active"].to_numpy(dtype=bool), "tab:blue", "0.55")
+        ax_mag.scatter(finite_mag["catalog_mag"], finite_mag["p_active_median"], c=colors, s=30, alpha=0.85)
+        ax_mag.errorbar(
+            finite_mag["catalog_mag"],
+            finite_mag["p_active_median"],
+            yerr=np.vstack(
+                [
+                    np.maximum(0.0, finite_mag["p_active_median"] - finite_mag["p_active_p16"]),
+                    np.maximum(0.0, finite_mag["p_active_p84"] - finite_mag["p_active_median"]),
+                ]
+            ),
+            fmt="none",
+            ecolor="0.35",
+            elinewidth=0.8,
+            alpha=0.45,
+        )
+    ax_mag.axhline(threshold, color="black", linestyle=":", linewidth=1.0, label=f"freeze threshold={threshold:.2f}")
+    ax_mag.set_ylim(-0.05, 1.05)
+    ax_mag.set_title("Probability vs magnitude")
+    ax_mag.set_xlabel("catalog magnitude")
+    ax_mag.set_ylabel(posterior_label)
+    if population_mode:
+        ax_mag.text(
+            0.02,
+            0.02,
+            "raw sigmoid gate in CSV as p_active_gate_*",
+            transform=ax_mag.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=8,
+            color="0.35",
+        )
+    ax_mag.invert_xaxis()
+    ax_mag.legend(loc="best", fontsize=8)
+
+    finite_rank = df[
+        np.isfinite(df["rank"].to_numpy(dtype=float))
+        & np.isfinite(df["p_active_median"].to_numpy(dtype=float))
+    ]
+    if finite_rank.empty:
+        ax_rank.text(0.5, 0.5, "p_active by rank unavailable", transform=ax_rank.transAxes, ha="center", va="center")
+    else:
+        for potfile_id, pot_df in finite_rank.groupby("potfile_id", sort=False):
+            ax_rank.plot(
+                pot_df["rank"],
+                pot_df["p_active_median"],
+                marker="o",
+                markersize=3.5,
+                linewidth=1.0,
+                label=str(potfile_id),
+            )
+    ax_rank.axhline(threshold, color="black", linestyle=":", linewidth=1.0)
+    ax_rank.set_ylim(-0.05, 1.05)
+    ax_rank.set_title("Probability vs rank")
+    ax_rank.set_xlabel("importance rank")
+    ax_rank.set_ylabel(probability_label)
+    ax_rank.legend(loc="best", fontsize=8)
+
+    counts = (
+        df.groupby(["potfile_id", "frozen_active"], observed=False)
+        .size()
+        .unstack(fill_value=0)
+        .rename(columns={False: "inactive", True: "active"})
+    )
+    for column in ("inactive", "active"):
+        if column not in counts:
+            counts[column] = 0
+    counts = counts[["inactive", "active"]]
+    x = np.arange(len(counts), dtype=float)
+    ax_counts.bar(x, counts["inactive"], color="0.72", label="frozen inactive")
+    ax_counts.bar(x, counts["active"], bottom=counts["inactive"], color="tab:blue", label="frozen active")
+    ax_counts.set_xticks(x)
+    ax_counts.set_xticklabels([str(value) for value in counts.index], rotation=25, ha="right")
+    ax_counts.set_title("Frozen counts")
+    ax_counts.set_ylabel("galaxies")
+    ax_counts.legend(loc="best", fontsize=8)
+
+    with PdfPages(pdf_path) as pdf:
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+        if population_mode:
+            _add_active_population_mixture_page2(pdf, df, threshold)
+            _add_active_population_mixture_page3(pdf, df, threshold)
+        return
+
+
+def _independent_scaling_diagnostics_table(
+    parameter_specs: list[ParameterSpec],
+    samples: np.ndarray,
+    best_fit: np.ndarray,
+    scaling_rank_df: pd.DataFrame,
+    packed_lens_spec: Any,
+    sample_weights: np.ndarray | None = None,
+) -> pd.DataFrame:
+    columns = [
+        "potfile_id",
+        "catalog_id",
+        "rank",
+        "component_index",
+        "free_component_index",
+        "catalog_mag",
+        "independent_magnitude_feature",
+        "scaling_v_disp_median",
+        "scaling_v_disp_p16",
+        "scaling_v_disp_p84",
+        "scaling_v_disp_map",
+        "scaling_core_radius_kpc_median",
+        "scaling_core_radius_kpc_p16",
+        "scaling_core_radius_kpc_p84",
+        "scaling_core_radius_kpc_map",
+        "scaling_cut_radius_kpc_median",
+        "scaling_cut_radius_kpc_p16",
+        "scaling_cut_radius_kpc_p84",
+        "scaling_cut_radius_kpc_map",
+        "free_v_disp_median",
+        "free_v_disp_p16",
+        "free_v_disp_p84",
+        "free_v_disp_map",
+        "free_core_radius_kpc_median",
+        "free_core_radius_kpc_p16",
+        "free_core_radius_kpc_p84",
+        "free_core_radius_kpc_map",
+        "free_cut_radius_kpc_median",
+        "free_cut_radius_kpc_p16",
+        "free_cut_radius_kpc_p84",
+        "free_cut_radius_kpc_map",
+        "free_log_v_disp_delta_median",
+        "free_log_v_disp_delta_p16",
+        "free_log_v_disp_delta_p84",
+        "free_log_v_disp_delta_map",
+        "free_log_core_radius_delta_median",
+        "free_log_core_radius_delta_p16",
+        "free_log_core_radius_delta_p84",
+        "free_log_core_radius_delta_map",
+        "free_log_cut_radius_delta_median",
+        "free_log_cut_radius_delta_p16",
+        "free_log_cut_radius_delta_p84",
+        "free_log_cut_radius_delta_map",
+        "free_log_v_disp_tau_median",
+        "free_log_v_disp_tau_p16",
+        "free_log_v_disp_tau_p84",
+        "free_log_v_disp_tau_map",
+        "free_log_core_radius_tau_median",
+        "free_log_core_radius_tau_p16",
+        "free_log_core_radius_tau_p84",
+        "free_log_core_radius_tau_map",
+        "free_log_cut_radius_tau_median",
+        "free_log_cut_radius_tau_p16",
+        "free_log_cut_radius_tau_p84",
+        "free_log_cut_radius_tau_map",
+        "v_disp_ratio_median",
+        "v_disp_ratio_p16",
+        "v_disp_ratio_p84",
+        "v_disp_ratio_map",
+        "core_radius_ratio_median",
+        "core_radius_ratio_p16",
+        "core_radius_ratio_p84",
+        "core_radius_ratio_map",
+        "cut_radius_ratio_median",
+        "cut_radius_ratio_p16",
+        "cut_radius_ratio_p84",
+        "cut_radius_ratio_map",
+    ]
+    sample_array = np.asarray(samples, dtype=float)
+    best_fit_array = np.asarray(best_fit, dtype=float).reshape(-1)
+    if (
+        not parameter_specs
+        or scaling_rank_df.empty
+        or sample_array.ndim != 2
+        or sample_array.shape[0] == 0
+        or sample_array.shape[1] == 0
+    ):
+        return pd.DataFrame(columns=columns)
+    selected_independent = scaling_rank_df.get(
+        "selected_independent",
+        pd.Series(False, index=scaling_rank_df.index),
+    ).astype(bool)
+    selected_df = scaling_rank_df.loc[selected_independent].copy()
+    if selected_df.empty:
+        return pd.DataFrame(columns=columns)
+    n_components = int(np.asarray(getattr(packed_lens_spec, "profile_type", []), dtype=np.int32).size)
+    if n_components <= 0:
+        return pd.DataFrame(columns=columns)
+    magnitude_features = _component_array_from_packed(
+        packed_lens_spec,
+        "independent_magnitude_feature",
+        n_components,
+        dtype=float,
+        fill_value=0.0,
+    )
+    luminosity_ratio = _component_array_from_packed(
+        packed_lens_spec,
+        "luminosity_ratio",
+        n_components,
+        dtype=float,
+        fill_value=1.0,
+    )
+    sigma_ref_base = _component_array_from_packed(packed_lens_spec, "sigma_ref_base", n_components, dtype=float, fill_value=0.0)
+    cut_ref_base = _component_array_from_packed(packed_lens_spec, "cut_ref_base", n_components, dtype=float, fill_value=0.0)
+    core_ref_base = _component_array_from_packed(packed_lens_spec, "core_ref_base", n_components, dtype=float, fill_value=0.0)
+    vdslope_base = _component_array_from_packed(packed_lens_spec, "vdslope_base", n_components, dtype=float, fill_value=4.0)
+    slope_base = _component_array_from_packed(packed_lens_spec, "slope_base", n_components, dtype=float, fill_value=4.0)
+    alpha_sigma_base = _component_array_from_packed(
+        packed_lens_spec, "alpha_sigma_base", n_components, dtype=float, fill_value=0.25
+    )
+    gamma_ml_base = _component_array_from_packed(
+        packed_lens_spec, "gamma_ml_base", n_components, dtype=float, fill_value=0.0
+    )
+    sigma_ref_indices = _component_array_from_packed(
+        packed_lens_spec, "sigma_ref_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    cut_ref_indices = _component_array_from_packed(
+        packed_lens_spec, "cut_ref_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    core_ref_indices = _component_array_from_packed(
+        packed_lens_spec, "core_ref_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    vdslope_indices = _component_array_from_packed(
+        packed_lens_spec, "vdslope_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    slope_param_indices = _component_array_from_packed(
+        packed_lens_spec, "slope_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    alpha_sigma_indices = _component_array_from_packed(
+        packed_lens_spec, "alpha_sigma_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    gamma_ml_indices = _component_array_from_packed(
+        packed_lens_spec, "gamma_ml_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    v_disp_base = _component_array_from_packed(packed_lens_spec, "v_disp_base", n_components, dtype=float, fill_value=0.0)
+    core_base = _component_array_from_packed(packed_lens_spec, "core_radius_kpc_base", n_components, dtype=float, fill_value=0.0)
+    cut_base = _component_array_from_packed(packed_lens_spec, "cut_radius_kpc_base", n_components, dtype=float, fill_value=0.0)
+    v_disp_indices = _component_array_from_packed(
+        packed_lens_spec, "v_disp_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    core_indices = _component_array_from_packed(
+        packed_lens_spec, "core_radius_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    cut_radius_indices = _component_array_from_packed(
+        packed_lens_spec, "cut_radius_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    free_v_delta_indices = _component_array_from_packed(
+        packed_lens_spec, "independent_free_log_v_disp_delta_unit_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    free_core_delta_indices = _component_array_from_packed(
+        packed_lens_spec, "independent_free_log_core_radius_delta_unit_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    free_cut_delta_indices = _component_array_from_packed(
+        packed_lens_spec, "independent_free_log_cut_radius_delta_unit_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    free_v_tau_indices = _component_array_from_packed(
+        packed_lens_spec, "independent_free_log_v_disp_tau_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    free_core_tau_indices = _component_array_from_packed(
+        packed_lens_spec, "independent_free_log_core_radius_tau_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    free_cut_tau_indices = _component_array_from_packed(
+        packed_lens_spec, "independent_free_log_cut_radius_tau_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    weights = _normalized_weights(sample_weights, sample_array.shape[0])
+
+    def _values(base_array: np.ndarray, index_array: np.ndarray, component_index: int) -> np.ndarray:
+        idx = int(index_array[component_index])
+        if 0 <= idx < sample_array.shape[1]:
+            return sample_array[:, idx]
+        return np.full(sample_array.shape[0], float(base_array[component_index]), dtype=float)
+
+    def _map_value(base_array: np.ndarray, index_array: np.ndarray, component_index: int) -> float:
+        idx = int(index_array[component_index])
+        if 0 <= idx < best_fit_array.size:
+            return float(best_fit_array[idx])
+        return float(base_array[component_index])
+
+    def _add_summary(row_dict: dict[str, Any], prefix: str, values: np.ndarray, map_value: float) -> None:
+        summary = _finite_weighted_summary(values, weights)
+        row_dict[f"{prefix}_median"] = summary["median"]
+        row_dict[f"{prefix}_p16"] = summary["p16"]
+        row_dict[f"{prefix}_p84"] = summary["p84"]
+        row_dict[f"{prefix}_map"] = float(map_value) if np.isfinite(map_value) else float("nan")
+
+    def _effective_exponents(component_index: int) -> tuple[np.ndarray, np.ndarray, float, float]:
+        vdslope = _values(vdslope_base, vdslope_indices, component_index)
+        slope_values = _values(slope_base, slope_param_indices, component_index)
+        safe_vdslope = np.where(
+            np.abs(vdslope) < 1.0e-12,
+            np.sign(vdslope) * 1.0e-12 + (vdslope == 0.0) * 1.0e-12,
+            vdslope,
+        )
+        safe_slope = np.where(
+            np.abs(slope_values) < 1.0e-12,
+            np.sign(slope_values) * 1.0e-12 + (slope_values == 0.0) * 1.0e-12,
+            slope_values,
+        )
+        denominator_alpha = 1.0 / safe_vdslope
+        denominator_beta = 2.0 / safe_slope
+        alpha_values = _values(alpha_sigma_base, alpha_sigma_indices, component_index)
+        gamma_values = _values(gamma_ml_base, gamma_ml_indices, component_index)
+        bergamini = int(alpha_sigma_indices[component_index]) >= 0
+        effective_alpha = alpha_values if bergamini else denominator_alpha
+        effective_beta = 1.0 + gamma_values - 2.0 * alpha_values if bergamini else denominator_beta
+        vdslope_map = _map_value(vdslope_base, vdslope_indices, component_index)
+        slope_map_value = _map_value(slope_base, slope_param_indices, component_index)
+        safe_vdslope_map = vdslope_map if abs(vdslope_map) >= 1.0e-12 else math.copysign(1.0e-12, vdslope_map or 1.0)
+        safe_slope_map = slope_map_value if abs(slope_map_value) >= 1.0e-12 else math.copysign(1.0e-12, slope_map_value or 1.0)
+        if bergamini:
+            alpha_map = _map_value(alpha_sigma_base, alpha_sigma_indices, component_index)
+            gamma_map = _map_value(gamma_ml_base, gamma_ml_indices, component_index)
+            return effective_alpha, effective_beta, alpha_map, 1.0 + gamma_map - 2.0 * alpha_map
+        return effective_alpha, effective_beta, 1.0 / safe_vdslope_map, 2.0 / safe_slope_map
+
+    rows: list[dict[str, Any]] = []
+    for row in selected_df.itertuples(index=False):
+        component_index = int(getattr(row, "component_index"))
+        if component_index < 0 or component_index >= n_components:
+            continue
+        free_component_index = int(getattr(row, "free_component_index", -1))
+        if free_component_index < 0 or free_component_index >= n_components:
+            continue
+        feature = float(magnitude_features[component_index])
+
+        sigma_ref = _values(sigma_ref_base, sigma_ref_indices, component_index)
+        cut_ref = _values(cut_ref_base, cut_ref_indices, component_index)
+        core_ref = _values(core_ref_base, core_ref_indices, component_index)
+        alpha_sigma, beta_radius, alpha_sigma_map, beta_radius_map = _effective_exponents(component_index)
+        lum = float(luminosity_ratio[component_index])
+        size_luminosity_scale = np.power(lum, beta_radius)
+        scaling_v_disp = sigma_ref * np.power(lum, alpha_sigma)
+        scaling_core = core_ref * size_luminosity_scale
+        scaling_cut = cut_ref * size_luminosity_scale
+
+        sigma_ref_map = _map_value(sigma_ref_base, sigma_ref_indices, component_index)
+        cut_ref_map = _map_value(cut_ref_base, cut_ref_indices, component_index)
+        core_ref_map = _map_value(core_ref_base, core_ref_indices, component_index)
+        size_luminosity_scale_map = float(np.power(lum, beta_radius_map))
+        scaling_v_disp_map = sigma_ref_map * float(np.power(lum, alpha_sigma_map))
+        scaling_core_map = core_ref_map * size_luminosity_scale_map
+        scaling_cut_map = cut_ref_map * size_luminosity_scale_map
+
+        log_displacement_free = int(free_v_delta_indices[free_component_index]) >= 0
+        if log_displacement_free:
+            free_v_delta_unit = _values(np.zeros(n_components, dtype=float), free_v_delta_indices, free_component_index)
+            free_core_delta_unit = _values(np.zeros(n_components, dtype=float), free_core_delta_indices, free_component_index)
+            free_cut_delta_unit = _values(np.zeros(n_components, dtype=float), free_cut_delta_indices, free_component_index)
+            free_v_tau = _values(np.zeros(n_components, dtype=float), free_v_tau_indices, free_component_index)
+            free_core_tau = _values(np.zeros(n_components, dtype=float), free_core_tau_indices, free_component_index)
+            free_cut_tau = _values(np.zeros(n_components, dtype=float), free_cut_tau_indices, free_component_index)
+            free_v_delta = free_v_tau * free_v_delta_unit
+            free_core_delta = free_core_tau * free_core_delta_unit
+            free_cut_delta = free_cut_tau * free_cut_delta_unit
+            free_v_disp = scaling_v_disp * np.exp(free_v_delta)
+            free_core = scaling_core * np.exp(free_core_delta)
+            free_cut = scaling_cut * np.exp(free_cut_delta)
+            free_v_delta_unit_map = _map_value(np.zeros(n_components, dtype=float), free_v_delta_indices, free_component_index)
+            free_core_delta_unit_map = _map_value(np.zeros(n_components, dtype=float), free_core_delta_indices, free_component_index)
+            free_cut_delta_unit_map = _map_value(np.zeros(n_components, dtype=float), free_cut_delta_indices, free_component_index)
+            free_v_tau_map = _map_value(np.zeros(n_components, dtype=float), free_v_tau_indices, free_component_index)
+            free_core_tau_map = _map_value(np.zeros(n_components, dtype=float), free_core_tau_indices, free_component_index)
+            free_cut_tau_map = _map_value(np.zeros(n_components, dtype=float), free_cut_tau_indices, free_component_index)
+            free_v_delta_map = free_v_tau_map * free_v_delta_unit_map
+            free_core_delta_map = free_core_tau_map * free_core_delta_unit_map
+            free_cut_delta_map = free_cut_tau_map * free_cut_delta_unit_map
+            free_v_disp_map = scaling_v_disp_map * float(np.exp(free_v_delta_map))
+            free_core_map = scaling_core_map * float(np.exp(free_core_delta_map))
+            free_cut_map = scaling_cut_map * float(np.exp(free_cut_delta_map))
+        else:
+            free_v_disp = _values(v_disp_base, v_disp_indices, free_component_index)
+            free_core = _values(core_base, core_indices, free_component_index)
+            free_cut = _values(cut_base, cut_radius_indices, free_component_index)
+            free_v_disp_map = _map_value(v_disp_base, v_disp_indices, free_component_index)
+            free_core_map = _map_value(core_base, core_indices, free_component_index)
+            free_cut_map = _map_value(cut_base, cut_radius_indices, free_component_index)
+            free_v_delta = np.full(sample_array.shape[0], np.nan, dtype=float)
+            free_core_delta = np.full(sample_array.shape[0], np.nan, dtype=float)
+            free_cut_delta = np.full(sample_array.shape[0], np.nan, dtype=float)
+            free_v_tau = np.full(sample_array.shape[0], np.nan, dtype=float)
+            free_core_tau = np.full(sample_array.shape[0], np.nan, dtype=float)
+            free_cut_tau = np.full(sample_array.shape[0], np.nan, dtype=float)
+            free_v_delta_map = free_core_delta_map = free_cut_delta_map = float("nan")
+            free_v_tau_map = free_core_tau_map = free_cut_tau_map = float("nan")
+
+        row_dict: dict[str, Any] = {
+            "potfile_id": str(getattr(row, "potfile_id")),
+            "catalog_id": str(getattr(row, "catalog_id")),
+            "rank": int(getattr(row, "rank")),
+            "component_index": component_index,
+            "free_component_index": free_component_index,
+            "catalog_mag": float(getattr(row, "catalog_mag", np.nan)),
+            "independent_magnitude_feature": feature,
+            "free_v_disp_parameter_index": int(v_disp_indices[free_component_index]),
+            "free_core_radius_kpc_parameter_index": int(core_indices[free_component_index]),
+            "free_cut_radius_kpc_parameter_index": int(cut_radius_indices[free_component_index]),
+        }
+        _add_summary(row_dict, "scaling_v_disp", scaling_v_disp, scaling_v_disp_map)
+        _add_summary(row_dict, "scaling_core_radius_kpc", scaling_core, scaling_core_map)
+        _add_summary(row_dict, "scaling_cut_radius_kpc", scaling_cut, scaling_cut_map)
+        _add_summary(row_dict, "free_v_disp", free_v_disp, free_v_disp_map)
+        _add_summary(row_dict, "free_core_radius_kpc", free_core, free_core_map)
+        _add_summary(row_dict, "free_cut_radius_kpc", free_cut, free_cut_map)
+        _add_summary(row_dict, "free_log_v_disp_delta", free_v_delta, free_v_delta_map)
+        _add_summary(row_dict, "free_log_core_radius_delta", free_core_delta, free_core_delta_map)
+        _add_summary(row_dict, "free_log_cut_radius_delta", free_cut_delta, free_cut_delta_map)
+        _add_summary(row_dict, "free_log_v_disp_tau", free_v_tau, free_v_tau_map)
+        _add_summary(row_dict, "free_log_core_radius_tau", free_core_tau, free_core_tau_map)
+        _add_summary(row_dict, "free_log_cut_radius_tau", free_cut_tau, free_cut_tau_map)
+        _add_summary(row_dict, "v_disp_ratio", free_v_disp / scaling_v_disp, free_v_disp_map / scaling_v_disp_map)
+        _add_summary(row_dict, "core_radius_ratio", free_core / scaling_core, free_core_map / scaling_core_map)
+        _add_summary(row_dict, "cut_radius_ratio", free_cut / scaling_cut, free_cut_map / scaling_cut_map)
+        rows.append(row_dict)
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns).sort_values(["potfile_id", "rank"]).reset_index(drop=True)
+
+
+def _independent_scaling_plot_table(
+    scaling_rank_df: pd.DataFrame,
+    independent_scaling_df: pd.DataFrame,
+) -> pd.DataFrame:
+    base_columns = [
+        "potfile_id",
+        "catalog_id",
+        "rank",
+        "component_index",
+        "free_component_index",
+        "catalog_mag",
+        "independent_magnitude_feature",
+        "x_centre",
+        "y_centre",
+        "selected_active",
+        "selected_independent",
+        "requested_active_count",
+        "importance",
+        "min_distance_arcsec",
+        "independent_plot_class",
+    ]
+    posterior_columns = [
+        "scaling_v_disp_median",
+        "scaling_core_radius_kpc_median",
+        "scaling_cut_radius_kpc_median",
+        "free_v_disp_median",
+        "free_core_radius_kpc_median",
+        "free_cut_radius_kpc_median",
+        "v_disp_ratio_median",
+        "v_disp_ratio_p16",
+        "v_disp_ratio_p84",
+        "core_radius_ratio_median",
+        "core_radius_ratio_p16",
+        "core_radius_ratio_p84",
+        "cut_radius_ratio_median",
+        "cut_radius_ratio_p16",
+        "cut_radius_ratio_p84",
+    ]
+    if scaling_rank_df.empty:
+        return pd.DataFrame(columns=base_columns + posterior_columns)
+    plot_df = scaling_rank_df.copy()
+    plot_df["potfile_id"] = plot_df["potfile_id"].astype(str)
+    plot_df["catalog_id"] = plot_df["catalog_id"].astype(str)
+    plot_df["component_index"] = plot_df["component_index"].astype(int)
+    if "free_component_index" not in plot_df:
+        plot_df["free_component_index"] = -1
+    if "catalog_mag" not in plot_df:
+        plot_df["catalog_mag"] = np.nan
+    if "independent_magnitude_feature" not in plot_df:
+        plot_df["independent_magnitude_feature"] = np.nan
+    if "requested_active_count" not in plot_df:
+        plot_df["requested_active_count"] = 0
+    if "importance" not in plot_df:
+        plot_df["importance"] = np.nan
+    if "min_distance_arcsec" not in plot_df:
+        plot_df["min_distance_arcsec"] = np.nan
+    if "selected_active" not in plot_df:
+        plot_df["selected_active"] = False
+    if "selected_independent" not in plot_df:
+        plot_df["selected_independent"] = False
+    plot_df["selected_active"] = plot_df["selected_active"].astype(bool)
+    plot_df["selected_independent"] = plot_df["selected_independent"].astype(bool)
+    for column in posterior_columns:
+        plot_df[column] = np.nan
+    if not independent_scaling_df.empty:
+        diag_df = independent_scaling_df.copy()
+        diag_df["potfile_id"] = diag_df["potfile_id"].astype(str)
+        diag_df["component_index"] = diag_df["component_index"].astype(int)
+        merge_columns = ["potfile_id", "component_index"] + [
+            column for column in posterior_columns if column in diag_df.columns
+        ]
+        plot_df = plot_df.drop(columns=[column for column in posterior_columns if column in plot_df.columns]).merge(
+            diag_df[merge_columns],
+            on=["potfile_id", "component_index"],
+            how="left",
+        )
+        for column in posterior_columns:
+            if column not in plot_df:
+                plot_df[column] = np.nan
+    plot_df["independent_plot_class"] = np.where(
+        plot_df["selected_independent"],
+        "independent_candidate",
+        np.where(plot_df["selected_active"], "active_not_independent", "not_sampled"),
+    )
+    return plot_df.sort_values(["potfile_id", "rank"]).reset_index(drop=True)
+
+
+def _scaling_relation_summary_table(
+    scaling_rank_df: pd.DataFrame,
+    parameter_specs: list[ParameterSpec],
+    samples: np.ndarray,
+    best_fit: np.ndarray,
+    packed_lens_spec: Any,
+    *,
+    sample_weights: np.ndarray | None = None,
+    independent_scaling_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    columns = [
+        "potfile_id",
+        "catalog_id",
+        "rank",
+        "component_index",
+        "free_component_index",
+        "catalog_mag",
+        "luminosity_ratio",
+        "selected_active",
+        "selected_independent",
+        "scaling_relation_class",
+        "scaling_v_disp_median",
+        "scaling_v_disp_p16",
+        "scaling_v_disp_p84",
+        "scaling_v_disp_map",
+        "scaling_core_radius_kpc_median",
+        "scaling_core_radius_kpc_p16",
+        "scaling_core_radius_kpc_p84",
+        "scaling_core_radius_kpc_map",
+        "scaling_cut_radius_kpc_median",
+        "scaling_cut_radius_kpc_p16",
+        "scaling_cut_radius_kpc_p84",
+        "scaling_cut_radius_kpc_map",
+        "free_v_disp_median",
+        "free_v_disp_p16",
+        "free_v_disp_p84",
+        "free_v_disp_map",
+        "free_core_radius_kpc_median",
+        "free_core_radius_kpc_p16",
+        "free_core_radius_kpc_p84",
+        "free_core_radius_kpc_map",
+        "free_cut_radius_kpc_median",
+        "free_cut_radius_kpc_p16",
+        "free_cut_radius_kpc_p84",
+        "free_cut_radius_kpc_map",
+    ]
+    sample_array = np.asarray(samples, dtype=float)
+    best_fit_array = np.asarray(best_fit, dtype=float).reshape(-1)
+    if (
+        not parameter_specs
+        or scaling_rank_df.empty
+        or sample_array.ndim != 2
+        or sample_array.shape[0] == 0
+        or sample_array.shape[1] == 0
+    ):
+        return pd.DataFrame(columns=columns)
+    n_components = int(np.asarray(getattr(packed_lens_spec, "profile_type", []), dtype=np.int32).size)
+    if n_components <= 0:
+        return pd.DataFrame(columns=columns)
+    luminosity_ratio = _component_array_from_packed(
+        packed_lens_spec,
+        "luminosity_ratio",
+        n_components,
+        dtype=float,
+        fill_value=1.0,
+    )
+    sigma_ref_base = _component_array_from_packed(packed_lens_spec, "sigma_ref_base", n_components, dtype=float, fill_value=0.0)
+    cut_ref_base = _component_array_from_packed(packed_lens_spec, "cut_ref_base", n_components, dtype=float, fill_value=0.0)
+    core_ref_base = _component_array_from_packed(packed_lens_spec, "core_ref_base", n_components, dtype=float, fill_value=0.0)
+    vdslope_base = _component_array_from_packed(packed_lens_spec, "vdslope_base", n_components, dtype=float, fill_value=4.0)
+    slope_base = _component_array_from_packed(packed_lens_spec, "slope_base", n_components, dtype=float, fill_value=4.0)
+    alpha_sigma_base = _component_array_from_packed(
+        packed_lens_spec, "alpha_sigma_base", n_components, dtype=float, fill_value=0.25
+    )
+    gamma_ml_base = _component_array_from_packed(
+        packed_lens_spec, "gamma_ml_base", n_components, dtype=float, fill_value=0.0
+    )
+    sigma_ref_indices = _component_array_from_packed(
+        packed_lens_spec, "sigma_ref_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    cut_ref_indices = _component_array_from_packed(
+        packed_lens_spec, "cut_ref_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    core_ref_indices = _component_array_from_packed(
+        packed_lens_spec, "core_ref_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    vdslope_indices = _component_array_from_packed(
+        packed_lens_spec, "vdslope_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    slope_param_indices = _component_array_from_packed(
+        packed_lens_spec, "slope_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    alpha_sigma_indices = _component_array_from_packed(
+        packed_lens_spec, "alpha_sigma_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    gamma_ml_indices = _component_array_from_packed(
+        packed_lens_spec, "gamma_ml_param_index", n_components, dtype=np.int32, fill_value=-1
+    )
+    weights = _normalized_weights(sample_weights, sample_array.shape[0])
+
+    def _values(base_array: np.ndarray, index_array: np.ndarray, component_index: int) -> np.ndarray:
+        idx = int(index_array[component_index])
+        if 0 <= idx < sample_array.shape[1]:
+            return sample_array[:, idx]
+        return np.full(sample_array.shape[0], float(base_array[component_index]), dtype=float)
+
+    def _map_value(base_array: np.ndarray, index_array: np.ndarray, component_index: int) -> float:
+        idx = int(index_array[component_index])
+        if 0 <= idx < best_fit_array.size:
+            return float(best_fit_array[idx])
+        return float(base_array[component_index])
+
+    def _add_summary(row_dict: dict[str, Any], prefix: str, values: np.ndarray, map_value: float) -> None:
+        summary = _finite_weighted_summary(values, weights)
+        row_dict[f"{prefix}_median"] = summary["median"]
+        row_dict[f"{prefix}_p16"] = summary["p16"]
+        row_dict[f"{prefix}_p84"] = summary["p84"]
+        row_dict[f"{prefix}_map"] = float(map_value) if np.isfinite(map_value) else float("nan")
+
+    def _effective_exponents(component_index: int) -> tuple[np.ndarray, np.ndarray, float, float]:
+        vdslope = _values(vdslope_base, vdslope_indices, component_index)
+        slope_values = _values(slope_base, slope_param_indices, component_index)
+        safe_vdslope = np.where(
+            np.abs(vdslope) < 1.0e-12,
+            np.sign(vdslope) * 1.0e-12 + (vdslope == 0.0) * 1.0e-12,
+            vdslope,
+        )
+        safe_slope = np.where(
+            np.abs(slope_values) < 1.0e-12,
+            np.sign(slope_values) * 1.0e-12 + (slope_values == 0.0) * 1.0e-12,
+            slope_values,
+        )
+        denominator_alpha = 1.0 / safe_vdslope
+        denominator_beta = 2.0 / safe_slope
+        alpha_values = _values(alpha_sigma_base, alpha_sigma_indices, component_index)
+        gamma_values = _values(gamma_ml_base, gamma_ml_indices, component_index)
+        bergamini = int(alpha_sigma_indices[component_index]) >= 0
+        effective_alpha = alpha_values if bergamini else denominator_alpha
+        effective_beta = 1.0 + gamma_values - 2.0 * alpha_values if bergamini else denominator_beta
+        vdslope_map = _map_value(vdslope_base, vdslope_indices, component_index)
+        slope_map_value = _map_value(slope_base, slope_param_indices, component_index)
+        safe_vdslope_map = vdslope_map if abs(vdslope_map) >= 1.0e-12 else math.copysign(1.0e-12, vdslope_map or 1.0)
+        safe_slope_map = slope_map_value if abs(slope_map_value) >= 1.0e-12 else math.copysign(1.0e-12, slope_map_value or 1.0)
+        if bergamini:
+            alpha_map = _map_value(alpha_sigma_base, alpha_sigma_indices, component_index)
+            gamma_map = _map_value(gamma_ml_base, gamma_ml_indices, component_index)
+            return effective_alpha, effective_beta, alpha_map, 1.0 + gamma_map - 2.0 * alpha_map
+        return effective_alpha, effective_beta, 1.0 / safe_vdslope_map, 2.0 / safe_slope_map
+
+    rows: list[dict[str, Any]] = []
+    for row in scaling_rank_df.itertuples(index=False):
+        component_index = int(getattr(row, "component_index", -1))
+        if component_index < 0 or component_index >= n_components:
+            continue
+        selected_active = bool(getattr(row, "selected_active", False))
+        selected_independent = bool(getattr(row, "selected_independent", False))
+        relation_class = "free" if selected_independent else ("active" if selected_active else "inactive")
+        sigma_ref = _values(sigma_ref_base, sigma_ref_indices, component_index)
+        cut_ref = _values(cut_ref_base, cut_ref_indices, component_index)
+        core_ref = _values(core_ref_base, core_ref_indices, component_index)
+        alpha_sigma, beta_radius, alpha_sigma_map, beta_radius_map = _effective_exponents(component_index)
+        lum = float(luminosity_ratio[component_index])
+        size_luminosity_scale = np.power(lum, beta_radius)
+        scaling_v_disp = sigma_ref * np.power(lum, alpha_sigma)
+        scaling_core = core_ref * size_luminosity_scale
+        scaling_cut = cut_ref * size_luminosity_scale
+        sigma_ref_map = _map_value(sigma_ref_base, sigma_ref_indices, component_index)
+        cut_ref_map = _map_value(cut_ref_base, cut_ref_indices, component_index)
+        core_ref_map = _map_value(core_ref_base, core_ref_indices, component_index)
+        row_dict: dict[str, Any] = {
+            "potfile_id": str(getattr(row, "potfile_id", "")),
+            "catalog_id": str(getattr(row, "catalog_id", "")),
+            "rank": int(getattr(row, "rank", -1)),
+            "component_index": component_index,
+            "free_component_index": int(getattr(row, "free_component_index", -1)),
+            "catalog_mag": float(getattr(row, "catalog_mag", np.nan)),
+            "luminosity_ratio": lum,
+            "selected_active": selected_active,
+            "selected_independent": selected_independent,
+            "scaling_relation_class": relation_class,
+        }
+        _add_summary(
+            row_dict,
+            "scaling_v_disp",
+            scaling_v_disp,
+            sigma_ref_map * float(np.power(lum, alpha_sigma_map)),
+        )
+        size_luminosity_scale_map = float(np.power(lum, beta_radius_map))
+        _add_summary(row_dict, "scaling_core_radius_kpc", scaling_core, core_ref_map * size_luminosity_scale_map)
+        _add_summary(
+            row_dict,
+            "scaling_cut_radius_kpc",
+            scaling_cut,
+            cut_ref_map * size_luminosity_scale_map,
+        )
+        rows.append(row_dict)
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    result = pd.DataFrame(rows)
+    free_columns = [
+        "free_v_disp_median",
+        "free_v_disp_p16",
+        "free_v_disp_p84",
+        "free_v_disp_map",
+        "free_core_radius_kpc_median",
+        "free_core_radius_kpc_p16",
+        "free_core_radius_kpc_p84",
+        "free_core_radius_kpc_map",
+        "free_cut_radius_kpc_median",
+        "free_cut_radius_kpc_p16",
+        "free_cut_radius_kpc_p84",
+        "free_cut_radius_kpc_map",
+    ]
+    for column in free_columns:
+        result[column] = np.nan
+    if independent_scaling_df is not None and not independent_scaling_df.empty:
+        diag_df = independent_scaling_df.copy()
+        if {"potfile_id", "component_index"}.issubset(diag_df.columns):
+            diag_df["potfile_id"] = diag_df["potfile_id"].astype(str)
+            diag_df["component_index"] = diag_df["component_index"].astype(int)
+            merge_columns = ["potfile_id", "component_index"] + [column for column in free_columns if column in diag_df.columns]
+            result = result.drop(columns=[column for column in free_columns if column in result.columns]).merge(
+                diag_df[merge_columns],
+                on=["potfile_id", "component_index"],
+                how="left",
+            )
+            for column in free_columns:
+                if column not in result:
+                    result[column] = np.nan
+    return result.reindex(columns=columns).sort_values(["potfile_id", "rank"]).reset_index(drop=True)
 
 
 def _constraint_strength_label(value: float) -> str:
@@ -1114,6 +3077,7 @@ def _fit_quality_chi_square_summary(
         "headline_missing_image_count": n_observed_images,
         "point_recovered_image_count": 0,
         "point_image_rms_arcsec": None,
+        "point_image_median_residual_arcsec": None,
         "arc_aware_chi_square": None,
         "arc_aware_n_data": 0,
         "arc_aware_dof": int(-k_effective),
@@ -1257,6 +3221,7 @@ def _fit_quality_chi_square_summary(
             "headline_missing_image_count": int(max(0, observed_image_count - point_count)),
             "point_recovered_image_count": point_count,
             "point_image_rms_arcsec": float(np.sqrt(np.mean(point_residual2))) if point_residual2.size else None,
+            "point_image_median_residual_arcsec": float(np.median(residuals)) if residuals.size else None,
             "image_residual_mean_arcsec": float(np.mean(residuals)) if residuals.size else None,
             "image_residual_median_arcsec": float(np.median(residuals)) if residuals.size else None,
             "image_residual_max_arcsec": float(np.max(residuals)) if residuals.size else None,
@@ -1794,16 +3759,28 @@ def _run_summary(
         "n_images": int(sum(f.n_images for f in state.family_data)),
         "n_large_scale_parameters": int(sum(spec.component_family == "large" for spec in state.parameter_specs)),
         "n_scaling_parameters": int(sum(spec.component_family == "scaling" for spec in state.parameter_specs)),
+        "n_independent_scaling_parameters": int(
+            sum(spec.component_family == "independent_scaling" for spec in state.parameter_specs)
+        ),
         "n_source_scatter_parameters": int(sum(spec.component_family == "source_scatter" for spec in state.parameter_specs)),
         "n_source_position_parameters": int(sum(spec.component_family == "source_position" for spec in state.parameter_specs)),
         "n_image_scatter_parameters": int(sum(spec.component_family == "image_scatter" for spec in state.parameter_specs)),
         "n_cosmology_parameters": int(sum(spec.component_family == "cosmology" for spec in state.parameter_specs)),
         "n_scaling_galaxy_components": int(np.sum(state.packed_lens_spec.component_family == 1)),
+        "n_independent_scaling_galaxy_candidates": int(
+            sum(bool(record.get("selected_independent", False)) for record in getattr(state, "scaling_component_records", []))
+        ),
+        "n_independent_scaling_free_branch_components": int(
+            np.sum(state.packed_lens_spec.component_family == 2)
+        ),
         "z_lens": float(lens_redshift) if lens_redshift is not None and np.isfinite(float(lens_redshift)) else None,
         "z_source_min": float(np.min(finite_source_redshifts)) if finite_source_redshifts.size else None,
         "z_source_max": float(np.max(finite_source_redshifts)) if finite_source_redshifts.size else None,
         "fit_method": str(getattr(args, "fit_method", "svi+nuts")),
         "sample_likelihood_mode": sample_likelihood_mode,
+        "local_jacobian_metric": str(
+            getattr(evaluator, "local_jacobian_metric_mode", init_diagnostics.get("local_jacobian_metric", "not_used"))
+        ),
         "image_plane_mode": str(getattr(args, "image_plane_mode", "none")),
         "skip_stage3_image_plane_local_jacobian": bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)),
         "quick_diagnostics": bool(getattr(args, "quick_diagnostics", False)),
@@ -1874,9 +3851,116 @@ def _run_summary(
         "active_scaling_galaxies": list(evaluator.active_scaling_galaxies_by_potfile),
         "active_scaling_components": int(len(evaluator.active_scaling_component_indices)),
         "inactive_scaling_components": int(len(evaluator.inactive_scaling_component_indices)),
+        "independent_scaling_model": "log_displacement",
+        "scaling_relation_mode": str(getattr(state, "scaling_relation_mode", getattr(args, "scaling_relation_mode", "lenstool-denominator"))),
+        "core_radius_scaling": (
+            "shared_beta_radius"
+            if str(getattr(state, "scaling_relation_mode", getattr(args, "scaling_relation_mode", "lenstool-denominator")))
+            == "bergamini-ml"
+            else "shared_cut_slope"
+        ),
+        "infer_active_scaling": bool(init_diagnostics.get("infer_active_scaling", getattr(state, "infer_active_scaling", False))),
+        "active_scaling_frozen_from_svi": bool(
+            init_diagnostics.get("infer_active_scaling", False)
+            and getattr(state, "frozen_active_scaling_component_indices", None) is not None
+        ),
+        "active_scaling_frozen_from_previous_stage": bool(
+            init_diagnostics.get(
+                "active_scaling_frozen_from_previous_stage",
+                getattr(state, "active_scaling_frozen_from_previous_stage", False),
+            )
+        ),
+        "active_scaling_frozen_source_run_dir": init_diagnostics.get(
+            "active_scaling_frozen_source_run_dir",
+            getattr(state, "active_scaling_frozen_source_run_dir", None),
+        ),
+        "active_scaling_frozen_source_path": init_diagnostics.get(
+            "active_scaling_frozen_source_path",
+            getattr(state, "active_scaling_frozen_source_path", None),
+        ),
+        "active_scaling_freeze_threshold": init_diagnostics.get(
+            "active_scaling_freeze_threshold",
+            getattr(args, "active_scaling_freeze_threshold", None),
+        ),
+        "active_scaling_frozen_active_count": init_diagnostics.get(
+            "active_scaling_frozen_active_count",
+            (
+                int(len(getattr(state, "frozen_active_scaling_component_indices", [])))
+                if getattr(state, "frozen_active_scaling_component_indices", None) is not None
+                else None
+            ),
+        ),
+        "active_scaling_frozen_inactive_count": init_diagnostics.get("active_scaling_frozen_inactive_count"),
+        "active_scaling_frozen_active_by_potfile": init_diagnostics.get("active_scaling_frozen_active_by_potfile", {}),
+        "active_scaling_frozen_inactive_by_potfile": init_diagnostics.get("active_scaling_frozen_inactive_by_potfile", {}),
+        "large_exact_components": int(len(getattr(evaluator, "large_component_indices", []))),
+        "exact_scaling_components": int(
+            len(getattr(evaluator, "exact_scaling_component_indices", evaluator.active_scaling_component_indices))
+        ),
+        "cached_scaling_components": int(
+            len(getattr(evaluator, "cached_scaling_component_indices", evaluator.inactive_scaling_component_indices))
+        ),
+        "free_correction_scaling_components": int(
+            len(getattr(evaluator, "free_correction_scaling_component_indices", []))
+        ),
+        "free_correction_free_branch_components": int(
+            len(getattr(evaluator, "free_correction_free_component_indices", []))
+        ),
+        "excluded_scaling_components": int(len(getattr(evaluator, "excluded_scaling_component_indices", []))),
+        "independent_scaling_components": int(len(getattr(evaluator, "independent_scaling_component_indices", []))),
+        "independent_scaling_free_branch_components": int(
+            len(getattr(evaluator, "independent_free_component_indices", []))
+        ),
         "requested_active_scaling_by_potfile": evaluator.requested_active_scaling_by_potfile,
         "actual_active_scaling_by_potfile": evaluator.actual_active_scaling_by_potfile,
         "total_scaling_by_potfile": evaluator.total_scaling_by_potfile,
+        "independent_scaling_settings": {
+            "candidate_source": "active_scaling_galaxies",
+            "free_branch": "log_displacement",
+            "free_log_vdisp_tau_prior_median": float(
+                getattr(
+                    state,
+                    "independent_scaling_free_log_vdisp_tau_prior_median",
+                    getattr(args, "independent_scaling_free_log_vdisp_tau_prior_median", 0.20),
+                )
+            ),
+            "free_log_core_tau_prior_median": float(
+                getattr(
+                    state,
+                    "independent_scaling_free_log_core_tau_prior_median",
+                    getattr(args, "independent_scaling_free_log_core_tau_prior_median", 0.30),
+                )
+            ),
+            "free_log_cut_tau_prior_median": float(
+                getattr(
+                    state,
+                    "independent_scaling_free_log_cut_tau_prior_median",
+                    getattr(args, "independent_scaling_free_log_cut_tau_prior_median", 0.30),
+                )
+            ),
+            "free_log_tau_prior_sigma": float(
+                getattr(
+                    state,
+                    "independent_scaling_free_log_tau_prior_sigma",
+                    getattr(args, "independent_scaling_free_log_tau_prior_sigma", 0.40),
+                )
+            ),
+            "solver_defined_scaling_law_priors": {
+                "sigma_ref": {"mean": 100.0, "std": 40.0, "lower": 20.0, "upper": 500.0},
+                "cut_ref_kpc": {"mean": 300.0, "std": 120.0, "lower": 20.0, "upper": 1000.0},
+                "core_ref_kpc": {"median": 0.15, "log_sigma": 0.7, "lower": 0.01, "upper": 10.0},
+                "vdslope": {"mean": 4.0, "std": 0.75, "lower": 1.5, "upper": 8.0},
+                "slope": {"mean": 4.0, "std": 0.75, "lower": 1.5, "upper": 8.0},
+            },
+        },
+        "independent_scaling_candidates_by_potfile": (
+            {}
+            if getattr(evaluator, "scaling_rank_df", pd.DataFrame()).empty
+            else {
+                str(potfile_id): int(group_df.get("selected_independent", pd.Series(False, index=group_df.index)).astype(bool).sum())
+                for potfile_id, group_df in evaluator.scaling_rank_df.groupby("potfile_id", sort=False)
+            }
+        ),
         "fit_quality_reference_sample_kind": str(
             init_diagnostics.get("fit_quality_reference_sample_kind", "max_likelihood")
         ),
@@ -2150,6 +4234,7 @@ def _format_run_summary_text(summary: dict[str, Any]) -> str:
         ("headline dof", headline_dof),
         ("headline_reduced_chi_square", headline_reduced_chi_square),
         ("point image RMS arcsec", summary.get("point_image_rms_arcsec")),
+        ("point median residual arcsec", summary.get("point_image_median_residual_arcsec")),
         ("point recovered images", f"{_metric_text(point_recovered_count)}/{_metric_text(observed_image_count)}"),
     ]
     if use_arc_aware_diagnostics:
@@ -2159,6 +4244,7 @@ def _format_run_summary_text(summary: dict[str, Any]) -> str:
                 ("arc-aware dof", arc_aware_dof),
                 ("arc_aware_reduced_chi_square", arc_aware_reduced_chi_square),
                 ("arc-aware image RMS arcsec", summary.get("arc_aware_image_rms_arcsec")),
+                ("arc-aware median residual arcsec", summary.get("arc_aware_image_residual_median_arcsec")),
                 ("arc-aware recovered images", f"{_metric_text(arc_aware_recovered_count)}/{_metric_text(observed_image_count)}"),
             ]
         )
@@ -2279,6 +4365,7 @@ def _format_sequential_run_summary_text(
         ("headline_dof", "headline_dof"),
         ("headline_red", "headline_reduced_chi_square"),
         ("point_RMS", "point_image_rms_arcsec"),
+        ("point_med", "point_image_median_residual_arcsec"),
         ("N_point", "point_recovered_image_count"),
     ]
     arc_columns = [
@@ -2289,6 +4376,7 @@ def _format_sequential_run_summary_text(
         ("N_arcaware", "arc_aware_recovered_image_count"),
         ("N_missing", "arc_aware_missing_image_count"),
         ("arc_RMS", "arc_aware_image_rms_arcsec"),
+        ("arc_med", "arc_aware_image_residual_median_arcsec"),
     ]
     tail_columns = [
         ("ESS_min", "ess_min"),
@@ -2357,23 +4445,24 @@ def _corner_without_source_positions(
 ) -> tuple[np.ndarray, list[ParameterSpec]]:
     sample_array = np.asarray(samples, dtype=float)
     n_columns = sample_array.shape[1] if sample_array.ndim == 2 else len(parameter_specs)
+    excluded_families = {"source_position", "independent_scaling"}
     keep_indices = [
         idx
         for idx, spec in enumerate(parameter_specs)
-        if getattr(spec, "component_family", None) != "source_position" and idx < n_columns
+        if getattr(spec, "component_family", None) not in excluded_families and idx < n_columns
     ]
     excluded = [
         getattr(spec, "name", str(spec))
         for idx, spec in enumerate(parameter_specs)
-        if getattr(spec, "component_family", None) == "source_position" and idx < n_columns
+        if getattr(spec, "component_family", None) in excluded_families and idx < n_columns
     ]
     if excluded:
-        _log(None, f"[plot:corner] {plot_name}: excluded source-position parameters={', '.join(excluded)}")
+        _log(None, f"[plot:corner] {plot_name}: excluded default-hidden parameters={', '.join(excluded)}")
     if sample_array.ndim != 2:
         subset_specs = [
             spec
             for spec in parameter_specs
-            if getattr(spec, "component_family", None) != "source_position"
+            if getattr(spec, "component_family", None) not in excluded_families
         ]
         return sample_array, subset_specs
     return sample_array[:, keep_indices], [parameter_specs[idx] for idx in keep_indices]
@@ -2794,8 +4883,8 @@ def _best_par_potfile_values(
             if cut_radius_kpc is not None and slope is not None and abs(slope) > 1.0e-12:
                 cut_refs.append(float(cut_radius_kpc / (luminosity_ratio ** (2.0 / slope))))
             core_radius_kpc = _finite_float_or_none(best_row.get("core_radius_kpc"))
-            if core_radius_kpc is not None:
-                core_refs.append(float(core_radius_kpc / np.sqrt(luminosity_ratio)))
+            if core_radius_kpc is not None and slope is not None and abs(slope) > 1.0e-12:
+                core_refs.append(float(core_radius_kpc / (luminosity_ratio ** (2.0 / slope))))
         for field, field_values in (("sigma", sigma_refs), ("cutkpc", cut_refs), ("corekpc", core_refs)):
             median = _finite_median(field_values)
             if median is not None:
@@ -3342,6 +5431,519 @@ def _plot_scaling_rank_scatter(plot_dir: Path, scaling_rank_df: pd.DataFrame) ->
     fig.tight_layout()
     fig.savefig(_plot_path(plot_dir, "scaling_rank_scatter.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
+
+
+def _independent_scaling_candidates(plot_df: pd.DataFrame) -> pd.DataFrame:
+    return plot_df[plot_df.get("selected_independent", pd.Series(False, index=plot_df.index)).astype(bool)].copy()
+
+
+def _numeric_frame_column(frame: pd.DataFrame, column_name: str, default: float = np.nan) -> np.ndarray:
+    if column_name not in frame:
+        return np.full(len(frame), float(default), dtype=float)
+    return pd.to_numeric(frame[column_name], errors="coerce").to_numpy(dtype=float)
+
+
+def _draw_independent_scaling_galaxy_map(
+    ax: Any,
+    pot_df: pd.DataFrame,
+    *,
+    potfile_id: str,
+    norm: Normalize,
+    cmap: Any,
+    observed_image_points: np.ndarray | None = None,
+    show_legend: bool = True,
+) -> Any:
+    not_sampled = pot_df[pot_df["independent_plot_class"] == "not_sampled"]
+    active_not_independent = pot_df[pot_df["independent_plot_class"] == "active_not_independent"]
+    independent = pot_df[pot_df["independent_plot_class"] == "independent_candidate"]
+    ax.scatter(
+        not_sampled["x_centre"],
+        not_sampled["y_centre"],
+        s=16,
+        color="0.78",
+        alpha=0.65,
+        label="not sampled for independence",
+    )
+    ax.scatter(
+        active_not_independent["x_centre"],
+        active_not_independent["y_centre"],
+        s=42,
+        facecolors="none",
+        edgecolors="tab:orange",
+        linewidths=1.2,
+        label="active exact, not independent candidate",
+    )
+    del norm, cmap
+    if not independent.empty:
+        ax.scatter(
+            independent["x_centre"],
+            independent["y_centre"],
+            marker="D",
+            s=58,
+            facecolors="tab:blue",
+            edgecolors="black",
+            linewidths=0.7,
+            label="independent/free candidate",
+        )
+    image_points = np.asarray(observed_image_points, dtype=float) if observed_image_points is not None else np.empty((0, 2))
+    if image_points.ndim == 2 and image_points.shape[1] == 2 and image_points.size:
+        finite_images = np.isfinite(image_points[:, 0]) & np.isfinite(image_points[:, 1])
+        image_points = image_points[finite_images]
+        if image_points.size:
+            ax.scatter(
+                image_points[:, 0],
+                image_points[:, 1],
+                marker="x",
+                s=42,
+                color="0.05",
+                linewidths=1.2,
+                alpha=0.9,
+                label="observed images",
+            )
+
+    annotate_parts = [active_not_independent, independent]
+    if len(pot_df) <= 60:
+        annotate_parts.insert(0, not_sampled)
+    nonempty_annotate_parts = [part for part in annotate_parts if not part.empty]
+    annotate_df = (
+        pd.concat(nonempty_annotate_parts, ignore_index=True)
+        if nonempty_annotate_parts
+        else pot_df.iloc[0:0].copy()
+    )
+    if not annotate_df.empty and "rank" in annotate_df.columns:
+        annotate_df = annotate_df.sort_values("rank", na_position="last")
+    for row in annotate_df.itertuples(index=False):
+        x = getattr(row, "x_centre", np.nan)
+        y = getattr(row, "y_centre", np.nan)
+        catalog_id = getattr(row, "catalog_id", "")
+        if not np.isfinite(float(x)) or not np.isfinite(float(y)) or pd.isna(catalog_id):
+            continue
+        label = str(catalog_id)
+        if not label:
+            continue
+        plot_class = getattr(row, "independent_plot_class", "")
+        if plot_class == "independent_candidate":
+            text_kwargs = {"fontsize": 7, "color": "black", "alpha": 0.92, "fontweight": "semibold"}
+        elif plot_class == "active_not_independent":
+            text_kwargs = {"fontsize": 7, "color": "0.20", "alpha": 0.85}
+        else:
+            text_kwargs = {"fontsize": 6, "color": "0.45", "alpha": 0.65}
+        ax.annotate(
+            label,
+            (x, y),
+            xytext=(3, 3),
+            textcoords="offset points",
+            **text_kwargs,
+        )
+    ax.set_title(f"{potfile_id}: modeled scaling galaxies")
+    ax.set_xlabel("x [arcsec]")
+    ax.set_ylabel("y [arcsec]")
+    ax.set_aspect("equal", adjustable="datalim")
+    if show_legend:
+        ax.legend(loc="best", fontsize=7)
+    return None
+
+
+def _observed_image_points_from_fit_quality(image_fit_quality_df: pd.DataFrame | None) -> np.ndarray:
+    if image_fit_quality_df is None or image_fit_quality_df.empty:
+        return np.empty((0, 2), dtype=float)
+    required = {"x_obs_arcsec", "y_obs_arcsec"}
+    if not required.issubset(set(image_fit_quality_df.columns)):
+        return np.empty((0, 2), dtype=float)
+    x = pd.to_numeric(image_fit_quality_df["x_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(image_fit_quality_df["y_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if not np.any(finite):
+        return np.empty((0, 2), dtype=float)
+    return np.column_stack([x[finite], y[finite]])
+
+
+def _draw_independent_scaling_ratios(ax: Any, pot_df: pd.DataFrame, *, potfile_id: str) -> None:
+    any_plotted = False
+    for label, color, prefix, x_offset in (
+        ("v_disp free/scaling", "tab:purple", "v_disp_ratio", -0.16),
+        ("core free/scaling", "tab:blue", "core_radius_ratio", 0.0),
+        ("cut free/scaling", "tab:green", "cut_radius_ratio", 0.16),
+    ):
+        median_col = f"{prefix}_median"
+        p16_col = f"{prefix}_p16"
+        p84_col = f"{prefix}_p84"
+        finite = (
+            np.isfinite(pot_df[median_col].to_numpy(dtype=float))
+            & np.isfinite(pot_df[p16_col].to_numpy(dtype=float))
+            & np.isfinite(pot_df[p84_col].to_numpy(dtype=float))
+            & (pot_df[median_col].to_numpy(dtype=float) > 0.0)
+        )
+        finite_df = pot_df[finite]
+        if finite_df.empty:
+            continue
+        x = finite_df["rank"].to_numpy(dtype=float) + x_offset
+        y = finite_df[median_col].to_numpy(dtype=float)
+        y_low = np.maximum(finite_df[p16_col].to_numpy(dtype=float), np.nextafter(0.0, 1.0))
+        y_high = np.maximum(finite_df[p84_col].to_numpy(dtype=float), y_low)
+        yerr = np.vstack([np.maximum(0.0, y - y_low), np.maximum(0.0, y_high - y)])
+        ax.errorbar(
+            x,
+            y,
+            yerr=yerr,
+            fmt="o",
+            color=color,
+            ecolor=color,
+            elinewidth=1.0,
+            capsize=2.5,
+            markersize=4.5,
+            label=label,
+        )
+        any_plotted = True
+    if not any_plotted:
+        ax.text(0.5, 0.5, "candidate ratios unavailable", transform=ax.transAxes, ha="center", va="center")
+    ax.axhline(1.0, color="0.35", linestyle=":", linewidth=1.0)
+    ax.set_yscale("log")
+    ax.set_title(f"{potfile_id}: free/scaling branch ratios")
+    ax.set_xlabel("importance rank")
+    ax.set_ylabel("free/scaling parameter ratio")
+    ax.legend(loc="best", fontsize=8)
+
+
+def _plot_independent_scaling_galaxy_map(plot_dir: Path, plot_df: pd.DataFrame) -> None:
+    output_path = _plot_path(plot_dir, "independent_scaling_galaxy_map.png")
+    if plot_df.empty:
+        _write_placeholder_plot(
+            output_path,
+            "Independent-scaling galaxy map",
+            "No modeled scaling galaxies are available.",
+        )
+        return
+    potfile_ids = plot_df["potfile_id"].drop_duplicates().tolist()
+    fig, axes = plt.subplots(
+        len(potfile_ids),
+        1,
+        figsize=(7.5, max(5.0, 5.0 * len(potfile_ids))),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    axes_flat = axes.reshape(-1)
+    norm = Normalize(vmin=0.0, vmax=1.0)
+    cmap = plt.get_cmap("viridis")
+    for ax, potfile_id in zip(axes_flat, potfile_ids):
+        pot_df = plot_df[plot_df["potfile_id"] == potfile_id].copy()
+        _draw_independent_scaling_galaxy_map(
+            ax,
+            pot_df,
+            potfile_id=str(potfile_id),
+            norm=norm,
+            cmap=cmap,
+        )
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_independent_scaling_rank_probability(plot_dir: Path, plot_df: pd.DataFrame) -> None:
+    output_path = _plot_path(plot_dir, "independent_scaling_rank_probability.png")
+    candidates = _independent_scaling_candidates(plot_df)
+    if candidates.empty:
+        _write_placeholder_plot(
+            output_path,
+            "Independent/free candidates by magnitude",
+            "No independent-scaling candidates are available.",
+        )
+        return
+    potfile_ids = candidates["potfile_id"].drop_duplicates().tolist()
+    fig, axes = plt.subplots(len(potfile_ids), 1, figsize=(8.5, max(4.0, 3.2 * len(potfile_ids))), squeeze=False)
+    for ax, potfile_id in zip(axes.reshape(-1), potfile_ids):
+        pot_df = candidates[candidates["potfile_id"] == potfile_id].copy().sort_values("rank")
+        x = pd.to_numeric(pot_df.get("catalog_mag"), errors="coerce").to_numpy(dtype=float)
+        y = pd.to_numeric(pot_df.get("rank"), errors="coerce").to_numpy(dtype=float)
+        finite = np.isfinite(x) & np.isfinite(y)
+        if bool(np.any(finite)):
+            ax.scatter(
+                x[finite],
+                y[finite],
+                marker="D",
+                s=42,
+                facecolors="tab:blue",
+                edgecolors="black",
+                linewidths=0.6,
+                label="deterministic free candidate",
+            )
+            for row in pot_df.loc[finite].itertuples(index=False):
+                catalog_id = getattr(row, "catalog_id", "")
+                if pd.isna(catalog_id) or not str(catalog_id):
+                    continue
+                ax.annotate(
+                    str(catalog_id),
+                    (float(getattr(row, "catalog_mag")), float(getattr(row, "rank"))),
+                    xytext=(3, 3),
+                    textcoords="offset points",
+                    fontsize=7,
+                    color="0.25",
+                    alpha=0.8,
+                )
+        else:
+            ax.text(0.5, 0.5, "candidate ranks unavailable", transform=ax.transAxes, ha="center", va="center")
+        ax.set_title(f"{potfile_id}: deterministic independent/free candidates")
+        ax.set_xlabel("catalog magnitude")
+        ax.set_ylabel("importance rank")
+        ax.invert_xaxis()
+        ax.invert_yaxis()
+        ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_independent_scaling_multiplier_summary(plot_dir: Path, plot_df: pd.DataFrame) -> None:
+    output_path = _plot_path(plot_dir, "independent_scaling_multiplier_summary.png")
+    candidates = _independent_scaling_candidates(plot_df)
+    if candidates.empty:
+        _write_placeholder_plot(
+            output_path,
+            "Independent-scaling free/scaling ratios",
+            "No independent-scaling candidates are available.",
+        )
+        return
+    potfile_ids = candidates["potfile_id"].drop_duplicates().tolist()
+    fig, axes = plt.subplots(len(potfile_ids), 1, figsize=(9.5, max(4.0, 3.4 * len(potfile_ids))), squeeze=False)
+    for ax, potfile_id in zip(axes.reshape(-1), potfile_ids):
+        pot_df = candidates[candidates["potfile_id"] == potfile_id].copy().sort_values("rank")
+        _draw_independent_scaling_ratios(ax, pot_df, potfile_id=str(potfile_id))
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) -> None:
+    output_path = _plot_path(plot_dir, "scaling_relation_summary.pdf")
+    if relation_df.empty:
+        _write_placeholder_plot(
+            output_path,
+            "Scaling relation summary",
+            "No modeled scaling galaxies are available.",
+        )
+        return
+    df = relation_df.copy()
+    df["potfile_id"] = df["potfile_id"].astype(str)
+    fields = [
+        ("v_disp", "velocity dispersion [km/s]"),
+        ("core_radius_kpc", "core radius [kpc]"),
+        ("cut_radius_kpc", "cut radius [kpc]"),
+    ]
+    potfile_ids = df["potfile_id"].drop_duplicates().tolist()
+    fig, axes = plt.subplots(
+        len(potfile_ids),
+        len(fields),
+        figsize=(16.0, max(4.2, 3.8 * len(potfile_ids))),
+        squeeze=False,
+        constrained_layout=True,
+    )
+
+    def _finite_xy(frame: pd.DataFrame, y_column: str) -> pd.DataFrame:
+        mag = pd.to_numeric(frame.get("catalog_mag"), errors="coerce").to_numpy(dtype=float)
+        y = pd.to_numeric(frame.get(y_column), errors="coerce").to_numpy(dtype=float)
+        return frame[np.isfinite(mag) & np.isfinite(y)]
+
+    def _errorbar_points(
+        ax: Any,
+        frame: pd.DataFrame,
+        *,
+        y_column: str,
+        p16_column: str,
+        p84_column: str,
+        label: str,
+        fmt: str,
+        color: str,
+        markerfacecolor: str | None = None,
+        markeredgecolor: str | None = None,
+        markersize: float = 5.0,
+        alpha: float = 0.9,
+    ) -> None:
+        finite = _finite_xy(frame, y_column)
+        if finite.empty:
+            return
+        x = finite["catalog_mag"].to_numpy(dtype=float)
+        y = finite[y_column].to_numpy(dtype=float)
+        y_low = pd.to_numeric(finite.get(p16_column), errors="coerce").to_numpy(dtype=float)
+        y_high = pd.to_numeric(finite.get(p84_column), errors="coerce").to_numpy(dtype=float)
+        finite_err = np.isfinite(y_low) & np.isfinite(y_high) & (y_low <= y) & (y <= y_high)
+        yerr = np.vstack([np.maximum(0.0, y - y_low), np.maximum(0.0, y_high - y)])
+        yerr[:, ~finite_err] = 0.0
+        ax.errorbar(
+            x,
+            y,
+            yerr=yerr,
+            fmt=fmt,
+            color=color,
+            ecolor=color,
+            elinewidth=0.8,
+            capsize=2.0,
+            markersize=markersize,
+            markerfacecolor=markerfacecolor if markerfacecolor is not None else color,
+            markeredgecolor=markeredgecolor if markeredgecolor is not None else color,
+            alpha=alpha,
+            linestyle="none",
+            label=label,
+        )
+
+    for row_idx, potfile_id in enumerate(potfile_ids):
+        pot_df = df[df["potfile_id"] == potfile_id].copy()
+        class_values = pot_df.get("scaling_relation_class", pd.Series("", index=pot_df.index)).astype(str)
+        inactive = pot_df[class_values == "inactive"]
+        active = pot_df[class_values == "active"]
+        free = pot_df[class_values == "free"]
+        counts_text = (
+            f"total: {len(pot_df):d}\n"
+            f"inactive: {len(inactive):d}\n"
+            f"active not free: {len(active):d}\n"
+            f"free: {len(free):d}"
+        )
+        for col_idx, (field, ylabel) in enumerate(fields):
+            ax = axes[row_idx, col_idx]
+            scaling_prefix = f"scaling_{field}"
+            free_prefix = f"free_{field}"
+            y_column = f"{scaling_prefix}_median"
+            _errorbar_points(
+                ax,
+                inactive,
+                y_column=y_column,
+                p16_column=f"{scaling_prefix}_p16",
+                p84_column=f"{scaling_prefix}_p84",
+                label="inactive/cached",
+                fmt="o",
+                color="0.60",
+                markersize=4.2,
+                alpha=0.70,
+            )
+            _errorbar_points(
+                ax,
+                active,
+                y_column=y_column,
+                p16_column=f"{scaling_prefix}_p16",
+                p84_column=f"{scaling_prefix}_p84",
+                label="active exact",
+                fmt="o",
+                color="tab:orange",
+                markerfacecolor="none",
+                markeredgecolor="tab:orange",
+                markersize=5.2,
+                alpha=0.95,
+            )
+            _errorbar_points(
+                ax,
+                free,
+                y_column=f"{free_prefix}_median",
+                p16_column=f"{free_prefix}_p16",
+                p84_column=f"{free_prefix}_p84",
+                label="free branch",
+                fmt="*",
+                color="tab:red",
+                markeredgecolor="tab:red",
+                markersize=7.0,
+                alpha=0.95,
+            )
+            curve_df = _finite_xy(pot_df, y_column)
+            curve_y = pd.to_numeric(curve_df.get(y_column), errors="coerce").to_numpy(dtype=float)
+            curve_x = pd.to_numeric(curve_df.get("catalog_mag"), errors="coerce").to_numpy(dtype=float)
+            positive = np.isfinite(curve_x) & np.isfinite(curve_y) & (curve_y > 0.0)
+            if np.sum(positive) >= 2 and float(np.nanmin(curve_x[positive])) < float(np.nanmax(curve_x[positive])):
+                coeff = np.polyfit(curve_x[positive], np.log(curve_y[positive]), deg=1)
+                grid = np.linspace(float(np.nanmin(curve_x[positive])), float(np.nanmax(curve_x[positive])), 160)
+                ax.plot(grid, np.exp(coeff[0] * grid + coeff[1]), color="black", linewidth=1.2, label="scaling relation")
+            finite_y = pd.to_numeric(pot_df.get(y_column), errors="coerce").to_numpy(dtype=float)
+            if np.any(np.isfinite(finite_y) & (finite_y > 0.0)):
+                ax.set_yscale("log")
+            ax.invert_xaxis()
+            ax.set_xlabel("catalog magnitude")
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"{potfile_id}: {ylabel}")
+            ax.grid(True, color="0.90", linewidth=0.6)
+            if col_idx == 0:
+                ax.text(
+                    0.98,
+                    0.04,
+                    counts_text,
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="bottom",
+                    fontsize=7,
+                    bbox={
+                        "boxstyle": "round,pad=0.25",
+                        "facecolor": "white",
+                        "edgecolor": "0.65",
+                        "alpha": 0.88,
+                    },
+                )
+            if row_idx == 0 and col_idx == 0:
+                ax.legend(loc="best", fontsize=7)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_independent_scaling_summary(
+    plot_dir: Path,
+    plot_df: pd.DataFrame,
+    independent_df: pd.DataFrame,
+    samples: np.ndarray,
+    best_fit: np.ndarray | None = None,
+    sample_weights: np.ndarray | None = None,
+    parameter_specs: list[ParameterSpec] | None = None,
+    image_fit_quality_df: pd.DataFrame | None = None,
+) -> None:
+    del best_fit
+    output_path = _plot_path(plot_dir, "independent_scaling_summary.pdf")
+    if plot_df.empty:
+        _write_placeholder_plot(
+            output_path,
+            "Independent-scaling summary",
+            "No modeled scaling galaxies are available.",
+        )
+        return
+    potfile_ids = plot_df["potfile_id"].drop_duplicates().tolist()
+    fig, axes = plt.subplots(
+        len(potfile_ids),
+        3,
+        figsize=(19.0, max(5.2, 4.8 * len(potfile_ids))),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    norm = Normalize(vmin=0.0, vmax=1.0)
+    cmap = plt.get_cmap("viridis")
+    candidates_all = _independent_scaling_candidates(plot_df)
+    observed_image_points = _observed_image_points_from_fit_quality(image_fit_quality_df)
+    for row_idx, potfile_id in enumerate(potfile_ids):
+        all_pot_df = plot_df[plot_df["potfile_id"] == potfile_id].copy()
+        candidate_df = candidates_all[candidates_all["potfile_id"] == potfile_id].copy().sort_values("rank")
+        _draw_independent_scaling_galaxy_map(
+            axes[row_idx, 0],
+            all_pot_df,
+            potfile_id=str(potfile_id),
+            norm=norm,
+            cmap=cmap,
+            observed_image_points=observed_image_points,
+            show_legend=row_idx == 0,
+        )
+        if candidate_df.empty:
+            axes[row_idx, 1].text(0.5, 0.5, "No independent-scaling candidates", transform=axes[row_idx, 1].transAxes, ha="center", va="center")
+            axes[row_idx, 1].set_title(f"{potfile_id}: deterministic free candidates")
+            axes[row_idx, 1].axis("off")
+            axes[row_idx, 2].text(0.5, 0.5, "No independent-scaling candidates", transform=axes[row_idx, 2].transAxes, ha="center", va="center")
+            axes[row_idx, 2].set_title(f"{potfile_id}: free/scaling branch ratios")
+            axes[row_idx, 2].set_xlabel("importance rank")
+            axes[row_idx, 2].set_ylabel("free/scaling parameter ratio")
+            continue
+        axes[row_idx, 1].axis("off")
+        axes[row_idx, 1].set_title(f"{potfile_id}: deterministic free candidates")
+        axes[row_idx, 1].text(
+            0.5,
+            0.5,
+            f"independent/free candidates: {len(candidate_df):d}\nmode: log displacement",
+            transform=axes[row_idx, 1].transAxes,
+            ha="center",
+            va="center",
+        )
+        _draw_independent_scaling_ratios(axes[row_idx, 2], candidate_df, potfile_id=str(potfile_id))
+    with PdfPages(output_path) as pdf:
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
 
 
 def _plot_run_diagnostics(plot_dir: Path, results: PosteriorResults) -> None:
@@ -5317,8 +7919,13 @@ def _plot_image_residual_histogram(
     def rms(values: np.ndarray) -> float:
         return float(np.sqrt(np.mean(np.square(values)))) if values.size else np.nan
 
+    def median(values: np.ndarray) -> float:
+        return float(np.median(values)) if values.size else np.nan
+
     point_rms = rms(point_residual)
+    point_median = median(point_residual)
     arc_aware_rms = rms(arc_aware_residual)
+    arc_aware_median = median(arc_aware_residual)
     total_count = int(len(image_df))
 
     if point_residual.size:
@@ -5329,7 +7936,10 @@ def _plot_image_residual_histogram(
             alpha=0.5,
             edgecolor="#1d4ed8",
             linewidth=0.85,
-            label=f"point recovery  {point_residual.size}/{total_count}  RMS={point_rms:.3g}\"",
+            label=(
+                f"point recovery  {point_residual.size}/{total_count}  "
+                f"RMS={point_rms:.3g}\"  median={point_median:.3g}\""
+            ),
             zorder=2,
         )
         ax.axvline(point_rms, color=point_color, linestyle="-", linewidth=1.35, alpha=0.9)
@@ -5340,22 +7950,28 @@ def _plot_image_residual_histogram(
             histtype="step",
             color=arc_color,
             linewidth=2.0,
-            label=f"arc-aware  {arc_aware_residual.size}/{total_count}  RMS={arc_aware_rms:.3g}\"",
+            label=(
+                f"arc-aware  {arc_aware_residual.size}/{total_count}  "
+                f"RMS={arc_aware_rms:.3g}\"  median={arc_aware_median:.3g}\""
+            ),
             zorder=4,
         )
         ax.axvline(arc_aware_rms, color="#b7791f", linestyle="-", linewidth=1.45, alpha=0.95)
     missed_count = int(np.sum(status == "MISSED"))
     arc_supported_count = int(np.sum(arc_mask))
     annotation_lines = [
-        "Image RMS",
-        f"point: {point_rms:.3g}\"  ({point_residual.size}/{total_count})"
+        "Image residuals",
+        f"point: RMS {point_rms:.3g}\"  median {point_median:.3g}\"  ({point_residual.size}/{total_count})"
         if point_residual.size
         else f"point: na  (0/{total_count})",
     ]
     if use_arc_aware_diagnostics:
         annotation_lines.extend(
             [
-                f"arc-aware: {arc_aware_rms:.3g}\"  ({arc_aware_residual.size}/{total_count})"
+                (
+                    f"arc-aware: RMS {arc_aware_rms:.3g}\"  median {arc_aware_median:.3g}\"  "
+                    f"({arc_aware_residual.size}/{total_count})"
+                )
                 if arc_aware_residual.size
                 else f"arc-aware: na  (0/{total_count})",
                 f"arc-supported: {arc_supported_count}/{total_count}",
@@ -9743,7 +12359,7 @@ def _generate_plots_and_tables(
     results: PosteriorResults,
     runtime_sec: float,
     args: argparse.Namespace,
-) -> None:
+) -> dict[str, Any]:
     tables_dir = run_dir / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
     sample_likelihood_mode = _active_sample_likelihood_mode(evaluator, args)
@@ -9859,6 +12475,47 @@ def _generate_plots_and_tables(
             sample_weights=results.sample_weights,
         ),
     )
+    scaling_results_df = _run_logged_phase(
+        args,
+        "plots.scaling_results_summary_table",
+        lambda: _scaling_results_summary_table(
+            state.parameter_specs,
+            results.samples,
+            best_fit,
+            str(getattr(state, "scaling_relation_mode", getattr(args, "scaling_relation_mode", "lenstool-denominator"))),
+            sample_weights=results.sample_weights,
+        ),
+    )
+    independent_scaling_df = _run_logged_phase(
+        args,
+        "plots.independent_scaling_table",
+        lambda: _independent_scaling_diagnostics_table(
+            state.parameter_specs,
+            results.samples,
+            best_fit,
+            evaluator.scaling_rank_df,
+            getattr(state, "packed_lens_spec", None),
+            sample_weights=results.sample_weights,
+        ),
+    )
+    independent_scaling_plot_df = _run_logged_phase(
+        args,
+        "plots.independent_scaling_plot_table",
+        lambda: _independent_scaling_plot_table(evaluator.scaling_rank_df, independent_scaling_df),
+    )
+    scaling_relation_df = _run_logged_phase(
+        args,
+        "plots.scaling_relation_table",
+        lambda: _scaling_relation_summary_table(
+            evaluator.scaling_rank_df,
+            state.parameter_specs,
+            results.samples,
+            best_fit,
+            getattr(state, "packed_lens_spec", None),
+            sample_weights=results.sample_weights,
+            independent_scaling_df=independent_scaling_df,
+        ),
+    )
     trace_specs, trace_grouped_samples = _run_logged_phase(
         args,
         "plots.scaling_grouped_subset",
@@ -9877,6 +12534,19 @@ def _generate_plots_and_tables(
 
     _run_logged_phase(args, "plots.write_potential_summary_csv", lambda: summary_df.to_csv(tables_dir / "potential_summary.csv", index=False))
     _run_logged_phase(args, "plots.write_family_diagnostics_csv", lambda: family_df.to_csv(tables_dir / "family_diagnostics.csv", index=False))
+    _run_logged_phase(
+        args,
+        "plots.write_scaling_results_summary_csv",
+        lambda: scaling_results_df.to_csv(tables_dir / "scaling_results_summary.csv", index=False),
+    )
+    if scaling_results_df.empty:
+        _log(args, "[scaling-results] no scaling relation parameters")
+    else:
+        _log(
+            args,
+            f"[scaling-results] potfiles={len(scaling_results_df)} mass_definition=\"{SCALING_RESULTS_MASS_NOTE}\"",
+            renderable=_build_scaling_results_rich_table(scaling_results_df),
+        )
     _run_logged_phase(
         args,
         "plots.write_image_fit_quality_csv",
@@ -9920,11 +12590,26 @@ def _generate_plots_and_tables(
             "plots.write_potfile_constraint_txt",
             lambda: _write_potfile_constraint_summary_txt(tables_dir, potfile_constraint_df),
         )
+    if not independent_scaling_df.empty:
+        _run_logged_phase(
+            args,
+            "plots.write_independent_scaling_csv",
+            lambda: independent_scaling_df.to_csv(
+                tables_dir / "independent_scaling_diagnostics.csv",
+                index=False,
+            ),
+        )
     if not evaluator.scaling_rank_df.empty:
         _run_logged_phase(
             args,
             "plots.write_scaling_rank_csv",
             lambda: evaluator.scaling_rank_df.to_csv(tables_dir / "scaling_rank_diagnostics.csv", index=False),
+        )
+    if not scaling_relation_df.empty:
+        _run_logged_phase(
+            args,
+            "plots.write_scaling_relation_csv",
+            lambda: scaling_relation_df.to_csv(tables_dir / "scaling_relation_summary.csv", index=False),
         )
     if not chain_health_df.empty:
         _run_logged_phase(
@@ -9999,6 +12684,40 @@ def _generate_plots_and_tables(
             "scaling_rank_scatter",
             "plots.scaling_rank_scatter",
             lambda: _plot_scaling_rank_scatter(run_dir, evaluator.scaling_rank_df),
+        ),
+        (
+            "scaling_relation_summary",
+            "plots.scaling_relation_summary",
+            lambda: _plot_scaling_relation_summary(run_dir, scaling_relation_df),
+        ),
+        (
+            "independent_scaling_galaxy_map",
+            "plots.independent_scaling_galaxy_map",
+            lambda: _plot_independent_scaling_galaxy_map(run_dir, independent_scaling_plot_df),
+        ),
+        (
+            "independent_scaling_summary",
+            "plots.independent_scaling_summary",
+            lambda: _plot_independent_scaling_summary(
+                run_dir,
+                independent_scaling_plot_df,
+                independent_scaling_df,
+                results.samples,
+                best_fit,
+                results.sample_weights,
+                parameter_specs=state.parameter_specs,
+                image_fit_quality_df=image_fit_quality_df,
+            ),
+        ),
+        (
+            "independent_scaling_rank_probability",
+            "plots.independent_scaling_rank_probability",
+            lambda: _plot_independent_scaling_rank_probability(run_dir, independent_scaling_plot_df),
+        ),
+        (
+            "independent_scaling_multiplier_summary",
+            "plots.independent_scaling_multiplier_summary",
+            lambda: _plot_independent_scaling_multiplier_summary(run_dir, independent_scaling_plot_df),
         ),
         ("run_diagnostics", "plots.run_diagnostics", lambda: _plot_run_diagnostics(run_dir, results)),
         ("weights_logl", "plots.weights_logl", lambda: _plot_weights_logl(run_dir, results)),
@@ -10297,6 +13016,7 @@ def _generate_plots_and_tables(
         )
     _run_plot_tasks_with_progress(args, plot_tasks)
     _log(args, "[done] run summary\n" + run_summary_text.rstrip())
+    return run_summary
 
 
 def _infer_stage1_artifacts_dir(args: argparse.Namespace) -> Path:

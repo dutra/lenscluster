@@ -13,9 +13,9 @@ from lenscluster import cluster_solver as solver
 
 def _controls() -> dict[str, solver.StageFitControls]:
     return {
-        "stage2": solver.StageFitControls("svi", 1, 0, 1, 1),
-        "stage3": solver.StageFitControls("svi", 1, 0, 1, 1),
-        "stage4": solver.StageFitControls("svi+nuts", 1, 0, 1, 1),
+        "stage2": solver.StageFitControls("svi", 1, 0, 1, 1, 1),
+        "stage3": solver.StageFitControls("svi", 1, 0, 1, 1, 1),
+        "stage4": solver.StageFitControls("svi+nuts", 1, 0, 1, 1, 1),
     }
 
 
@@ -39,7 +39,6 @@ def _sequential_args(tmp_path: Path, **updates: Any) -> argparse.Namespace:
         "stage4_fresh_process": True,
         "stage4_sampling_engine": solver.STAGE4_SAMPLING_ENGINE_INHERIT,
         "sampling_engine": solver.SAMPLING_ENGINE_REFRESHING_SURROGATE,
-        "potfile_mass_size_reparam": False,
         "fit_cosmology_flat_wcdm": False,
     }
     payload.update(updates)

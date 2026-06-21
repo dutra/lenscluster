@@ -202,7 +202,7 @@ def test_parse_args_dense_mass_choices() -> None:
             multi._parse_args([*base, *invalid_args])
 
 
-def test_parse_args_potfile_mass_size_reparam_flag() -> None:
+def test_parse_args_rejects_removed_potfile_mass_size_reparam_flag() -> None:
     base = [
         "--cluster",
         "a2744",
@@ -214,8 +214,8 @@ def test_parse_args_potfile_mass_size_reparam_flag() -> None:
         "runs/m0416",
     ]
 
-    assert multi._parse_args(base).potfile_mass_size_reparam is False
-    assert multi._parse_args([*base, "--potfile-mass-size-reparam"]).potfile_mass_size_reparam is True
+    with pytest.raises(SystemExit):
+        multi._parse_args([*base, "--potfile-mass-size-reparam"])
 
 
 def test_parse_args_maps_blocked_linearized_mode_to_explicit_likelihood() -> None:

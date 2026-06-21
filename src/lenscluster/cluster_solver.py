@@ -21,7 +21,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from threading import Lock
-from typing import Any, Callable, Iterable, NamedTuple
+from typing import Any, Callable, Iterable, Mapping, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -122,13 +122,11 @@ from .model import (
     BinData,
     BuildState,
     ChainSeed,
-    COUPLED_ROLE_MASS_NORM,
-    COUPLED_ROLE_SIZE,
-    COUPLED_TRANSFORM_POTFILE_MASS_SIZE,
     EvaluationResult,
     FamilyData,
     FamilyValidationCache,
     GeometryCache,
+    ActiveInferenceFlatCache,
     NUTSInitialization,
     PackedLensSpec,
     ParameterSpec,
@@ -145,10 +143,15 @@ from .model import (
     latent_jax_to_physical as _latent_to_physical_jax,
     latent_to_physical as _latent_to_physical_numpy,
     physical_to_latent as _physical_to_latent_numpy,
-    potfile_mass_size_coupling_arrays as _potfile_mass_size_coupling_arrays,
     positive_lognormal_parameters as _positive_lognormal_parameters,
 )
-from .plotting import CAUSTIC_PLOT_GRID_SCALE_ARCSEC, _format_sequential_run_summary_text, _generate_plots_and_tables
+from .plotting import (
+    CAUSTIC_PLOT_GRID_SCALE_ARCSEC,
+    _active_scaling_diagnostics_table,
+    _format_sequential_run_summary_text,
+    _generate_plots_and_tables,
+    _plot_active_scaling_summary,
+)
 from .utils import (
     close_debug_log as _close_debug_log,
     configure_debug_log as _configure_debug_log,
@@ -166,20 +169,45 @@ from .utils import (
 SUPPORTED_PROFILES = {81, 14}
 DP_IE_PROFILE = 81
 SHEAR_PROFILE = 14
-DEFAULT_MATCH_TOLERANCE = 1.5
-DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC = 0.2
+DEFAULT_MATCH_TOLERANCE = 2.0
+DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC = 0.1
 DEFAULT_EXACT_IMAGE_PRECISION_LIMIT = 1.0e-8
 DEFAULT_EXACT_IMAGE_NUM_ITER_MAX = 200
 DEFAULT_SEARCH_PADDING = 8.0
 DEFAULT_Z_BIN_EFFICIENCY_TOL = 0.01
 DEFAULT_WARMUP = 300
 DEFAULT_SAMPLES = 500
+DEFAULT_SAMPLING_REFRESH_RUNS = 1
 DEFAULT_TARGET_ACCEPT = 0.85
 DEFAULT_MAX_TREE_DEPTH = 10
 DEFAULT_INITIAL_STEP_SIZE = 1.0e-3
 DEFAULT_ACTIVE_SCALING_GALAXIES = 64
 DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION = 0.995
 DEFAULT_ACTIVE_SCALING_MIN = 4
+SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION = "magnification"
+SOURCE_PLANE_COVARIANCE_MODE_UNIT = "unit"
+SOURCE_PLANE_COVARIANCE_MODES = (
+    SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
+    SOURCE_PLANE_COVARIANCE_MODE_UNIT,
+)
+DEFAULT_ACTIVE_SCALING_LOGIT_PRIOR_SIGMA = 1.5
+DEFAULT_ACTIVE_SCALING_MAG_SLOPE_PRIOR_SIGMA = 1.0
+DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA = 1.0
+DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD = 0.5
+ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION = "population"
+ACTIVE_SCALING_INFERENCE_LIKELIHOOD_BLEND = "blend"
+ACTIVE_SCALING_INFERENCE_LIKELIHOODS = (
+    ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION,
+    ACTIVE_SCALING_INFERENCE_LIKELIHOOD_BLEND,
+)
+DEFAULT_ACTIVE_SCALING_POPULATION_DELTA_CLIP = 30.0
+COMPONENT_FAMILY_LARGE = 0
+COMPONENT_FAMILY_SCALING = 1
+COMPONENT_FAMILY_INDEPENDENT_FREE = 2
+INDEPENDENT_BRANCH_NONE = 0
+INDEPENDENT_BRANCH_SCALING = 1
+INDEPENDENT_BRANCH_FREE = 2
+ACTIVE_SCALING_GATE_COMPONENT_FAMILY = "active_scaling_gate"
 DEFAULT_REFRESH_EVERY = 250
 DEFAULT_REFRESH_PARAM_DRIFT_FRAC = 0.25
 DEFAULT_JAX_CLEAR_CACHES_AFTER_SVI_REFRESH = True
@@ -235,13 +263,21 @@ SAMPLING_ENGINE_FULL = "full"
 SAMPLING_ENGINE_FULL_FLAT = "full_flat"
 SAMPLING_ENGINE_REFRESHING_SURROGATE = "refreshing_surrogate"
 SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT = "refreshing_surrogate_flat"
+SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT = "topk_discovery_flat"
 SAMPLING_ENGINE_ACTIVE_SUBSET = "active_subset"
 SAMPLING_ENGINES = (
     SAMPLING_ENGINE_FULL,
     SAMPLING_ENGINE_FULL_FLAT,
     SAMPLING_ENGINE_REFRESHING_SURROGATE,
     SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+    SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT,
     SAMPLING_ENGINE_ACTIVE_SUBSET,
+)
+TOPK_DISCOVERY_SCORE_ALPHA_JACOBIAN = "alpha_jacobian"
+TOPK_DISCOVERY_SCORES = (TOPK_DISCOVERY_SCORE_ALPHA_JACOBIAN,)
+TOPK_DISCOVERY_FINAL_ENGINES = (
+    SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+    SAMPLING_ENGINE_FULL_FLAT,
 )
 STAGE4_SAMPLING_ENGINE_INHERIT = "inherit"
 STAGE4_SAMPLING_ENGINE_CHOICES = (STAGE4_SAMPLING_ENGINE_INHERIT, *SAMPLING_ENGINES)
@@ -262,6 +298,42 @@ DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_MEDIAN_ARCSEC = 0.3
 DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_LOG_SIGMA = 0.5
 DEFAULT_SCALING_SCATTER_PRIOR_MEDIAN = 0.02
 DEFAULT_SCALING_SCATTER_PRIOR_LOG_SIGMA = 0.5
+DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN = 0.20
+DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN = 0.30
+DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN = 0.30
+DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA = 0.40
+DEFAULT_SOLVER_POTFILE_SIGMA_REF_MEAN = 100.0
+DEFAULT_SOLVER_POTFILE_SIGMA_REF_STD = 40.0
+DEFAULT_SOLVER_POTFILE_SIGMA_REF_LOWER = 20.0
+DEFAULT_SOLVER_POTFILE_SIGMA_REF_UPPER = 500.0
+DEFAULT_SOLVER_POTFILE_CUT_REF_MEAN_KPC = 300.0
+DEFAULT_SOLVER_POTFILE_CUT_REF_STD_KPC = 120.0
+DEFAULT_SOLVER_POTFILE_CUT_REF_LOWER_KPC = 20.0
+DEFAULT_SOLVER_POTFILE_CUT_REF_UPPER_KPC = 1000.0
+DEFAULT_SOLVER_POTFILE_CORE_REF_MEDIAN_KPC = 0.15
+DEFAULT_SOLVER_POTFILE_CORE_REF_LOG_SIGMA = 0.7
+DEFAULT_SOLVER_POTFILE_CORE_REF_LOWER_KPC = 0.01
+DEFAULT_SOLVER_POTFILE_CORE_REF_UPPER_KPC = 10.0
+DEFAULT_SOLVER_POTFILE_SLOPE_MEAN = 4.0
+DEFAULT_SOLVER_POTFILE_SLOPE_STD = 0.75
+DEFAULT_SOLVER_POTFILE_SLOPE_LOWER = 1.5
+DEFAULT_SOLVER_POTFILE_SLOPE_UPPER = 8.0
+SCALING_RELATION_MODE_LENSTOOL_DENOMINATOR = "lenstool-denominator"
+SCALING_RELATION_MODE_BERGAMINI_ML = "bergamini-ml"
+SCALING_RELATION_MODES = (
+    SCALING_RELATION_MODE_LENSTOOL_DENOMINATOR,
+    SCALING_RELATION_MODE_BERGAMINI_ML,
+)
+DEFAULT_SCALING_RELATION_MODE = SCALING_RELATION_MODE_LENSTOOL_DENOMINATOR
+DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN = 0.25
+DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD = 0.06
+DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER = 0.05
+DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER = 0.60
+DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN = 0.0
+DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD = 0.25
+DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER = -0.70
+DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER = 0.70
+SOLVER_POTFILE_POSITIVE_PRIOR_COORDINATE = "log_positive_latent"
 DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC = 2.0
 DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC = 10.0
 DEFAULT_IMAGE_PRESENCE_STAGE4_PENALTY_WEIGHT = 2.0
@@ -404,6 +476,11 @@ EVIDENCE_LIKELIHOOD_MODES = (
     SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
 )
 DEFAULT_EVIDENCE_LIKELIHOOD_MODE = SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
+LOCAL_JACOBIAN_METRIC_CURRENT_EXACT = "current_exact"
+LOCAL_JACOBIAN_METRIC_FROZEN_REFRESHED = "frozen_refreshed"
+LOCAL_JACOBIAN_METRIC_REFRESHED_MAGNIFICATION = "refreshed_magnification"
+LOCAL_JACOBIAN_METRIC_UNIT = "unit"
+LOCAL_JACOBIAN_METRIC_NOT_USED = "not_used"
 SOURCE_POSITION_PARAMETERIZATION_DIRECT = "direct"
 SOURCE_POSITION_PARAMETERIZATION_PRIOR_WHITENED = "prior-whitened"
 SOURCE_POSITION_PARAMETERIZATION_CONDITIONAL_WHITENED = "conditional-whitened"
@@ -438,6 +515,7 @@ FIT_MODE_EVIDENCE_NS = "evidence-ns"
 FIT_METHOD_SVI = "svi"
 FIT_METHOD_SVI_NUTS = "svi+nuts"
 FIT_METHOD_NUTS = "nuts"
+FIT_METHOD_ACTIVE_BLOCKED_NUTS = "active-blocked-nuts"
 FIT_METHOD_NS = "ns"
 FIT_METHOD_SMC = "smc"
 FIT_METHOD_MCHMC = "mchmc"
@@ -504,6 +582,7 @@ class StageFitControls:
     svi_steps: int
     warmup: int
     samples: int
+    sampling_refresh_runs: int
     max_tree_depth: int
 
     def to_json(self) -> dict[str, str | int]:
@@ -512,6 +591,7 @@ class StageFitControls:
             "svi_steps": self.svi_steps,
             "warmup": self.warmup,
             "samples": self.samples,
+            "sampling_refresh_runs": self.sampling_refresh_runs,
             "max_tree_depth": self.max_tree_depth,
         }
 
@@ -892,6 +972,16 @@ def _positive_int_arg(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return parsed
+
+
 def _nonnegative_float_arg(value: str) -> float:
     try:
         parsed = float(value)
@@ -1063,6 +1153,14 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--exact-image-diagnostics-stage2",
+        action="store_true",
+        help=(
+            "Sequential-only diagnostic override: run exact image matching and residual diagnostics for "
+            "stage2_joint even when a later image-plane stage is enabled."
+        ),
+    )
+    parser.add_argument(
         "--exact-image-diagnostics-stage3",
         action="store_true",
         help=(
@@ -1217,10 +1315,50 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--topk-discovery-scaling-galaxies",
+        type=int,
+        default=10,
+        help="Per-image number of full-population scaling galaxies used for final Top-K candidate discovery.",
+    )
+    parser.add_argument(
+        "--topk-discovery-score",
+        choices=TOPK_DISCOVERY_SCORES,
+        default=TOPK_DISCOVERY_SCORE_ALPHA_JACOBIAN,
+        help="Score used to rank per-image Top-K discovery candidates.",
+    )
+    parser.add_argument(
+        "--topk-discovery-jacobian-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight of Jacobian perturbations in the Top-K alpha_jacobian discovery score.",
+    )
+    parser.add_argument(
+        "--topk-discovery-final-engine",
+        choices=TOPK_DISCOVERY_FINAL_ENGINES,
+        default=SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+        help="Sampling engine used after exact Top-K discovery rebuilds the final independent/free candidate set.",
+    )
+    parser.add_argument(
+        "--topk-discovery-final-svi-polish-steps",
+        type=_nonnegative_int_arg,
+        default=2000,
+        help="Fixed-candidate SVI polish steps after final Top-K discovery rebuild. Zero disables polishing.",
+    )
+    parser.add_argument(
         "--source-plane-covariance-floor",
         type=float,
         default=1.0e-6,
         help="Source-plane covariance diagonal floor in arcsec^2 for magnification-weighted source-plane errors.",
+    )
+    parser.add_argument(
+        "--source-plane-covariance-mode",
+        choices=SOURCE_PLANE_COVARIANCE_MODES,
+        default=SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
+        help=(
+            "How to convert image-position uncertainty into source-plane covariance. "
+            "'magnification' uses the cached local lensing metric; 'unit' uses inv_abs_mu=1 "
+            "for fast source-plane clustering."
+        ),
     )
     parser.add_argument(
         "--active-scaling-galaxies",
@@ -1252,6 +1390,89 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_ACTIVE_SCALING_MIN,
         help="Minimum active galaxies per potfile for adaptive scaling selection.",
+    )
+    parser.add_argument(
+        "--infer-active-scaling",
+        action="store_true",
+        help=(
+            "During SVI, append active-gate parameters and infer which scaling-law galaxies should be "
+            "kept exact for the subsequent NUTS run."
+        ),
+    )
+    parser.add_argument(
+        "--active-scaling-inference-likelihood",
+        choices=ACTIVE_SCALING_INFERENCE_LIKELIHOODS,
+        default=ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION,
+        help=(
+            "SVI-only p_active likelihood. population adds an explicit marginalized active/inactive "
+            "mixture term; blend uses the older continuous lens-field blend."
+        ),
+    )
+    parser.add_argument(
+        "--active-scaling-prior-prob",
+        type=float,
+        default=None,
+        help=(
+            "Optional prior mean p_active for each potfile active gate. If omitted, the prior mean is "
+            "derived from the requested active-scaling count divided by that potfile catalog size."
+        ),
+    )
+    parser.add_argument(
+        "--active-scaling-logit-prior-sigma",
+        type=float,
+        default=DEFAULT_ACTIVE_SCALING_LOGIT_PRIOR_SIGMA,
+        help="Normal prior sigma for each potfile SVI active-gate intercept.",
+    )
+    parser.add_argument(
+        "--active-scaling-mag-slope-prior-sigma",
+        type=float,
+        default=DEFAULT_ACTIVE_SCALING_MAG_SLOPE_PRIOR_SIGMA,
+        help="Half-normal prior sigma for the nonnegative magnitude slope in the SVI active gate.",
+    )
+    parser.add_argument(
+        "--active-scaling-local-logit-prior-sigma",
+        type=float,
+        default=DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA,
+        help="Normal prior sigma for per-galaxy SVI active-gate logit offsets.",
+    )
+    parser.add_argument(
+        "--active-scaling-freeze-threshold",
+        type=float,
+        default=DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD,
+        help="Median p_active threshold used after SVI to freeze scaling galaxies exact for NUTS.",
+    )
+    parser.add_argument(
+        "--independent-scaling-free-log-vdisp-tau-prior-median",
+        type=float,
+        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+        help="Lognormal prior median for selected free-galaxy log-vdisp displacement tau.",
+    )
+    parser.add_argument(
+        "--independent-scaling-free-log-core-tau-prior-median",
+        type=float,
+        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
+        help="Lognormal prior median for selected free-galaxy log-core displacement tau.",
+    )
+    parser.add_argument(
+        "--independent-scaling-free-log-cut-tau-prior-median",
+        type=float,
+        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+        help="Lognormal prior median for selected free-galaxy log-cut displacement tau.",
+    )
+    parser.add_argument(
+        "--independent-scaling-free-log-tau-prior-sigma",
+        type=float,
+        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+        help="Shared lognormal prior log-sigma for selected free-galaxy displacement tau parameters.",
+    )
+    parser.add_argument(
+        "--scaling-relation-mode",
+        choices=SCALING_RELATION_MODES,
+        default=DEFAULT_SCALING_RELATION_MODE,
+        help=(
+            "Member-galaxy scaling-law parametrization. lenstool-denominator samples vdslope/slope; "
+            "bergamini-ml samples alpha_sigma and mass-to-light tilt gamma_ml."
+        ),
     )
     parser.add_argument(
         "--scaling-scatter",
@@ -1298,15 +1519,17 @@ def _parse_args() -> argparse.Namespace:
             FIT_METHOD_SVI,
             FIT_METHOD_SVI_NUTS,
             FIT_METHOD_NUTS,
+            FIT_METHOD_ACTIVE_BLOCKED_NUTS,
             FIT_METHOD_NS,
             FIT_METHOD_SMC,
             FIT_METHOD_MCHMC,
             FIT_METHOD_MCLMC,
         ),
         default=[FIT_METHOD_SVI_NUTS],
-        metavar="{svi,svi+nuts,nuts,ns,smc,mchmc,mclmc}",
+        metavar="{svi,svi+nuts,nuts,active-blocked-nuts,ns,smc,mchmc,mclmc}",
         help=(
             "Use SVI only, SVI initialized NUTS, or a direct sampler. "
+            "active-blocked-nuts runs SVI initialization followed by random active-galaxy conditional NUTS blocks. "
             "The ns value is accepted only for backwards-compatible parsing and is reserved for --fit-mode evidence-ns; "
             "nuts and smc are accepted only for non-blocked sequential stage 4 image-plane modes. "
             "mchmc and mclmc are direct BlackJAX microcanonical samplers for sampled stages. "
@@ -1373,6 +1596,11 @@ def _parse_args() -> argparse.Namespace:
         "--skip-critical-det-diagnostic",
         action="store_true",
         help="Disable the post-stage-3 tiny-detA image diagnostic before stage 4.",
+    )
+    parser.add_argument(
+        "--start-at-stage2",
+        action="store_true",
+        help="Start a sequential workflow at stage 2, skipping stage1_large_only and using base large-halo priors.",
     )
     parser.add_argument(
         "--start-at-stage3",
@@ -1837,6 +2065,16 @@ def _parse_args() -> argparse.Namespace:
             "two values for stage 2 and stage 3, or three values when a final stage 4 image-plane mode is enabled."
         ),
     )
+    parser.add_argument(
+        "--sampling-refresh-runs",
+        type=int,
+        nargs="+",
+        default=[DEFAULT_SAMPLING_REFRESH_RUNS],
+        help=(
+            "Total posterior sampler runs per sampled stage. Values resolve like --samples; "
+            "1 preserves the current single-run behavior."
+        ),
+    )
     parser.add_argument("--chains", type=int, default=1)
     parser.add_argument("--thin", type=int, default=1)
     parser.add_argument(
@@ -1897,15 +2135,6 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--potfile-mass-size-reparam",
-        action="store_true",
-        default=False,
-        help=(
-            "Opt in to a NumPyro SVI/NUTS-only potfile sigma/cutkpc reparameterization that samples "
-            "prior-standardized mass-size coordinates while preserving the original sigma and cutkpc priors."
-        ),
-    )
-    parser.add_argument(
         "--blocked-nuts-cycles",
         type=int,
         default=None,
@@ -1921,6 +2150,33 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Pilot warmup steps for each blocked-NUTS conditional block. "
             "Defaults to the stage warmup count."
+        ),
+    )
+    parser.add_argument(
+        "--active-blocked-nuts-block-size",
+        type=int,
+        default=None,
+        help="Number of active independent-scaling galaxies updated in each active-blocked-nuts conditional block.",
+    )
+    parser.add_argument(
+        "--active-blocked-nuts-cycles",
+        type=int,
+        default=None,
+        help="Production active-blocked-nuts cycles. Defaults to the stage sample count.",
+    )
+    parser.add_argument(
+        "--active-blocked-nuts-global-period",
+        type=int,
+        default=1,
+        help="Update the global/non-galaxy block every N active-blocked-nuts cycles.",
+    )
+    parser.add_argument(
+        "--active-blocked-nuts-block-library-size",
+        type=int,
+        default=None,
+        help=(
+            "Number of seeded random active-galaxy subset blocks to compile and recycle. "
+            "Defaults to enough blocks for two shuffled active-galaxy sweeps."
         ),
     )
     parser.set_defaults(nuts_init_strategy="svi")
@@ -2167,6 +2423,32 @@ def _explicit_source_position_parameterization_for_state(state: BuildState) -> s
     return mode
 
 
+def _local_jacobian_metric_mode_for_values(
+    sampling_engine: str,
+    sample_likelihood_mode: str,
+    source_plane_covariance_mode: str = SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
+) -> str:
+    sample_mode = str(sample_likelihood_mode)
+    engine = str(sampling_engine)
+    if sample_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
+        if engine in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT}:
+            return LOCAL_JACOBIAN_METRIC_CURRENT_EXACT
+        return LOCAL_JACOBIAN_METRIC_FROZEN_REFRESHED
+    if sample_mode == SAMPLE_LIKELIHOOD_SOURCE:
+        if str(source_plane_covariance_mode) == SOURCE_PLANE_COVARIANCE_MODE_UNIT:
+            return LOCAL_JACOBIAN_METRIC_UNIT
+        return LOCAL_JACOBIAN_METRIC_REFRESHED_MAGNIFICATION
+    return LOCAL_JACOBIAN_METRIC_NOT_USED
+
+
+def _local_jacobian_metric_mode(evaluator: Any) -> str:
+    return _local_jacobian_metric_mode_for_values(
+        str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)),
+        str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)),
+        str(getattr(evaluator, "source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION)),
+    )
+
+
 def _log_runtime_summary(args: argparse.Namespace) -> None:
     try:
         jax_devices = jax.device_count()
@@ -2182,12 +2464,29 @@ def _log_runtime_summary(args: argparse.Namespace) -> None:
             f"smc_device={getattr(args, 'smc_device', JAX_DEVICE_AUTO)} output_dir={args.output_dir}"
         ),
     )
+    sample_likelihood_mode = str(getattr(args, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))
+    source_plane_covariance_mode = str(
+        getattr(args, "source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION)
+    )
+    local_jacobian_metric = _local_jacobian_metric_mode_for_values(
+        str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)),
+        sample_likelihood_mode,
+        source_plane_covariance_mode,
+    )
+    local_jacobian_metric_item = (
+        f"local_jacobian_metric={local_jacobian_metric} "
+        if sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
+        else ""
+    )
     _log(
         args,
         (
             f"[runtime] par_path={args.par_path} fit_mode={args.fit_mode} fit_method={args.fit_method} "
-            f"sampling_engine={args.sampling_engine} sample_likelihood_mode={getattr(args, 'sample_likelihood_mode', SAMPLE_LIKELIHOOD_SOURCE)} "
+            f"sampling_engine={args.sampling_engine} sample_likelihood_mode={sample_likelihood_mode} "
+            f"source_plane_covariance_mode={source_plane_covariance_mode} "
+            f"{local_jacobian_metric_item}"
             f"image_plane_mode={getattr(args, 'image_plane_mode', IMAGE_PLANE_MODE_NONE)} warmup={args.warmup} samples={args.samples} "
+            f"sampling_refresh_runs={getattr(args, 'sampling_refresh_runs', DEFAULT_SAMPLING_REFRESH_RUNS)} "
             f"anchored_image_plane_solve_steps={getattr(args, 'anchored_image_plane_solve_steps', DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)} "
             f"anchored_image_plane_trust_radius_arcsec={getattr(args, 'anchored_image_plane_trust_radius_arcsec', DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC)} "
             f"anchored_image_plane_lm_damping_relative={getattr(args, 'anchored_image_plane_lm_damping_relative', DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE)} "
@@ -2208,7 +2507,6 @@ def _log_runtime_summary(args: argparse.Namespace) -> None:
             f"exact_image_precision_limit={getattr(args, 'exact_image_precision_limit', DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)} "
             f"exact_image_num_iter_max={getattr(args, 'exact_image_num_iter_max', DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)} "
             f"fit_cosmology_flat_wcdm={bool(getattr(args, 'fit_cosmology_flat_wcdm', False))} "
-            f"potfile_mass_size_reparam={bool(getattr(args, 'potfile_mass_size_reparam', False))} "
             f"chains={args.chains} thin={args.thin} skip_validation={args.skip_validation} "
             f"ns_num_live_points={getattr(args, 'ns_num_live_points', None)} "
             f"ns_max_samples={getattr(args, 'ns_max_samples', DEFAULT_NS_MAX_SAMPLES)} "
@@ -2369,7 +2667,6 @@ def _log_state_summary(args: argparse.Namespace, state: BuildState) -> None:
     positive_transforms = sum(
         1 for spec in state.parameter_specs if str(spec.transform_kind) in {"log_positive", "log_offset_positive"}
     )
-    potfile_mass_size_groups = _potfile_mass_size_group_count(state.parameter_specs)
     _log(
         args,
         (
@@ -2395,9 +2692,7 @@ def _log_state_summary(args: argparse.Namespace, state: BuildState) -> None:
         (
             f"[parameters] total={len(state.parameter_specs)} by_family={_format_count_map(parameter_families)} "
             f"priors={_format_count_map(prior_kinds)} transforms={_format_count_map(transform_kinds)} "
-            f"positive={positive_transforms} "
-            f"potfile_mass_size_reparam={bool(getattr(args, 'potfile_mass_size_reparam', False))} "
-            f"potfile_mass_size_groups={potfile_mass_size_groups}"
+            f"positive={positive_transforms}"
         ),
     )
     if potfile_rows:
@@ -2455,7 +2750,8 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
     if bool(getattr(evaluator, "surrogate_enabled", False)):
         items.append(
             "refreshing_surrogate=active "
-            f"inactive_scaling={_count_items(getattr(evaluator, 'inactive_scaling_component_indices', []))}"
+            f"cached_scaling={_count_items(getattr(evaluator, 'cached_scaling_component_indices', getattr(evaluator, 'inactive_scaling_component_indices', [])))} "
+            f"free_correction={_count_items(getattr(evaluator, 'free_correction_scaling_component_indices', []))}"
         )
     if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_ACTIVE_SUBSET:
         inactive = _count_items(getattr(evaluator, "inactive_scaling_component_indices", []))
@@ -2465,7 +2761,10 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
                 f"inactive_scaling={inactive}"
             )
     if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_FULL_FLAT:
-        if str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)) == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
+        sample_likelihood_mode = str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))
+        if sample_likelihood_mode == SAMPLE_LIKELIHOOD_SOURCE:
+            items.append("sampling_engine=full_flat exact flattened source-plane likelihood")
+        elif sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
             items.append("sampling_engine=full_flat exact flattened local-metric likelihood")
         else:
             items.append("sampling_engine=full_flat exact flattened critical-arc likelihood")
@@ -2473,6 +2772,11 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
         items.append("sampling_engine=refreshing_surrogate legacy per-bin surrogate")
     if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT:
         items.append("sampling_engine=refreshing_surrogate_flat flattened surrogate")
+    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT:
+        items.append(
+            "sampling_engine=topk_discovery_flat exact full-population discovery "
+            f"k={int(getattr(evaluator, 'topk_discovery_scaling_galaxies', 0))}"
+        )
     if family_count > 0 and bin_count < family_count:
         items.append(f"z_bins=active grouped_families={family_count} bins={bin_count}")
     if bool(getattr(evaluator, "quick_diagnostics", False)):
@@ -2481,6 +2785,7 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
     sample_likelihood_mode = str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))
     if sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
         items.append("sample_likelihood=local-jacobian local image-plane covariance")
+        items.append(f"local_jacobian_metric={_local_jacobian_metric_mode(evaluator)}")
     elif sample_likelihood_mode == SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE:
         items.append("sample_likelihood=linearized-forward-beta-image-plane local linear image correction")
     elif sample_likelihood_mode == SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE:
@@ -2573,7 +2878,15 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
         and _count_items(getattr(evaluator, "scaling_component_indices", [])) > 0
     ):
         items.append("scaling_scatter_cache=linearized scaling-scatter covariance")
-    if _count_items(getattr(evaluator, "source_metric_cache_by_z", {})) > 0:
+    source_covariance_mode = str(
+        getattr(evaluator, "source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION)
+    )
+    if (
+        source_covariance_mode == SOURCE_PLANE_COVARIANCE_MODE_UNIT
+        and str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)) == SAMPLE_LIKELIHOOD_SOURCE
+    ):
+        items.append("source_plane_covariance=unit")
+    elif _count_items(getattr(evaluator, "source_metric_cache_by_z", {})) > 0:
         items.append("source_metric_cache=refreshed local lensing metric")
     return items
 
@@ -2662,6 +2975,8 @@ def _active_scaling_realized_fraction_value_style(value: str) -> str:
 
 
 def _active_scaling_rank_summary(evaluator: Any) -> dict[str, str]:
+    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT:
+        return {}
     scaling_rank_df = getattr(evaluator, "scaling_rank_df", None)
     if scaling_rank_df is None or getattr(scaling_rank_df, "empty", True):
         return {}
@@ -2756,8 +3071,29 @@ _APPROXIMATION_CATEGORY_STYLES: dict[str, str] = {
 
 def _active_approximation_rows(evaluator: Any) -> list[ApproximationRow]:
     state = getattr(evaluator, "state", None)
+    active_inference_enabled = bool(getattr(evaluator, "active_inference_enabled", False))
+    using_frozen_active_scaling = bool(getattr(evaluator, "using_frozen_active_scaling", False))
     active_scaling = _count_items(getattr(evaluator, "active_scaling_component_indices", []))
+    exact_scaling = _count_items(
+        getattr(
+            evaluator,
+            "exact_scaling_component_indices",
+            getattr(evaluator, "active_scaling_component_indices", []),
+        )
+    )
+    cached_scaling = _count_items(
+        getattr(
+            evaluator,
+            "cached_scaling_component_indices",
+            getattr(evaluator, "inactive_scaling_component_indices", []),
+        )
+    )
+    free_correction_scaling = _count_items(getattr(evaluator, "free_correction_scaling_component_indices", []))
+    excluded_scaling = _count_items(getattr(evaluator, "excluded_scaling_component_indices", []))
     total_scaling = _count_items(getattr(evaluator, "scaling_component_indices", []))
+    topk_discovery_engine = (
+        str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT
+    )
     rows: list[ApproximationRow] = [
         ("sampling_engine", _format_approximation_value(getattr(evaluator, "sampling_engine", "unknown")), "engine"),
         (
@@ -2765,23 +3101,68 @@ def _active_approximation_rows(evaluator: Any) -> list[ApproximationRow]:
             _format_approximation_value(bool(getattr(evaluator, "surrogate_enabled", False))),
             "surrogate",
         ),
+        (
+            "active_scaling_inference",
+            "svi_p_active" if active_inference_enabled else ("svi_frozen" if using_frozen_active_scaling else "off"),
+            "selection",
+        ),
+        (
+            "large_exact",
+            _format_approximation_value(_count_items(getattr(evaluator, "large_component_indices", []))),
+            "active",
+        ),
         ("active_scaling", f"{active_scaling}/{total_scaling}", "active"),
+        ("exact_scaling", _format_approximation_value(exact_scaling), "active"),
+        ("cached_scaling", _format_approximation_value(cached_scaling), "active"),
+        ("free_correction_candidates", _format_approximation_value(free_correction_scaling), "active"),
+        ("excluded_scaling", _format_approximation_value(excluded_scaling), "active"),
         (
             "inactive_scaling",
-            _format_approximation_value(_count_items(getattr(evaluator, "inactive_scaling_component_indices", []))),
+            _format_approximation_value(cached_scaling),
             "active",
         ),
         (
             "active_scaling_selection",
-            _format_approximation_value(getattr(evaluator, "active_scaling_selection", "na")),
+            "svi_inferred"
+            if active_inference_enabled
+            else ("svi_frozen" if using_frozen_active_scaling else _format_approximation_value(getattr(evaluator, "active_scaling_selection", "na"))),
             "selection",
         ),
     ]
-    for name, value in _active_scaling_rank_summary(evaluator).items():
-        if name == "active_scaling_realized_fraction":
-            rows.append((name, value, "selection", _active_scaling_realized_fraction_value_style(value)))
-        else:
-            rows.append((name, value, "selection"))
+    if topk_discovery_engine:
+        rows.append(("topk_discovery_exact_scaling", _format_approximation_value(total_scaling), "selection"))
+        rows.append(
+            (
+                "topk_discovery_scaling_galaxies",
+                _format_approximation_value(getattr(evaluator, "topk_discovery_scaling_galaxies", 10)),
+                "selection",
+            )
+        )
+        rows.append(("topk_discovery_independent_candidates", _format_approximation_value(free_correction_scaling), "selection"))
+    if active_inference_enabled:
+        rows.append(("p_active_candidates", _format_approximation_value(total_scaling), "selection"))
+        rows.append(
+            (
+                "p_active_likelihood",
+                _format_approximation_value(
+                    getattr(
+                        evaluator,
+                        "active_scaling_inference_likelihood",
+                        ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION,
+                    )
+                ),
+                "selection",
+            )
+        )
+        rows.append(("p_active_freeze_threshold", _format_approximation_value(getattr(evaluator, "active_scaling_freeze_threshold", "na")), "selection"))
+    elif using_frozen_active_scaling:
+        rows.append(("frozen_active_scaling", f"{active_scaling}/{total_scaling}", "selection"))
+    else:
+        for name, value in _active_scaling_rank_summary(evaluator).items():
+            if name == "active_scaling_realized_fraction":
+                rows.append((name, value, "selection", _active_scaling_realized_fraction_value_style(value)))
+            else:
+                rows.append((name, value, "selection"))
     rows.extend((name, value, "zbin") for name, value in _z_bin_summary_rows(evaluator).items())
     rows.extend(
         [
@@ -2797,6 +3178,12 @@ def _active_approximation_rows(evaluator: Any) -> list[ApproximationRow]:
             ),
         ]
     )
+    source_covariance_mode = str(
+        getattr(evaluator, "source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION)
+    )
+    rows.append(("source_plane_covariance_mode", _format_approximation_value(source_covariance_mode), "likelihood"))
+    if str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)) == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
+        rows.append(("local_jacobian_metric", _format_approximation_value(_local_jacobian_metric_mode(evaluator)), "likelihood"))
     source_position_count = sum(
         str(getattr(spec, "component_family", "")) == "source_position"
         for spec in getattr(state, "parameter_specs", [])
@@ -2814,7 +3201,12 @@ def _active_approximation_rows(evaluator: Any) -> list[ApproximationRow]:
         )
     if _count_items(getattr(evaluator, "scaling_scatter_param_indices", [])) > 0:
         rows.append(("scaling_scatter_cache", "linearized", "cache"))
-    if _count_items(getattr(evaluator, "source_metric_cache_by_z", {})) > 0:
+    if (
+        source_covariance_mode == SOURCE_PLANE_COVARIANCE_MODE_UNIT
+        and str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)) == SAMPLE_LIKELIHOOD_SOURCE
+    ):
+        rows.append(("source_metric_cache", "unit", "cache"))
+    elif _count_items(getattr(evaluator, "source_metric_cache_by_z", {})) > 0:
         rows.append(("source_metric_cache", "refreshed", "cache"))
     return rows
 
@@ -2862,6 +3254,154 @@ def _log_active_approximation_table(args: argparse.Namespace | None, evaluator: 
         args,
         _format_active_approximation_table_from_rows(rows),
         renderable=_build_active_approximation_rich_table(rows),
+    )
+
+
+def _stage_quality_metric_text(value: Any) -> str:
+    if value is None:
+        return "na"
+    if isinstance(value, (float, np.floating)):
+        value_f = float(value)
+        return f"{value_f:.6g}" if np.isfinite(value_f) else "na"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    return str(value)
+
+
+def _stage_quality_count_text(count: Any, total: Any) -> str:
+    return f"{_stage_quality_metric_text(count)}/{_stage_quality_metric_text(total)}"
+
+
+def _stage_quality_uses_arc_aware(summary: dict[str, Any]) -> bool:
+    mode = str(summary.get("sample_likelihood_mode", ""))
+    try:
+        if _sample_likelihood_uses_critical_arc_terms(mode):
+            return True
+    except Exception:
+        pass
+    arc_keys = (
+        "arc_aware_recovered_image_count",
+        "arc_aware_arc_supported_image_count",
+        "arc_aware_image_rms_arcsec",
+        "arc_aware_image_residual_median_arcsec",
+        "arc_aware_reduced_chi_square",
+    )
+    return any(summary.get(key) is not None for key in arc_keys)
+
+
+def _stage_fit_quality_table(summary: dict[str, Any]) -> Any:
+    run_name = str(summary.get("run_name", "stage"))
+    stage_name = Path(run_name).name or run_name
+    table = _RichTable(
+        title=f"Stage Fit Quality: {stage_name}",
+        title_style="bold green",
+        header_style="bold white",
+        border_style="green",
+        show_lines=False,
+        expand=False,
+    )
+    table.add_column("metric", style="dim", no_wrap=True)
+    table.add_column("value", overflow="fold")
+    observed = summary.get("observed_image_count", summary.get("n_images"))
+    rows: list[tuple[str, Any]] = [
+        ("run", run_name),
+        ("sampler", summary.get("sampler")),
+        ("likelihood", summary.get("sample_likelihood_mode")),
+        ("observed images", observed),
+        ("point recovered images", _stage_quality_count_text(summary.get("point_recovered_image_count"), observed)),
+        ("point RMS residual arcsec", summary.get("point_image_rms_arcsec")),
+        (
+            "point median residual arcsec",
+            summary.get("point_image_median_residual_arcsec", summary.get("image_residual_median_arcsec")),
+        ),
+        ("headline chi-square", summary.get("headline_chi_square")),
+        ("headline dof", summary.get("headline_dof")),
+        ("headline reduced chi-square", summary.get("headline_reduced_chi_square")),
+    ]
+    if _stage_quality_uses_arc_aware(summary):
+        rows.extend(
+            [
+                (
+                    "arc-aware recovered images",
+                    _stage_quality_count_text(summary.get("arc_aware_recovered_image_count"), observed),
+                ),
+                ("arc-supported images", summary.get("arc_aware_arc_supported_image_count")),
+                ("missed images", summary.get("arc_aware_missing_image_count")),
+                ("arc-aware RMS residual arcsec", summary.get("arc_aware_image_rms_arcsec")),
+                ("arc-aware median residual arcsec", summary.get("arc_aware_image_residual_median_arcsec")),
+                ("arc-aware reduced chi-square", summary.get("arc_aware_reduced_chi_square")),
+            ]
+        )
+    rows.extend(
+        [
+            ("accept probability mean", summary.get("accept_prob_mean")),
+            ("divergence count", summary.get("divergence_count")),
+            ("max tree-depth saturation", summary.get("max_tree_depth_saturation_fraction")),
+            ("ESS min", summary.get("ess_min")),
+            ("Rhat max", summary.get("rhat_max")),
+            ("runtime seconds", summary.get("runtime_sec")),
+        ]
+    )
+    for metric, value in rows:
+        table.add_row(str(metric), _stage_quality_metric_text(value))
+    return table
+
+
+def _format_stage_fit_quality_table(summary: dict[str, Any]) -> str:
+    run_name = str(summary.get("run_name", "stage"))
+    stage_name = Path(run_name).name or run_name
+    observed = summary.get("observed_image_count", summary.get("n_images"))
+    rows: list[tuple[str, Any]] = [
+        ("run", run_name),
+        ("sampler", summary.get("sampler")),
+        ("likelihood", summary.get("sample_likelihood_mode")),
+        ("observed images", observed),
+        ("point recovered images", _stage_quality_count_text(summary.get("point_recovered_image_count"), observed)),
+        ("point RMS residual arcsec", summary.get("point_image_rms_arcsec")),
+        (
+            "point median residual arcsec",
+            summary.get("point_image_median_residual_arcsec", summary.get("image_residual_median_arcsec")),
+        ),
+        ("headline chi-square", summary.get("headline_chi_square")),
+        ("headline dof", summary.get("headline_dof")),
+        ("headline reduced chi-square", summary.get("headline_reduced_chi_square")),
+    ]
+    if _stage_quality_uses_arc_aware(summary):
+        rows.extend(
+            [
+                (
+                    "arc-aware recovered images",
+                    _stage_quality_count_text(summary.get("arc_aware_recovered_image_count"), observed),
+                ),
+                ("arc-supported images", summary.get("arc_aware_arc_supported_image_count")),
+                ("missed images", summary.get("arc_aware_missing_image_count")),
+                ("arc-aware RMS residual arcsec", summary.get("arc_aware_image_rms_arcsec")),
+                ("arc-aware median residual arcsec", summary.get("arc_aware_image_residual_median_arcsec")),
+                ("arc-aware reduced chi-square", summary.get("arc_aware_reduced_chi_square")),
+            ]
+        )
+    rows.extend(
+        [
+            ("accept probability mean", summary.get("accept_prob_mean")),
+            ("divergence count", summary.get("divergence_count")),
+            ("max tree-depth saturation", summary.get("max_tree_depth_saturation_fraction")),
+            ("ESS min", summary.get("ess_min")),
+            ("Rhat max", summary.get("rhat_max")),
+            ("runtime seconds", summary.get("runtime_sec")),
+        ]
+    )
+    lines = [f"[stage-fit-quality] {stage_name}", "| metric | value |"]
+    lines.extend(f"| {metric} | {_stage_quality_metric_text(value)} |" for metric, value in rows)
+    return "\n".join(lines)
+
+
+def _log_stage_fit_quality_table(args: argparse.Namespace | None, summary: dict[str, Any] | None) -> None:
+    if not summary:
+        return
+    _log(
+        args,
+        _format_stage_fit_quality_table(summary),
+        renderable=_stage_fit_quality_table(summary),
     )
 
 
@@ -2931,8 +3471,10 @@ def _log_evaluator_summary(args: argparse.Namespace, evaluator: Any) -> None:
         (
             f"[surrogate] engine={evaluator.sampling_engine} enabled={evaluator.surrogate_enabled} "
             f"selection={evaluator.active_scaling_selection} "
-            f"active={len(evaluator.active_scaling_component_indices)} "
-            f"inactive={len(evaluator.inactive_scaling_component_indices)} "
+            f"exact_scaling={len(getattr(evaluator, 'exact_scaling_component_indices', getattr(evaluator, 'active_scaling_component_indices', [])))} "
+            f"cached_scaling={len(getattr(evaluator, 'cached_scaling_component_indices', getattr(evaluator, 'inactive_scaling_component_indices', [])))} "
+            f"free_correction={len(getattr(evaluator, 'free_correction_scaling_component_indices', []))} "
+            f"excluded_scaling={len(getattr(evaluator, 'excluded_scaling_component_indices', []))} "
             f"total_scaling={len(evaluator.scaling_component_indices)}"
         ),
     )
@@ -2942,7 +3484,7 @@ def _log_evaluator_summary(args: argparse.Namespace, evaluator: Any) -> None:
             (
                 "[active-subset] posterior target omits inactive scaling potentials "
                 f"active={len(evaluator.active_scaling_component_indices)} "
-                f"ignored_inactive={len(evaluator.inactive_scaling_component_indices)} "
+                f"ignored_cached={len(getattr(evaluator, 'cached_scaling_component_indices', getattr(evaluator, 'inactive_scaling_component_indices', [])))} "
                 f"total_scaling={len(evaluator.scaling_component_indices)}"
             ),
         )
@@ -4129,44 +4671,13 @@ def _clip_theta_to_support(
 ) -> np.ndarray:
     clipped = np.asarray(theta, dtype=float).copy()
     for idx, spec in enumerate(parameter_specs):
-        if _is_potfile_mass_size_spec(spec):
-            continue
         clipped[idx] = _clip_value_to_safe_bounds(clipped[idx], spec, boundary_frac=boundary_frac)
-    for site in _parameter_sample_sites(parameter_specs):
-        if len(site.indices) != 2:
-            continue
-        mass_idx, size_idx = site.indices
-        mass_spec = parameter_specs[mass_idx]
-        size_spec = parameter_specs[size_idx]
-        if not (_is_potfile_mass_size_spec(mass_spec) and _is_potfile_mass_size_spec(size_spec)):
-            continue
-        log_cut_gap = (
-            float(mass_spec.coupled_size_center)
-            + float(mass_spec.coupled_size_scale) * float(clipped[size_idx])
-        )
-        log_cut_gap = _clip_value_to_safe_bounds(log_cut_gap, size_spec, boundary_frac=boundary_frac)
-        clipped[size_idx] = (
-            log_cut_gap - float(mass_spec.coupled_size_center)
-        ) / float(mass_spec.coupled_size_scale)
-        mass_raw = (
-            float(mass_spec.coupled_mass_center)
-            + float(mass_spec.coupled_mass_scale) * float(clipped[mass_idx])
-        )
-        log_sigma = 0.5 * (mass_raw - log_cut_gap)
-        log_sigma = _clip_value_to_safe_bounds(log_sigma, mass_spec, boundary_frac=boundary_frac)
-        mass_raw = 2.0 * log_sigma + log_cut_gap
-        clipped[mass_idx] = (
-            mass_raw - float(mass_spec.coupled_mass_center)
-        ) / float(mass_spec.coupled_mass_scale)
     return clipped
 
 
 def _default_theta(parameter_specs: list[ParameterSpec]) -> np.ndarray:
     default = np.asarray(
         [
-            0.0
-            if _is_potfile_mass_size_spec(spec)
-            else
             0.5 * (spec.lower + spec.upper) if spec.prior_kind == "uniform" else float(spec.mean)
             for spec in parameter_specs
         ],
@@ -4184,9 +4695,7 @@ def _jitter_theta_in_support(
 ) -> np.ndarray:
     theta_array = np.asarray(theta, dtype=float).copy()
     for idx, spec in enumerate(parameter_specs):
-        if _is_potfile_mass_size_spec(spec):
-            scale = max(float(jitter_frac), 1.0e-6)
-        elif spec.prior_kind == "normal":
+        if spec.prior_kind == "normal":
             scale = max(float(spec.std or 0.0) * 0.15, 1.0e-6)
         elif spec.prior_kind == "truncated_normal":
             scale = max(float(spec.std or 0.0) * 0.15, 1.0e-6)
@@ -5394,6 +5903,183 @@ def _student_t_2d_loglike_from_quad_logdet(
         - 0.5 * logdet
         - 0.5 * (nu + 2.0) * jnp.log1p(safe_quad / nu)
     )
+
+
+def _active_population_mixture_terms(
+    q_active: jnp.ndarray,
+    delta_loglike: jnp.ndarray,
+    *,
+    delta_clip: float = DEFAULT_ACTIVE_SCALING_POPULATION_DELTA_CLIP,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Stable active/inactive mixture term and active responsibility."""
+    q = jnp.clip(
+        jnp.asarray(q_active, dtype=jnp.float64),
+        jnp.asarray(1.0e-12, dtype=jnp.float64),
+        jnp.asarray(1.0 - 1.0e-12, dtype=jnp.float64),
+    )
+    delta = jnp.asarray(delta_loglike, dtype=jnp.float64)
+    if float(delta_clip) > 0.0:
+        clip = jnp.asarray(float(delta_clip), dtype=jnp.float64)
+        delta = jnp.clip(delta, -clip, clip)
+    active_log = jnp.log(q)
+    inactive_log = jnp.log1p(-q) + delta
+    norm = jnp.logaddexp(active_log, inactive_log)
+    responsibility = jnp.exp(active_log - norm)
+    return norm, responsibility
+
+
+def _linearized_source_plane_population_delta(
+    beta_x: jnp.ndarray,
+    beta_y: jnp.ndarray,
+    delta_beta_x: jnp.ndarray,
+    delta_beta_y: jnp.ndarray,
+    family_idx: jnp.ndarray,
+    n_families: int,
+    sigma_per_image: jnp.ndarray,
+    reliability_per_image: jnp.ndarray,
+    image_has_constraint: jnp.ndarray,
+    source_sigma_int: jnp.ndarray,
+    scatter_var_x: jnp.ndarray,
+    scatter_var_y: jnp.ndarray,
+    inv_abs_mu: jnp.ndarray,
+    covariance_floor: float,
+    *,
+    max_gain: float = DEFAULT_LIKELIHOOD_STABILIZER_MAX_GAIN,
+    max_residual_arcsec: float = DEFAULT_LIKELIHOOD_STABILIZER_MAX_RESIDUAL_ARCSEC,
+) -> jnp.ndarray:
+    """Quadratic source-plane log-likelihood change for all candidate source shifts."""
+    if int(delta_beta_x.shape[0]) == 0:
+        return jnp.zeros((0,), dtype=jnp.float64)
+    if float(max_gain) > 0.0:
+        inv_abs_mu = jnp.maximum(
+            inv_abs_mu,
+            jnp.asarray(1.0 / float(max_gain) ** 2, dtype=jnp.float64),
+        )
+    sigma2_image = jnp.square(sigma_per_image) * inv_abs_mu
+    cov_floor = jnp.asarray(covariance_floor, dtype=jnp.float64)
+    sigma2_x = sigma2_image + jnp.square(source_sigma_int) + scatter_var_x + cov_floor
+    sigma2_y = sigma2_image + jnp.square(source_sigma_int) + scatter_var_y + cov_floor
+    sigma2_weight = 0.5 * (sigma2_x + sigma2_y)
+    reliability = jnp.clip(reliability_per_image, 1.0e-6, 1.0 - 1.0e-6)
+    weights = reliability / jnp.maximum(sigma2_weight, 1.0e-18)
+    sum_w = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights)
+    sum_bx = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights * beta_x)
+    sum_by = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights * beta_y)
+    centroid_x = sum_bx / jnp.maximum(sum_w, 1.0e-18)
+    centroid_y = sum_by / jnp.maximum(sum_w, 1.0e-18)
+    residual_x = beta_x - centroid_x[family_idx]
+    residual_y = beta_y - centroid_y[family_idx]
+    residual_x, residual_y = _smooth_residual_cap(residual_x, residual_y, max_residual_arcsec)
+
+    def centered(row_x: jnp.ndarray, row_y: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        mean_dx = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights * row_x) / jnp.maximum(
+            sum_w,
+            1.0e-18,
+        )
+        mean_dy = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(weights * row_y) / jnp.maximum(
+            sum_w,
+            1.0e-18,
+        )
+        return row_x - mean_dx[family_idx], row_y - mean_dy[family_idx]
+
+    centered_dx, centered_dy = jax.vmap(centered)(delta_beta_x, delta_beta_y)
+    quad_change = (
+        (2.0 * residual_x[None, :] * centered_dx + jnp.square(centered_dx)) / jnp.maximum(sigma2_x[None, :], 1.0e-18)
+        + (2.0 * residual_y[None, :] * centered_dy + jnp.square(centered_dy)) / jnp.maximum(sigma2_y[None, :], 1.0e-18)
+    )
+    delta = -0.5 * jnp.sum(jnp.where(image_has_constraint[None, :], quad_change, 0.0), axis=1)
+    finite = (
+        jnp.all(jnp.isfinite(sigma2_x))
+        & jnp.all(jnp.isfinite(sigma2_y))
+        & jnp.all(jnp.isfinite(residual_x))
+        & jnp.all(jnp.isfinite(residual_y))
+        & jnp.all(jnp.isfinite(centered_dx), axis=1)
+        & jnp.all(jnp.isfinite(centered_dy), axis=1)
+        & jnp.isfinite(delta)
+    )
+    return jnp.where(finite, delta, jnp.full_like(delta, jnp.nan))
+
+
+def _linearized_local_jacobian_population_delta_source_only(
+    beta_x: jnp.ndarray,
+    beta_y: jnp.ndarray,
+    delta_beta_x: jnp.ndarray,
+    delta_beta_y: jnp.ndarray,
+    family_idx: jnp.ndarray,
+    n_families: int,
+    sigma_per_image: jnp.ndarray,
+    reliability_per_image: jnp.ndarray,
+    image_has_constraint: jnp.ndarray,
+    source_sigma_int: jnp.ndarray,
+    scatter_var_x: jnp.ndarray,
+    scatter_var_y: jnp.ndarray,
+    jac_a00: jnp.ndarray,
+    jac_a01: jnp.ndarray,
+    jac_a10: jnp.ndarray,
+    jac_a11: jnp.ndarray,
+    covariance_floor: float,
+    *,
+    max_gain: float = DEFAULT_LIKELIHOOD_STABILIZER_MAX_GAIN,
+    max_residual_arcsec: float = DEFAULT_LIKELIHOOD_STABILIZER_MAX_RESIDUAL_ARCSEC,
+) -> jnp.ndarray:
+    """Quadratic local-Jacobian log-likelihood change from source shifts only."""
+    if int(delta_beta_x.shape[0]) == 0:
+        return jnp.zeros((0,), dtype=jnp.float64)
+    sigma2_img = jnp.square(sigma_per_image)
+    source_var = jnp.square(source_sigma_int)
+    cov_floor = jnp.asarray(covariance_floor, dtype=jnp.float64)
+    c00 = sigma2_img * (jnp.square(jac_a00) + jnp.square(jac_a01)) + source_var + scatter_var_x + cov_floor
+    c11 = sigma2_img * (jnp.square(jac_a10) + jnp.square(jac_a11)) + source_var + scatter_var_y + cov_floor
+    c01 = sigma2_img * (jac_a00 * jac_a10 + jac_a01 * jac_a11)
+    if float(max_gain) > 0.0:
+        gain_floor = jnp.square(sigma_per_image / jnp.asarray(float(max_gain), dtype=jnp.float64))
+        c00 = c00 + gain_floor
+        c11 = c11 + gain_floor
+    c00 = jnp.maximum(c00, cov_floor)
+    c11 = jnp.maximum(c11, cov_floor)
+    c00, c11, det = _jittered_2x2_covariance_det(c00, c01, c11)
+    inv00 = c11 / det
+    inv11 = c00 / det
+    inv01 = -c01 / det
+
+    reliability = jnp.clip(reliability_per_image, 1.0e-6, 1.0 - 1.0e-6)
+    w_inv00 = reliability * inv00
+    w_inv01 = reliability * inv01
+    w_inv11 = reliability * inv11
+    sum00 = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(w_inv00)
+    sum01 = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(w_inv01)
+    sum11 = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(w_inv11)
+    rhs_x = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(w_inv00 * beta_x + w_inv01 * beta_y)
+    rhs_y = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(w_inv01 * beta_x + w_inv11 * beta_y)
+    centroid_det = jnp.maximum(sum00 * sum11 - jnp.square(sum01), 1.0e-18)
+    centroid_x = (sum11 * rhs_x - sum01 * rhs_y) / centroid_det
+    centroid_y = (-sum01 * rhs_x + sum00 * rhs_y) / centroid_det
+    residual_x = beta_x - centroid_x[family_idx]
+    residual_y = beta_y - centroid_y[family_idx]
+    residual_x, residual_y = _smooth_residual_cap(residual_x, residual_y, max_residual_arcsec)
+
+    def centered(row_x: jnp.ndarray, row_y: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        drhs_x = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(w_inv00 * row_x + w_inv01 * row_y)
+        drhs_y = jnp.zeros(n_families, dtype=jnp.float64).at[family_idx].add(w_inv01 * row_x + w_inv11 * row_y)
+        shift_x = (sum11 * drhs_x - sum01 * drhs_y) / centroid_det
+        shift_y = (-sum01 * drhs_x + sum00 * drhs_y) / centroid_det
+        return row_x - shift_x[family_idx], row_y - shift_y[family_idx]
+
+    centered_dx, centered_dy = jax.vmap(centered)(delta_beta_x, delta_beta_y)
+    inv_centered_x = inv00[None, :] * centered_dx + inv01[None, :] * centered_dy
+    inv_centered_y = inv01[None, :] * centered_dx + inv11[None, :] * centered_dy
+    linear_change = 2.0 * (residual_x[None, :] * inv_centered_x + residual_y[None, :] * inv_centered_y)
+    quadratic_change = centered_dx * inv_centered_x + centered_dy * inv_centered_y
+    delta = -0.5 * jnp.sum(jnp.where(image_has_constraint[None, :], linear_change + quadratic_change, 0.0), axis=1)
+    finite = (
+        jnp.all(jnp.isfinite(det))
+        & jnp.all(jnp.isfinite(residual_x))
+        & jnp.all(jnp.isfinite(residual_y))
+        & jnp.all(jnp.isfinite(centered_dx), axis=1)
+        & jnp.all(jnp.isfinite(centered_dy), axis=1)
+        & jnp.isfinite(delta)
+    )
+    return jnp.where(finite, delta, jnp.full_like(delta, jnp.nan))
 
 
 def _source_plane_bin_loglike(
@@ -7469,9 +8155,7 @@ def _small_svi_nuts_perturbation(
     if float(jitter_frac) <= 0.0:
         return _clip_theta_to_support(perturbed, parameter_specs, boundary_frac=boundary_frac)
     for idx, spec in enumerate(parameter_specs):
-        if _is_potfile_mass_size_spec(spec):
-            scale = max(float(jitter_frac), 1.0e-6)
-        elif spec.prior_kind in {"normal", "truncated_normal"}:
+        if spec.prior_kind in {"normal", "truncated_normal"}:
             scale = max(float(jitter_frac) * float(spec.std or 0.0), 1.0e-6)
         else:
             scale = max(float(jitter_frac) * float(spec.upper - spec.lower), 1.0e-6)
@@ -7560,8 +8244,6 @@ def _run_svi_initializer(
         "svi_steps": int(args.svi_steps),
         "svi_learning_rate": float(args.svi_learning_rate),
         "svi_final_elbo_loss": float(np.asarray(svi_result.losses[-1], dtype=float)) if len(svi_result.losses) else float("nan"),
-        "potfile_mass_size_reparam_enabled": bool(_potfile_mass_size_group_count(parameter_specs) > 0),
-        "potfile_mass_size_reparam_group_count": int(_potfile_mass_size_group_count(parameter_specs)),
         "svi_chain_seed_labels": [seed.source_label for seed in chain_seeds],
         "svi_chain_start_labels": chain_start_labels,
     }
@@ -8916,6 +9598,497 @@ def _prepare_svi_health_for_nuts(
     return chain_seeds
 
 
+@dataclass(frozen=True)
+class _SviFitResult:
+    best_fit: np.ndarray
+    posterior: PosteriorResults
+    diagnostics: dict[str, Any]
+    state: BuildState
+    evaluator: ClusterJAXEvaluator
+    sample_model: Any
+
+    def __iter__(self):
+        yield self.best_fit
+        yield self.posterior
+        yield self.diagnostics
+
+
+def _empty_selected_by_potfile(state: BuildState) -> list[set[int]]:
+    return [set() for _ in getattr(state, "potfiles", [])]
+
+
+def _normalize_selected_by_potfile(
+    selected_by_potfile: Iterable[Iterable[int]],
+    n_potfiles: int,
+) -> list[set[int]]:
+    normalized = [set() for _ in range(int(n_potfiles))]
+    for potfile_order, selected in enumerate(selected_by_potfile):
+        if potfile_order >= n_potfiles:
+            break
+        normalized[potfile_order] = {int(value) for value in selected}
+    return normalized
+
+
+def _selected_by_potfile_counts(
+    state: BuildState,
+    selected_by_potfile: list[set[int]],
+) -> dict[str, int]:
+    return {
+        str(potfile.get("id", f"potfile{idx}")): int(len(selected_by_potfile[idx]))
+        for idx, potfile in enumerate(getattr(state, "potfiles", []))
+        if idx < len(selected_by_potfile) and len(selected_by_potfile[idx]) > 0
+    }
+
+
+def _selected_component_set_from_state(state: BuildState) -> set[int]:
+    return {
+        int(record.get("component_index", -1))
+        for record in getattr(state, "scaling_component_records", [])
+        if bool(record.get("selected_independent", False)) and int(record.get("component_index", -1)) >= 0
+    }
+
+
+def _selected_by_potfile_component_set(
+    state: BuildState,
+    selected_by_potfile: list[set[int]],
+) -> set[int]:
+    result: set[int] = set()
+    for record in getattr(state, "scaling_component_records", []):
+        potfile_order = int(record.get("potfile_order", -1))
+        row_index = int(record.get("catalog_row_index", -1))
+        component_index = int(record.get("component_index", -1))
+        if (
+            0 <= potfile_order < len(selected_by_potfile)
+            and row_index in selected_by_potfile[potfile_order]
+            and component_index >= 0
+        ):
+            result.add(component_index)
+    return result
+
+
+def _int_component_set(values: Any) -> set[int]:
+    return {int(value) for value in np.asarray(values, dtype=np.int64).reshape(-1) if int(value) >= 0}
+
+
+def _validate_topk_discovery_strict_final_partition(
+    evaluator: Any,
+    requested_components: set[int],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    scaling_set = _int_component_set(getattr(evaluator, "scaling_component_indices", []))
+    requested_set = {int(value) for value in requested_components if int(value) >= 0}
+    active_set = _int_component_set(getattr(evaluator, "active_scaling_component_indices", []))
+    exact_set = _int_component_set(getattr(evaluator, "exact_scaling_component_indices", []))
+    independent_set = _int_component_set(getattr(evaluator, "independent_scaling_component_indices", []))
+    free_set = _int_component_set(getattr(evaluator, "free_correction_scaling_component_indices", []))
+    cached_set = _int_component_set(getattr(evaluator, "cached_scaling_component_indices", []))
+    expected_cached = scaling_set - requested_set
+    errors: list[str] = []
+    if independent_set != requested_set:
+        errors.append(
+            f"independent={len(independent_set)} requested={len(requested_set)}"
+        )
+    if active_set != requested_set:
+        errors.append(f"active={len(active_set)} requested={len(requested_set)}")
+    if exact_set != requested_set:
+        errors.append(f"exact={len(exact_set)} requested={len(requested_set)}")
+    if free_set != requested_set:
+        errors.append(f"free={len(free_set)} requested={len(requested_set)}")
+    if cached_set != expected_cached:
+        errors.append(f"cached={len(cached_set)} expected_cached={len(expected_cached)}")
+    if errors:
+        raise RuntimeError(
+            "Top-K discovery final strict active partition failed "
+            f"for reason={reason}: "
+            + ", ".join(errors)
+        )
+    return {
+        "strict_active": True,
+        "active_equals_independent": active_set == independent_set,
+        "active_scaling": len(active_set),
+        "independent_scaling": len(independent_set),
+        "cached_scaling": len(cached_set),
+        "total_scaling": len(scaling_set),
+    }
+
+
+def _component_set_to_selected_by_potfile(
+    state: BuildState,
+    component_indices: set[int],
+) -> list[set[int]]:
+    selected_by_potfile = _empty_selected_by_potfile(state)
+    requested_components = {int(value) for value in component_indices if int(value) >= 0}
+    for record_index, record in enumerate(getattr(state, "scaling_component_records", [])):
+        component_index = int(record.get("component_index", -1))
+        if component_index not in requested_components:
+            continue
+        potfile_order = int(record.get("potfile_order", -1))
+        row_index = int(record.get("catalog_row_index", record_index))
+        if 0 <= potfile_order < len(selected_by_potfile) and row_index >= 0:
+            selected_by_potfile[potfile_order].add(int(row_index))
+    return selected_by_potfile
+
+
+def _topk_discovery_union_from_evaluator(
+    state: BuildState,
+    evaluator: ClusterJAXEvaluator,
+    reference_params: np.ndarray,
+) -> tuple[list[set[int]], dict[str, Any]]:
+    selected_by_potfile = _empty_selected_by_potfile(state)
+    candidates = np.asarray(getattr(evaluator, "scaling_component_indices", np.asarray([], dtype=np.int32)), dtype=np.int32)
+    candidates = candidates.reshape(-1)
+    flat_data = getattr(evaluator, "flat_critical_arc_data", None)
+    n_images = 0 if flat_data is None else int(np.asarray(flat_data.x_obs).shape[0])
+    if candidates.size == 0 or flat_data is None or n_images == 0:
+        return selected_by_potfile, {
+            "count": 0,
+            "exact_unique": 0,
+            "pairs": 0,
+            "source": "full_scaling",
+            "score_fraction": 0.0,
+            "candidate_galaxies": int(candidates.size),
+            "n_images": int(n_images),
+            "k": int(max(1, int(getattr(evaluator, "topk_discovery_scaling_galaxies", 10)))),
+            "k_valid": 0,
+        }
+    reference = np.asarray(reference_params, dtype=float)
+    reference_jax = jnp.asarray(reference, dtype=jnp.float64)
+    physical_params = evaluator._physical_parameter_vector(reference_jax)
+    packed_state, validity = evaluator._build_flat_packed_lens_state_with_validity_from_physical(
+        physical_params,
+        flat_data,
+        stop_gradient=False,
+    )
+    if not bool(np.asarray(validity["is_valid"], dtype=bool)):
+        evaluator._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+        return selected_by_potfile, {
+            "count": 0,
+            "exact_unique": 0,
+            "pairs": 0,
+            "source": "full_scaling",
+            "refresh_failed": True,
+            "score_fraction": 0.0,
+            "candidate_galaxies": int(candidates.size),
+            "n_images": int(n_images),
+            "k": int(max(1, int(getattr(evaluator, "topk_discovery_scaling_galaxies", 10)))),
+            "k_valid": 0,
+        }
+    rows = evaluator._flat_component_alpha_and_jacobian_delta_rows_for_components(
+        flat_data.x_obs,
+        flat_data.y_obs,
+        packed_state,
+        candidates,
+    )
+    arrays = [np.asarray(value, dtype=float) for value in rows]
+    if not all(np.isfinite(array).all() for array in arrays):
+        return selected_by_potfile, {
+            "count": 0,
+            "exact_unique": 0,
+            "pairs": 0,
+            "source": "full_scaling",
+            "refresh_failed": True,
+            "score_fraction": 0.0,
+            "candidate_galaxies": int(candidates.size),
+            "n_images": int(n_images),
+            "k": int(max(1, int(getattr(evaluator, "topk_discovery_scaling_galaxies", 10)))),
+            "k_valid": 0,
+        }
+    alpha_x, alpha_y, jac00, jac01, jac10, jac11 = arrays
+    sigma = np.maximum(np.asarray(flat_data.sigma_per_image, dtype=float), 1.0e-6)
+    score = (np.square(alpha_x) + np.square(alpha_y)) / np.square(sigma)[None, :]
+    if str(getattr(evaluator, "topk_discovery_score", TOPK_DISCOVERY_SCORE_ALPHA_JACOBIAN)) == TOPK_DISCOVERY_SCORE_ALPHA_JACOBIAN:
+        score = score + float(getattr(evaluator, "topk_discovery_jacobian_weight", 1.0)) * (
+            np.square(jac00) + np.square(jac01) + np.square(jac10) + np.square(jac11)
+        )
+    score = np.where(np.isfinite(score), np.maximum(score, 0.0), 0.0)
+    k_requested = max(1, int(getattr(evaluator, "topk_discovery_scaling_galaxies", 10)))
+    k_valid = min(k_requested, int(candidates.size))
+    selected_components = np.empty((n_images, 0), dtype=np.int32)
+    selected_mask = np.zeros((n_images, 0), dtype=bool)
+    ranked_order = np.argsort(-score, axis=0).T
+    ranked_components = candidates[ranked_order]
+    ranked_scores = np.take_along_axis(score.T, ranked_order, axis=1)
+    if k_valid > 0:
+        order = ranked_order[:, :k_valid]
+        selected_components = candidates[order]
+        selected_mask = np.ones_like(selected_components, dtype=bool)
+    valid_components = {
+        int(value)
+        for value in selected_components[selected_mask].reshape(-1).tolist()
+        if int(value) >= 0
+    }
+    component_to_record = {
+        int(record.get("component_index", -1)): (
+            int(record.get("potfile_order", -1)),
+            int(record.get("catalog_row_index", record_index)),
+        )
+        for record_index, record in enumerate(getattr(state, "scaling_component_records", []))
+    }
+    missing_components: list[int] = []
+    for component_index in sorted(valid_components):
+        potfile_order, row_index = component_to_record.get(component_index, (-1, -1))
+        if 0 <= potfile_order < len(selected_by_potfile) and row_index >= 0:
+            selected_by_potfile[potfile_order].add(int(row_index))
+        else:
+            missing_components.append(int(component_index))
+    selected_score = np.take_along_axis(score.T, order, axis=1) if k_valid > 0 else np.zeros((n_images, 0))
+    score_total = np.sum(score, axis=0)
+    score_selected = np.sum(selected_score, axis=1)
+    score_fraction = np.divide(
+        score_selected,
+        score_total,
+        out=np.zeros_like(score_selected),
+        where=score_total > 0.0,
+    )
+    return selected_by_potfile, {
+        "count": int(sum(len(values) for values in selected_by_potfile)),
+        "exact_unique": int(len(valid_components)),
+        "pairs": int(np.count_nonzero(selected_mask)),
+        "missing_components": missing_components,
+        "source": "topk_discovery_full_scaling",
+        "score_fraction": float(np.mean(score_fraction)) if score_fraction.size else 0.0,
+        "candidate_galaxies": int(candidates.size),
+        "n_images": int(n_images),
+        "k": int(k_requested),
+        "k_valid": int(k_valid),
+        "ranked_component_indices": np.asarray(ranked_components, dtype=np.int32),
+        "ranked_scores": np.asarray(ranked_scores, dtype=float),
+    }
+
+
+def _topk_discovery_svi_final_log_message(
+    final_union_diag: Mapping[str, Any],
+    *,
+    final_engine: str,
+    final_polish_steps: int,
+    fallback_k: int = 10,
+) -> str:
+    return (
+        "[topk-discovery:svi-final] "
+        f"k={int(final_union_diag.get('k', fallback_k))} "
+        f"candidate_galaxies={int(final_union_diag.get('candidate_galaxies', 0))} "
+        f"images={int(final_union_diag.get('n_images', 0))} "
+        f"pairs={int(final_union_diag.get('pairs', 0))} "
+        f"unique_topk={int(final_union_diag.get('exact_unique', 0))} "
+        f"independent_candidates={int(final_union_diag.get('count', 0))} "
+        f"score_fraction={float(final_union_diag.get('score_fraction', 0.0)):.4g} "
+        f"final_engine={final_engine} "
+        f"final_svi_polish_steps={int(final_polish_steps)}"
+    )
+
+
+def _topk_discovery_final_model_counts(evaluator: Any) -> dict[str, Any]:
+    active_set = {int(value) for value in np.asarray(getattr(evaluator, "active_scaling_component_indices", [])).reshape(-1)}
+    exact_set = {int(value) for value in np.asarray(getattr(evaluator, "exact_scaling_component_indices", [])).reshape(-1)}
+    independent_set = {
+        int(value) for value in np.asarray(getattr(evaluator, "independent_scaling_component_indices", [])).reshape(-1)
+    }
+    free_set = {
+        int(value) for value in np.asarray(getattr(evaluator, "free_correction_scaling_component_indices", [])).reshape(-1)
+    }
+    cached_set = {int(value) for value in np.asarray(getattr(evaluator, "cached_scaling_component_indices", [])).reshape(-1)}
+    scaling_set = {int(value) for value in np.asarray(getattr(evaluator, "scaling_component_indices", [])).reshape(-1)}
+    return {
+        "active_scaling": _count_items(getattr(evaluator, "active_scaling_component_indices", [])),
+        "exact_scaling": _count_items(getattr(evaluator, "exact_scaling_component_indices", [])),
+        "cached_scaling": _count_items(getattr(evaluator, "cached_scaling_component_indices", [])),
+        "independent_scaling": _count_items(getattr(evaluator, "independent_scaling_component_indices", [])),
+        "free_correction_candidates": _count_items(getattr(evaluator, "free_correction_scaling_component_indices", [])),
+        "large_exact": _count_items(getattr(evaluator, "large_component_indices", [])),
+        "total_scaling": _count_items(getattr(evaluator, "scaling_component_indices", [])),
+        "topk_discovery_final_strict_active": bool(
+            active_set == exact_set == independent_set == free_set and cached_set == (scaling_set - independent_set)
+        ),
+        "active_equals_independent": bool(active_set == independent_set),
+    }
+
+
+def _topk_discovery_final_model_log_message(
+    counts: Mapping[str, Any],
+    *,
+    old_parameter_count: int,
+    new_parameter_count: int,
+) -> str:
+    strict_active = "yes" if bool(counts.get("topk_discovery_final_strict_active", False)) else "no"
+    active_equals_independent = "yes" if bool(counts.get("active_equals_independent", False)) else "no"
+    return (
+        "[topk-discovery:final-model] "
+        f"active_scaling={int(counts.get('active_scaling', 0))} "
+        f"exact_scaling={int(counts.get('exact_scaling', 0))} "
+        f"cached_scaling={int(counts.get('cached_scaling', 0))} "
+        f"independent_scaling={int(counts.get('independent_scaling', 0))} "
+        f"free_correction_candidates={int(counts.get('free_correction_candidates', 0))} "
+        f"large_exact={int(counts.get('large_exact', 0))} "
+        f"total_scaling={int(counts.get('total_scaling', 0))} "
+        f"topk_discovery_final_strict_active={strict_active} "
+        f"active_equals_independent={active_equals_independent} "
+        f"old_parameters={int(old_parameter_count)} "
+        f"new_parameters={int(new_parameter_count)}"
+    )
+
+
+def _topk_discovery_svi_final_diagnostics(
+    final_union_diag: Mapping[str, Any],
+    final_rebuild_diag: Mapping[str, Any],
+    final_model_counts: Mapping[str, Any],
+    *,
+    final_engine: str,
+    final_polish_steps: int,
+) -> dict[str, Any]:
+    return {
+        "topk_discovery_svi_final_k": int(final_union_diag.get("k", 0)),
+        "topk_discovery_svi_final_k_valid": int(final_union_diag.get("k_valid", 0)),
+        "topk_discovery_svi_final_candidate_galaxies": int(final_union_diag.get("candidate_galaxies", 0)),
+        "topk_discovery_svi_final_images": int(final_union_diag.get("n_images", 0)),
+        "topk_discovery_svi_final_pairs": int(final_union_diag.get("pairs", 0)),
+        "topk_discovery_svi_final_unique_topk": int(final_union_diag.get("exact_unique", 0)),
+        "topk_discovery_svi_final_independent_candidates": int(final_rebuild_diag.get("count", 0)),
+        "topk_discovery_svi_final_score_fraction": float(final_union_diag.get("score_fraction", 0.0)),
+        "topk_discovery_svi_final_engine": str(final_engine),
+        "topk_discovery_svi_final_polish_steps": int(final_polish_steps),
+        "topk_discovery_final_strict_active": bool(
+            final_model_counts.get("topk_discovery_final_strict_active", False)
+        ),
+        "topk_discovery_final_active_equals_independent": bool(
+            final_model_counts.get("active_equals_independent", False)
+        ),
+        **{
+            f"topk_discovery_final_model_{key}": int(value)
+            for key, value in final_model_counts.items()
+            if isinstance(value, (int, np.integer)) and not isinstance(value, bool)
+        },
+    }
+
+
+def _transfer_theta_by_sample_name(
+    old_specs: list[ParameterSpec],
+    old_theta: np.ndarray,
+    new_specs: list[ParameterSpec],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    old_theta_array = np.asarray(old_theta, dtype=float)
+    old_by_name = {
+        str(spec.sample_name): float(old_theta_array[idx])
+        for idx, spec in enumerate(old_specs)
+        if idx < old_theta_array.size and np.isfinite(float(old_theta_array[idx]))
+    }
+    transferred = _default_theta(new_specs)
+    copied = 0
+    initialized = 0
+    for idx, spec in enumerate(new_specs):
+        value = old_by_name.get(str(spec.sample_name))
+        if value is None:
+            initialized += 1
+            continue
+        transferred[idx] = value
+        copied += 1
+    transferred = _clip_theta_to_support(
+        transferred,
+        new_specs,
+        boundary_frac=DEFAULT_NUTS_INIT_BOUNDARY_FRAC,
+    )
+    return transferred, {
+        "copied": int(copied),
+        "initialized": int(initialized),
+        "old_parameter_count": int(len(old_specs)),
+        "new_parameter_count": int(len(new_specs)),
+    }
+
+
+def _transfer_posterior_samples_by_sample_name(
+    posterior: PosteriorResults,
+    old_specs: list[ParameterSpec],
+    new_specs: list[ParameterSpec],
+) -> PosteriorResults:
+    samples = np.asarray(posterior.samples, dtype=float)
+    if samples.ndim != 2:
+        return posterior
+    old_by_name = {str(spec.sample_name): idx for idx, spec in enumerate(old_specs)}
+    default = _default_theta(new_specs)
+    transferred = np.tile(default[None, :], (samples.shape[0], 1))
+    for new_idx, spec in enumerate(new_specs):
+        old_idx = old_by_name.get(str(spec.sample_name))
+        if old_idx is not None and old_idx < samples.shape[1]:
+            transferred[:, new_idx] = samples[:, old_idx]
+    transferred = _clip_theta_matrix_to_support(transferred, new_specs)
+    grouped_samples = posterior.grouped_samples
+    if grouped_samples is not None:
+        grouped = np.asarray(grouped_samples, dtype=float)
+        if grouped.ndim >= 3:
+            grouped_transferred = np.broadcast_to(default, (*grouped.shape[:-1], default.size)).copy()
+            for new_idx, spec in enumerate(new_specs):
+                old_idx = old_by_name.get(str(spec.sample_name))
+                if old_idx is not None and old_idx < grouped.shape[-1]:
+                    grouped_transferred[..., new_idx] = grouped[..., old_idx]
+            grouped_samples = grouped_transferred
+    return replace(
+        posterior,
+        samples=np.asarray(transferred, dtype=float),
+        grouped_samples=grouped_samples,
+    )
+
+
+def _rebuild_topk_discovery_state_from_union(
+    args: argparse.Namespace,
+    old_state: BuildState,
+    old_theta: np.ndarray,
+    selected_by_potfile: list[set[int]],
+    *,
+    reason: str,
+) -> tuple[BuildState, ClusterJAXEvaluator, Any, np.ndarray, dict[str, Any]]:
+    normalized = _normalize_selected_by_potfile(selected_by_potfile, len(getattr(old_state, "potfiles", [])))
+    old_components = _selected_component_set_from_state(old_state)
+    new_state = _build_state_from_inputs(
+        args,
+        fit_mode_override=str(getattr(old_state, "fit_mode", getattr(args, "fit_mode", FIT_MODE_JOINT))),
+        previous_stage_best_values=getattr(old_state, "previous_stage_best_values", None),
+        frozen_active_scaling_component_indices=getattr(old_state, "frozen_active_scaling_component_indices", None),
+        topk_discovery_independent_override_by_potfile=normalized,
+    )
+    requested_components = _selected_by_potfile_component_set(new_state, normalized)
+    if str(reason) == "topk_discovery_final":
+        new_state = replace(
+            new_state,
+            frozen_active_scaling_component_indices=np.asarray(sorted(requested_components), dtype=np.int32),
+            active_scaling_frozen_from_previous_stage=False,
+            active_scaling_frozen_source_run_dir=None,
+            active_scaling_frozen_source_path=None,
+        )
+    new_theta, transfer_diag = _transfer_theta_by_sample_name(
+        list(getattr(old_state, "parameter_specs", [])),
+        np.asarray(old_theta, dtype=float),
+        list(getattr(new_state, "parameter_specs", [])),
+    )
+    new_init_values = {
+        str(spec.sample_name): float(new_theta[idx])
+        for idx, spec in enumerate(new_state.parameter_specs)
+    }
+    new_state = replace(new_state, svi_init_values=new_init_values)
+    evaluator = _build_cluster_evaluator_from_args(args, new_state)
+    strict_diag: dict[str, Any] = {}
+    if str(reason) == "topk_discovery_final":
+        strict_diag = _validate_topk_discovery_strict_final_partition(
+            evaluator,
+            requested_components,
+            reason=str(reason),
+        )
+    sample_model = _posterior_model(new_state.parameter_specs, evaluator)
+    new_components = _selected_component_set_from_state(new_state)
+    diagnostics = {
+        "reason": str(reason),
+        "count": int(len(new_components)),
+        "added": int(len(new_components - old_components)),
+        "removed": int(len(old_components - new_components)),
+        "retained": int(len(new_components & old_components)),
+        "requested_components": int(len(requested_components)),
+        "counts_by_potfile": _selected_by_potfile_counts(new_state, normalized),
+        "strict_active": bool(strict_diag.get("strict_active", False)),
+        "active_equals_independent": bool(strict_diag.get("active_equals_independent", False)),
+        **{f"theta_transfer_{key}": value for key, value in transfer_diag.items()},
+    }
+    return new_state, evaluator, sample_model, new_theta, diagnostics
+
+
 _SVI_REFRESH_MAX_ARRAYS = 64
 _SVI_REFRESH_MAX_VALUES_PER_ARRAY = 256
 _SVI_REFRESH_TOP_PARAMETER_CHANGES = 3
@@ -9117,6 +10290,11 @@ def _svi_refresh_cache_snapshot(
 
 
 def _svi_refresh_evaluator_snapshot(evaluator: Any) -> dict[str, _SviRefreshCacheSnapshot]:
+    source_metric_enabled = not (
+        str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)) == SAMPLE_LIKELIHOOD_SOURCE
+        and str(getattr(evaluator, "source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION))
+        == SOURCE_PLANE_COVARIANCE_MODE_UNIT
+    )
     return {
         "surrogate": _svi_refresh_cache_snapshot(
             getattr(evaluator, "surrogate_cache_by_z", {}),
@@ -9130,6 +10308,7 @@ def _svi_refresh_evaluator_snapshot(evaluator: Any) -> dict[str, _SviRefreshCach
         "source_metric": _svi_refresh_cache_snapshot(
             getattr(evaluator, "source_metric_cache_by_z", {}),
             getattr(evaluator, "source_metric_reference_params", None),
+            enabled=source_metric_enabled,
         ),
     }
 
@@ -9166,6 +10345,13 @@ def _log_evaluator_memory_shape_diagnostics(
         for name, snapshot in cache_snapshot.items()
     ]
     sample_likelihood_mode = str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))
+    jacobian_surrogate_enabled = bool(
+        getattr(evaluator, "surrogate_enabled", False)
+        and _flat_surrogate_refresh_needs_inactive_jacobian(
+            sample_likelihood_mode,
+            sampling_engine=str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)),
+        )
+    )
     _log(
         args,
         (
@@ -9179,9 +10365,10 @@ def _log_evaluator_memory_shape_diagnostics(
             f"y_obs_ndim={','.join(str(value) for value in sorted(y_ndims)) if y_ndims else 'none'} "
             f"obs_nbytes={_format_mb_from_bytes(x_nbytes + y_nbytes)} "
             f"surrogate_enabled={bool(getattr(evaluator, 'surrogate_enabled', False))} "
-            f"jacobian_surrogate={bool(getattr(evaluator, 'surrogate_enabled', False) and _sample_likelihood_uses_image_plane_jacobian(sample_likelihood_mode))} "
+            f"jacobian_surrogate={jacobian_surrogate_enabled} "
             f"active_scaling={len(getattr(evaluator, 'active_scaling_component_indices', []))} "
-            f"inactive_scaling={len(getattr(evaluator, 'inactive_scaling_component_indices', []))} "
+            f"cached_scaling={len(getattr(evaluator, 'cached_scaling_component_indices', getattr(evaluator, 'inactive_scaling_component_indices', [])))} "
+            f"free_correction={len(getattr(evaluator, 'free_correction_scaling_component_indices', []))} "
             f"cache_mb={' '.join(cache_parts)}"
         ),
     )
@@ -9347,9 +10534,12 @@ def _classify_svi_refresh_cache_delta(label: str, delta: _SviRefreshCacheDelta) 
 
 def _svi_refresh_cache_status_rows(
     deltas: dict[str, _SviRefreshCacheDelta],
+    after: dict[str, _SviRefreshCacheSnapshot] | None = None,
 ) -> list[_SviRefreshCacheStatus]:
-    rows = [_classify_svi_refresh_cache_delta(label, deltas[label]) for label in ("surrogate", "scaling", "source_metric")]
-    for label in ("surrogate", "scaling", "source_metric"):
+    del after
+    ordered_labels = [label for label in ("surrogate", "scaling", "source_metric") if label in deltas]
+    rows = [_classify_svi_refresh_cache_delta(label, deltas[label]) for label in ordered_labels]
+    for label in ordered_labels:
         delta = deltas[label]
         if delta.enabled and (delta.added_arrays or delta.removed_arrays or delta.shape_changed_arrays):
             rows.append(
@@ -9529,8 +10719,9 @@ def _svi_refresh_status_log_payload(
     deltas = {
         label: _svi_refresh_cache_delta(before[label], after[label])
         for label in ("surrogate", "scaling", "source_metric")
+        if label in before and label in after
     }
-    rows = _svi_refresh_cache_status_rows(deltas)
+    rows = _svi_refresh_cache_status_rows(deltas, after)
     return (
         _format_svi_refresh_status_message(
             reason=reason,
@@ -9913,8 +11104,6 @@ def _nuts_initialization_from_svi_center(
         "strategy_used": "svi",
         "svi_used": True,
         **svi_diagnostics,
-        "potfile_mass_size_reparam_enabled": bool(_potfile_mass_size_group_count(parameter_specs) > 0),
-        "potfile_mass_size_reparam_group_count": int(_potfile_mass_size_group_count(parameter_specs)),
         "svi_chain_seed_labels": [seed.source_label for seed in chain_seeds],
         "svi_chain_start_labels": chain_start_labels,
         "chain_seed_labels": [seed.source_label for seed in chain_seeds],
@@ -9954,8 +11143,6 @@ def _nuts_initialization_from_reference(
         "strategy_requested": FIT_METHOD_NUTS,
         "strategy_used": "previous_stage",
         "svi_used": False,
-        "potfile_mass_size_reparam_enabled": bool(_potfile_mass_size_group_count(parameter_specs) > 0),
-        "potfile_mass_size_reparam_group_count": int(_potfile_mass_size_group_count(parameter_specs)),
         "nuts_init_source": "state_init_values_or_midpoint",
         "direct_nuts_chain_seed_labels": [seed.source_label for seed in chain_seeds],
         "direct_nuts_chain_start_labels": chain_start_labels,
@@ -9975,7 +11162,7 @@ def _run_svi_fit(
     state: BuildState,
     evaluator: ClusterJAXEvaluator,
     sample_model,
-) -> tuple[np.ndarray, PosteriorResults, dict[str, Any]]:
+) -> _SviFitResult:
     total_steps = int(args.svi_steps)
     refresh_every = max(1, int(getattr(args, "refresh_every", DEFAULT_REFRESH_EVERY)))
     use_blocked_refresh = total_steps > refresh_every
@@ -9993,6 +11180,15 @@ def _run_svi_fit(
     block_steps: list[int] = []
     block_refresh_count = 0
     jax_cache_clear_count = 0
+    if str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT:
+        _log(
+            args,
+            (
+                "[topk-discovery:svi] exact_flat_discovery "
+                f"scaling_galaxies={len(getattr(evaluator, 'scaling_component_indices', []))} "
+                "independent_candidates=0 refresh_rebuilds=0"
+            ),
+        )
     init_values = dict(state.svi_init_values or {})
     guide = None
     svi = None
@@ -10035,6 +11231,8 @@ def _run_svi_fit(
         if remaining_steps > 0:
             refresh_reason = f"svi_block_{block_index}"
             before_refresh = _svi_refresh_evaluator_snapshot(evaluator)
+            if getattr(evaluator, "active_inference_enabled", False):
+                evaluator.refresh_active_inference_cache(center_theta, reason=refresh_reason)
             if evaluator.surrogate_enabled:
                 evaluator.refresh_surrogate(center_theta, reason=refresh_reason)
             evaluator.refresh_scaling_scatter_cache(center_theta, reason=refresh_reason)
@@ -10066,6 +11264,18 @@ def _run_svi_fit(
     if guide is None or svi is None or svi_result is None or params is None or center_theta_previous is None:
         raise RuntimeError("SVI did not run any steps.")
     before_refresh = _svi_refresh_evaluator_snapshot(evaluator)
+    active_inference_final_refresh_skipped = bool(
+        getattr(evaluator, "active_inference_enabled", False)
+        and str(getattr(evaluator, "active_scaling_inference_likelihood", "")) == ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION
+    )
+    if getattr(evaluator, "active_inference_enabled", False):
+        if active_inference_final_refresh_skipped:
+            _log(
+                args,
+                "[active-scaling] population freeze uses last SVI active-inference cache; skipped svi_final active cache refresh",
+            )
+        else:
+            evaluator.refresh_active_inference_cache(center_theta_previous, reason="svi_final")
     if evaluator.surrogate_enabled:
         evaluator.refresh_surrogate(center_theta_previous, reason="svi_final")
     evaluator.refresh_scaling_scatter_cache(center_theta_previous, reason="svi_final")
@@ -10118,15 +11328,19 @@ def _run_svi_fit(
         "svi_final_elbo_loss": float(losses[-1]) if len(losses) else float("nan"),
         "svi_runtime_sec": float(svi_elapsed),
         "svi_init_values_used": bool(state.svi_init_values),
-        "potfile_mass_size_reparam_enabled": bool(_potfile_mass_size_group_count(state.parameter_specs) > 0),
-        "potfile_mass_size_reparam_group_count": int(_potfile_mass_size_group_count(state.parameter_specs)),
         "svi_blocked_refresh": bool(use_blocked_refresh),
         "svi_refresh_every": int(refresh_every),
         "svi_block_count": int(len(block_steps)),
         "svi_block_steps": [int(value) for value in block_steps],
         "svi_cache_refresh_count": int(block_refresh_count),
         "svi_jax_cache_clear_count": int(jax_cache_clear_count),
+        "svi_active_inference_final_refresh_skipped": bool(active_inference_final_refresh_skipped),
         "svi_block_center_shift": [float(value) for value in block_center_shift],
+        "topk_discovery_svi_exact": bool(
+            str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT
+        ),
+        "topk_discovery_svi_independent_candidates": int(len(_selected_component_set_from_state(state))),
+        "topk_discovery_svi_rebuild_count": 0,
         "direct_evaluator_startup": True,
         "requested_chains": 0,
         "retained_finite_chains": 0,
@@ -10182,7 +11396,110 @@ def _run_svi_fit(
             f"jax_cache_clears={diagnostics['svi_jax_cache_clear_count']}"
         ),
     )
-    return np.asarray(center_theta, dtype=float), posterior, diagnostics
+    return _SviFitResult(
+        best_fit=np.asarray(center_theta, dtype=float),
+        posterior=posterior,
+        diagnostics=diagnostics,
+        state=state,
+        evaluator=evaluator,
+        sample_model=sample_model,
+    )
+
+
+def _run_topk_discovery_final_svi_polish(
+    args: argparse.Namespace,
+    state: BuildState,
+    evaluator: ClusterJAXEvaluator,
+    sample_model: Any,
+    initial_theta: np.ndarray,
+    *,
+    steps: int,
+) -> tuple[np.ndarray, PosteriorResults, dict[str, Any]]:
+    polish_steps = max(0, int(steps))
+    if polish_steps <= 0:
+        raise ValueError("Top-K discovery final SVI polish requires a positive step count.")
+    initial = _clip_theta_to_support(
+        np.asarray(initial_theta, dtype=float),
+        state.parameter_specs,
+        boundary_frac=float(getattr(args, "nuts_init_boundary_frac", DEFAULT_NUTS_INIT_BOUNDARY_FRAC)),
+    )
+    init_values = {
+        str(spec.sample_name): float(initial[idx])
+        for idx, spec in enumerate(state.parameter_specs)
+        if idx < initial.size
+    }
+    _log(args, f"[topk-discovery:nuts] final_svi_polish start steps={polish_steps}")
+    guide = _make_auto_normal_guide(sample_model, state.parameter_specs, init_values)
+    svi = SVI(sample_model, guide, numpyro_optim.Adam(float(args.svi_learning_rate)), Trace_ELBO())
+    svi_result = _run_logged_phase(
+        args,
+        "topk_discovery.final_svi_polish",
+        lambda: svi.run(
+            jax.random.PRNGKey(0 if args.seed is None else int(args.seed) + 606),
+            int(polish_steps),
+            progress_bar=True,
+        ),
+    )
+    params = svi.get_params(svi_result.state)
+    median_values = guide.median(params)
+    polished_theta = _clip_theta_to_support(
+        _values_dict_to_theta(state.parameter_specs, median_values),
+        state.parameter_specs,
+        boundary_frac=float(getattr(args, "nuts_init_boundary_frac", DEFAULT_NUTS_INIT_BOUNDARY_FRAC)),
+    )
+    if not np.all(np.isfinite(polished_theta)):
+        raise ValueError("Top-K discovery final SVI polish produced non-finite guide median values.")
+    total_draws = max(1, int(args.samples) * max(1, int(args.chains)))
+    guide_samples_dict = _run_logged_phase(
+        args,
+        "topk_discovery.final_svi_polish.sample_posterior",
+        lambda: guide.sample_posterior(
+            jax.random.PRNGKey(0 if args.seed is None else int(args.seed) + 607),
+            params,
+            sample_shape=(total_draws,),
+        ),
+    )
+    guide_samples = np.stack(
+        [_site_array_for_spec(guide_samples_dict, spec) for spec in state.parameter_specs],
+        axis=-1,
+    )
+    guide_samples = _clip_theta_matrix_to_support(np.asarray(guide_samples, dtype=float), state.parameter_specs)
+    log_prob = _run_logged_phase(
+        args,
+        "topk_discovery.final_svi_polish.posterior_logprob",
+        lambda: _posterior_logprob_matrix(state.parameter_specs, evaluator, guide_samples),
+    )
+    losses = np.asarray(getattr(svi_result, "losses", np.empty((0,), dtype=float)), dtype=float)
+    center_shift = float(np.linalg.norm(polished_theta - initial))
+    diagnostics = {
+        "topk_discovery_final_svi_polish_enabled": True,
+        "topk_discovery_final_svi_polish_steps": int(polish_steps),
+        "topk_discovery_final_svi_polish_final_loss": float(losses[-1]) if losses.size else float("nan"),
+        "topk_discovery_final_svi_polish_center_shift": center_shift,
+    }
+    posterior = PosteriorResults(
+        samples=guide_samples,
+        log_prob=np.asarray(log_prob, dtype=float),
+        accept_prob=np.empty((0,), dtype=float),
+        diverging=np.empty((0,), dtype=bool),
+        num_steps=np.empty((0,), dtype=float),
+        warmup_steps=0,
+        sample_steps=total_draws,
+        num_chains=0,
+        init_diagnostics=diagnostics.copy(),
+        grouped_samples=None,
+        grouped_log_prob=None,
+        sampler="svi_polish",
+    )
+    _log(
+        args,
+        (
+            "[topk-discovery:nuts] final_svi_polish complete "
+            f"steps={polish_steps} final_loss={diagnostics['topk_discovery_final_svi_polish_final_loss']:.4g} "
+            f"center_shift={center_shift:.4g}"
+        ),
+    )
+    return np.asarray(polished_theta, dtype=float), posterior, diagnostics
 
 
 def _clip_theta_matrix_to_support(
@@ -10225,12 +11542,6 @@ def _run_numpyro_nuts_sampler(
     nuts_init.diagnostics["nuts_chain_method"] = chain_method
     nuts_init.diagnostics["nuts_chain_method_requested"] = requested_chain_method
     nuts_init.diagnostics["numpyro_print_summary"] = print_summary
-    nuts_init.diagnostics["potfile_mass_size_reparam_enabled"] = bool(
-        _potfile_mass_size_group_count(state.parameter_specs) > 0
-    )
-    nuts_init.diagnostics["potfile_mass_size_reparam_group_count"] = int(
-        _potfile_mass_size_group_count(state.parameter_specs)
-    )
     nuts_init.diagnostics["fixed_image_sigma_int_arcsec"] = (
         None
         if getattr(evaluator, "fixed_image_sigma_int_arcsec", None) is None
@@ -10250,7 +11561,6 @@ def _run_numpyro_nuts_sampler(
             f"target_accept={args.target_accept:.2f} max_tree_depth={max_tree_depth} "
             f"dense_mass={_format_nuts_dense_mass_for_log(dense_mass)} "
             f"dense_mass_structure={dense_mass_structure} print_summary={print_summary} "
-            f"potfile_mass_size_reparam_groups={_potfile_mass_size_group_count(state.parameter_specs)} "
             f"image_sigma_int_sampled={bool(getattr(evaluator, 'image_sigma_int_sampled', False))} "
             f"fixed_image_sigma_int_arcsec={getattr(evaluator, 'fixed_image_sigma_int_arcsec', None)} "
             f"initial_step_size={float(args.initial_step_size):.3g} "
@@ -10418,6 +11728,118 @@ def _blocked_nuts_parameter_blocks(parameter_specs: list[ParameterSpec]) -> tupl
     )
 
 
+_ACTIVE_BLOCK_COMPONENT_PARAM_FIELDS = (
+    "x_center_param_index",
+    "y_center_param_index",
+    "e1_param_index",
+    "e2_param_index",
+    "core_radius_param_index",
+    "cut_radius_param_index",
+    "v_disp_param_index",
+    "gamma1_param_index",
+    "gamma2_param_index",
+)
+
+
+def _valid_parameter_indices_from_component_fields(
+    packed_lens_spec: PackedLensSpec,
+    component_index: int,
+    field_names: tuple[str, ...],
+    parameter_count: int,
+) -> tuple[int, ...]:
+    if component_index < 0:
+        return ()
+    indices: list[int] = []
+    for field_name in field_names:
+        values = np.asarray(getattr(packed_lens_spec, field_name, []), dtype=np.int32)
+        if component_index >= values.size:
+            continue
+        param_index = int(values[component_index])
+        if 0 <= param_index < parameter_count:
+            indices.append(param_index)
+    return tuple(sorted(set(indices)))
+
+
+def _active_blocked_nuts_galaxy_blocks(
+    state: BuildState,
+) -> tuple[BlockedNUTSParameterBlock, ...]:
+    parameter_count = int(len(state.parameter_specs))
+    packed = state.packed_lens_spec
+    blocks: list[BlockedNUTSParameterBlock] = []
+    for record in getattr(state, "scaling_component_records", []):
+        if not bool(record.get("selected_independent", False)):
+            continue
+        component_index = int(record.get("component_index", -1))
+        free_component_index = int(record.get("free_component_index", -1))
+        indices: set[int] = set(
+            _valid_parameter_indices_from_component_fields(
+                packed,
+                free_component_index,
+                _ACTIVE_BLOCK_COMPONENT_PARAM_FIELDS,
+                parameter_count,
+            )
+        )
+        values = np.asarray(getattr(packed, "active_gate_logit_offset_param_index", []), dtype=np.int32)
+        if 0 <= component_index < values.size:
+            param_index = int(values[component_index])
+            if 0 <= param_index < parameter_count:
+                indices.add(param_index)
+        if not indices:
+            continue
+        potfile_id = str(record.get("potfile_id", "potfile"))
+        catalog_id = str(record.get("catalog_id", component_index))
+        blocks.append(
+            BlockedNUTSParameterBlock(
+                f"active_galaxy:{potfile_id}:{catalog_id}:{component_index}",
+                tuple(sorted(indices)),
+            )
+        )
+    return tuple(blocks)
+
+
+def _active_blocked_nuts_parameter_blocks(
+    state: BuildState,
+) -> tuple[BlockedNUTSParameterBlock, tuple[BlockedNUTSParameterBlock, ...]]:
+    galaxy_blocks = _active_blocked_nuts_galaxy_blocks(state)
+    active_indices = {idx for block in galaxy_blocks for idx in block.indices}
+    global_indices = tuple(idx for idx in range(len(state.parameter_specs)) if idx not in active_indices)
+    if not galaxy_blocks:
+        raise ValueError("active-blocked-nuts requires at least one selected independent-scaling galaxy with local/free parameters.")
+    if not global_indices:
+        raise ValueError("active-blocked-nuts requires at least one non-active-galaxy/global parameter block.")
+    return BlockedNUTSParameterBlock("global", global_indices), galaxy_blocks
+
+
+def _active_blocked_nuts_default_block_size(n_active_galaxies: int) -> int:
+    return max(1, min(16, int(n_active_galaxies)))
+
+
+def _active_blocked_nuts_default_library_size(n_active_galaxies: int, block_size: int) -> int:
+    return max(1, 2 * int(math.ceil(max(1, n_active_galaxies) / float(max(1, block_size)))))
+
+
+def _active_blocked_nuts_block_library(
+    galaxy_blocks: tuple[BlockedNUTSParameterBlock, ...],
+    *,
+    block_size: int,
+    library_size: int,
+    seed: int,
+) -> tuple[BlockedNUTSParameterBlock, ...]:
+    n_blocks = int(len(galaxy_blocks))
+    if n_blocks <= 0:
+        raise ValueError("active-blocked-nuts block library requires at least one galaxy block.")
+    block_size = max(1, min(int(block_size), n_blocks))
+    library_size = max(1, int(library_size))
+    rng = np.random.default_rng(int(seed))
+    library: list[BlockedNUTSParameterBlock] = []
+    for library_index in range(library_size):
+        chosen = np.asarray(rng.choice(n_blocks, size=block_size, replace=False), dtype=int)
+        indices = tuple(sorted({idx for block_index in chosen.tolist() for idx in galaxy_blocks[int(block_index)].indices}))
+        labels = ",".join(str(int(value)) for value in sorted(chosen.tolist()))
+        library.append(BlockedNUTSParameterBlock(f"active_subset:{library_index}:{labels}", indices))
+    return tuple(library)
+
+
 def _conditioned_posterior_model_for_block(
     parameter_specs: list[ParameterSpec],
     evaluator: ClusterJAXEvaluator,
@@ -10425,10 +11847,24 @@ def _conditioned_posterior_model_for_block(
     theta: np.ndarray,
 ):
     base_model = _posterior_model(parameter_specs, evaluator)
-    fixed_data = {
-        parameter_specs[idx].sample_name: jnp.asarray(float(theta[idx]), dtype=jnp.float64)
-        for idx in fixed_indices
-    }
+    fixed_set = {int(idx) for idx in fixed_indices}
+    fixed_data: dict[str, jnp.ndarray] = {}
+    for site in _parameter_sample_sites(parameter_specs):
+        site_indices = set(site.indices)
+        fixed_site_indices = fixed_set.intersection(site_indices)
+        if not fixed_site_indices:
+            continue
+        if fixed_site_indices != site_indices:
+            raise ValueError(
+                f"Conditional block split vector sample site {site.name!r}; "
+                "blocked NUTS blocks must contain either all or none of a vector sample site."
+            )
+        site_values = [float(theta[idx]) for idx in site.indices]
+        fixed_data[site.name] = (
+            jnp.asarray(site_values[0], dtype=jnp.float64)
+            if len(site_values) == 1
+            else jnp.asarray(site_values, dtype=jnp.float64)
+        )
     return numpyro.handlers.condition(base_model, data=fixed_data)
 
 
@@ -10438,20 +11874,31 @@ def _block_init_params(
     block_model,
     theta: np.ndarray,
 ) -> dict[str, jnp.ndarray]:
-    constrained_params = {
-        parameter_specs[idx].sample_name: jnp.asarray(float(theta[idx]), dtype=jnp.float64)
-        for idx in block.indices
-    }
+    block_set = {int(idx) for idx in block.indices}
+    constrained_params: dict[str, jnp.ndarray] = {}
+    for site in _parameter_sample_sites(parameter_specs):
+        site_indices = set(site.indices)
+        block_site_indices = block_set.intersection(site_indices)
+        if not block_site_indices:
+            continue
+        if block_site_indices != site_indices:
+            raise ValueError(
+                f"Blocked NUTS block {block.name!r} split vector sample site {site.name!r}; "
+                "blocks must contain either all or none of a vector sample site."
+            )
+        site_values = [float(theta[idx]) for idx in site.indices]
+        constrained_params[site.name] = (
+            jnp.asarray(site_values[0], dtype=jnp.float64)
+            if len(site_values) == 1
+            else jnp.asarray(site_values, dtype=jnp.float64)
+        )
     unconstrained = unconstrain_fn(
         block_model,
         model_args=(),
         model_kwargs={},
         params=constrained_params,
     )
-    return {
-        parameter_specs[idx].sample_name: jnp.asarray(unconstrained[parameter_specs[idx].sample_name])
-        for idx in block.indices
-    }
+    return {name: jnp.asarray(value) for name, value in unconstrained.items()}
 
 
 def _update_theta_from_block_samples(
@@ -10461,11 +11908,31 @@ def _update_theta_from_block_samples(
     samples_dict: dict[str, Any],
 ) -> np.ndarray:
     updated = np.asarray(theta, dtype=float).copy()
-    for idx in block.indices:
-        name = parameter_specs[idx].sample_name
-        values = np.asarray(samples_dict[name], dtype=float).reshape(-1)
-        if values.size:
-            updated[idx] = float(values[-1])
+    block_set = {int(idx) for idx in block.indices}
+    for site in _parameter_sample_sites(parameter_specs):
+        site_indices = set(site.indices)
+        if not block_set.intersection(site_indices):
+            continue
+        if not site_indices.issubset(block_set):
+            raise ValueError(
+                f"Blocked NUTS sample update split vector sample site {site.name!r}; "
+                "blocks must contain either all or none of a vector sample site."
+            )
+        if site.name not in samples_dict:
+            fallback_name = parameter_specs[site.indices[0]].sample_name
+            if fallback_name not in samples_dict:
+                continue
+            values = np.asarray(samples_dict[fallback_name], dtype=float)
+        else:
+            values = np.asarray(samples_dict[site.name], dtype=float)
+        if values.size == 0:
+            continue
+        if len(site.indices) == 1:
+            updated[site.indices[0]] = float(values.reshape(-1)[-1])
+            continue
+        last = np.asarray(values.reshape((-1, len(site.indices)))[-1], dtype=float)
+        for offset, idx in enumerate(site.indices):
+            updated[idx] = float(last[offset])
     return _clip_theta_to_support(updated, parameter_specs, boundary_frac=DEFAULT_NUTS_INIT_BOUNDARY_FRAC)
 
 
@@ -10531,6 +11998,126 @@ def _run_block_nuts_once(
     samples_dict = mcmc.get_samples(group_by_chain=False)
     extra = mcmc.get_extra_fields(group_by_chain=False)
     updated_theta = _update_theta_from_block_samples(theta, parameter_specs, block, samples_dict)
+    last_state = mcmc.last_state
+    adapt_state = getattr(last_state, "adapt_state", None)
+    adapted = {
+        "step_size": float(np.asarray(adapt_state.step_size)) if adapt_state is not None else float(args.initial_step_size),
+        "inverse_mass_matrix": (
+            _copy_inverse_mass_matrix(adapt_state.inverse_mass_matrix)
+            if adapt_state is not None
+            else None
+        ),
+    }
+    metrics = {
+        "accept_prob": _block_extra_scalar(extra, "accept_prob"),
+        "diverging": bool(_block_extra_scalar(extra, "diverging", 0.0)),
+        "num_steps": _block_extra_scalar(extra, "num_steps", 0.0),
+        "potential_energy": _block_extra_scalar(extra, "potential_energy"),
+    }
+    del mcmc, samples_dict, extra
+    gc.collect()
+    return updated_theta, metrics, adapted
+
+
+def _scalar_index_block_posterior_model(
+    parameter_specs: list[ParameterSpec],
+    evaluator: ClusterJAXEvaluator,
+    block_dim: int,
+):
+    block_dim = int(block_dim)
+    if block_dim <= 0:
+        raise ValueError("active-blocked-nuts scalar block dimension must be positive.")
+
+    def model(block_indices: jnp.ndarray, fixed_theta: jnp.ndarray):
+        sampled_values = numpyro.sample(
+            "active_block_theta",
+            dist.ImproperUniform(dist.constraints.real, (), event_shape=(block_dim,)),
+        )
+        theta_current = fixed_theta.at[jnp.asarray(block_indices, dtype=jnp.int32)].set(sampled_values)
+        numpyro.factor("active_block_prior", _prior_log_prob(parameter_specs, theta_current))
+        numpyro.factor("position_loglike", evaluator._source_loglike_fn(theta_current))
+
+    return model
+
+
+def _run_scalar_index_block_nuts_once(
+    args: argparse.Namespace,
+    parameter_specs: list[ParameterSpec],
+    block_model,
+    theta: np.ndarray,
+    block: BlockedNUTSParameterBlock,
+    rng_key: jax.Array,
+    *,
+    num_warmup: int,
+    step_size: float | None = None,
+    inverse_mass_matrix: Any | None = None,
+    adapt: bool = True,
+    phase_name: str | None = None,
+) -> tuple[np.ndarray, dict[str, float], dict[str, Any]]:
+    block_indices = tuple(int(idx) for idx in block.indices)
+    for idx in block_indices:
+        spec = parameter_specs[idx]
+        if spec.prior_kind == "hierarchical_normal":
+            raise ValueError(
+                f"active-blocked-nuts scalar block {block.name!r} cannot sample hierarchical parameter {spec.name!r}."
+            )
+    block_indices_jax = jnp.asarray(block_indices, dtype=jnp.int32)
+    fixed_theta = jnp.asarray(theta, dtype=jnp.float64)
+    constrained_params = {
+        "active_block_theta": jnp.asarray([float(theta[idx]) for idx in block_indices], dtype=jnp.float64)
+    }
+    init_params = unconstrain_fn(
+        block_model,
+        model_args=(block_indices_jax, fixed_theta),
+        model_kwargs={},
+        params=constrained_params,
+    )
+    dense_mass = _blocked_nuts_dense_mass_argument(args)
+    nuts = NUTS(
+        block_model,
+        target_accept_prob=float(args.target_accept),
+        max_tree_depth=_max_tree_depth_for_args(args),
+        step_size=float(step_size if step_size is not None else args.initial_step_size),
+        inverse_mass_matrix=None if inverse_mass_matrix is None else _copy_inverse_mass_matrix(inverse_mass_matrix),
+        adapt_step_size=bool(adapt),
+        adapt_mass_matrix=bool(adapt),
+        dense_mass=dense_mass,
+    )
+    mcmc = MCMC(
+        nuts,
+        num_warmup=int(num_warmup),
+        num_samples=1,
+        num_chains=1,
+        chain_method="sequential",
+        progress_bar=False,
+    )
+
+    def run() -> None:
+        mcmc.run(
+            rng_key,
+            block_indices_jax,
+            fixed_theta,
+            extra_fields=("accept_prob", "diverging", "num_steps", "potential_energy"),
+            init_params=init_params,
+        )
+
+    if phase_name:
+        _run_logged_phase(args, phase_name, run)
+    else:
+        run()
+    samples_dict = mcmc.get_samples(group_by_chain=False)
+    extra = mcmc.get_extra_fields(group_by_chain=False)
+    updated_theta = np.asarray(theta, dtype=float).copy()
+    active_values = np.asarray(samples_dict.get("active_block_theta"), dtype=float)
+    if active_values.size:
+        last = np.asarray(active_values.reshape((-1, len(block_indices)))[-1], dtype=float)
+        for offset, idx in enumerate(block_indices):
+            updated_theta[idx] = float(last[offset])
+    updated_theta = _clip_theta_to_support(
+        updated_theta,
+        parameter_specs,
+        boundary_frac=DEFAULT_NUTS_INIT_BOUNDARY_FRAC,
+    )
     last_state = mcmc.last_state
     adapt_state = getattr(last_state, "adapt_state", None)
     adapted = {
@@ -10786,6 +12373,289 @@ def _run_blocked_numpyro_nuts_sampler(
         args,
         (
             "[blocked-nuts] invalid-state guards "
+            f"rejections={int(getattr(evaluator, 'invalid_state_rejection_count', 0))} "
+            f"reasons={json.dumps({key: int(value) for key, value in dict(getattr(evaluator, 'invalid_state_reason_counts', {})).items() if int(value) > 0}, sort_keys=True)}"
+        ),
+    )
+    gc.collect()
+    return posterior
+
+
+def _run_active_blocked_numpyro_nuts_sampler(
+    args: argparse.Namespace,
+    state: BuildState,
+    evaluator: ClusterJAXEvaluator,
+    nuts_init: NUTSInitialization,
+) -> PosteriorResults:
+    global_block, galaxy_blocks = _active_blocked_nuts_parameter_blocks(state)
+    n_active_galaxies = int(len(galaxy_blocks))
+    block_size = int(
+        getattr(args, "active_blocked_nuts_block_size", None)
+        or _active_blocked_nuts_default_block_size(n_active_galaxies)
+    )
+    block_size = max(1, min(block_size, n_active_galaxies))
+    library_size = int(
+        getattr(args, "active_blocked_nuts_block_library_size", None)
+        or _active_blocked_nuts_default_library_size(n_active_galaxies, block_size)
+    )
+    cycles = int(getattr(args, "active_blocked_nuts_cycles", None) or args.samples)
+    global_period = int(getattr(args, "active_blocked_nuts_global_period", 1))
+    pilot_warmup = int(getattr(args, "blocked_nuts_pilot_warmup", None) or args.warmup)
+    if cycles <= 0:
+        raise ValueError("--active-blocked-nuts-cycles must be positive.")
+    if global_period <= 0:
+        raise ValueError("--active-blocked-nuts-global-period must be positive.")
+    if pilot_warmup < 0:
+        raise ValueError("--blocked-nuts-pilot-warmup must be non-negative.")
+
+    base_seed = 0 if args.seed is None else int(args.seed)
+    active_library = _active_blocked_nuts_block_library(
+        galaxy_blocks,
+        block_size=block_size,
+        library_size=library_size,
+        seed=base_seed + 7103,
+    )
+    active_block_dims = sorted({int(len(block.indices)) for block in active_library})
+    if len(active_block_dims) != 1:
+        raise ValueError(
+            "active-blocked-nuts currently requires active subset blocks with one shared parameter count "
+            f"to avoid per-subset JAX compilation; observed dimensions={active_block_dims}. "
+            "Use a block size that selects candidates with a uniform parameterization."
+        )
+    active_block_model = _scalar_index_block_posterior_model(
+        state.parameter_specs,
+        evaluator,
+        active_block_dims[0],
+    )
+    all_blocks = (global_block, *active_library)
+    _log(
+        args,
+        (
+            "[active-blocked-nuts] preparing sampler "
+            f"chains={args.chains} cycles={cycles} pilot_warmup={pilot_warmup} "
+            f"active_galaxies={n_active_galaxies} block_size={block_size} "
+            f"block_library={len(active_library)} active_block_dim={active_block_dims[0]} "
+            f"global_period={global_period} "
+            f"dense_mass={_blocked_nuts_dense_mass_argument(args)} "
+            "block_conditioned_source_evaluator=False"
+        ),
+    )
+    start = time.time()
+    grouped_samples: list[np.ndarray] = []
+    grouped_accept: list[np.ndarray] = []
+    grouped_diverging: list[np.ndarray] = []
+    grouped_num_steps: list[np.ndarray] = []
+    per_block_metrics: dict[str, dict[str, list[float]]] = {
+        block.name: {"accept_prob": [], "diverging": [], "num_steps": []}
+        for block in all_blocks
+    }
+
+    chain_seeds = list(nuts_init.chain_seeds)
+    if len(chain_seeds) < int(args.chains):
+        raise ValueError("active-blocked-nuts received fewer chain seeds than requested chains.")
+
+    for chain_index in range(int(args.chains)):
+        theta = np.asarray(chain_seeds[chain_index].values, dtype=float).copy()
+        if not np.all(np.isfinite(theta)):
+            raise ValueError(f"active-blocked-nuts initializer received non-finite values for chain {chain_index + 1}.")
+        _log(args, f"[active-blocked-nuts] chain={chain_index + 1}/{args.chains} pilot warmup started")
+        rng_key = jax.random.PRNGKey(base_seed + 7303 + chain_index * 1009)
+        adapted_by_name: dict[str, dict[str, Any]] = {}
+        rng_key, global_key, active_pilot_key = jax.random.split(rng_key, 3)
+        theta, global_metrics, global_adapted = _run_block_nuts_once(
+            args,
+            state.parameter_specs,
+            evaluator,
+            theta,
+            global_block,
+            global_key,
+            num_warmup=pilot_warmup,
+            adapt=True,
+            phase_name=f"active_blocked_nuts.chain_{chain_index + 1}.pilot.{global_block.name}",
+        )
+        adapted_by_name[global_block.name] = global_adapted
+        per_block_metrics[global_block.name]["accept_prob"].append(float(global_metrics["accept_prob"]))
+        per_block_metrics[global_block.name]["diverging"].append(float(global_metrics["diverging"]))
+        per_block_metrics[global_block.name]["num_steps"].append(float(global_metrics["num_steps"]))
+
+        active_pilot_block = active_library[0]
+        theta, active_metrics, active_adapted = _run_scalar_index_block_nuts_once(
+            args,
+            state.parameter_specs,
+            active_block_model,
+            theta,
+            active_pilot_block,
+            active_pilot_key,
+            num_warmup=pilot_warmup,
+            adapt=True,
+            phase_name=f"active_blocked_nuts.chain_{chain_index + 1}.pilot.active_shared",
+        )
+        per_block_metrics[active_pilot_block.name]["accept_prob"].append(float(active_metrics["accept_prob"]))
+        per_block_metrics[active_pilot_block.name]["diverging"].append(float(active_metrics["diverging"]))
+        per_block_metrics[active_pilot_block.name]["num_steps"].append(float(active_metrics["num_steps"]))
+        for block in active_library:
+            adapted_by_name[block.name] = active_adapted
+
+        chain_samples = np.empty((cycles, len(state.parameter_specs)), dtype=float)
+        chain_accept = np.empty((cycles,), dtype=float)
+        chain_diverging = np.empty((cycles,), dtype=bool)
+        chain_num_steps = np.empty((cycles,), dtype=float)
+        report_every = max(1, cycles // 5)
+        _log(args, f"[active-blocked-nuts] chain={chain_index + 1}/{args.chains} production started")
+        for cycle in range(cycles):
+            cycle_metrics: list[dict[str, float]] = []
+            if cycle % global_period == 0:
+                rng_key, global_key = jax.random.split(rng_key)
+                adapted = adapted_by_name[global_block.name]
+                theta, metrics, _ = _run_block_nuts_once(
+                    args,
+                    state.parameter_specs,
+                    evaluator,
+                    theta,
+                    global_block,
+                    global_key,
+                    num_warmup=0,
+                    step_size=float(adapted["step_size"]),
+                    inverse_mass_matrix=adapted["inverse_mass_matrix"],
+                    adapt=False,
+                )
+                cycle_metrics.append(metrics)
+                per_block_metrics[global_block.name]["accept_prob"].append(float(metrics["accept_prob"]))
+                per_block_metrics[global_block.name]["diverging"].append(float(metrics["diverging"]))
+                per_block_metrics[global_block.name]["num_steps"].append(float(metrics["num_steps"]))
+
+            active_block = active_library[cycle % len(active_library)]
+            rng_key, active_key = jax.random.split(rng_key)
+            adapted = adapted_by_name[active_block.name]
+            theta, metrics, _ = _run_scalar_index_block_nuts_once(
+                args,
+                state.parameter_specs,
+                active_block_model,
+                theta,
+                active_block,
+                active_key,
+                num_warmup=0,
+                step_size=float(adapted["step_size"]),
+                inverse_mass_matrix=adapted["inverse_mass_matrix"],
+                adapt=False,
+            )
+            cycle_metrics.append(metrics)
+            per_block_metrics[active_block.name]["accept_prob"].append(float(metrics["accept_prob"]))
+            per_block_metrics[active_block.name]["diverging"].append(float(metrics["diverging"]))
+            per_block_metrics[active_block.name]["num_steps"].append(float(metrics["num_steps"]))
+
+            chain_samples[cycle] = theta
+            chain_accept[cycle] = float(np.nanmean([item["accept_prob"] for item in cycle_metrics]))
+            chain_diverging[cycle] = any(bool(item["diverging"]) for item in cycle_metrics)
+            chain_num_steps[cycle] = float(np.nansum([item["num_steps"] for item in cycle_metrics]))
+            if (cycle + 1) % report_every == 0 or cycle + 1 == cycles:
+                _log(args, f"[active-blocked-nuts] chain={chain_index + 1}/{args.chains} cycle={cycle + 1}/{cycles}")
+
+        grouped_samples.append(chain_samples)
+        grouped_accept.append(chain_accept)
+        grouped_diverging.append(chain_diverging)
+        grouped_num_steps.append(chain_num_steps)
+
+    grouped_samples_array = np.asarray(grouped_samples, dtype=float)
+    grouped_accept_array = np.asarray(grouped_accept, dtype=float)
+    grouped_diverging_array = np.asarray(grouped_diverging, dtype=bool)
+    grouped_num_steps_array = np.asarray(grouped_num_steps, dtype=float)
+    flat_unthinned = grouped_samples_array.reshape(-1, grouped_samples_array.shape[-1])
+    log_prob_unthinned = _run_logged_phase(
+        args,
+        "active_blocked_nuts.full_posterior_logprob",
+        lambda: _posterior_logprob_matrix(state.parameter_specs, evaluator, flat_unthinned),
+    )
+    grouped_log_prob_array = np.asarray(log_prob_unthinned, dtype=float).reshape(grouped_samples_array.shape[:2])
+    sample_finite = np.isfinite(grouped_samples_array).all(axis=(1, 2))
+    log_prob_finite = np.isfinite(grouped_log_prob_array).all(axis=1)
+    valid_chain_mask = sample_finite & log_prob_finite
+    retained_indices = np.where(valid_chain_mask)[0].astype(int).tolist()
+    dropped_indices = np.where(~valid_chain_mask)[0].astype(int).tolist()
+    if not retained_indices:
+        raise RuntimeError(
+            "All active-blocked-nuts chains produced non-finite posterior samples or log probabilities; no finite chains remain."
+        )
+    grouped_samples_array = grouped_samples_array[valid_chain_mask]
+    grouped_log_prob_array = grouped_log_prob_array[valid_chain_mask]
+    grouped_accept_array = grouped_accept_array[valid_chain_mask]
+    grouped_diverging_array = grouped_diverging_array[valid_chain_mask]
+    grouped_num_steps_array = grouped_num_steps_array[valid_chain_mask]
+    thin = max(1, int(args.thin))
+    grouped_samples_thinned = grouped_samples_array[:, ::thin, :]
+    grouped_log_prob_thinned = grouped_log_prob_array[:, ::thin]
+    samples = grouped_samples_array.reshape(-1, grouped_samples_array.shape[-1])[::thin]
+    log_prob = grouped_log_prob_array.reshape(-1)[::thin]
+    accept_prob = grouped_accept_array.reshape(-1)[::thin]
+    diverging = grouped_diverging_array.reshape(-1)[::thin]
+    num_steps = grouped_num_steps_array.reshape(-1)[::thin]
+    elapsed = time.time() - start
+    evaluator.timing_totals["nuts_runtime"] += elapsed
+    block_summaries = {
+        block_name: _summarize_blocked_nuts_metrics(values)
+        for block_name, values in per_block_metrics.items()
+    }
+    diagnostics = {
+        **nuts_init.diagnostics,
+        "sampler": "numpyro_active_blocked_nuts",
+        "active_blocked_nuts": True,
+        "dense_mass": _blocked_nuts_dense_mass_argument(args),
+        "nuts_dense_mass": _blocked_nuts_dense_mass_argument(args),
+        "nuts_dense_mass_structure": _resolved_nuts_dense_mass_structure(args),
+        "active_blocked_nuts_cycles": int(cycles),
+        "active_blocked_nuts_pilot_warmup": int(pilot_warmup),
+        "active_blocked_nuts_block_size": int(block_size),
+        "active_blocked_nuts_active_block_dim": int(active_block_dims[0]),
+        "active_blocked_nuts_active_galaxy_blocks": int(n_active_galaxies),
+        "active_blocked_nuts_block_library_size": int(len(active_library)),
+        "active_blocked_nuts_global_period": int(global_period),
+        "active_blocked_nuts_shared_active_adaptation": True,
+        "active_blocked_nuts_block_conditioned_source_evaluator": False,
+        "active_blocked_nuts_blocks": {
+            block.name: [state.parameter_specs[idx].sample_name for idx in block.indices]
+            for block in all_blocks
+        },
+        "active_blocked_nuts_block_sizes": {block.name: int(len(block.indices)) for block in all_blocks},
+        "active_blocked_nuts_block_summaries": block_summaries,
+        "requested_chains": int(args.chains),
+        "retained_finite_chains": int(len(retained_indices)),
+        "dropped_nonfinite_chains": int(len(dropped_indices)),
+        "retained_chain_indices": retained_indices,
+        "dropped_chain_indices": dropped_indices,
+        "invalid_state_rejection_count": int(getattr(evaluator, "invalid_state_rejection_count", 0)),
+        "invalid_state_reason_counts": {
+            key: int(value) for key, value in dict(getattr(evaluator, "invalid_state_reason_counts", {})).items()
+        },
+    }
+    posterior = PosteriorResults(
+        samples=samples,
+        log_prob=log_prob,
+        accept_prob=accept_prob,
+        diverging=diverging,
+        num_steps=num_steps,
+        warmup_steps=pilot_warmup,
+        sample_steps=cycles,
+        num_chains=int(len(retained_indices)),
+        init_diagnostics=diagnostics,
+        grouped_samples=grouped_samples_thinned,
+        grouped_log_prob=grouped_log_prob_thinned,
+        sampler="numpyro_active_blocked_nuts",
+    )
+    _apply_nuts_quality_gate(args, posterior, state.parameter_specs)
+    _log_posterior_summary(args, "active_blocked_nuts", posterior)
+    _log(
+        args,
+        (
+            "[active-blocked-nuts] complete "
+            f"in {_fmt_seconds(elapsed)} accept_mean={np.mean(accept_prob):.3f} "
+            f"divergences={int(np.sum(diverging))} mean_steps={np.mean(num_steps):.2f} "
+            f"retained_samples={samples.shape[0]}"
+        ),
+    )
+    _log(
+        args,
+        (
+            "[active-blocked-nuts] invalid-state guards "
             f"rejections={int(getattr(evaluator, 'invalid_state_rejection_count', 0))} "
             f"reasons={json.dumps({key: int(value) for key, value in dict(getattr(evaluator, 'invalid_state_reason_counts', {})).items() if int(value) > 0}, sort_keys=True)}"
         ),
@@ -11138,6 +13008,19 @@ def _sample_likelihood_uses_image_plane_jacobian(sample_likelihood_mode: str) ->
     }
 
 
+def _surrogate_refresh_needs_inactive_jacobian(sample_likelihood_mode: str) -> bool:
+    return _sample_likelihood_uses_image_plane_jacobian(sample_likelihood_mode)
+
+
+def _flat_surrogate_refresh_needs_inactive_jacobian(
+    sample_likelihood_mode: str,
+    *,
+    sampling_engine: str,
+) -> bool:
+    del sampling_engine
+    return _surrogate_refresh_needs_inactive_jacobian(sample_likelihood_mode)
+
+
 def _effective_image_presence_penalty_weight(
     requested_weight: float | None,
     *,
@@ -11334,12 +13217,23 @@ def _stage3_exact_image_diagnostics_enabled(args: argparse.Namespace | None, val
     )
 
 
+def _stage2_exact_image_diagnostics_enabled(args: argparse.Namespace | None, value: str | Path) -> bool:
+    return (
+        bool(getattr(args, "exact_image_diagnostics_stage2", False))
+        and _sequential_stage_name(value) == "stage2_joint"
+    )
+
+
+def _stage_exact_image_diagnostics_enabled(args: argparse.Namespace | None, value: str | Path) -> bool:
+    return _stage2_exact_image_diagnostics_enabled(args, value) or _stage3_exact_image_diagnostics_enabled(args, value)
+
+
 def _force_quick_diagnostics_for_nonfinal_stage(
     stage_args: argparse.Namespace,
     run_name: str | Path,
     exact_diagnostics_stage: str | Path | None,
 ) -> argparse.Namespace:
-    if _stage3_exact_image_diagnostics_enabled(stage_args, run_name):
+    if _stage_exact_image_diagnostics_enabled(stage_args, run_name):
         return _clone_args(stage_args, quick_diagnostics=False)
     if _is_sequential_stage_path(run_name) and not _stage_allows_exact_image_diagnostics(run_name, exact_diagnostics_stage):
         return _clone_args(stage_args, quick_diagnostics=True)
@@ -11378,6 +13272,7 @@ def _plots_only_exact_diagnostics_stage(run_dir: Path) -> str | None:
 def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFitControls]:
     fit_mode = str(getattr(args, "fit_mode", FIT_MODE_SEQUENTIAL))
     mode = str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE))
+    start_at_stage2 = bool(getattr(args, "start_at_stage2", False))
     start_at_stage3 = bool(getattr(args, "start_at_stage3", False))
     requested_stage3_mode = str(getattr(args, "stage3_image_plane_mode", STAGE3_IMAGE_PLANE_MODE_AUTO))
     if requested_stage3_mode not in STAGE3_IMAGE_PLANE_MODES:
@@ -11398,10 +13293,18 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     if stage4_sampling_engine != STAGE4_SAMPLING_ENGINE_INHERIT and fit_mode != FIT_MODE_SEQUENTIAL:
         _fail("--stage4-sampling-engine is only valid with --fit-mode sequential.")
     _validate_jax_device_controls(args)
-    if bool(getattr(args, "quick_diagnostics", False)) and bool(getattr(args, "exact_image_diagnostics_stage3", False)):
-        _fail("--exact-image-diagnostics-stage3 cannot be combined with --quick-diagnostics.")
+    if bool(getattr(args, "quick_diagnostics", False)):
+        if bool(getattr(args, "exact_image_diagnostics_stage2", False)):
+            _fail("--exact-image-diagnostics-stage2 cannot be combined with --quick-diagnostics.")
+        if bool(getattr(args, "exact_image_diagnostics_stage3", False)):
+            _fail("--exact-image-diagnostics-stage3 cannot be combined with --quick-diagnostics.")
     if _resume_mode_is_fast(args) and fit_mode != FIT_MODE_SEQUENTIAL:
         _fail("--resume fast is only valid with --fit-mode sequential.")
+    if start_at_stage2:
+        if fit_mode != FIT_MODE_SEQUENTIAL:
+            _fail("--start-at-stage2 is only valid with --fit-mode sequential.")
+        if start_at_stage3:
+            _fail("--start-at-stage2 cannot be combined with --start-at-stage3.")
     if start_at_stage3:
         if fit_mode != FIT_MODE_SEQUENTIAL:
             _fail("--start-at-stage3 is only valid with --fit-mode sequential.")
@@ -11879,8 +13782,6 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     if any(value < 0 for value in max_tree_depths):
         _fail("--max-tree-depth values must be non-negative.")
     if fit_mode == FIT_MODE_EVIDENCE_NS:
-        if bool(getattr(args, "potfile_mass_size_reparam", False)):
-            _fail("--potfile-mass-size-reparam is only supported with NumPyro SVI/NUTS samplers, not --fit-mode evidence-ns.")
         if evidence_prior_sigma is None:
             _fail("--fit-mode evidence-ns requires --evidence-source-prior-sigma-arcsec.")
         if mode != IMAGE_PLANE_MODE_NONE:
@@ -11917,6 +13818,7 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
                 svi_steps=0,
                 warmup=0,
                 samples=0,
+                sampling_refresh_runs=DEFAULT_SAMPLING_REFRESH_RUNS,
                 max_tree_depth=int(max_tree_depths[0]),
             ),
             "stage3": StageFitControls(
@@ -11924,6 +13826,7 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
                 svi_steps=0,
                 warmup=0,
                 samples=0,
+                sampling_refresh_runs=DEFAULT_SAMPLING_REFRESH_RUNS,
                 max_tree_depth=int(max_tree_depths[0]),
             ),
             "stage4": StageFitControls(
@@ -11931,6 +13834,7 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
                 svi_steps=0,
                 warmup=0,
                 samples=0,
+                sampling_refresh_runs=DEFAULT_SAMPLING_REFRESH_RUNS,
                 max_tree_depth=int(max_tree_depths[0]),
             ),
         }
@@ -11969,6 +13873,13 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     svi_steps = [int(value) for value in _stage_arg_values(getattr(args, "svi_steps", DEFAULT_SVI_STEPS), flag_name="--svi-steps")]
     warmups = [int(value) for value in _stage_arg_values(getattr(args, "warmup", DEFAULT_WARMUP), flag_name="--warmup")]
     samples = [int(value) for value in _stage_arg_values(getattr(args, "samples", DEFAULT_SAMPLES), flag_name="--samples")]
+    sampling_refresh_runs = [
+        int(value)
+        for value in _stage_arg_values(
+            getattr(args, "sampling_refresh_runs", DEFAULT_SAMPLING_REFRESH_RUNS),
+            flag_name="--sampling-refresh-runs",
+        )
+    ]
 
     invalid_fit_methods = sorted(
         set(fit_methods).difference(
@@ -11976,6 +13887,7 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
                 FIT_METHOD_SVI,
                 FIT_METHOD_SVI_NUTS,
                 FIT_METHOD_NUTS,
+                FIT_METHOD_ACTIVE_BLOCKED_NUTS,
                 FIT_METHOD_NS,
                 FIT_METHOD_SMC,
                 FIT_METHOD_MCHMC,
@@ -11993,12 +13905,32 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         _fail("--warmup values must be non-negative.")
     if any(value <= 0 for value in samples):
         _fail("--samples values must be positive.")
+    if any(value <= 0 for value in sampling_refresh_runs):
+        _fail("--sampling-refresh-runs values must be positive.")
     if getattr(args, "blocked_nuts_cycles", None) is not None and int(args.blocked_nuts_cycles) <= 0:
         _fail("--blocked-nuts-cycles must be positive when provided.")
     if getattr(args, "blocked_nuts_pilot_warmup", None) is not None and int(args.blocked_nuts_pilot_warmup) < 0:
         _fail("--blocked-nuts-pilot-warmup must be non-negative when provided.")
+    if getattr(args, "active_blocked_nuts_block_size", None) is not None and int(args.active_blocked_nuts_block_size) <= 0:
+        _fail("--active-blocked-nuts-block-size must be positive when provided.")
+    if getattr(args, "active_blocked_nuts_cycles", None) is not None and int(args.active_blocked_nuts_cycles) <= 0:
+        _fail("--active-blocked-nuts-cycles must be positive when provided.")
+    if int(getattr(args, "active_blocked_nuts_global_period", 1)) <= 0:
+        _fail("--active-blocked-nuts-global-period must be positive.")
+    if (
+        getattr(args, "active_blocked_nuts_block_library_size", None) is not None
+        and int(args.active_blocked_nuts_block_library_size) <= 0
+    ):
+        _fail("--active-blocked-nuts-block-library-size must be positive when provided.")
 
-    max_value_count = max(len(fit_methods), len(svi_steps), len(warmups), len(samples), len(max_tree_depths))
+    max_value_count = max(
+        len(fit_methods),
+        len(svi_steps),
+        len(warmups),
+        len(samples),
+        len(sampling_refresh_runs),
+        len(max_tree_depths),
+    )
     has_stage_specific_values = max_value_count >= 2
     has_three_stage_values = max_value_count == 3
     is_sequential = fit_mode == FIT_MODE_SEQUENTIAL
@@ -12021,12 +13953,12 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         )
     if has_stage_specific_values and not has_stage3_or_stage4:
         _fail(
-            "Two-value --fit-method, --svi-steps, --warmup, --samples, or --max-tree-depth is only valid with "
+            "Two-value --fit-method, --svi-steps, --warmup, --samples, --sampling-refresh-runs, or --max-tree-depth is only valid with "
             "--fit-mode sequential and an image-plane mode."
         )
     if has_three_stage_values and not (has_stage3 and has_stage4):
         _fail(
-            "Three-value --fit-method, --svi-steps, --warmup, --samples, or --max-tree-depth is only valid with "
+            "Three-value --fit-method, --svi-steps, --warmup, --samples, --sampling-refresh-runs, or --max-tree-depth is only valid with "
             "both an enabled stage 3 and a final stage-4 image-plane mode."
         )
 
@@ -12048,6 +13980,7 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
             svi_steps=int(stage_value(svi_steps, 0)),
             warmup=int(stage_value(warmups, 0)),
             samples=int(stage_value(samples, 0)),
+            sampling_refresh_runs=int(stage_value(sampling_refresh_runs, 0)),
             max_tree_depth=int(stage_value(max_tree_depths, 0)),
         ),
         "stage3": StageFitControls(
@@ -12055,6 +13988,7 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
             svi_steps=int(stage_value(svi_steps, 1)),
             warmup=int(stage_value(warmups, 1)),
             samples=int(stage_value(samples, 1)),
+            sampling_refresh_runs=int(stage_value(sampling_refresh_runs, 1)),
             max_tree_depth=int(stage_value(max_tree_depths, 1)),
         ),
         "stage4": StageFitControls(
@@ -12062,9 +13996,16 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
             svi_steps=int(stage4_value(svi_steps)),
             warmup=int(stage4_value(warmups)),
             samples=int(stage4_value(samples)),
+            sampling_refresh_runs=int(stage4_value(sampling_refresh_runs)),
             max_tree_depth=int(stage4_value(max_tree_depths)),
         ),
     }
+    if start_at_stage2 and controls["stage2"].fit_method not in {
+        FIT_METHOD_SVI,
+        FIT_METHOD_SVI_NUTS,
+        FIT_METHOD_ACTIVE_BLOCKED_NUTS,
+    }:
+        _fail("--start-at-stage2 requires stage-2 --fit-method svi or svi+nuts, or active-blocked-nuts, so SVI can initialize the stage.")
     stage4_direct_sampler_modes = {
         IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
         IMAGE_PLANE_MODE_FORWARD_METRIC,
@@ -12099,22 +14040,29 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
             "--image-plane-mode linearized-forward-beta-blocked-image-plane requires "
             "stage-4 --fit-method svi+nuts."
         )
+    active_sampling_stage_names = ["stage2"]
+    if has_stage3:
+        active_sampling_stage_names.append("stage3")
+    if has_stage4:
+        active_sampling_stage_names.append("stage4")
+    unsupported_sampling_refresh_stages = [
+        stage_name
+        for stage_name in active_sampling_stage_names
+        for controls_for_stage in (controls[stage_name],)
+        if int(controls_for_stage.sampling_refresh_runs) > 1
+        and str(controls_for_stage.fit_method) not in {FIT_METHOD_NUTS, FIT_METHOD_SVI_NUTS, FIT_METHOD_ACTIVE_BLOCKED_NUTS}
+    ]
+    if unsupported_sampling_refresh_stages:
+        _fail(
+            "--sampling-refresh-runs > 1 is currently supported only for --fit-method nuts or svi+nuts; "
+            f"unsupported stage(s): {', '.join(unsupported_sampling_refresh_stages)}."
+        )
     if smc_stages:
         if smc_stages != ["stage4"] or str(mode) not in stage4_direct_sampler_modes:
             _fail("--fit-method smc is only valid for non-blocked sequential stage 4 image-plane modes.")
     if nuts_stages:
         if nuts_stages != ["stage4"] or str(mode) not in stage4_direct_sampler_modes:
             _fail("--fit-method nuts is only valid for non-blocked sequential stage 4 image-plane modes.")
-    if bool(getattr(args, "potfile_mass_size_reparam", False)):
-        if _blocked_linearized_stage_enabled(args):
-            _fail("--potfile-mass-size-reparam is not supported with blocked linearized stage 4 NUTS.")
-        if smc_stages:
-            _fail("--potfile-mass-size-reparam is only supported with NumPyro SVI/NUTS samplers, not --fit-method smc.")
-        if microcanonical_stages:
-            _fail(
-                "--potfile-mass-size-reparam is only supported with NumPyro SVI/NUTS samplers, "
-                "not --fit-method mchmc or mclmc."
-            )
     return controls
 
 
@@ -12124,6 +14072,7 @@ def _args_with_fit_controls(args: argparse.Namespace, controls: StageFitControls
         "svi_steps": controls.svi_steps,
         "warmup": controls.warmup,
         "samples": controls.samples,
+        "sampling_refresh_runs": controls.sampling_refresh_runs,
         "max_tree_depth": controls.max_tree_depth,
     }
     payload.update(updates)
@@ -12613,19 +14562,6 @@ def _spec_sample_site_index(spec: ParameterSpec) -> int | None:
     return None if value is None else int(value)
 
 
-def _is_potfile_mass_size_spec(spec: ParameterSpec) -> bool:
-    return str(getattr(spec, "coupled_transform_kind", "none")) == COUPLED_TRANSFORM_POTFILE_MASS_SIZE
-
-
-def _potfile_mass_size_group_count(parameter_specs: list[ParameterSpec]) -> int:
-    groups = {
-        str(spec.coupled_group or spec.sample_site_name or spec.potential_id)
-        for spec in parameter_specs
-        if _is_potfile_mass_size_spec(spec)
-    }
-    return len(groups)
-
-
 @dataclass(frozen=True)
 class _SampleSiteSpec:
     name: str
@@ -12767,54 +14703,6 @@ def _site_array_for_spec(samples_dict: dict[str, Any], spec: ParameterSpec) -> n
             return values
         return np.asarray(values[..., int(site_index)], dtype=float)
     return np.asarray(samples_dict[spec.sample_name], dtype=float)
-
-
-class _PotfileMassSizeReparamDistribution(dist.Distribution):
-    arg_constraints: dict[str, Any] = {}
-    support = dist.constraints.real_vector
-    reparametrized_params: list[str] = []
-
-    def __init__(
-        self,
-        sigma_distribution: dist.Distribution,
-        cut_distribution: dist.Distribution,
-        *,
-        mass_center: float,
-        mass_scale: float,
-        size_center: float,
-        size_scale: float,
-        validate_args: bool | None = None,
-    ) -> None:
-        self.sigma_distribution = sigma_distribution
-        self.cut_distribution = cut_distribution
-        self.mass_center = jnp.asarray(float(mass_center), dtype=jnp.float64)
-        self.mass_scale = jnp.asarray(float(mass_scale), dtype=jnp.float64)
-        self.size_center = jnp.asarray(float(size_center), dtype=jnp.float64)
-        self.size_scale = jnp.asarray(float(size_scale), dtype=jnp.float64)
-        self.log_abs_det_jacobian = jnp.log(jnp.abs(0.5 * self.mass_scale * self.size_scale))
-        super().__init__(batch_shape=(), event_shape=(2,), validate_args=validate_args)
-
-    def sample(self, key: jax.Array, sample_shape: tuple[int, ...] = ()) -> jnp.ndarray:
-        sigma_key, cut_key = jax.random.split(key)
-        log_sigma = self.sigma_distribution.sample(sigma_key, sample_shape=sample_shape)
-        log_cut_gap = self.cut_distribution.sample(cut_key, sample_shape=sample_shape)
-        mass_raw = 2.0 * log_sigma + log_cut_gap
-        u_m = (mass_raw - self.mass_center) / self.mass_scale
-        u_s = (log_cut_gap - self.size_center) / self.size_scale
-        return jnp.stack([u_m, u_s], axis=-1)
-
-    def log_prob(self, value: jnp.ndarray) -> jnp.ndarray:
-        value_array = jnp.asarray(value, dtype=jnp.float64)
-        u_m = value_array[..., 0]
-        u_s = value_array[..., 1]
-        log_cut_gap = self.size_center + self.size_scale * u_s
-        mass_raw = self.mass_center + self.mass_scale * u_m
-        log_sigma = 0.5 * (mass_raw - log_cut_gap)
-        return (
-            self.sigma_distribution.log_prob(log_sigma)
-            + self.cut_distribution.log_prob(log_cut_gap)
-            + self.log_abs_det_jacobian
-        )
 
 
 def _potfile_fixed_or_nominal(value: Any, context: str) -> float:
@@ -13165,68 +15053,6 @@ def _vdisp_transform_for_component_prior(
     }
 
 
-def _latent_prior_center_scale(spec: ParameterSpec) -> tuple[float, float]:
-    if spec.prior_kind == "uniform" and np.isfinite(float(spec.lower)) and np.isfinite(float(spec.upper)):
-        lower = float(spec.lower)
-        upper = float(spec.upper)
-        width = max(upper - lower, 1.0e-12)
-        return 0.5 * (lower + upper), width / math.sqrt(12.0)
-    if spec.mean is not None and spec.std is not None and np.isfinite(float(spec.mean)) and np.isfinite(float(spec.std)):
-        return float(spec.mean), max(float(spec.std), 1.0e-12)
-    if np.isfinite(float(spec.lower)) and np.isfinite(float(spec.upper)):
-        lower = float(spec.lower)
-        upper = float(spec.upper)
-        width = max(upper - lower, 1.0e-12)
-        return 0.5 * (lower + upper), width / math.sqrt(12.0)
-    return 0.0, 1.0
-
-
-def _apply_potfile_mass_size_reparameterization(
-    specs: list[ParameterSpec],
-    field_index: dict[str, int],
-    *,
-    start_index: int,
-    potfile_id: str,
-) -> None:
-    if "sigma" not in field_index or "cutkpc" not in field_index:
-        return
-    sigma_list_index = int(field_index["sigma"]) - int(start_index)
-    cut_list_index = int(field_index["cutkpc"]) - int(start_index)
-    if sigma_list_index < 0 or cut_list_index < 0:
-        return
-    sigma_spec = specs[sigma_list_index]
-    cut_spec = specs[cut_list_index]
-    sigma_center, sigma_scale = _latent_prior_center_scale(sigma_spec)
-    cut_center, cut_scale = _latent_prior_center_scale(cut_spec)
-    mass_center = 2.0 * sigma_center + cut_center
-    mass_scale = max(math.sqrt(4.0 * sigma_scale * sigma_scale + cut_scale * cut_scale), 1.0e-12)
-    size_center = cut_center
-    size_scale = max(cut_scale, 1.0e-12)
-    site_name = _sample_name(potfile_id, "mass_size")
-    group_name = f"{potfile_id}.mass_size"
-    common = {
-        "sample_site_name": site_name,
-        "coupled_transform_kind": COUPLED_TRANSFORM_POTFILE_MASS_SIZE,
-        "coupled_group": group_name,
-        "coupled_mass_center": float(mass_center),
-        "coupled_mass_scale": float(mass_scale),
-        "coupled_size_center": float(size_center),
-        "coupled_size_scale": float(size_scale),
-    }
-    specs[sigma_list_index] = replace(
-        sigma_spec,
-        sample_site_index=0,
-        coupled_role=COUPLED_ROLE_MASS_NORM,
-        **common,
-    )
-    specs[cut_list_index] = replace(
-        cut_spec,
-        sample_site_index=1,
-        coupled_role=COUPLED_ROLE_SIZE,
-        **common,
-    )
-
-
 def _append_component_parameter_spec(
     specs: list[ParameterSpec],
     assignments: list[tuple[str, int]],
@@ -13463,7 +15289,7 @@ def _build_scaling_parameter_specs(
     potfiles: list[dict[str, Any]],
     start_index: int = 0,
     kpc_per_arcsec: float = 1.0,
-    potfile_mass_size_reparam: bool = False,
+    scaling_relation_mode: str = DEFAULT_SCALING_RELATION_MODE,
 ) -> tuple[list[ParameterSpec], list[dict[str, int]], list[str]]:
     specs: list[ParameterSpec] = []
     param_index_by_potfile: list[dict[str, int]] = []
@@ -13476,52 +15302,112 @@ def _build_scaling_parameter_specs(
         for _ in range(len(potfile["catalog_df"])):
             lens_model_list.append(ORIGINAL_DPIE_PROFILE_NAME)
         field_index: dict[str, int] = {}
-        core_radius_kpc = _potfile_core_radius_kpc(potfile, kpc_per_arcsec)
-        for field_name in ("sigma", "cutkpc", "corekpc", "vdslope", "slope"):
-            raw_value = potfile.get(field_name)
-            if field_name == "cutkpc" and raw_value is None:
-                raw_value = _scale_potfile_prior_to_kpc(potfile.get("cut"), kpc_per_arcsec)
-            elif field_name == "corekpc" and raw_value is None:
-                raw_value = _scale_potfile_prior_to_kpc(potfile.get("core"), kpc_per_arcsec)
-            decoded_prior = _decode_parameter_prior(raw_value, f"{potfile_id}.{field_name}")
-            if decoded_prior is None:
-                continue
-            prior_kind = str(decoded_prior["prior_kind"])
-            lower = float(decoded_prior["lower"])
-            upper = float(decoded_prior["upper"])
-            mean = None if decoded_prior["mean"] is None else float(decoded_prior["mean"])
-            std = None if decoded_prior["std"] is None else float(decoded_prior["std"])
-            transform_kind = "identity"
+        # Positive potfile scale parameters are sampled in log-positive latent
+        # coordinates. Their latent means/widths are chosen from the physical
+        # scales below; they are not literal physical-space truncated normals.
+        solver_priors = {
+            "sigma": {
+                "prior_kind": "truncated_normal",
+                "lower": DEFAULT_SOLVER_POTFILE_SIGMA_REF_LOWER,
+                "upper": DEFAULT_SOLVER_POTFILE_SIGMA_REF_UPPER,
+                "mean": DEFAULT_SOLVER_POTFILE_SIGMA_REF_MEAN,
+                "std": DEFAULT_SOLVER_POTFILE_SIGMA_REF_STD,
+                "step": 5.0,
+                "transform_kind": "log_positive",
+                "floor": VDISP_TRUNCATION_FLOOR_KM_S,
+            },
+            "cutkpc": {
+                "prior_kind": "truncated_normal",
+                "lower": DEFAULT_SOLVER_POTFILE_CUT_REF_LOWER_KPC,
+                "upper": DEFAULT_SOLVER_POTFILE_CUT_REF_UPPER_KPC,
+                "mean": DEFAULT_SOLVER_POTFILE_CUT_REF_MEAN_KPC,
+                "std": DEFAULT_SOLVER_POTFILE_CUT_REF_STD_KPC,
+                "step": 10.0,
+                "transform_kind": "log_positive",
+                "floor": SAFE_RADIUS_MARGIN_KPC,
+            },
+            "corekpc": {
+                "prior_kind": "truncated_normal",
+                "lower": DEFAULT_SOLVER_POTFILE_CORE_REF_LOWER_KPC,
+                "upper": DEFAULT_SOLVER_POTFILE_CORE_REF_UPPER_KPC,
+                "mean": DEFAULT_SOLVER_POTFILE_CORE_REF_MEDIAN_KPC,
+                "std": None,
+                "latent_std": DEFAULT_SOLVER_POTFILE_CORE_REF_LOG_SIGMA,
+                "step": 0.05,
+                "transform_kind": "log_positive",
+                "floor": SAFE_RADIUS_MARGIN_KPC,
+            },
+            "vdslope": {
+                "prior_kind": "truncated_normal",
+                "lower": DEFAULT_SOLVER_POTFILE_SLOPE_LOWER,
+                "upper": DEFAULT_SOLVER_POTFILE_SLOPE_UPPER,
+                "mean": DEFAULT_SOLVER_POTFILE_SLOPE_MEAN,
+                "std": DEFAULT_SOLVER_POTFILE_SLOPE_STD,
+                "step": 0.1,
+                "transform_kind": "identity",
+            },
+            "slope": {
+                "prior_kind": "truncated_normal",
+                "lower": DEFAULT_SOLVER_POTFILE_SLOPE_LOWER,
+                "upper": DEFAULT_SOLVER_POTFILE_SLOPE_UPPER,
+                "mean": DEFAULT_SOLVER_POTFILE_SLOPE_MEAN,
+                "std": DEFAULT_SOLVER_POTFILE_SLOPE_STD,
+                "step": 0.1,
+                "transform_kind": "identity",
+            },
+            "alpha_sigma": {
+                "prior_kind": "truncated_normal",
+                "lower": DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER,
+                "upper": DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER,
+                "mean": DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN,
+                "std": DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD,
+                "step": 0.02,
+                "transform_kind": "identity",
+            },
+            "gamma_ml": {
+                "prior_kind": "truncated_normal",
+                "lower": DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER,
+                "upper": DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER,
+                "mean": DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN,
+                "std": DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD,
+                "step": 0.05,
+                "transform_kind": "identity",
+            },
+        }
+        if scaling_relation_mode == SCALING_RELATION_MODE_BERGAMINI_ML:
+            scaling_fields = ("sigma", "cutkpc", "corekpc", "alpha_sigma", "gamma_ml")
+        else:
+            scaling_fields = ("sigma", "cutkpc", "corekpc", "vdslope", "slope")
+        for field_name in scaling_fields:
+            prior = solver_priors[field_name]
+            prior_kind = str(prior["prior_kind"])
+            physical_lower = float(prior["lower"])
+            physical_upper = float(prior["upper"])
+            physical_mean = float(prior["mean"])
+            physical_std = None if prior.get("std") is None else float(prior["std"])
+            lower = physical_lower
+            upper = physical_upper
+            mean = physical_mean
+            std = physical_std
+            transform_kind = str(prior["transform_kind"])
             transform_offset = 0.0
-            physical_lower = lower
-            physical_upper = upper
-            physical_mean = mean
-            physical_std = std
 
-            if field_name == "sigma":
-                transform_kind = "log_positive"
-                lower, upper, mean, std = _transform_positive_prior_to_log_space(
-                    prior_kind,
-                    lower,
-                    upper,
-                    mean,
-                    std,
-                    floor=1.0e-12,
-                    context=f"{potfile_id}.{field_name}",
-                )
-            elif field_name == "cutkpc":
-                transform_kind = "log_offset_positive"
-                transform_offset = core_radius_kpc
-                lower, upper, mean, std = _transform_offset_positive_prior_to_log_space(
-                    prior_kind,
-                    lower,
-                    upper,
-                    mean,
-                    std,
-                    offset=transform_offset,
-                    floor=1.0e-9,
-                    context=f"{potfile_id}.{field_name}",
-                )
+            if transform_kind == "log_positive":
+                if field_name == "corekpc":
+                    lower = float(np.log(physical_lower))
+                    upper = float(np.log(physical_upper))
+                    mean = float(np.log(physical_mean))
+                    std = float(prior["latent_std"])
+                else:
+                    lower, upper, mean, std = _transform_positive_prior_to_log_space(
+                        prior_kind,
+                        physical_lower,
+                        physical_upper,
+                        physical_mean,
+                        physical_std,
+                        floor=float(prior["floor"]),
+                        context=f"{potfile_id}.{field_name}",
+                    )
             index = start_index + len(specs)
             specs.append(
                 ParameterSpec(
@@ -13533,7 +15419,7 @@ def _build_scaling_parameter_specs(
                     prior_kind=prior_kind,
                     lower=float(lower),
                     upper=float(upper),
-                    step=float(decoded_prior["step"]),
+                    step=float(prior["step"]),
                     mean=mean,
                     std=std,
                     component_family="scaling",
@@ -13546,13 +15432,6 @@ def _build_scaling_parameter_specs(
                 )
             )
             field_index[field_name] = index
-        if bool(potfile_mass_size_reparam):
-            _apply_potfile_mass_size_reparameterization(
-                specs,
-                field_index,
-                start_index=start_index,
-                potfile_id=potfile_id,
-            )
         param_index_by_potfile.append(field_index)
     return specs, param_index_by_potfile, lens_model_list
 
@@ -13615,6 +15494,331 @@ def _build_scaling_scatter_parameter_specs(
             field_index[field_name] = index
         scatter_indices_by_potfile.append(field_index)
     return specs, scatter_indices_by_potfile
+
+
+def _build_independent_scaling_parameter_specs(
+    potfiles: list[dict[str, Any]],
+    selected_by_potfile: list[set[int]],
+    *,
+    start_index: int,
+    log_vdisp_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+    log_core_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
+    log_cut_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+    log_tau_prior_sigma: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+) -> tuple[list[ParameterSpec], list[dict[int, dict[str, int]]]]:
+    tau_medians = _validate_independent_scaling_log_displacement_hyperparameters(
+        log_vdisp_tau_prior_median=log_vdisp_tau_prior_median,
+        log_core_tau_prior_median=log_core_tau_prior_median,
+        log_cut_tau_prior_median=log_cut_tau_prior_median,
+        log_tau_prior_sigma=log_tau_prior_sigma,
+    )
+    tau_prior_sigma = float(log_tau_prior_sigma)
+    specs: list[ParameterSpec] = []
+    indices_by_potfile: list[dict[int, dict[str, int]]] = []
+
+    def _unit_delta_spec(
+        *,
+        name: str,
+        sample_name: str,
+        potential_id: str,
+        field_name: str,
+        site_name: str,
+        site_index: int,
+    ) -> ParameterSpec:
+        return ParameterSpec(
+            name=name,
+            sample_name=sample_name,
+            potential_id=potential_id,
+            profile_type=DP_IE_PROFILE,
+            field=field_name,
+            prior_kind="normal",
+            lower=float("-inf"),
+            upper=float("inf"),
+            step=0.1,
+            mean=0.0,
+            std=1.0,
+            component_family="independent_scaling",
+            transform_kind="identity",
+            physical_mean=0.0,
+            physical_std=1.0,
+            sample_site_name=site_name,
+            sample_site_index=int(site_index),
+        )
+
+    def _tau_spec(*, potfile_id: str, field_name: str, median: float) -> ParameterSpec:
+        return ParameterSpec(
+            name=f"{potfile_id}.{field_name}",
+            sample_name=_sample_name(potfile_id, field_name),
+            potential_id=potfile_id,
+            profile_type=DP_IE_PROFILE,
+            field=field_name,
+            prior_kind="normal",
+            lower=float("-inf"),
+            upper=float("inf"),
+            step=0.1,
+            mean=float(np.log(median)),
+            std=tau_prior_sigma,
+            component_family="independent_scaling",
+            transform_kind="log_positive",
+            physical_lower=0.0,
+            physical_mean=float(median),
+        )
+
+    for potfile_order, potfile in enumerate(potfiles):
+        selected_rows = sorted(selected_by_potfile[potfile_order]) if potfile_order < len(selected_by_potfile) else []
+        row_indices: dict[int, dict[str, int]] = {}
+        if not selected_rows:
+            indices_by_potfile.append(row_indices)
+            continue
+        potfile_id = str(potfile["id"])
+        catalog_df = potfile["catalog_df"]
+        catalog_ids = catalog_df["id"].astype(str).tolist()
+        site_names = {
+            "independent_free_log_v_disp_delta_unit": _sample_name(potfile_id, "independent_free_log_v_disp_delta_unit"),
+            "independent_free_log_core_radius_delta_unit": _sample_name(potfile_id, "independent_free_log_core_radius_delta_unit"),
+            "independent_free_log_cut_radius_delta_unit": _sample_name(potfile_id, "independent_free_log_cut_radius_delta_unit"),
+        }
+        tau_indices: dict[str, int] = {}
+        for field_name, median in (
+            ("independent_free_log_v_disp_tau", tau_medians[0]),
+            ("independent_free_log_core_radius_tau", tau_medians[1]),
+            ("independent_free_log_cut_radius_tau", tau_medians[2]),
+        ):
+            tau_indices[field_name] = start_index + len(specs)
+            specs.append(_tau_spec(potfile_id=potfile_id, field_name=field_name, median=float(median)))
+        for site_index, row_index in enumerate(selected_rows):
+            catalog_id = str(catalog_ids[int(row_index)])
+            row_lookup = dict(tau_indices)
+            for field_name in (
+                "independent_free_log_v_disp_delta_unit",
+                "independent_free_log_core_radius_delta_unit",
+                "independent_free_log_cut_radius_delta_unit",
+            ):
+                index = start_index + len(specs)
+                specs.append(
+                    _unit_delta_spec(
+                        name=f"{potfile_id}.{catalog_id}.{field_name}",
+                        sample_name=_sample_name(f"{potfile_id}.{catalog_id}", field_name),
+                        potential_id=potfile_id,
+                        field_name=field_name,
+                        site_name=site_names[field_name],
+                        site_index=site_index,
+                    )
+                )
+                row_lookup[field_name] = index
+            row_indices[int(row_index)] = row_lookup
+        indices_by_potfile.append(row_indices)
+    return specs, indices_by_potfile
+
+
+def _validate_active_scaling_hyperparameters(
+    *,
+    prior_prob: float | None,
+    logit_prior_sigma: float,
+    mag_slope_prior_sigma: float,
+    local_logit_prior_sigma: float,
+    freeze_threshold: float | None = None,
+) -> tuple[float | None, float, float, float]:
+    prior_logit = None
+    if prior_prob is not None:
+        prior_logit = _logit_probability(prior_prob, context="--active-scaling-prior-prob")
+    logit_sigma = float(logit_prior_sigma)
+    slope_sigma = float(mag_slope_prior_sigma)
+    local_sigma = float(local_logit_prior_sigma)
+    if not np.isfinite(logit_sigma) or logit_sigma <= 0.0:
+        raise ValueError("--active-scaling-logit-prior-sigma must be finite and positive.")
+    if not np.isfinite(slope_sigma) or slope_sigma <= 0.0:
+        raise ValueError("--active-scaling-mag-slope-prior-sigma must be finite and positive.")
+    if not np.isfinite(local_sigma) or local_sigma <= 0.0:
+        raise ValueError("--active-scaling-local-logit-prior-sigma must be finite and positive.")
+    if freeze_threshold is not None:
+        threshold = float(freeze_threshold)
+        if not np.isfinite(threshold) or threshold < 0.0 or threshold > 1.0:
+            raise ValueError("--active-scaling-freeze-threshold must be finite and in [0, 1].")
+    return prior_logit, logit_sigma, slope_sigma, local_sigma
+
+
+def _active_scaling_prior_prob_for_potfile(
+    potfile_order: int,
+    potfile: dict[str, Any],
+    explicit_prior_prob: float | None,
+    active_selected_counts: dict[str, int] | None,
+) -> float:
+    if explicit_prior_prob is not None:
+        return float(explicit_prior_prob)
+    potfile_id = str(potfile.get("id", f"potfile{potfile_order}"))
+    catalog_df = potfile.get("catalog_df")
+    n_catalog = int(len(catalog_df)) if catalog_df is not None else 0
+    if n_catalog <= 0:
+        return 0.5
+    selected = int((active_selected_counts or {}).get(potfile_id, min(DEFAULT_ACTIVE_SCALING_GALAXIES, n_catalog)))
+    return float(np.clip(selected / float(n_catalog), 1.0e-3, 1.0 - 1.0e-3))
+
+
+def _build_active_scaling_parameter_specs(
+    potfiles: list[dict[str, Any]],
+    scaling_component_records: list[dict[str, Any]],
+    *,
+    start_index: int,
+    prior_prob: float | None,
+    logit_prior_sigma: float,
+    mag_slope_prior_sigma: float,
+    local_logit_prior_sigma: float,
+    active_selected_counts: dict[str, int] | None = None,
+    freeze_threshold: float | None = None,
+) -> tuple[list[ParameterSpec], dict[int, dict[str, int]]]:
+    _prior_logit, logit_sigma, slope_sigma, local_sigma = _validate_active_scaling_hyperparameters(
+        prior_prob=prior_prob,
+        logit_prior_sigma=logit_prior_sigma,
+        mag_slope_prior_sigma=mag_slope_prior_sigma,
+        local_logit_prior_sigma=local_logit_prior_sigma,
+        freeze_threshold=freeze_threshold,
+    )
+    records = [dict(record) for record in scaling_component_records]
+    specs: list[ParameterSpec] = []
+    indices_by_component: dict[int, dict[str, int]] = {}
+    if not records:
+        return specs, indices_by_component
+
+    mag_slope_index = start_index + len(specs)
+    specs.append(
+        ParameterSpec(
+            name="active_scaling.mag_slope",
+            sample_name="active_scaling_mag_slope",
+            potential_id="active_scaling",
+            profile_type=DP_IE_PROFILE,
+            field="active_gate_mag_slope",
+            prior_kind="truncated_normal",
+            lower=0.0,
+            upper=float("inf"),
+            step=0.1,
+            mean=0.0,
+            std=float(slope_sigma),
+            component_family=ACTIVE_SCALING_GATE_COMPONENT_FAMILY,
+            transform_kind="identity",
+            physical_lower=0.0,
+            physical_upper=None,
+            physical_mean=0.0,
+            physical_std=float(slope_sigma),
+        )
+    )
+
+    records_by_potfile: dict[int, list[dict[str, Any]]] = {}
+    for record in records:
+        records_by_potfile.setdefault(int(record.get("potfile_order", -1)), []).append(record)
+
+    for potfile_order, potfile in enumerate(potfiles):
+        potfile_records = sorted(
+            records_by_potfile.get(int(potfile_order), []),
+            key=lambda item: (int(item.get("catalog_row_index", 0)), int(item.get("component_index", -1))),
+        )
+        if not potfile_records:
+            continue
+        potfile_id = str(potfile.get("id", f"potfile{potfile_order}"))
+        potfile_prior_prob = _active_scaling_prior_prob_for_potfile(
+            potfile_order,
+            potfile,
+            prior_prob,
+            active_selected_counts,
+        )
+        intercept_index = start_index + len(specs)
+        specs.append(
+            ParameterSpec(
+                name=f"{potfile_id}.active_gate_intercept",
+                sample_name=_sample_name(potfile_id, "active_gate_intercept"),
+                potential_id=potfile_id,
+                profile_type=int(potfile.get("type", DP_IE_PROFILE)),
+                field="active_gate_intercept",
+                prior_kind="normal",
+                lower=float("-inf"),
+                upper=float("inf"),
+                step=0.1,
+                mean=_logit_probability(potfile_prior_prob, context=f"active-scaling prior probability for {potfile_id}"),
+                std=float(logit_sigma),
+                component_family=ACTIVE_SCALING_GATE_COMPONENT_FAMILY,
+                transform_kind="identity",
+                physical_mean=_logit_probability(
+                    potfile_prior_prob,
+                    context=f"active-scaling prior probability for {potfile_id}",
+                ),
+                physical_std=float(logit_sigma),
+            )
+        )
+        offset_site_name = _sample_name(potfile_id, "active_gate_logit_offset")
+        for site_index, record in enumerate(potfile_records):
+            component_index = int(record.get("component_index", -1))
+            catalog_id = str(record.get("catalog_id", component_index))
+            offset_index = start_index + len(specs)
+            specs.append(
+                ParameterSpec(
+                    name=f"{potfile_id}.{catalog_id}.active_gate_logit_offset",
+                    sample_name=_sample_name(f"{potfile_id}.{catalog_id}", "active_gate_logit_offset"),
+                    potential_id=potfile_id,
+                    profile_type=int(potfile.get("type", DP_IE_PROFILE)),
+                    field="active_gate_logit_offset",
+                    prior_kind="normal",
+                    lower=float("-inf"),
+                    upper=float("inf"),
+                    step=0.1,
+                    mean=0.0,
+                    std=float(local_sigma),
+                    component_family=ACTIVE_SCALING_GATE_COMPONENT_FAMILY,
+                    transform_kind="identity",
+                    physical_mean=0.0,
+                    physical_std=float(local_sigma),
+                    sample_site_name=offset_site_name,
+                    sample_site_index=int(site_index),
+                )
+            )
+            indices_by_component[component_index] = {
+                "active_gate_intercept": int(intercept_index),
+                "active_gate_mag_slope": int(mag_slope_index),
+                "active_gate_logit_offset": int(offset_index),
+            }
+    return specs, indices_by_component
+
+
+def _packed_lens_spec_with_active_scaling_gates(
+    packed_lens_spec: PackedLensSpec,
+    scaling_component_records: list[dict[str, Any]],
+    active_scaling_indices: dict[int, dict[str, int]],
+) -> tuple[PackedLensSpec, list[dict[str, Any]]]:
+    n_components = int(np.asarray(packed_lens_spec.profile_type).size)
+    intercept_indices = np.full(n_components, -1, dtype=np.int32)
+    slope_indices = np.full(n_components, -1, dtype=np.int32)
+    offset_indices = np.full(n_components, -1, dtype=np.int32)
+    magnitude_features = np.zeros(n_components, dtype=float)
+    updated_records: list[dict[str, Any]] = []
+    for record in scaling_component_records:
+        item = dict(record)
+        component_index = int(item.get("component_index", -1))
+        lookup = active_scaling_indices.get(component_index, {})
+        feature = float(
+            item.get(
+                "active_magnitude_feature",
+                item.get("independent_magnitude_feature", 0.0),
+            )
+        )
+        item["active_magnitude_feature"] = feature
+        item["active_gate_intercept_param_index"] = int(lookup.get("active_gate_intercept", -1))
+        item["active_gate_mag_slope_param_index"] = int(lookup.get("active_gate_mag_slope", -1))
+        item["active_gate_logit_offset_param_index"] = int(lookup.get("active_gate_logit_offset", -1))
+        if 0 <= component_index < n_components:
+            magnitude_features[component_index] = feature
+            intercept_indices[component_index] = item["active_gate_intercept_param_index"]
+            slope_indices[component_index] = item["active_gate_mag_slope_param_index"]
+            offset_indices[component_index] = item["active_gate_logit_offset_param_index"]
+        updated_records.append(item)
+    return (
+        replace(
+            packed_lens_spec,
+            active_gate_intercept_param_index=intercept_indices,
+            active_gate_mag_slope_param_index=slope_indices,
+            active_gate_logit_offset_param_index=offset_indices,
+            active_magnitude_feature=magnitude_features,
+        ),
+        updated_records,
+    )
 
 
 def _physical_normal_moments_to_latent(
@@ -14004,18 +16208,30 @@ def _build_packed_lens_spec(
     core_ref_base = np.zeros(n_components, dtype=float)
     vdslope_base = np.zeros(n_components, dtype=float)
     slope_base = np.zeros(n_components, dtype=float)
+    alpha_sigma_base = np.full(n_components, DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN, dtype=float)
+    gamma_ml_base = np.full(n_components, DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN, dtype=float)
     sigma_ref_param_index = np.full(n_components, -1, dtype=np.int32)
     cut_ref_param_index = np.full(n_components, -1, dtype=np.int32)
     core_ref_param_index = np.full(n_components, -1, dtype=np.int32)
     vdslope_param_index = np.full(n_components, -1, dtype=np.int32)
     slope_param_index = np.full(n_components, -1, dtype=np.int32)
+    alpha_sigma_param_index = np.full(n_components, -1, dtype=np.int32)
+    gamma_ml_param_index = np.full(n_components, -1, dtype=np.int32)
     sigma_log_scatter_param_index = np.full(n_components, -1, dtype=np.int32)
     core_log_scatter_param_index = np.full(n_components, -1, dtype=np.int32)
     cut_log_scatter_param_index = np.full(n_components, -1, dtype=np.int32)
+    independent_branch_role = np.full(n_components, INDEPENDENT_BRANCH_NONE, dtype=np.int32)
+    independent_magnitude_feature = np.zeros(n_components, dtype=float)
+    independent_free_log_v_disp_delta_unit_param_index = np.full(n_components, -1, dtype=np.int32)
+    independent_free_log_core_radius_delta_unit_param_index = np.full(n_components, -1, dtype=np.int32)
+    independent_free_log_cut_radius_delta_unit_param_index = np.full(n_components, -1, dtype=np.int32)
+    independent_free_log_v_disp_tau_param_index = np.full(n_components, -1, dtype=np.int32)
+    independent_free_log_core_radius_tau_param_index = np.full(n_components, -1, dtype=np.int32)
+    independent_free_log_cut_radius_tau_param_index = np.full(n_components, -1, dtype=np.int32)
 
     for idx, (component, assignments) in enumerate(zip(base_components, component_param_assignments)):
         profile_type[idx] = int(component["profil"])
-        component_family[idx] = 0
+        component_family[idx] = int(component.get("component_family_code", COMPONENT_FAMILY_LARGE))
         x_center_base[idx] = float(component.get("x_centre", 0.0))
         y_center_base[idx] = float(component.get("y_centre", 0.0))
         angle_pos = float(component.get("angle_pos", 0.0))
@@ -14043,21 +16259,60 @@ def _build_packed_lens_spec(
     scaling_component_assignments = scaling_component_assignments or []
     for item in scaling_component_assignments:
         idx = int(item["component_index"])
-        component_family[idx] = 1
+        component_family[idx] = COMPONENT_FAMILY_SCALING
         luminosity_ratio[idx] = float(item["luminosity_ratio"])
         sigma_ref_base[idx] = float(item["sigma_ref_base"])
         cut_ref_base[idx] = float(item["cut_ref_base"])
         core_ref_base[idx] = float(item["core_ref_base"])
         vdslope_base[idx] = float(item["vdslope_base"])
         slope_base[idx] = float(item["slope_base"])
+        alpha_sigma_base[idx] = float(item.get("alpha_sigma_base", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN))
+        gamma_ml_base[idx] = float(item.get("gamma_ml_base", DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN))
         sigma_ref_param_index[idx] = int(item.get("sigma_ref_param_index", -1))
         cut_ref_param_index[idx] = int(item.get("cut_ref_param_index", -1))
         core_ref_param_index[idx] = int(item.get("core_ref_param_index", -1))
         vdslope_param_index[idx] = int(item.get("vdslope_param_index", -1))
         slope_param_index[idx] = int(item.get("slope_param_index", -1))
+        alpha_sigma_param_index[idx] = int(item.get("alpha_sigma_param_index", -1))
+        gamma_ml_param_index[idx] = int(item.get("gamma_ml_param_index", -1))
         sigma_log_scatter_param_index[idx] = int(item.get("sigma_log_scatter_param_index", -1))
         core_log_scatter_param_index[idx] = int(item.get("core_log_scatter_param_index", -1))
         cut_log_scatter_param_index[idx] = int(item.get("cut_log_scatter_param_index", -1))
+        independent_branch_role[idx] = int(item.get("independent_branch_role", INDEPENDENT_BRANCH_NONE))
+        independent_magnitude_feature[idx] = float(item.get("independent_magnitude_feature", 0.0))
+        independent_free_log_v_disp_delta_unit_param_index[idx] = int(item.get("independent_free_log_v_disp_delta_unit_param_index", -1))
+        independent_free_log_core_radius_delta_unit_param_index[idx] = int(item.get("independent_free_log_core_radius_delta_unit_param_index", -1))
+        independent_free_log_cut_radius_delta_unit_param_index[idx] = int(item.get("independent_free_log_cut_radius_delta_unit_param_index", -1))
+        independent_free_log_v_disp_tau_param_index[idx] = int(item.get("independent_free_log_v_disp_tau_param_index", -1))
+        independent_free_log_core_radius_tau_param_index[idx] = int(item.get("independent_free_log_core_radius_tau_param_index", -1))
+        independent_free_log_cut_radius_tau_param_index[idx] = int(item.get("independent_free_log_cut_radius_tau_param_index", -1))
+
+    for idx, component in enumerate(base_components):
+        if int(component.get("component_family_code", COMPONENT_FAMILY_LARGE)) != COMPONENT_FAMILY_INDEPENDENT_FREE:
+            continue
+        independent_branch_role[idx] = int(component.get("independent_branch_role", INDEPENDENT_BRANCH_FREE))
+        independent_magnitude_feature[idx] = float(component.get("independent_magnitude_feature", 0.0))
+        luminosity_ratio[idx] = float(component.get("luminosity_ratio", 1.0))
+        sigma_ref_base[idx] = float(component.get("sigma_ref_base", 0.0))
+        cut_ref_base[idx] = float(component.get("cut_ref_base", 0.0))
+        core_ref_base[idx] = float(component.get("core_ref_base", 0.0))
+        vdslope_base[idx] = float(component.get("vdslope_base", 0.0))
+        slope_base[idx] = float(component.get("slope_base", 0.0))
+        alpha_sigma_base[idx] = float(component.get("alpha_sigma_base", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN))
+        gamma_ml_base[idx] = float(component.get("gamma_ml_base", DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN))
+        sigma_ref_param_index[idx] = int(component.get("sigma_ref_param_index", -1))
+        cut_ref_param_index[idx] = int(component.get("cut_ref_param_index", -1))
+        core_ref_param_index[idx] = int(component.get("core_ref_param_index", -1))
+        vdslope_param_index[idx] = int(component.get("vdslope_param_index", -1))
+        slope_param_index[idx] = int(component.get("slope_param_index", -1))
+        alpha_sigma_param_index[idx] = int(component.get("alpha_sigma_param_index", -1))
+        gamma_ml_param_index[idx] = int(component.get("gamma_ml_param_index", -1))
+        independent_free_log_v_disp_delta_unit_param_index[idx] = int(component.get("independent_free_log_v_disp_delta_unit_param_index", -1))
+        independent_free_log_core_radius_delta_unit_param_index[idx] = int(component.get("independent_free_log_core_radius_delta_unit_param_index", -1))
+        independent_free_log_cut_radius_delta_unit_param_index[idx] = int(component.get("independent_free_log_cut_radius_delta_unit_param_index", -1))
+        independent_free_log_v_disp_tau_param_index[idx] = int(component.get("independent_free_log_v_disp_tau_param_index", -1))
+        independent_free_log_core_radius_tau_param_index[idx] = int(component.get("independent_free_log_core_radius_tau_param_index", -1))
+        independent_free_log_cut_radius_tau_param_index[idx] = int(component.get("independent_free_log_cut_radius_tau_param_index", -1))
 
     return PackedLensSpec(
         profile_type=profile_type,
@@ -14086,14 +16341,26 @@ def _build_packed_lens_spec(
         core_ref_base=core_ref_base,
         vdslope_base=vdslope_base,
         slope_base=slope_base,
+        alpha_sigma_base=alpha_sigma_base,
+        gamma_ml_base=gamma_ml_base,
         sigma_ref_param_index=sigma_ref_param_index,
         cut_ref_param_index=cut_ref_param_index,
         core_ref_param_index=core_ref_param_index,
         vdslope_param_index=vdslope_param_index,
         slope_param_index=slope_param_index,
+        alpha_sigma_param_index=alpha_sigma_param_index,
+        gamma_ml_param_index=gamma_ml_param_index,
         sigma_log_scatter_param_index=sigma_log_scatter_param_index,
         core_log_scatter_param_index=core_log_scatter_param_index,
         cut_log_scatter_param_index=cut_log_scatter_param_index,
+        independent_branch_role=independent_branch_role,
+        independent_magnitude_feature=independent_magnitude_feature,
+        independent_free_log_v_disp_delta_unit_param_index=independent_free_log_v_disp_delta_unit_param_index,
+        independent_free_log_core_radius_delta_unit_param_index=independent_free_log_core_radius_delta_unit_param_index,
+        independent_free_log_cut_radius_delta_unit_param_index=independent_free_log_cut_radius_delta_unit_param_index,
+        independent_free_log_v_disp_tau_param_index=independent_free_log_v_disp_tau_param_index,
+        independent_free_log_core_radius_tau_param_index=independent_free_log_core_radius_tau_param_index,
+        independent_free_log_cut_radius_tau_param_index=independent_free_log_cut_radius_tau_param_index,
     )
 
 
@@ -14119,6 +16386,8 @@ def _build_scaling_components(
     reference: tuple[int, float, float],
     scaling_param_indices: list[dict[str, int]],
     scaling_scatter_indices: list[dict[str, int]] | None,
+    independent_scaling_indices: list[dict[int, dict[str, int]]] | None,
+    independent_rank_info: dict[tuple[int, int], dict[str, Any]] | None,
     start_component_index: int,
     kpc_per_arcsec: float = 1.0,
 ) -> tuple[list[dict[str, Any]], list[list[tuple[str, int]]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -14128,8 +16397,10 @@ def _build_scaling_components(
     scaling_component_assignments: list[dict[str, Any]] = []
     scaling_component_records: list[dict[str, Any]] = []
     scaling_scatter_indices = scaling_scatter_indices or [{} for _ in potfiles]
-    for potfile_order, (potfile, param_index_lookup, scatter_index_lookup) in enumerate(
-        zip(potfiles, scaling_param_indices, scaling_scatter_indices)
+    independent_scaling_indices = independent_scaling_indices or [{} for _ in potfiles]
+    independent_rank_info = independent_rank_info or {}
+    for potfile_order, (potfile, param_index_lookup, scatter_index_lookup, independent_index_lookup) in enumerate(
+        zip(potfiles, scaling_param_indices, scaling_scatter_indices, independent_scaling_indices)
     ):
         catalog_df = potfile["catalog_df"]
         if catalog_df.empty:
@@ -14143,10 +16414,27 @@ def _build_scaling_components(
             dec0_deg,
         )
         magnitudes = catalog_df["catalog_mag"].to_numpy(dtype=float)
+        finite_magnitudes = magnitudes[np.isfinite(magnitudes)]
+        if finite_magnitudes.size:
+            mag_mean = float(np.mean(finite_magnitudes))
+            mag_std = float(np.std(finite_magnitudes))
+        else:
+            mag_mean = 0.0
+            mag_std = 0.0
+        if not np.isfinite(mag_std) or mag_std <= 1.0e-12:
+            magnitude_feature = np.zeros_like(magnitudes, dtype=float)
+        else:
+            magnitude_feature = (mag_mean - magnitudes) / mag_std
+            magnitude_feature = np.nan_to_num(magnitude_feature, nan=0.0, posinf=0.0, neginf=0.0)
         luminosity_ratio = np.power(10.0, -0.4 * (magnitudes - float(potfile["mag0"])))
+        vdslope_base_value = float(potfile.get("vdslope_nominal", DEFAULT_SOLVER_POTFILE_SLOPE_MEAN))
+        slope_base_value = float(potfile.get("slope_nominal", DEFAULT_SOLVER_POTFILE_SLOPE_MEAN))
+        alpha_sigma_base_value = DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN
+        gamma_ml_base_value = DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN
         for row_index, row in enumerate(catalog_df.itertuples(index=False)):
             ellipticite, angle_pos = _catalog_shape_to_ellipticity(row.catalog_a, row.catalog_b, row.catalog_theta)
             component_index = start_component_index + len(components)
+            independent_lookup = independent_index_lookup.get(int(row_index), {})
             components.append(
                 {
                     "id": f"{potfile['id']}.{row.id}",
@@ -14159,9 +16447,12 @@ def _build_scaling_components(
                     "cut_radius_kpc": cut_radius_kpc,
                     "v_disp": float(potfile["sigma_nominal"]),
                     "z_lens": float(potfile["zlens"]),
+                    "component_family_code": COMPONENT_FAMILY_SCALING,
                 }
             )
             assignments.append([])
+            free_component_index = -1
+            branch_role = INDEPENDENT_BRANCH_SCALING if independent_lookup else INDEPENDENT_BRANCH_NONE
             scaling_component_assignments.append(
                 {
                     "component_index": component_index,
@@ -14169,33 +16460,87 @@ def _build_scaling_components(
                     "sigma_ref_base": float(potfile["sigma_nominal"]),
                     "cut_ref_base": cut_radius_kpc,
                     "core_ref_base": core_radius_kpc,
-                    "vdslope_base": float(potfile["vdslope_nominal"]),
-                    "slope_base": float(potfile["slope_nominal"]),
+                    "vdslope_base": vdslope_base_value,
+                    "slope_base": slope_base_value,
+                    "alpha_sigma_base": alpha_sigma_base_value,
+                    "gamma_ml_base": gamma_ml_base_value,
                     "sigma_ref_param_index": int(param_index_lookup.get("sigma", -1)),
                     "cut_ref_param_index": int(param_index_lookup.get("cutkpc", -1)),
                     "core_ref_param_index": int(param_index_lookup.get("corekpc", -1)),
                     "vdslope_param_index": int(param_index_lookup.get("vdslope", -1)),
                     "slope_param_index": int(param_index_lookup.get("slope", -1)),
+                    "alpha_sigma_param_index": int(param_index_lookup.get("alpha_sigma", -1)),
+                    "gamma_ml_param_index": int(param_index_lookup.get("gamma_ml", -1)),
                     "sigma_log_scatter_param_index": int(scatter_index_lookup.get("sigma", -1)),
                     "core_log_scatter_param_index": int(scatter_index_lookup.get("core", -1)),
                     "cut_log_scatter_param_index": int(scatter_index_lookup.get("cut", -1)),
+                    "independent_branch_role": int(branch_role),
+                    "independent_magnitude_feature": float(magnitude_feature[row_index]),
                 }
             )
+            if independent_lookup:
+                free_component_index = start_component_index + len(components)
+                components.append(
+                    {
+                        "id": f"{potfile['id']}.{row.id}.free",
+                        "profil": DP_IE_PROFILE,
+                        "x_centre": float(x_offsets[row_index]),
+                        "y_centre": float(y_offsets[row_index]),
+                        "ellipticite": ellipticite,
+                        "angle_pos": angle_pos,
+                        "core_radius_kpc": core_radius_kpc,
+                        "cut_radius_kpc": cut_radius_kpc,
+                        "v_disp": float(potfile["sigma_nominal"]),
+                        "z_lens": float(potfile["zlens"]),
+                        "component_family_code": COMPONENT_FAMILY_INDEPENDENT_FREE,
+                        "independent_branch_role": INDEPENDENT_BRANCH_FREE,
+                        "independent_magnitude_feature": float(magnitude_feature[row_index]),
+                        "luminosity_ratio": float(luminosity_ratio[row_index]),
+                        "sigma_ref_base": float(potfile["sigma_nominal"]),
+                        "cut_ref_base": cut_radius_kpc,
+                        "core_ref_base": core_radius_kpc,
+                        "vdslope_base": vdslope_base_value,
+                        "slope_base": slope_base_value,
+                        "alpha_sigma_base": alpha_sigma_base_value,
+                        "gamma_ml_base": gamma_ml_base_value,
+                        "sigma_ref_param_index": int(param_index_lookup.get("sigma", -1)),
+                        "cut_ref_param_index": int(param_index_lookup.get("cutkpc", -1)),
+                        "core_ref_param_index": int(param_index_lookup.get("corekpc", -1)),
+                        "vdslope_param_index": int(param_index_lookup.get("vdslope", -1)),
+                        "slope_param_index": int(param_index_lookup.get("slope", -1)),
+                        "alpha_sigma_param_index": int(param_index_lookup.get("alpha_sigma", -1)),
+                        "gamma_ml_param_index": int(param_index_lookup.get("gamma_ml", -1)),
+                        "independent_free_log_v_disp_delta_unit_param_index": int(independent_lookup.get("independent_free_log_v_disp_delta_unit", -1)),
+                        "independent_free_log_core_radius_delta_unit_param_index": int(independent_lookup.get("independent_free_log_core_radius_delta_unit", -1)),
+                        "independent_free_log_cut_radius_delta_unit_param_index": int(independent_lookup.get("independent_free_log_cut_radius_delta_unit", -1)),
+                        "independent_free_log_v_disp_tau_param_index": int(independent_lookup.get("independent_free_log_v_disp_tau", -1)),
+                        "independent_free_log_core_radius_tau_param_index": int(independent_lookup.get("independent_free_log_core_radius_tau", -1)),
+                        "independent_free_log_cut_radius_tau_param_index": int(independent_lookup.get("independent_free_log_cut_radius_tau", -1)),
+                    }
+                )
+                assignments.append([])
+            rank_item = independent_rank_info.get((int(potfile_order), int(row_index)), {})
             scaling_component_records.append(
                 {
                     "potfile_id": str(potfile["id"]),
                     "potfile_order": int(potfile_order),
+                    "catalog_row_index": int(row_index),
                     "component_index": int(component_index),
                     "catalog_id": str(row.id),
                     "catalog_mag": float(row.catalog_mag),
+                    "independent_magnitude_feature": float(magnitude_feature[row_index]),
                     "x_centre": float(x_offsets[row_index]),
                     "y_centre": float(y_offsets[row_index]),
+                    "selected_independent": bool(independent_lookup),
+                    "free_component_index": int(free_component_index),
+                    "independent_rank": int(rank_item["rank"]) if rank_item else None,
+                    "independent_importance": float(rank_item["importance"]) if rank_item else None,
                 }
             )
     return components, assignments, scaling_component_assignments, scaling_component_records
 
 
-def _normalize_active_scaling_counts(
+def _active_scaling_count_values(
     active_scaling_galaxies: Any,
     potfiles: list[dict[str, Any]],
 ) -> list[int]:
@@ -14214,6 +16559,14 @@ def _normalize_active_scaling_counts(
             "--active-scaling-galaxies expects exactly one value per potfile. "
             f"Detected {n_potfiles} potfiles {potfile_ids}, received {len(values)} value(s): {values}."
         )
+    return values
+
+
+def _normalize_active_scaling_counts(
+    active_scaling_galaxies: Any,
+    potfiles: list[dict[str, Any]],
+) -> list[int]:
+    values = _active_scaling_count_values(active_scaling_galaxies, potfiles)
     resolved: list[int] = []
     for idx, value in enumerate(values):
         if value < 0:
@@ -14221,6 +16574,13 @@ def _normalize_active_scaling_counts(
         else:
             resolved.append(int(value))
     return resolved
+
+
+def _active_scaling_all_requested(
+    active_scaling_galaxies: Any,
+    potfiles: list[dict[str, Any]],
+) -> list[bool]:
+    return [value < 0 for value in _active_scaling_count_values(active_scaling_galaxies, potfiles)]
 
 
 def _adaptive_active_scaling_count(
@@ -14255,6 +16615,148 @@ def _adaptive_active_scaling_count(
     selected = max(int(min_count), knee_count, cumulative_count)
     selected = min(max(selected, 1), cap)
     return selected, cumulative_count, knee_count
+
+
+def _logit_probability(probability: float, *, context: str) -> float:
+    value = float(probability)
+    if not np.isfinite(value) or not (0.0 < value < 1.0):
+        raise ValueError(f"{context} must be finite and strictly between 0 and 1.")
+    return float(np.log(value / (1.0 - value)))
+
+
+def _validate_independent_scaling_log_displacement_hyperparameters(
+    *,
+    log_vdisp_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+    log_core_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
+    log_cut_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+    log_tau_prior_sigma: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+) -> tuple[float, float, float]:
+    tau_v = float(log_vdisp_tau_prior_median)
+    tau_core = float(log_core_tau_prior_median)
+    tau_cut = float(log_cut_tau_prior_median)
+    tau_sigma = float(log_tau_prior_sigma)
+    if not np.isfinite(tau_v) or tau_v <= 0.0:
+        raise ValueError("--independent-scaling-free-log-vdisp-tau-prior-median must be finite and positive.")
+    if not np.isfinite(tau_core) or tau_core <= 0.0:
+        raise ValueError("--independent-scaling-free-log-core-tau-prior-median must be finite and positive.")
+    if not np.isfinite(tau_cut) or tau_cut <= 0.0:
+        raise ValueError("--independent-scaling-free-log-cut-tau-prior-median must be finite and positive.")
+    if not np.isfinite(tau_sigma) or tau_sigma <= 0.0:
+        raise ValueError("--independent-scaling-free-log-tau-prior-sigma must be finite and positive.")
+    return tau_v, tau_core, tau_cut
+
+
+def _rank_potfile_scaling_rows(
+    potfile: dict[str, Any],
+    *,
+    potfile_order: int,
+    reference: tuple[int, float, float],
+    image_x: np.ndarray,
+    image_y: np.ndarray,
+) -> list[dict[str, Any]]:
+    catalog_df = potfile.get("catalog_df")
+    if catalog_df is None or catalog_df.empty:
+        return []
+    _, ra0_deg, dec0_deg = reference
+    x_offsets, y_offsets = _radec_to_offsets_arcsec(
+        catalog_df["ra"].to_numpy(dtype=float),
+        catalog_df["dec"].to_numpy(dtype=float),
+        ra0_deg,
+        dec0_deg,
+    )
+    magnitudes = catalog_df["catalog_mag"].to_numpy(dtype=float)
+    mag0 = float(potfile["mag0"])
+    brightness = np.power(10.0, -0.4 * (magnitudes - mag0))
+    if image_x.size and image_y.size:
+        dx = x_offsets[:, None] - image_x[None, :]
+        dy = y_offsets[:, None] - image_y[None, :]
+        min_dist = np.min(np.sqrt(dx**2 + dy**2), axis=1)
+        importance = brightness / np.square(min_dist + 0.5)
+    else:
+        min_dist = np.full(len(catalog_df), np.nan, dtype=float)
+        importance = brightness.copy()
+    finite_importance = np.nan_to_num(importance, nan=0.0, posinf=0.0, neginf=0.0)
+    order = np.argsort(-finite_importance)
+    rows_by_position: dict[int, dict[str, Any]] = {}
+    catalog_ids = catalog_df["id"].astype(str).tolist()
+    for rank, row_index in enumerate(order.tolist(), start=1):
+        rows_by_position[int(row_index)] = {
+            "potfile_order": int(potfile_order),
+            "row_index": int(row_index),
+            "catalog_id": str(catalog_ids[row_index]),
+            "rank": int(rank),
+            "importance": float(importance[row_index]),
+            "min_distance_arcsec": float(min_dist[row_index]),
+            "brightness": float(brightness[row_index]),
+            "catalog_mag": float(magnitudes[row_index]),
+            "x_centre": float(x_offsets[row_index]),
+            "y_centre": float(y_offsets[row_index]),
+        }
+    return [rows_by_position[int(row_index)] for row_index in order.tolist()]
+
+
+def _image_offsets_for_scaling_importance(
+    images_df: pd.DataFrame,
+    reference: tuple[int, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    if images_df.empty:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    _, ra0_deg, dec0_deg = reference
+    x_obs, y_obs = _radec_to_offsets_arcsec(
+        images_df["ra"].to_numpy(dtype=float),
+        images_df["dec"].to_numpy(dtype=float),
+        ra0_deg,
+        dec0_deg,
+    )
+    return np.asarray(x_obs, dtype=float), np.asarray(y_obs, dtype=float)
+
+
+def _select_active_scaling_candidates(
+    potfiles: list[dict[str, Any]],
+    reference: tuple[int, float, float],
+    images_df: pd.DataFrame,
+    active_scaling_galaxies: Any,
+    *,
+    active_scaling_selection: str,
+    active_scaling_cumulative_fraction: float,
+    active_scaling_min: int,
+) -> tuple[list[set[int]], dict[tuple[int, int], dict[str, Any]], dict[str, int], dict[str, int]]:
+    counts = _normalize_active_scaling_counts(active_scaling_galaxies, potfiles)
+    all_requested = _active_scaling_all_requested(active_scaling_galaxies, potfiles)
+    selected_by_potfile: list[set[int]] = [set() for _ in potfiles]
+    rank_info: dict[tuple[int, int], dict[str, Any]] = {}
+    requested_counts: dict[str, int] = {}
+    selected_counts: dict[str, int] = {}
+    image_x, image_y = _image_offsets_for_scaling_importance(images_df, reference)
+    for potfile_order, potfile in enumerate(potfiles):
+        potfile_id = str(potfile.get("id", f"potfile{potfile_order}"))
+        ranked_rows = _rank_potfile_scaling_rows(
+            potfile,
+            potfile_order=potfile_order,
+            reference=reference,
+            image_x=image_x,
+            image_y=image_y,
+        )
+        for item in ranked_rows:
+            rank_info[(potfile_order, int(item["row_index"]))] = item
+        requested_count = min(max(int(counts[potfile_order]), 0), len(ranked_rows))
+        if all_requested[potfile_order]:
+            count = len(ranked_rows)
+        elif active_scaling_selection == "adaptive":
+            count, _cumulative_count, _knee_count = _adaptive_active_scaling_count(
+                np.asarray([float(item["importance"]) for item in ranked_rows], dtype=float),
+                cumulative_fraction=float(active_scaling_cumulative_fraction),
+                min_count=int(active_scaling_min),
+                max_count=int(counts[potfile_order]),
+            )
+            count = min(max(int(count), 0), len(ranked_rows))
+        else:
+            count = requested_count
+        selected = {int(item["row_index"]) for item in ranked_rows[:count]}
+        selected_by_potfile[potfile_order] = selected
+        requested_counts[potfile_id] = int(requested_count)
+        selected_counts[potfile_id] = int(len(selected))
+    return selected_by_potfile, rank_info, requested_counts, selected_counts
 
 
 def _has_arc_constraints_in_state(state: BuildState) -> bool:
@@ -14333,6 +16835,7 @@ def _prepare_arc_constraint_data(
         sigma_curvature_arcsec_inv=np.asarray(sigma_curvature, dtype=float),
         reliability=np.asarray(np.clip(numeric["arc_reliability"], 0.0, 1.0), dtype=float),
     )
+
 
 
 def _prepare_family_data(
@@ -14512,11 +17015,16 @@ class ClusterJAXEvaluator:
         active_scaling_selection: str = "adaptive",
         active_scaling_cumulative_fraction: float = DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
         active_scaling_min: int = DEFAULT_ACTIVE_SCALING_MIN,
+        topk_discovery_scaling_galaxies: int = 10,
+        topk_discovery_score: str = TOPK_DISCOVERY_SCORE_ALPHA_JACOBIAN,
+        topk_discovery_jacobian_weight: float = 1.0,
         refresh_every: int = DEFAULT_REFRESH_EVERY,
         refresh_param_drift_frac: float = DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
         source_plane_covariance_floor: float = 1.0e-6,
+        source_plane_covariance_mode: str = SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
         source_plane_outlier_sigma_arcsec: float = DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
         sample_likelihood_mode: str = SAMPLE_LIKELIHOOD_SOURCE,
+        active_scaling_inference_likelihood: str | None = None,
         image_plane_newton_steps: int = 0,
         anchored_image_plane_solve_steps: int = DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS,
         anchored_image_plane_trust_radius_arcsec: float = DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC,
@@ -14578,14 +17086,47 @@ class ClusterJAXEvaluator:
                 f"expected one of {', '.join(SAMPLING_ENGINES)}."
             )
         self.active_scaling_galaxies_by_potfile = _normalize_active_scaling_counts(active_scaling_galaxies, state.potfiles)
+        self.active_scaling_all_requested_by_potfile = _active_scaling_all_requested(active_scaling_galaxies, state.potfiles)
         self.active_scaling_selection = str(active_scaling_selection)
         self.active_scaling_cumulative_fraction = float(active_scaling_cumulative_fraction)
         self.active_scaling_min = max(1, int(active_scaling_min))
+        self.topk_discovery_scaling_galaxies = max(1, int(topk_discovery_scaling_galaxies))
+        self.topk_discovery_score = str(topk_discovery_score)
+        if self.topk_discovery_score not in TOPK_DISCOVERY_SCORES:
+            raise ValueError(
+                "Unsupported topk_discovery_score="
+                f"{self.topk_discovery_score!r}; expected one of {', '.join(TOPK_DISCOVERY_SCORES)}."
+            )
+        self.topk_discovery_jacobian_weight = float(topk_discovery_jacobian_weight)
+        if not np.isfinite(self.topk_discovery_jacobian_weight) or self.topk_discovery_jacobian_weight < 0.0:
+            raise ValueError("topk_discovery_jacobian_weight must be finite and non-negative.")
         self.refresh_every = max(1, int(refresh_every))
         self.refresh_param_drift_frac = float(refresh_param_drift_frac)
         self.source_plane_covariance_floor = max(float(source_plane_covariance_floor), 0.0)
+        self.source_plane_covariance_mode = str(source_plane_covariance_mode)
+        if self.source_plane_covariance_mode not in SOURCE_PLANE_COVARIANCE_MODES:
+            raise ValueError(
+                "Unsupported source_plane_covariance_mode="
+                f"{self.source_plane_covariance_mode!r}; expected one of "
+                f"{', '.join(SOURCE_PLANE_COVARIANCE_MODES)}."
+            )
         self.source_plane_outlier_sigma_arcsec = max(float(source_plane_outlier_sigma_arcsec), 1.0e-6)
         self.sample_likelihood_mode = str(sample_likelihood_mode)
+        self.active_scaling_inference_likelihood = str(
+            active_scaling_inference_likelihood
+            if active_scaling_inference_likelihood is not None
+            else getattr(
+                state,
+                "active_scaling_inference_likelihood",
+                ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION,
+            )
+        )
+        if self.active_scaling_inference_likelihood not in ACTIVE_SCALING_INFERENCE_LIKELIHOODS:
+            raise ValueError(
+                "Unsupported active_scaling_inference_likelihood="
+                f"{self.active_scaling_inference_likelihood!r}; expected one of "
+                f"{', '.join(ACTIVE_SCALING_INFERENCE_LIKELIHOODS)}."
+            )
         if self.sample_likelihood_mode not in {
             SAMPLE_LIKELIHOOD_SOURCE,
             SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
@@ -14598,14 +17139,15 @@ class ClusterJAXEvaluator:
             SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
         }:
             raise ValueError(f"Unsupported sample_likelihood_mode={self.sample_likelihood_mode!r}.")
-        if self.sampling_engine == SAMPLING_ENGINE_FULL_FLAT and self.sample_likelihood_mode not in {
+        if self.sampling_engine in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT} and self.sample_likelihood_mode not in {
+            SAMPLE_LIKELIHOOD_SOURCE,
             SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
         }:
             raise ValueError(
-                "sampling_engine='full_flat' is experimental and currently only supports "
-                "local-jacobian, critical-arc-mixture-image-plane, and "
+                f"sampling_engine={self.sampling_engine!r} currently only supports "
+                "source, local-jacobian, critical-arc-mixture-image-plane, and "
                 "critical-arc-mixture-centroid-image-plane."
             )
         if self.sampling_engine == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT and self.sample_likelihood_mode not in {
@@ -14619,6 +17161,11 @@ class ClusterJAXEvaluator:
                 f"sample_likelihood_mode={self.sample_likelihood_mode!r}; use "
                 "sampling_engine='refreshing_surrogate' for the legacy per-bin surrogate path."
             )
+        self.local_jacobian_metric_mode = _local_jacobian_metric_mode_for_values(
+            self.sampling_engine,
+            self.sample_likelihood_mode,
+            self.source_plane_covariance_mode,
+        )
         requested_image_plane_newton_steps = int(image_plane_newton_steps)
         if (
             self.sample_likelihood_mode
@@ -14902,8 +17449,9 @@ class ClusterJAXEvaluator:
         self.traced_bin_data_by_z = {bin_item.effective_z_source: bin_item for bin_item in self.traced_bin_data}
         self.traced_arc_data = self._prepare_traced_arc_constraint_data(state.arc_data)
         component_family = np.asarray(self.state.packed_lens_spec.component_family, dtype=np.int32)
-        self.scaling_component_indices = np.where(component_family == 1)[0].astype(np.int32)
-        self.large_component_indices = np.where(component_family != 1)[0].astype(np.int32)
+        self.scaling_component_indices = np.where(component_family == COMPONENT_FAMILY_SCALING)[0].astype(np.int32)
+        self.independent_free_component_indices = np.where(component_family == COMPONENT_FAMILY_INDEPENDENT_FREE)[0].astype(np.int32)
+        self.large_component_indices = np.where(component_family == COMPONENT_FAMILY_LARGE)[0].astype(np.int32)
         self.scaling_param_indices = np.asarray(
             [idx for idx, spec in enumerate(self.state.parameter_specs) if spec.component_family == "scaling"],
             dtype=np.int32,
@@ -14911,6 +17459,23 @@ class ClusterJAXEvaluator:
         self.scaling_scatter_param_indices = np.asarray(
             [idx for idx, spec in enumerate(self.state.parameter_specs) if spec.component_family == "scaling_scatter"],
             dtype=np.int32,
+        )
+        self.independent_scaling_param_indices = np.asarray(
+            [idx for idx, spec in enumerate(self.state.parameter_specs) if spec.component_family == "independent_scaling"],
+            dtype=np.int32,
+        )
+        self.independent_scaling_gate_param_indices = np.asarray([], dtype=np.int32)
+        self.active_scaling_gate_param_indices = np.asarray(
+            [
+                idx
+                for idx, spec in enumerate(self.state.parameter_specs)
+                if spec.component_family == ACTIVE_SCALING_GATE_COMPONENT_FAMILY
+            ],
+            dtype=np.int32,
+        )
+        self.infer_active_scaling = bool(
+            getattr(self.state, "infer_active_scaling", False)
+            and self.active_scaling_gate_param_indices.size > 0
         )
         source_scatter_indices = [
             idx for idx, spec in enumerate(self.state.parameter_specs) if spec.component_family == "source_scatter"
@@ -15060,28 +17625,107 @@ class ClusterJAXEvaluator:
         self.transform_kind_affine_mask = jnp.asarray(transform_kind_array == "affine", dtype=bool)
         self.transform_offset_array = jnp.asarray(transform_offset_array, dtype=jnp.float64)
         self.transform_scale_array = jnp.asarray(transform_scale_array, dtype=jnp.float64)
-        coupling_arrays = _potfile_mass_size_coupling_arrays(self.state.parameter_specs)
-        self.potfile_mass_size_mass_indices = jnp.asarray(coupling_arrays["mass_indices"], dtype=jnp.int32)
-        self.potfile_mass_size_size_indices = jnp.asarray(coupling_arrays["size_indices"], dtype=jnp.int32)
-        self.potfile_mass_size_mass_centers = jnp.asarray(coupling_arrays["mass_centers"], dtype=jnp.float64)
-        self.potfile_mass_size_mass_scales = jnp.asarray(coupling_arrays["mass_scales"], dtype=jnp.float64)
-        self.potfile_mass_size_size_centers = jnp.asarray(coupling_arrays["size_centers"], dtype=jnp.float64)
-        self.potfile_mass_size_size_scales = jnp.asarray(coupling_arrays["size_scales"], dtype=jnp.float64)
-        self.potfile_mass_size_cut_offsets = jnp.asarray(coupling_arrays["cut_offsets"], dtype=jnp.float64)
-        self.potfile_mass_size_reparam_group_count = int(len(coupling_arrays["mass_indices"]))
         self.packed_spec_jax = self._prepare_packed_spec_arrays()
         self.flat_critical_arc_data = self._build_flat_critical_arc_data()
         self.scaling_rank_df = self._build_scaling_rank_diagnostics()
-        self.active_scaling_component_indices = np.asarray(
+        selected_active_scaling = np.asarray(
             self.scaling_rank_df.loc[self.scaling_rank_df["selected_active"], "component_index"].to_numpy(dtype=np.int32)
             if not self.scaling_rank_df.empty
             else np.asarray([], dtype=np.int32),
             dtype=np.int32,
         )
-        self.inactive_scaling_component_indices = np.asarray(
+        frozen_active_scaling = getattr(self.state, "frozen_active_scaling_component_indices", None)
+        self.using_frozen_active_scaling = frozen_active_scaling is not None
+        if frozen_active_scaling is not None:
+            selected_active_scaling = np.asarray(frozen_active_scaling, dtype=np.int32).reshape(-1)
+            if not self.scaling_rank_df.empty:
+                frozen_set = {int(value) for value in selected_active_scaling.tolist()}
+                self.scaling_rank_df = self.scaling_rank_df.copy()
+                self.scaling_rank_df["selected_active"] = self.scaling_rank_df["component_index"].astype(int).isin(frozen_set)
+                self.scaling_rank_df["frozen_active"] = self.scaling_rank_df["selected_active"].astype(bool)
+        self.active_scaling_inference_svi = bool(self.infer_active_scaling and frozen_active_scaling is None)
+        if self.active_scaling_inference_svi:
+            selected_active_scaling = np.asarray(self.scaling_component_indices, dtype=np.int32).reshape(-1)
+            if not self.scaling_rank_df.empty:
+                self.scaling_rank_df = self.scaling_rank_df.copy()
+                self.scaling_rank_df["selected_active"] = True
+                self.scaling_rank_df["selection_mode"] = "svi_inferred"
+                self.scaling_rank_df["svi_active_gate_candidate"] = True
+        if self.sampling_engine == SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT:
+            selected_active_scaling = np.asarray([], dtype=np.int32)
+            if not self.scaling_rank_df.empty:
+                self.scaling_rank_df = self.scaling_rank_df.copy()
+                self.scaling_rank_df["selected_active"] = False
+                self.scaling_rank_df["selection_mode"] = "topk_discovery_exact_svi"
+        self.independent_scaling_component_indices = np.asarray(
+            self.scaling_rank_df.loc[
+                self.scaling_rank_df.get("selected_independent", pd.Series(False, index=self.scaling_rank_df.index)).astype(bool),
+                "component_index",
+            ].to_numpy(dtype=np.int32)
+            if not self.scaling_rank_df.empty
+            else np.asarray([], dtype=np.int32),
+            dtype=np.int32,
+        )
+        self.free_correction_scaling_component_indices = np.asarray(
+            sorted(set(self.independent_scaling_component_indices.tolist())),
+            dtype=np.int32,
+        )
+        self.free_correction_free_component_indices = np.asarray(
+            sorted(
+                int(value)
+                for value in (
+                    self.scaling_rank_df.loc[
+                        self.scaling_rank_df.get(
+                            "selected_independent",
+                            pd.Series(False, index=self.scaling_rank_df.index),
+                        ).astype(bool),
+                        "free_component_index",
+                    ].to_numpy(dtype=np.int32)
+                    if not self.scaling_rank_df.empty and "free_component_index" in self.scaling_rank_df
+                    else np.asarray([], dtype=np.int32)
+                )
+                if int(value) >= 0
+            ),
+            dtype=np.int32,
+        )
+        self.exact_scaling_component_indices = np.asarray(
+            sorted(set(selected_active_scaling.tolist()) | set(self.free_correction_scaling_component_indices.tolist())),
+            dtype=np.int32,
+        )
+        self.active_scaling_component_indices = self.exact_scaling_component_indices
+        if self.independent_scaling_component_indices.size:
+            self.active_scaling_component_indices = np.asarray(
+                sorted(
+                    set(self.active_scaling_component_indices.tolist())
+                    | set(self.independent_scaling_component_indices.tolist())
+                ),
+                dtype=np.int32,
+            )
+            self.exact_scaling_component_indices = self.active_scaling_component_indices
+        self.cached_scaling_component_indices = np.asarray(
             sorted(set(self.scaling_component_indices.tolist()) - set(self.active_scaling_component_indices.tolist())),
             dtype=np.int32,
         )
+        self.inactive_scaling_component_indices = self.cached_scaling_component_indices
+        self.excluded_scaling_component_indices = np.asarray([], dtype=np.int32)
+        active_set = set(self.active_scaling_component_indices.tolist())
+        cached_set = set(self.cached_scaling_component_indices.tolist())
+        excluded_set = set(self.excluded_scaling_component_indices.tolist())
+        free_correction_scaling_set = set(self.free_correction_scaling_component_indices.tolist())
+        free_correction_free_set = set(self.free_correction_free_component_indices.tolist())
+        scaling_set = set(self.scaling_component_indices.tolist())
+        if active_set & cached_set:
+            raise ValueError("Exact and cached scaling component sets overlap; this would double count lensing.")
+        if active_set & excluded_set or cached_set & excluded_set:
+            raise ValueError("Excluded scaling components overlap exact or cached scaling components.")
+        if active_set | cached_set | excluded_set != scaling_set:
+            raise ValueError("Exact, cached, and excluded scaling component sets do not cover all scaling components.")
+        if free_correction_scaling_set & cached_set:
+            raise ValueError("Independent free-correction scaling branches must not be cached.")
+        if not free_correction_scaling_set.issubset(active_set):
+            raise ValueError("Independent free-correction scaling branches must be exact active components.")
+        if not free_correction_free_set.issubset(set(self.independent_free_component_indices.tolist())):
+            raise ValueError("Independent free-correction free branches are not valid independent-free components.")
         self.requested_active_scaling_by_potfile = {
             str(potfile.get("id", f"potfile{idx}")): int(self.active_scaling_galaxies_by_potfile[idx])
             for idx, potfile in enumerate(self.state.potfiles)
@@ -15103,11 +17747,27 @@ class ClusterJAXEvaluator:
             for idx, potfile in enumerate(self.state.potfiles)
         }
         self.active_component_indices = np.asarray(
-            np.concatenate([self.large_component_indices, self.active_scaling_component_indices]).tolist(),
+            np.concatenate(
+                [
+                    self.large_component_indices,
+                    self.exact_scaling_component_indices,
+                    self.free_correction_free_component_indices,
+                ]
+            ).tolist(),
             dtype=np.int32,
         )
         self.active_scaling_component_indices_jax = jnp.asarray(self.active_scaling_component_indices, dtype=jnp.int32)
         self.active_component_indices_jax = jnp.asarray(self.active_component_indices, dtype=jnp.int32)
+        self.scaling_component_indices_jax = jnp.asarray(self.scaling_component_indices, dtype=jnp.int32)
+        self.free_correction_scaling_component_indices_jax = jnp.asarray(
+            self.free_correction_scaling_component_indices,
+            dtype=jnp.int32,
+        )
+        self.active_scaling_freeze_threshold = float(
+            getattr(self.state, "active_scaling_freeze_threshold", DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD)
+        )
+        if not free_correction_free_set.issubset(set(self.active_component_indices.tolist())):
+            raise ValueError("Independent free-correction free branches must be exact active components.")
         stage4_refreshing_surrogate_supported = (
             _sample_likelihood_uses_image_plane_jacobian(self.sample_likelihood_mode)
             and self.image_plane_newton_steps == 0
@@ -15119,11 +17779,32 @@ class ClusterJAXEvaluator:
         source_plane_refreshing_surrogate_supported = not _sample_likelihood_uses_image_scatter(
             self.sample_likelihood_mode
         )
+        active_inference_supported = bool(
+            self.active_scaling_inference_svi
+            and self.sampling_engine == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT
+            and self.sample_likelihood_mode in {SAMPLE_LIKELIHOOD_SOURCE, SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN}
+            and len(self.scaling_component_indices) > 0
+        )
+        if self.active_scaling_inference_svi and not active_inference_supported:
+            raise ValueError(
+                "--infer-active-scaling currently requires --sampling-engine refreshing_surrogate_flat, "
+                "sample likelihood source or local-jacobian, and at least one scaling galaxy."
+            )
+        self.active_inference_enabled = active_inference_supported
+        self.active_population_inference_enabled = bool(
+            self.active_inference_enabled
+            and self.active_scaling_inference_likelihood == ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION
+        )
+        self.active_blend_inference_enabled = bool(
+            self.active_inference_enabled
+            and self.active_scaling_inference_likelihood == ACTIVE_SCALING_INFERENCE_LIKELIHOOD_BLEND
+        )
         self.surrogate_enabled = (
             self.sampling_engine in {
                 SAMPLING_ENGINE_REFRESHING_SURROGATE,
                 SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
             }
+            and not self.active_inference_enabled
             and self.use_bulk_ray_shooting
             and len(self.scaling_component_indices) > 0
             and len(self.inactive_scaling_component_indices) > 0
@@ -15134,6 +17815,8 @@ class ClusterJAXEvaluator:
         self.surrogate_reference_param_values = np.zeros(len(self.surrogate_param_indices), dtype=float)
         self.surrogate_cache_by_z: dict[float, SurrogateBinCache] = {}
         self.flat_surrogate_cache: FlatSurrogateCache | None = None
+        self.active_inference_reference_params: np.ndarray | None = None
+        self.flat_active_inference_cache: ActiveInferenceFlatCache | None = None
         self.scaling_scatter_reference_params: np.ndarray | None = None
         self.scaling_scatter_cache_by_z: dict[float, dict[str, np.ndarray]] = {}
         self.source_metric_reference_params: np.ndarray | None = None
@@ -15336,6 +18019,20 @@ class ClusterJAXEvaluator:
     def _refresh_flat_source_metric_arrays(self) -> None:
         self.flat_source_metric_cache = self._flat_source_metric_arrays_from_cache()
 
+    def _source_plane_unit_covariance_enabled(self) -> bool:
+        return (
+            self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_SOURCE
+            and self.source_plane_covariance_mode == SOURCE_PLANE_COVARIANCE_MODE_UNIT
+        )
+
+    def _reset_source_metric_cache_to_unit(self, reference_params: np.ndarray | None = None) -> None:
+        self.source_metric_cache_by_z = {}
+        self.source_metric_reference_params = (
+            None if reference_params is None else np.asarray(reference_params, dtype=float).copy()
+        )
+        self._refresh_flat_source_metric_arrays()
+        self._source_loglike_fn = jax.jit(self._source_loglike_impl)
+
     def _flat_surrogate_cache_from_bins(self) -> FlatSurrogateCache | None:
         if not self.surrogate_cache_by_z:
             return None
@@ -15387,6 +18084,84 @@ class ClusterJAXEvaluator:
     def _refresh_flat_surrogate_cache(self) -> None:
         self.flat_surrogate_cache = self._flat_surrogate_cache_from_bins()
 
+    def _flat_bin_slices(self) -> list[tuple[TracedBinData, slice]]:
+        slices: list[tuple[TracedBinData, slice]] = []
+        start = 0
+        for bin_data in self.traced_bin_data:
+            n_images = int(np.asarray(bin_data.x_obs).size)
+            stop = start + n_images
+            slices.append((bin_data, slice(start, stop)))
+            start = stop
+        return slices
+
+    def _surrogate_cache_by_z_from_flat_cache(
+        self,
+        flat_cache: FlatSurrogateCache,
+    ) -> dict[float, SurrogateBinCache]:
+        def slice_1d(value: Any, item_slice: slice) -> np.ndarray | None:
+            if value is None:
+                return None
+            return np.asarray(value, dtype=float)[item_slice]
+
+        def slice_derivative(value: Any, item_slice: slice) -> np.ndarray | None:
+            if value is None:
+                return None
+            return np.asarray(value, dtype=float)[:, item_slice]
+
+        cache_by_z: dict[float, SurrogateBinCache] = {}
+        for bin_data, item_slice in self._flat_bin_slices():
+            cache_by_z[float(bin_data.effective_z_source)] = SurrogateBinCache(
+                effective_z_source=float(bin_data.effective_z_source),
+                inactive_alpha_x=np.asarray(flat_cache.inactive_alpha_x, dtype=float)[item_slice],
+                inactive_alpha_y=np.asarray(flat_cache.inactive_alpha_y, dtype=float)[item_slice],
+                inactive_alpha_dx_dparams=np.asarray(flat_cache.inactive_alpha_dx_dparams, dtype=float)[:, item_slice],
+                inactive_alpha_dy_dparams=np.asarray(flat_cache.inactive_alpha_dy_dparams, dtype=float)[:, item_slice],
+                inactive_jacobian_delta_a00=slice_1d(flat_cache.inactive_jacobian_delta_a00, item_slice),
+                inactive_jacobian_delta_a01=slice_1d(flat_cache.inactive_jacobian_delta_a01, item_slice),
+                inactive_jacobian_delta_a10=slice_1d(flat_cache.inactive_jacobian_delta_a10, item_slice),
+                inactive_jacobian_delta_a11=slice_1d(flat_cache.inactive_jacobian_delta_a11, item_slice),
+                inactive_jacobian_delta_da00_dparams=slice_derivative(
+                    flat_cache.inactive_jacobian_delta_da00_dparams, item_slice
+                ),
+                inactive_jacobian_delta_da01_dparams=slice_derivative(
+                    flat_cache.inactive_jacobian_delta_da01_dparams, item_slice
+                ),
+                inactive_jacobian_delta_da10_dparams=slice_derivative(
+                    flat_cache.inactive_jacobian_delta_da10_dparams, item_slice
+                ),
+                inactive_jacobian_delta_da11_dparams=slice_derivative(
+                    flat_cache.inactive_jacobian_delta_da11_dparams, item_slice
+                ),
+            )
+        return cache_by_z
+
+    def _source_metric_cache_by_z_from_flat_cache(
+        self,
+        flat_cache: FlatSourceMetricCache,
+    ) -> dict[float, dict[str, np.ndarray]]:
+        cache_by_z: dict[float, dict[str, np.ndarray]] = {}
+        for bin_data, item_slice in self._flat_bin_slices():
+            cache_by_z[float(bin_data.effective_z_source)] = {
+                "inv_abs_mu": np.asarray(flat_cache.inv_abs_mu, dtype=float)[item_slice],
+                "jac_a00": np.asarray(flat_cache.jac_a00, dtype=float)[item_slice],
+                "jac_a01": np.asarray(flat_cache.jac_a01, dtype=float)[item_slice],
+                "jac_a10": np.asarray(flat_cache.jac_a10, dtype=float)[item_slice],
+                "jac_a11": np.asarray(flat_cache.jac_a11, dtype=float)[item_slice],
+            }
+        return cache_by_z
+
+    def _scaling_scatter_cache_by_z_from_flat_arrays(
+        self,
+        derivatives: dict[str, np.ndarray],
+    ) -> dict[float, dict[str, np.ndarray]]:
+        cache_by_z: dict[float, dict[str, np.ndarray]] = {}
+        for bin_data, item_slice in self._flat_bin_slices():
+            cache_by_z[float(bin_data.effective_z_source)] = {
+                key: np.asarray(value, dtype=float)[item_slice]
+                for key, value in derivatives.items()
+            }
+        return cache_by_z
+
     def _prepare_traced_arc_constraint_data(self, arc_data: ArcConstraintData | None) -> TracedArcConstraintData:
         if arc_data is None or int(getattr(arc_data, "n_arcs", 0)) <= 0:
             empty = jnp.asarray([], dtype=jnp.float64)
@@ -15427,6 +18202,24 @@ class ClusterJAXEvaluator:
 
     def _prepare_packed_spec_arrays(self) -> dict[str, jnp.ndarray]:
         spec = self.state.packed_lens_spec
+        n_components = int(np.asarray(spec.profile_type).size)
+
+        def int_component_array(field_name: str, fill_value: int = -1) -> jnp.ndarray:
+            values = np.asarray(getattr(spec, field_name), dtype=np.int32)
+            if values.size == n_components:
+                return jnp.asarray(values, dtype=jnp.int32)
+            if values.size == 0:
+                return jnp.full(n_components, int(fill_value), dtype=jnp.int32)
+            raise ValueError(f"PackedLensSpec.{field_name} length {values.size} does not match component count {n_components}.")
+
+        def float_component_array(field_name: str, fill_value: float = 0.0) -> jnp.ndarray:
+            values = np.asarray(getattr(spec, field_name), dtype=float)
+            if values.size == n_components:
+                return jnp.asarray(values, dtype=jnp.float64)
+            if values.size == 0:
+                return jnp.full(n_components, float(fill_value), dtype=jnp.float64)
+            raise ValueError(f"PackedLensSpec.{field_name} length {values.size} does not match component count {n_components}.")
+
         return {
             "x_center_base": jnp.asarray(spec.x_center_base, dtype=jnp.float64),
             "x_center_param_index": jnp.asarray(spec.x_center_param_index, dtype=jnp.int32),
@@ -15459,9 +18252,25 @@ class ClusterJAXEvaluator:
             "vdslope_param_index": jnp.asarray(spec.vdslope_param_index, dtype=jnp.int32),
             "slope_base": jnp.asarray(spec.slope_base, dtype=jnp.float64),
             "slope_param_index": jnp.asarray(spec.slope_param_index, dtype=jnp.int32),
+            "alpha_sigma_base": float_component_array("alpha_sigma_base", fill_value=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN),
+            "alpha_sigma_param_index": int_component_array("alpha_sigma_param_index"),
+            "gamma_ml_base": float_component_array("gamma_ml_base", fill_value=DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN),
+            "gamma_ml_param_index": int_component_array("gamma_ml_param_index"),
             "sigma_log_scatter_param_index": jnp.asarray(spec.sigma_log_scatter_param_index, dtype=jnp.int32),
             "core_log_scatter_param_index": jnp.asarray(spec.core_log_scatter_param_index, dtype=jnp.int32),
             "cut_log_scatter_param_index": jnp.asarray(spec.cut_log_scatter_param_index, dtype=jnp.int32),
+            "independent_branch_role": int_component_array("independent_branch_role", fill_value=INDEPENDENT_BRANCH_NONE),
+            "independent_magnitude_feature": float_component_array("independent_magnitude_feature"),
+            "independent_free_log_v_disp_delta_unit_param_index": int_component_array("independent_free_log_v_disp_delta_unit_param_index"),
+            "independent_free_log_core_radius_delta_unit_param_index": int_component_array("independent_free_log_core_radius_delta_unit_param_index"),
+            "independent_free_log_cut_radius_delta_unit_param_index": int_component_array("independent_free_log_cut_radius_delta_unit_param_index"),
+            "independent_free_log_v_disp_tau_param_index": int_component_array("independent_free_log_v_disp_tau_param_index"),
+            "independent_free_log_core_radius_tau_param_index": int_component_array("independent_free_log_core_radius_tau_param_index"),
+            "independent_free_log_cut_radius_tau_param_index": int_component_array("independent_free_log_cut_radius_tau_param_index"),
+            "active_gate_intercept_param_index": int_component_array("active_gate_intercept_param_index"),
+            "active_gate_mag_slope_param_index": int_component_array("active_gate_mag_slope_param_index"),
+            "active_gate_logit_offset_param_index": int_component_array("active_gate_logit_offset_param_index"),
+            "active_magnitude_feature": float_component_array("active_magnitude_feature"),
         }
 
     def _physical_parameter_vector(self, params: jnp.ndarray) -> jnp.ndarray:
@@ -15472,13 +18281,6 @@ class ClusterJAXEvaluator:
             self.transform_offset_array,
             self.transform_kind_affine_mask,
             self.transform_scale_array,
-            self.potfile_mass_size_mass_indices,
-            self.potfile_mass_size_size_indices,
-            self.potfile_mass_size_mass_centers,
-            self.potfile_mass_size_mass_scales,
-            self.potfile_mass_size_size_centers,
-            self.potfile_mass_size_size_scales,
-            self.potfile_mass_size_cut_offsets,
         )
 
     def _source_sigma_int_jax(self, params: jnp.ndarray) -> jnp.ndarray:
@@ -16055,6 +18857,44 @@ class ClusterJAXEvaluator:
             _field_scale(spec_jax["cut_log_scatter_param_index"]),
         )
 
+    def _active_scaling_probability_from_physical(self, physical_params: jnp.ndarray) -> jnp.ndarray:
+        spec_jax = self.packed_spec_jax
+        intercept = self._apply_param_updates(
+            jnp.zeros_like(spec_jax["luminosity_ratio"]),
+            spec_jax["active_gate_intercept_param_index"],
+            physical_params,
+        )
+        slope = self._apply_param_updates(
+            jnp.zeros_like(spec_jax["luminosity_ratio"]),
+            spec_jax["active_gate_mag_slope_param_index"],
+            physical_params,
+        )
+        offset = self._apply_param_updates(
+            jnp.zeros_like(spec_jax["luminosity_ratio"]),
+            spec_jax["active_gate_logit_offset_param_index"],
+            physical_params,
+        )
+        has_gate = (
+            (spec_jax["active_gate_intercept_param_index"] >= 0)
+            & (spec_jax["active_gate_mag_slope_param_index"] >= 0)
+            & (spec_jax["active_gate_logit_offset_param_index"] >= 0)
+        )
+        logits = intercept + slope * spec_jax["active_magnitude_feature"] + offset
+        return jnp.where(has_gate, jax.nn.sigmoid(logits), 1.0)
+
+    def _independent_branch_weight_from_physical(
+        self,
+        physical_params: jnp.ndarray,
+    ) -> jnp.ndarray:
+        del physical_params
+        spec_jax = self.packed_spec_jax
+        branch_role = spec_jax["independent_branch_role"]
+        return jnp.where(
+            branch_role == INDEPENDENT_BRANCH_SCALING,
+            0.0,
+            1.0,
+        )
+
     def _scaling_scatter_extra_variance(
         self,
         params: jnp.ndarray,
@@ -16173,12 +19013,21 @@ class ClusterJAXEvaluator:
         return cov00, cov01, cov11, finite
 
     def refresh_scaling_scatter_cache(self, reference_params: np.ndarray, reason: str = "manual") -> None:
+        if self.sampling_engine in {
+            SAMPLING_ENGINE_FULL_FLAT,
+            SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+            SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT,
+        }:
+            self._refresh_flat_scaling_scatter_cache_from_reference(reference_params, reason=reason)
+            return
         self.scaling_scatter_cache_by_z = {}
         self.scaling_scatter_reference_params = None
         if len(self._fit_scaling_component_indices()) == 0 or len(self.scaling_scatter_param_indices) == 0:
             return
         reference = np.asarray(reference_params, dtype=float)
         reference_jax = jnp.asarray(reference, dtype=jnp.float64)
+        physical_reference = self._physical_parameter_vector(reference_jax)
+        scatter_offset_weight = jnp.ones_like(self.packed_spec_jax["luminosity_ratio"], dtype=jnp.float64)
         eps = 1.0e-3
         fit_component_indices = self._fit_component_indices()
 
@@ -16227,9 +19076,11 @@ class ClusterJAXEvaluator:
                 packed_state,
                 fit_component_indices,
             )
-            sigma_dx, sigma_dy = _derivative_for_field(bin_data, x_obs, y_obs, beta_x, beta_y, eps, 0.0, 0.0)
-            core_dx, core_dy = _derivative_for_field(bin_data, x_obs, y_obs, beta_x, beta_y, 0.0, eps, 0.0)
-            cut_dx, cut_dy = _derivative_for_field(bin_data, x_obs, y_obs, beta_x, beta_y, 0.0, 0.0, eps)
+            zero_offset = jnp.zeros_like(scatter_offset_weight)
+            weighted_offset = eps * scatter_offset_weight
+            sigma_dx, sigma_dy = _derivative_for_field(bin_data, x_obs, y_obs, beta_x, beta_y, weighted_offset, zero_offset, zero_offset)
+            core_dx, core_dy = _derivative_for_field(bin_data, x_obs, y_obs, beta_x, beta_y, zero_offset, weighted_offset, zero_offset)
+            cut_dx, cut_dy = _derivative_for_field(bin_data, x_obs, y_obs, beta_x, beta_y, zero_offset, zero_offset, weighted_offset)
             derivatives = {
                 "sigma_x": sigma_dx,
                 "sigma_y": sigma_dy,
@@ -16247,7 +19098,157 @@ class ClusterJAXEvaluator:
         self._refresh_flat_critical_arc_scatter_arrays()
         self._source_loglike_fn = jax.jit(self._source_loglike_impl)
 
+    def _refresh_flat_scaling_scatter_cache_from_reference(
+        self,
+        reference_params: np.ndarray,
+        reason: str = "manual",
+    ) -> None:
+        del reason
+        self.scaling_scatter_cache_by_z = {}
+        self.scaling_scatter_reference_params = None
+        if len(self._fit_scaling_component_indices()) == 0 or len(self.scaling_scatter_param_indices) == 0:
+            self._refresh_flat_critical_arc_scatter_arrays()
+            return
+        reference = np.asarray(reference_params, dtype=float)
+        reference_jax = jnp.asarray(reference, dtype=jnp.float64)
+        physical_params = self._physical_parameter_vector(reference_jax)
+        scatter_offset_weight = jnp.ones_like(self.packed_spec_jax["luminosity_ratio"], dtype=jnp.float64)
+        eps = 1.0e-3
+        flat_data = self.flat_critical_arc_data
+        fit_component_indices = self._fit_component_indices()
+        packed_state, validity = self._build_flat_packed_lens_state_with_validity_from_physical(
+            physical_params,
+            flat_data,
+            stop_gradient=False,
+        )
+        if not bool(np.asarray(validity["is_valid"], dtype=bool)):
+            self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+            self._refresh_flat_critical_arc_scatter_arrays()
+            return
+        beta_x, beta_y = self._flat_ray_shooting_for_components(
+            flat_data.x_obs,
+            flat_data.y_obs,
+            packed_state,
+            fit_component_indices,
+        )
+
+        def _derivative_for_field(
+            sigma_offset: float,
+            core_offset: float,
+            cut_offset: float,
+        ) -> tuple[np.ndarray, np.ndarray]:
+            packed_plus, plus_validity = self._build_flat_packed_lens_state_with_validity_from_physical(
+                physical_params,
+                flat_data,
+                stop_gradient=False,
+                sigma_log_offset=sigma_offset,
+                core_log_offset=core_offset,
+                cut_log_offset=cut_offset,
+            )
+            if not bool(np.asarray(plus_validity["is_valid"], dtype=bool)):
+                self._record_invalid_state_callback(np.asarray(plus_validity["reason_flags"], dtype=bool))
+                raise ValueError("invalid flat scaling-scatter offset state")
+            beta_plus_x, beta_plus_y = self._flat_ray_shooting_for_components(
+                flat_data.x_obs,
+                flat_data.y_obs,
+                packed_plus,
+                fit_component_indices,
+            )
+            deriv_x = np.asarray((beta_plus_x - beta_x) / eps, dtype=float)
+            deriv_y = np.asarray((beta_plus_y - beta_y) / eps, dtype=float)
+            return deriv_x, deriv_y
+
+        try:
+            zero_offset = jnp.zeros_like(scatter_offset_weight)
+            weighted_offset = eps * scatter_offset_weight
+            sigma_dx, sigma_dy = _derivative_for_field(weighted_offset, zero_offset, zero_offset)
+            core_dx, core_dy = _derivative_for_field(zero_offset, weighted_offset, zero_offset)
+            cut_dx, cut_dy = _derivative_for_field(zero_offset, zero_offset, weighted_offset)
+        except ValueError:
+            self._refresh_flat_critical_arc_scatter_arrays()
+            return
+
+        derivatives = {
+            "sigma_x": sigma_dx,
+            "sigma_y": sigma_dy,
+            "core_x": core_dx,
+            "core_y": core_dy,
+            "cut_x": cut_dx,
+            "cut_y": cut_dy,
+        }
+        if not all(np.isfinite(value).all() for value in derivatives.values()):
+            self._refresh_flat_critical_arc_scatter_arrays()
+            return
+        self.scaling_scatter_cache_by_z = self._scaling_scatter_cache_by_z_from_flat_arrays(derivatives)
+        self.scaling_scatter_reference_params = reference.copy()
+        self.flat_critical_arc_data = replace(
+            self.flat_critical_arc_data,
+            sigma_scatter_x=jnp.asarray(sigma_dx, dtype=jnp.float64),
+            sigma_scatter_y=jnp.asarray(sigma_dy, dtype=jnp.float64),
+            core_scatter_x=jnp.asarray(core_dx, dtype=jnp.float64),
+            core_scatter_y=jnp.asarray(core_dy, dtype=jnp.float64),
+            cut_scatter_x=jnp.asarray(cut_dx, dtype=jnp.float64),
+            cut_scatter_y=jnp.asarray(cut_dy, dtype=jnp.float64),
+        )
+        self._source_loglike_fn = jax.jit(self._source_loglike_impl)
+
+    def _refresh_flat_source_metric_cache_from_reference(
+        self,
+        reference_params: np.ndarray,
+        reason: str = "manual",
+    ) -> None:
+        del reason
+        reference = np.asarray(reference_params, dtype=float)
+        reference_jax = jnp.asarray(reference, dtype=jnp.float64)
+        physical_params = self._physical_parameter_vector(reference_jax)
+        flat_data = self.flat_critical_arc_data
+        packed_state, validity = self._build_flat_packed_lens_state_with_validity_from_physical(
+            physical_params,
+            flat_data,
+            stop_gradient=False,
+        )
+        if not bool(np.asarray(validity["is_valid"], dtype=bool)):
+            self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+            return
+        jac_a00, jac_a01, jac_a10, jac_a11 = self._flat_lensing_jacobian_for_components(
+            flat_data.x_obs,
+            flat_data.y_obs,
+            packed_state,
+            self._fit_component_indices(),
+        )
+        inv_abs_mu = jnp.abs(jac_a00 * jac_a11 - jac_a01 * jac_a10)
+        inv_abs_mu_np = np.clip(np.asarray(inv_abs_mu, dtype=float), 1.0e-6, 1.0e6)
+        jacobian_entries = {
+            "jac_a00": np.asarray(jac_a00, dtype=float),
+            "jac_a01": np.asarray(jac_a01, dtype=float),
+            "jac_a10": np.asarray(jac_a10, dtype=float),
+            "jac_a11": np.asarray(jac_a11, dtype=float),
+        }
+        if not np.isfinite(inv_abs_mu_np).all() or not all(np.isfinite(value).all() for value in jacobian_entries.values()):
+            return
+        self.flat_source_metric_cache = FlatSourceMetricCache(
+            inv_abs_mu=jnp.asarray(inv_abs_mu_np, dtype=jnp.float64),
+            jac_a00=jnp.asarray(jacobian_entries["jac_a00"], dtype=jnp.float64),
+            jac_a01=jnp.asarray(jacobian_entries["jac_a01"], dtype=jnp.float64),
+            jac_a10=jnp.asarray(jacobian_entries["jac_a10"], dtype=jnp.float64),
+            jac_a11=jnp.asarray(jacobian_entries["jac_a11"], dtype=jnp.float64),
+        )
+        self.source_metric_cache_by_z = self._source_metric_cache_by_z_from_flat_cache(self.flat_source_metric_cache)
+        self.source_metric_reference_params = reference.copy()
+        self._source_loglike_fn = jax.jit(self._source_loglike_impl)
+
     def refresh_source_metric_cache(self, reference_params: np.ndarray, reason: str = "manual") -> None:
+        if self._source_plane_unit_covariance_enabled():
+            del reason
+            self._reset_source_metric_cache_to_unit(reference_params)
+            return
+        if self.sampling_engine in {
+            SAMPLING_ENGINE_FULL_FLAT,
+            SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+            SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT,
+        }:
+            self._refresh_flat_source_metric_cache_from_reference(reference_params, reason=reason)
+            return
         reference = np.asarray(reference_params, dtype=float)
         reference_jax = jnp.asarray(reference, dtype=jnp.float64)
         physical_params = self._physical_parameter_vector(reference_jax)
@@ -16483,11 +19484,11 @@ class ClusterJAXEvaluator:
             axes=1,
         )
 
-    def _flat_surrogate_inactive_alpha(self, params: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-        cache = self.flat_surrogate_cache
-        if cache is None:
-            raise RuntimeError("Flat surrogate cache is unavailable; refresh the surrogate before evaluating.")
-        delta = self._surrogate_parameter_delta(params)
+    def _flat_surrogate_inactive_alpha_from_delta(
+        self,
+        cache: FlatSurrogateCache,
+        delta: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
         inactive_alpha_x = self._flat_cached_surrogate_vector(
             cache.inactive_alpha_x,
             cache.inactive_alpha_dx_dparams,
@@ -16501,6 +19502,13 @@ class ClusterJAXEvaluator:
             field_name="inactive_alpha_y",
         )
         return inactive_alpha_x, inactive_alpha_y
+
+    def _flat_surrogate_inactive_alpha(self, params: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        cache = self.flat_surrogate_cache
+        if cache is None:
+            raise RuntimeError("Flat surrogate cache is unavailable; refresh the surrogate before evaluating.")
+        delta = self._surrogate_parameter_delta(params)
+        return self._flat_surrogate_inactive_alpha_from_delta(cache, delta)
 
     def _flat_surrogate_beta(
         self,
@@ -16600,12 +19608,279 @@ class ClusterJAXEvaluator:
             active_a11 + inactive_delta_a11,
         )
 
+    def _flat_active_population_diagnostics_impl(
+        self,
+        params: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        flat_data = self.flat_critical_arc_data
+        params = jnp.asarray(params, dtype=jnp.float64)
+        physical_params = self._physical_parameter_vector(params)
+        component_indices = self._flat_active_population_candidate_indices()
+        raw_gate = jnp.take(self._active_scaling_probability_from_physical(physical_params), component_indices)
+        q_active = self._flat_active_population_gate_probabilities(physical_params, component_indices)
+        source_sigma_int = self._source_sigma_int_from_physical(physical_params)
+        with_jacobian = self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
+        beta_x, beta_y, jacobian_entries, invalid, packed_state = self._flat_active_population_exact_state(
+            physical_params,
+            flat_data,
+            with_jacobian=with_jacobian,
+        )
+        scatter_var_x, scatter_var_y = self._flat_scaling_scatter_extra_variance_from_physical(
+            physical_params,
+            flat_data,
+        )
+        inactive_beta_x, inactive_beta_y = self._flat_active_population_alpha_replacement(
+            beta_x,
+            beta_y,
+            packed_state,
+            flat_data,
+            component_indices,
+        )
+        if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN and jacobian_entries is not None:
+            jac_a00, jac_a01, jac_a10, jac_a11 = jacobian_entries
+            exact_loglike = _local_jacobian_bin_loglike(
+                beta_x=beta_x,
+                beta_y=beta_y,
+                family_idx=flat_data.global_family_index_per_image,
+                n_families=flat_data.n_families,
+                sigma_per_image=flat_data.sigma_per_image,
+                reliability_per_image=jnp.clip(flat_data.reliability_per_image, 1.0e-6, 1.0 - 1.0e-6),
+                image_has_constraint=flat_data.image_has_constraint,
+                source_sigma_int=source_sigma_int,
+                scatter_var_x=scatter_var_x,
+                scatter_var_y=scatter_var_y,
+                jac_a00=jac_a00,
+                jac_a01=jac_a01,
+                jac_a10=jac_a10,
+                jac_a11=jac_a11,
+                covariance_floor=self.source_plane_covariance_floor,
+                outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
+                max_gain=self.likelihood_stabilizer_max_gain,
+                max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
+                residual_loss=self.likelihood_stabilizer_residual_loss,
+                student_t_nu=self.likelihood_stabilizer_student_t_nu,
+            )
+            inactive_jac_entries = self._flat_active_population_jacobian_replacement(
+                jacobian_entries,
+                packed_state,
+                flat_data,
+                component_indices,
+            )
+
+            def inactive_local_loglike(
+                one_beta_x: jnp.ndarray,
+                one_beta_y: jnp.ndarray,
+                one_jac_a00: jnp.ndarray,
+                one_jac_a01: jnp.ndarray,
+                one_jac_a10: jnp.ndarray,
+                one_jac_a11: jnp.ndarray,
+            ) -> jnp.ndarray:
+                return _local_jacobian_bin_loglike(
+                    beta_x=one_beta_x,
+                    beta_y=one_beta_y,
+                    family_idx=flat_data.global_family_index_per_image,
+                    n_families=flat_data.n_families,
+                    sigma_per_image=flat_data.sigma_per_image,
+                    reliability_per_image=jnp.clip(flat_data.reliability_per_image, 1.0e-6, 1.0 - 1.0e-6),
+                    image_has_constraint=flat_data.image_has_constraint,
+                    source_sigma_int=source_sigma_int,
+                    scatter_var_x=scatter_var_x,
+                    scatter_var_y=scatter_var_y,
+                    jac_a00=one_jac_a00,
+                    jac_a01=one_jac_a01,
+                    jac_a10=one_jac_a10,
+                    jac_a11=one_jac_a11,
+                    covariance_floor=self.source_plane_covariance_floor,
+                    outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
+                    max_gain=self.likelihood_stabilizer_max_gain,
+                    max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
+                    residual_loss=self.likelihood_stabilizer_residual_loss,
+                    student_t_nu=self.likelihood_stabilizer_student_t_nu,
+                )
+
+            if int(component_indices.shape[0]) == 0:
+                inactive_loglikes = jnp.zeros((0,), dtype=jnp.float64)
+            else:
+                inactive_loglikes = jax.vmap(inactive_local_loglike)(inactive_beta_x, inactive_beta_y, *inactive_jac_entries)
+        else:
+            source_metric = self.flat_source_metric_cache
+            exact_loglike = _source_plane_bin_loglike(
+                beta_x=beta_x,
+                beta_y=beta_y,
+                family_idx=flat_data.global_family_index_per_image,
+                n_families=flat_data.n_families,
+                sigma_per_image=flat_data.sigma_per_image,
+                reliability_per_image=jnp.clip(flat_data.reliability_per_image, 1.0e-6, 1.0 - 1.0e-6),
+                image_has_constraint=flat_data.image_has_constraint,
+                source_sigma_int=source_sigma_int,
+                scatter_var_x=scatter_var_x,
+                scatter_var_y=scatter_var_y,
+                inv_abs_mu=source_metric.inv_abs_mu,
+                covariance_floor=self.source_plane_covariance_floor,
+                outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
+                max_gain=self.likelihood_stabilizer_max_gain,
+                max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
+                residual_loss=self.likelihood_stabilizer_residual_loss,
+                student_t_nu=self.likelihood_stabilizer_student_t_nu,
+            )
+
+            def inactive_source_loglike(one_beta_x: jnp.ndarray, one_beta_y: jnp.ndarray) -> jnp.ndarray:
+                return _source_plane_bin_loglike(
+                    beta_x=one_beta_x,
+                    beta_y=one_beta_y,
+                    family_idx=flat_data.global_family_index_per_image,
+                    n_families=flat_data.n_families,
+                    sigma_per_image=flat_data.sigma_per_image,
+                    reliability_per_image=jnp.clip(flat_data.reliability_per_image, 1.0e-6, 1.0 - 1.0e-6),
+                    image_has_constraint=flat_data.image_has_constraint,
+                    source_sigma_int=source_sigma_int,
+                    scatter_var_x=scatter_var_x,
+                    scatter_var_y=scatter_var_y,
+                    inv_abs_mu=source_metric.inv_abs_mu,
+                    covariance_floor=self.source_plane_covariance_floor,
+                    outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
+                    max_gain=self.likelihood_stabilizer_max_gain,
+                    max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
+                    residual_loss=self.likelihood_stabilizer_residual_loss,
+                    student_t_nu=self.likelihood_stabilizer_student_t_nu,
+                )
+
+            if int(component_indices.shape[0]) == 0:
+                inactive_loglikes = jnp.zeros((0,), dtype=jnp.float64)
+            else:
+                inactive_loglikes = jax.vmap(inactive_source_loglike)(inactive_beta_x, inactive_beta_y)
+
+        delta_loglike = inactive_loglikes - exact_loglike
+        _mixture_terms, responsibility = _active_population_mixture_terms(q_active, delta_loglike)
+        finite = (
+            (~invalid)
+            & jnp.all(jnp.isfinite(q_active))
+            & jnp.all(jnp.isfinite(delta_loglike))
+            & jnp.all(jnp.isfinite(responsibility))
+        )
+        nan_rows = jnp.full_like(q_active, jnp.nan)
+        return (
+            jnp.where(finite, raw_gate, nan_rows),
+            jnp.where(finite, responsibility, nan_rows),
+            jnp.where(finite, delta_loglike, nan_rows),
+        )
+
+    def active_population_diagnostics_for_samples(
+        self,
+        samples: np.ndarray,
+        best_fit: np.ndarray | None = None,
+    ) -> dict[str, np.ndarray] | None:
+        if not bool(getattr(self, "active_population_inference_enabled", False)):
+            return None
+        if self.flat_active_inference_cache is None:
+            return None
+        sample_array = np.asarray(samples, dtype=float)
+        if sample_array.ndim != 2 or sample_array.shape[0] == 0:
+            return None
+        single_diagnostics_fn = jax.jit(self._flat_active_population_diagnostics_impl)
+        batched_diagnostics_fn = jax.jit(jax.vmap(self._flat_active_population_diagnostics_impl))
+        gate_rows: list[np.ndarray] = []
+        membership_rows: list[np.ndarray] = []
+        delta_rows: list[np.ndarray] = []
+        chunk_size = 128
+        for start in range(0, sample_array.shape[0], chunk_size):
+            chunk = jnp.asarray(sample_array[start : start + chunk_size], dtype=jnp.float64)
+            gate, membership, delta = batched_diagnostics_fn(chunk)
+            gate_rows.append(np.asarray(gate, dtype=float))
+            membership_rows.append(np.asarray(membership, dtype=float))
+            delta_rows.append(np.asarray(delta, dtype=float))
+        result: dict[str, np.ndarray] = {
+            "component_indices": np.asarray(self.flat_active_inference_cache.component_indices, dtype=np.int32),
+            "gate_samples": np.concatenate(gate_rows, axis=0),
+            "membership_samples": np.concatenate(membership_rows, axis=0),
+            "delta_samples": np.concatenate(delta_rows, axis=0),
+            "active_inference_likelihood": np.asarray(
+                [ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION],
+                dtype=object,
+            ),
+        }
+        if best_fit is not None:
+            gate, membership, delta = single_diagnostics_fn(
+                jnp.asarray(np.asarray(best_fit, dtype=float), dtype=jnp.float64)
+            )
+            result["gate_map"] = np.asarray(gate, dtype=float)
+            result["membership_map"] = np.asarray(membership, dtype=float)
+            result["delta_map"] = np.asarray(delta, dtype=float)
+        return result
+
+    def refresh_active_inference_cache(self, reference_params: np.ndarray, reason: str = "manual") -> None:
+        del reason
+        self.flat_active_inference_cache = None
+        self.active_inference_reference_params = None
+        if not bool(getattr(self, "active_inference_enabled", False)):
+            return
+        component_indices = np.asarray(self.scaling_component_indices, dtype=np.int32).reshape(-1)
+        if component_indices.size == 0:
+            return
+        reference = np.asarray(reference_params, dtype=float)
+        reference_jax = jnp.asarray(reference, dtype=jnp.float64)
+        physical_params = self._physical_parameter_vector(reference_jax)
+        flat_data = self.flat_critical_arc_data
+        packed_state, validity = self._build_flat_packed_lens_state_with_validity_from_physical(
+            physical_params,
+            flat_data,
+            stop_gradient=False,
+        )
+        if not bool(np.asarray(validity["is_valid"], dtype=bool)):
+            self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+            return
+        alpha_x_rows: list[np.ndarray] = []
+        alpha_y_rows: list[np.ndarray] = []
+        jac00_rows: list[np.ndarray] = []
+        jac01_rows: list[np.ndarray] = []
+        jac10_rows: list[np.ndarray] = []
+        jac11_rows: list[np.ndarray] = []
+        for component_index in component_indices.tolist():
+            component = np.asarray([int(component_index)], dtype=np.int32)
+            beta_x, beta_y = self._flat_ray_shooting_for_components(
+                flat_data.x_obs,
+                flat_data.y_obs,
+                packed_state,
+                component,
+            )
+            alpha_x_rows.append(np.asarray(flat_data.x_obs - beta_x, dtype=float))
+            alpha_y_rows.append(np.asarray(flat_data.y_obs - beta_y, dtype=float))
+            jac_a00, jac_a01, jac_a10, jac_a11 = self._flat_lensing_jacobian_for_components(
+                flat_data.x_obs,
+                flat_data.y_obs,
+                packed_state,
+                component,
+            )
+            jac00_rows.append(np.asarray(jac_a00 - 1.0, dtype=float))
+            jac01_rows.append(np.asarray(jac_a01, dtype=float))
+            jac10_rows.append(np.asarray(jac_a10, dtype=float))
+            jac11_rows.append(np.asarray(jac_a11 - 1.0, dtype=float))
+        arrays = [np.asarray(rows, dtype=float) for rows in (alpha_x_rows, alpha_y_rows, jac00_rows, jac01_rows, jac10_rows, jac11_rows)]
+        if not all(np.isfinite(array).all() for array in arrays):
+            return
+        self.flat_active_inference_cache = ActiveInferenceFlatCache(
+            component_indices=component_indices,
+            reference_alpha_x=jnp.asarray(arrays[0], dtype=jnp.float64),
+            reference_alpha_y=jnp.asarray(arrays[1], dtype=jnp.float64),
+            reference_jacobian_delta_a00=jnp.asarray(arrays[2], dtype=jnp.float64),
+            reference_jacobian_delta_a01=jnp.asarray(arrays[3], dtype=jnp.float64),
+            reference_jacobian_delta_a10=jnp.asarray(arrays[4], dtype=jnp.float64),
+            reference_jacobian_delta_a11=jnp.asarray(arrays[5], dtype=jnp.float64),
+        )
+        self.active_inference_reference_params = reference.copy()
+        self._source_loglike_fn = jax.jit(self._source_loglike_impl)
+
     def _flat_refreshing_surrogate_source_loglike_impl(self, params: jnp.ndarray) -> jnp.ndarray:
         flat_data = self.flat_critical_arc_data
         params = jnp.asarray(params, dtype=jnp.float64)
         physical_params = self._physical_parameter_vector(params)
         source_sigma_int = self._source_sigma_int_from_physical(physical_params)
-        beta_x, beta_y, invalid, _packed_state = self._flat_surrogate_beta(params, physical_params, flat_data)
+        if bool(getattr(self, "active_population_inference_enabled", False)):
+            return self._flat_active_population_source_loglike_impl(params, physical_params, flat_data)
+        if bool(getattr(self, "active_blend_inference_enabled", False)):
+            beta_x, beta_y, invalid, _packed_state = self._flat_active_inference_beta(params, physical_params, flat_data)
+        else:
+            beta_x, beta_y, invalid, _packed_state = self._flat_surrogate_beta(params, physical_params, flat_data)
         scatter_var_x, scatter_var_y = self._flat_scaling_scatter_extra_variance_from_physical(
             physical_params,
             flat_data,
@@ -16649,7 +19924,12 @@ class ClusterJAXEvaluator:
         params = jnp.asarray(params, dtype=jnp.float64)
         physical_params = self._physical_parameter_vector(params)
         source_sigma_int = self._source_sigma_int_from_physical(physical_params)
-        beta_x, beta_y, invalid, _packed_state = self._flat_surrogate_beta(params, physical_params, flat_data)
+        if bool(getattr(self, "active_population_inference_enabled", False)):
+            return self._flat_active_population_local_jacobian_loglike_impl(params, physical_params, flat_data)
+        if bool(getattr(self, "active_blend_inference_enabled", False)):
+            beta_x, beta_y, invalid, _packed_state = self._flat_active_inference_beta(params, physical_params, flat_data)
+        else:
+            beta_x, beta_y, invalid, _packed_state = self._flat_surrogate_beta(params, physical_params, flat_data)
         scatter_var_x, scatter_var_y = self._flat_scaling_scatter_extra_variance_from_physical(
             physical_params,
             flat_data,
@@ -16670,6 +19950,74 @@ class ClusterJAXEvaluator:
             jac_a01=source_metric.jac_a01,
             jac_a10=source_metric.jac_a10,
             jac_a11=source_metric.jac_a11,
+            covariance_floor=self.source_plane_covariance_floor,
+            outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
+            max_gain=self.likelihood_stabilizer_max_gain,
+            max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
+            residual_loss=self.likelihood_stabilizer_residual_loss,
+            student_t_nu=self.likelihood_stabilizer_student_t_nu,
+        )
+        invalid = (
+            invalid
+            | (~jnp.all(jnp.isfinite(beta_x)))
+            | (~jnp.all(jnp.isfinite(beta_y)))
+            | (~jnp.all(jnp.isfinite(scatter_var_x)))
+            | (~jnp.all(jnp.isfinite(scatter_var_y)))
+            | (~jnp.isfinite(flat_loglike))
+        )
+        return jnp.where(
+            invalid,
+            jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64),
+            jnp.nan_to_num(flat_loglike, nan=BAD_LOG_LIKE, posinf=BAD_LOG_LIKE, neginf=BAD_LOG_LIKE),
+        )
+
+    def _flat_source_loglike_impl(self, params: jnp.ndarray) -> jnp.ndarray:
+        flat_data = self.flat_critical_arc_data
+        params = jnp.asarray(params, dtype=jnp.float64)
+        physical_params = self._physical_parameter_vector(params)
+        source_sigma_int = self._source_sigma_int_from_physical(physical_params)
+        sampled_kpc_per_arcsec = None
+        sampled_dpie_sigma0_factors = None
+        if bool(getattr(self, "fit_cosmology_flat_wcdm", False)):
+            sampled_kpc_per_arcsec, sampled_dpie_sigma0_factors = self._sampled_cosmology_geometry_for_physical(
+                physical_params
+            )
+        packed_state, validity = self._build_flat_packed_lens_state_with_validity_from_physical(
+            physical_params,
+            flat_data,
+            stop_gradient=True,
+            kpc_per_arcsec=sampled_kpc_per_arcsec,
+            dpie_sigma0_factors=sampled_dpie_sigma0_factors,
+        )
+        self._maybe_record_invalid_state(validity)
+        invalid = ~validity["is_valid"]
+        beta_x, beta_y = jax.lax.cond(
+            invalid,
+            lambda _: (flat_data.x_obs, flat_data.y_obs),
+            lambda current_state: self._flat_ray_shooting_for_components(
+                flat_data.x_obs,
+                flat_data.y_obs,
+                current_state,
+            ),
+            packed_state,
+        )
+        scatter_var_x, scatter_var_y = self._flat_scaling_scatter_extra_variance_from_physical(
+            physical_params,
+            flat_data,
+        )
+        source_metric = self.flat_source_metric_cache
+        flat_loglike = _source_plane_bin_loglike(
+            beta_x=beta_x,
+            beta_y=beta_y,
+            family_idx=flat_data.global_family_index_per_image,
+            n_families=flat_data.n_families,
+            sigma_per_image=flat_data.sigma_per_image,
+            reliability_per_image=jnp.clip(flat_data.reliability_per_image, 1.0e-6, 1.0 - 1.0e-6),
+            image_has_constraint=flat_data.image_has_constraint,
+            source_sigma_int=source_sigma_int,
+            scatter_var_x=scatter_var_x,
+            scatter_var_y=scatter_var_y,
+            inv_abs_mu=source_metric.inv_abs_mu,
             covariance_floor=self.source_plane_covariance_floor,
             outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
             max_gain=self.likelihood_stabilizer_max_gain,
@@ -16832,9 +20180,11 @@ class ClusterJAXEvaluator:
             jnp.nan_to_num(total_loglike, nan=BAD_LOG_LIKE, posinf=BAD_LOG_LIKE, neginf=BAD_LOG_LIKE),
         )
 
+
     def _flat_local_jacobian_source_loglike_impl(self, params: jnp.ndarray) -> jnp.ndarray:
         flat_data = self.flat_critical_arc_data
-        physical_params = self._physical_parameter_vector(jnp.asarray(params, dtype=jnp.float64))
+        params = jnp.asarray(params, dtype=jnp.float64)
+        physical_params = self._physical_parameter_vector(params)
         source_sigma_int = self._source_sigma_int_from_physical(physical_params)
         sampled_kpc_per_arcsec = None
         sampled_dpie_sigma0_factors = None
@@ -16851,19 +20201,21 @@ class ClusterJAXEvaluator:
         )
         self._maybe_record_invalid_state(validity)
         invalid = ~validity["is_valid"]
-        beta_x, beta_y = jax.lax.cond(
+        beta_x, beta_y, jac_a00, jac_a01, jac_a10, jac_a11 = jax.lax.cond(
             invalid,
-            lambda _: (flat_data.x_obs, flat_data.y_obs),
-            lambda current_state: self._flat_ray_shooting_for_components(
+            lambda _: (
+                flat_data.x_obs,
+                flat_data.y_obs,
+                jnp.ones_like(flat_data.x_obs),
+                jnp.zeros_like(flat_data.x_obs),
+                jnp.zeros_like(flat_data.y_obs),
+                jnp.ones_like(flat_data.y_obs),
+            ),
+            lambda current_state: self._flat_ray_shooting_and_lensing_jacobian_for_components(
                 flat_data.x_obs,
                 flat_data.y_obs,
                 current_state,
             ),
-            packed_state,
-        )
-        jac_a00, jac_a01, jac_a10, jac_a11 = self._flat_lensing_jacobian_for_components(
-            flat_data.x_obs,
-            flat_data.y_obs,
             packed_state,
         )
         scatter_var_x, scatter_var_y = self._flat_scaling_scatter_extra_variance_from_physical(
@@ -16946,21 +20298,24 @@ class ClusterJAXEvaluator:
         )
         self._maybe_record_invalid_state(validity)
         invalid = ~validity["is_valid"]
-        beta_x, beta_y = jax.lax.cond(
+        beta_x, beta_y, jac_a00, jac_a01, jac_a10, jac_a11 = jax.lax.cond(
             invalid,
-            lambda _: (flat_data.x_obs, flat_data.y_obs),
-            lambda current_state: self._flat_ray_shooting_for_components(
+            lambda _: (
+                flat_data.x_obs,
+                flat_data.y_obs,
+                jnp.ones_like(flat_data.x_obs),
+                jnp.zeros_like(flat_data.x_obs),
+                jnp.zeros_like(flat_data.y_obs),
+                jnp.ones_like(flat_data.y_obs),
+            ),
+            lambda current_state: self._flat_ray_shooting_and_lensing_jacobian_for_components(
                 flat_data.x_obs,
                 flat_data.y_obs,
                 current_state,
             ),
             packed_state,
         )
-        observed_jacobian_entries = self._flat_lensing_jacobian_for_components(
-            flat_data.x_obs,
-            flat_data.y_obs,
-            packed_state,
-        )
+        observed_jacobian_entries = (jac_a00, jac_a01, jac_a10, jac_a11)
         beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._flat_source_position_vectors(
             jnp.asarray(params, dtype=jnp.float64),
             physical_params,
@@ -17083,7 +20438,9 @@ class ClusterJAXEvaluator:
                     "component_index",
                     "catalog_id",
                     "rank",
+                    "free_component_index",
                     "selected_active",
+                    "selected_independent",
                     "requested_active_count",
                     "selection_mode",
                     "adaptive_cumulative_count",
@@ -17093,6 +20450,7 @@ class ClusterJAXEvaluator:
                     "min_distance_arcsec",
                     "brightness",
                     "catalog_mag",
+                    "independent_magnitude_feature",
                     "x_centre",
                     "y_centre",
                 ]
@@ -17121,7 +20479,15 @@ class ClusterJAXEvaluator:
             brightness = np.power(10.0, -0.4 * (magnitudes - mag0))
             importance = brightness / np.square(min_dist + 0.5)
             order = np.argsort(-importance)
-            if self.active_scaling_selection == "adaptive":
+            all_requested = bool(
+                potfile_order < len(getattr(self, "active_scaling_all_requested_by_potfile", []))
+                and self.active_scaling_all_requested_by_potfile[potfile_order]
+            )
+            if all_requested:
+                top_k = len(order)
+                cumulative_count = top_k
+                knee_count = top_k
+            elif self.active_scaling_selection == "adaptive":
                 top_k, cumulative_count, knee_count = _adaptive_active_scaling_count(
                     importance[order],
                     cumulative_fraction=self.active_scaling_cumulative_fraction,
@@ -17133,6 +20499,11 @@ class ClusterJAXEvaluator:
                 cumulative_count = top_k
                 knee_count = top_k
             active_positions = set(order[:top_k].tolist())
+            independent_positions = {
+                idx
+                for idx, record in enumerate(records)
+                if bool(record.get("selected_independent", False))
+            }
             ordered_importance = importance[order]
             total_importance = float(np.sum(ordered_importance[np.isfinite(ordered_importance)]))
             cumulative_importance = np.cumsum(np.nan_to_num(ordered_importance, nan=0.0, posinf=0.0, neginf=0.0))
@@ -17145,7 +20516,9 @@ class ClusterJAXEvaluator:
                         "component_index": int(record["component_index"]),
                         "catalog_id": str(record["catalog_id"]),
                         "rank": rank,
-                        "selected_active": bool(record_pos in active_positions),
+                        "free_component_index": int(record.get("free_component_index", -1)),
+                        "selected_active": bool(record_pos in active_positions or record_pos in independent_positions),
+                        "selected_independent": bool(record_pos in independent_positions),
                         "requested_active_count": requested_active_count,
                         "selection_mode": self.active_scaling_selection,
                         "adaptive_cumulative_count": int(cumulative_count),
@@ -17157,6 +20530,7 @@ class ClusterJAXEvaluator:
                         "min_distance_arcsec": float(min_dist[record_pos]),
                         "brightness": float(brightness[record_pos]),
                         "catalog_mag": float(record["catalog_mag"]),
+                        "independent_magnitude_feature": float(record.get("independent_magnitude_feature", 0.0)),
                         "x_centre": float(record["x_centre"]),
                         "y_centre": float(record["y_centre"]),
                     }
@@ -17177,6 +20551,36 @@ class ClusterJAXEvaluator:
         safe_index = jnp.where(param_index_jax >= 0, param_index_jax, 0)
         updated = jnp.take(params, safe_index)
         return jnp.where(param_index_jax >= 0, updated, base)
+
+    def _effective_scaling_exponents_from_physical(
+        self,
+        spec_jax: dict[str, Any],
+        physical_params: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        vdslope = self._apply_param_updates(
+            spec_jax["vdslope_base"], spec_jax["vdslope_param_index"], physical_params
+        )
+        slope = self._apply_param_updates(
+            spec_jax["slope_base"], spec_jax["slope_param_index"], physical_params
+        )
+        alpha_sigma = self._apply_param_updates(
+            spec_jax["alpha_sigma_base"], spec_jax["alpha_sigma_param_index"], physical_params
+        )
+        gamma_ml = self._apply_param_updates(
+            spec_jax["gamma_ml_base"], spec_jax["gamma_ml_param_index"], physical_params
+        )
+        safe_vdslope = _safe_signed_min_abs(vdslope, SAFE_SCALING_EXPONENT_ABS_MIN)
+        safe_slope = _safe_signed_min_abs(slope, SAFE_SCALING_EXPONENT_ABS_MIN)
+        denominator_alpha_sigma = 1.0 / safe_vdslope
+        denominator_beta_radius = 2.0 / safe_slope
+        bergamini_enabled = spec_jax["alpha_sigma_param_index"] >= 0
+        effective_alpha_sigma = jnp.where(bergamini_enabled, alpha_sigma, denominator_alpha_sigma)
+        effective_beta_radius = jnp.where(
+            bergamini_enabled,
+            1.0 + gamma_ml - 2.0 * alpha_sigma,
+            denominator_beta_radius,
+        )
+        return effective_alpha_sigma, effective_beta_radius, gamma_ml
 
     def _dpie_sigma0_factor_for_z_source(self, z_source: float) -> float:
         factor = self.dpie_sigma0_factors.get(float(z_source))
@@ -17272,26 +20676,11 @@ class ClusterJAXEvaluator:
                 [float(getattr(spec_item, "transform_scale", 1.0)) for spec_item in self.state.parameter_specs],
                 dtype=jnp.float64,
             )
-            coupling_arrays = _potfile_mass_size_coupling_arrays(self.state.parameter_specs)
-            potfile_mass_size_mass_indices = jnp.asarray(coupling_arrays["mass_indices"], dtype=jnp.int32)
-            potfile_mass_size_size_indices = jnp.asarray(coupling_arrays["size_indices"], dtype=jnp.int32)
-            potfile_mass_size_mass_centers = jnp.asarray(coupling_arrays["mass_centers"], dtype=jnp.float64)
-            potfile_mass_size_mass_scales = jnp.asarray(coupling_arrays["mass_scales"], dtype=jnp.float64)
-            potfile_mass_size_size_centers = jnp.asarray(coupling_arrays["size_centers"], dtype=jnp.float64)
-            potfile_mass_size_size_scales = jnp.asarray(coupling_arrays["size_scales"], dtype=jnp.float64)
-            potfile_mass_size_cut_offsets = jnp.asarray(coupling_arrays["cut_offsets"], dtype=jnp.float64)
         else:
             transform_kind_log_offset_positive_mask = self.transform_kind_log_offset_positive_mask
             transform_offset_array = self.transform_offset_array
             transform_kind_affine_mask = self.transform_kind_affine_mask
             transform_scale_array = self.transform_scale_array
-            potfile_mass_size_mass_indices = self.potfile_mass_size_mass_indices
-            potfile_mass_size_size_indices = self.potfile_mass_size_size_indices
-            potfile_mass_size_mass_centers = self.potfile_mass_size_mass_centers
-            potfile_mass_size_mass_scales = self.potfile_mass_size_mass_scales
-            potfile_mass_size_size_centers = self.potfile_mass_size_size_centers
-            potfile_mass_size_size_scales = self.potfile_mass_size_size_scales
-            potfile_mass_size_cut_offsets = self.potfile_mass_size_cut_offsets
         physical_params = _apply_parameter_transforms_jax(
             params,
             transform_kind_log_positive_mask,
@@ -17299,13 +20688,6 @@ class ClusterJAXEvaluator:
             transform_offset_array,
             transform_kind_affine_mask,
             transform_scale_array,
-            potfile_mass_size_mass_indices,
-            potfile_mass_size_size_indices,
-            potfile_mass_size_mass_centers,
-            potfile_mass_size_mass_scales,
-            potfile_mass_size_size_centers,
-            potfile_mass_size_size_scales,
-            potfile_mass_size_cut_offsets,
         )
         return self._build_packed_lens_state_details_from_physical(physical_params, z_source)
 
@@ -17348,17 +20730,58 @@ class ClusterJAXEvaluator:
         core_ref = self._apply_param_updates(
             spec_jax["core_ref_base"], spec_jax["core_ref_param_index"], physical_params
         )
-        vdslope = self._apply_param_updates(
-            spec_jax["vdslope_base"], spec_jax["vdslope_param_index"], physical_params
+        alpha_sigma, beta_radius, gamma_ml = self._effective_scaling_exponents_from_physical(spec_jax, physical_params)
+        scaled_vdisp = sigma_ref * jnp.power(luminosity_ratio, alpha_sigma)
+        size_luminosity_scale = jnp.power(luminosity_ratio, beta_radius)
+        scaled_core = core_ref * size_luminosity_scale
+        scaled_cut = cut_ref * size_luminosity_scale
+        free_role = spec_jax["independent_branch_role"] == INDEPENDENT_BRANCH_FREE
+        log_displacement_free = free_role & (spec_jax["independent_free_log_v_disp_delta_unit_param_index"] >= 0)
+        free_v_delta = self._apply_param_updates(
+            jnp.zeros_like(spec_jax["luminosity_ratio"]),
+            spec_jax["independent_free_log_v_disp_delta_unit_param_index"],
+            physical_params,
         )
-        slope = self._apply_param_updates(
-            spec_jax["slope_base"], spec_jax["slope_param_index"], physical_params
+        free_core_delta = self._apply_param_updates(
+            jnp.zeros_like(spec_jax["luminosity_ratio"]),
+            spec_jax["independent_free_log_core_radius_delta_unit_param_index"],
+            physical_params,
         )
-        safe_vdslope = _safe_signed_min_abs(vdslope, SAFE_SCALING_EXPONENT_ABS_MIN)
-        safe_slope = _safe_signed_min_abs(slope, SAFE_SCALING_EXPONENT_ABS_MIN)
-        scaled_vdisp = sigma_ref * jnp.power(luminosity_ratio, 1.0 / safe_vdslope)
-        scaled_core = core_ref * jnp.power(luminosity_ratio, 0.5)
-        scaled_cut = cut_ref * jnp.power(luminosity_ratio, 2.0 / safe_slope)
+        free_cut_delta = self._apply_param_updates(
+            jnp.zeros_like(spec_jax["luminosity_ratio"]),
+            spec_jax["independent_free_log_cut_radius_delta_unit_param_index"],
+            physical_params,
+        )
+        free_v_tau = self._apply_param_updates(
+            jnp.zeros_like(spec_jax["luminosity_ratio"]),
+            spec_jax["independent_free_log_v_disp_tau_param_index"],
+            physical_params,
+        )
+        free_core_tau = self._apply_param_updates(
+            jnp.zeros_like(spec_jax["luminosity_ratio"]),
+            spec_jax["independent_free_log_core_radius_tau_param_index"],
+            physical_params,
+        )
+        free_cut_tau = self._apply_param_updates(
+            jnp.zeros_like(spec_jax["luminosity_ratio"]),
+            spec_jax["independent_free_log_cut_radius_tau_param_index"],
+            physical_params,
+        )
+        v_disp = jnp.where(
+            log_displacement_free,
+            scaled_vdisp * jnp.exp(free_v_tau * free_v_delta),
+            v_disp,
+        )
+        core_radius_kpc = jnp.where(
+            log_displacement_free,
+            scaled_core * jnp.exp(free_core_tau * free_core_delta),
+            core_radius_kpc,
+        )
+        cut_radius_kpc = jnp.where(
+            log_displacement_free,
+            scaled_cut * jnp.exp(free_cut_tau * free_cut_delta),
+            cut_radius_kpc,
+        )
         v_disp = jnp.where(is_scaling, scaled_vdisp, v_disp)
         core_radius_kpc = jnp.where(is_scaling, scaled_core, core_radius_kpc)
         cut_radius_kpc = jnp.where(is_scaling, scaled_cut, cut_radius_kpc)
@@ -17375,7 +20798,10 @@ class ClusterJAXEvaluator:
         else:
             factor_array = jnp.asarray(dpie_sigma0_factor, dtype=jnp.float64)
         safe_factor = jnp.where(jnp.isfinite(factor_array), factor_array, 0.0)
-        sigma0 = (v_disp**2) * safe_factor / ra
+        branch_weight = self._independent_branch_weight_from_physical(
+            physical_params,
+        )
+        sigma0 = branch_weight * (v_disp**2) * safe_factor / ra
 
         packed_state = {
             "__packed__": True,
@@ -17398,8 +20824,9 @@ class ClusterJAXEvaluator:
             "ra_raw": ra_raw,
             "rs_raw": rs_raw,
             "v_disp": v_disp,
-            "vdslope": vdslope,
-            "slope": slope,
+            "alpha_sigma": alpha_sigma,
+            "beta_radius": beta_radius,
+            "gamma_ml": gamma_ml,
             "x_center": x_center,
             "y_center": y_center,
             "gamma1": gamma1,
@@ -17407,6 +20834,7 @@ class ClusterJAXEvaluator:
             "e1": e1,
             "e2": e2,
             "factor_array": factor_array,
+            "independent_branch_weight": branch_weight,
         }
         return packed_state, details
 
@@ -17424,10 +20852,8 @@ class ClusterJAXEvaluator:
                 jnp.any(
                     details["is_scaling"]
                     & (
-                        ~jnp.isfinite(details["vdslope"])
-                        | ~jnp.isfinite(details["slope"])
-                        | (jnp.abs(details["vdslope"]) < SAFE_SCALING_EXPONENT_ABS_MIN)
-                        | (jnp.abs(details["slope"]) < SAFE_SCALING_EXPONENT_ABS_MIN)
+                        ~jnp.isfinite(details["alpha_sigma"])
+                        | ~jnp.isfinite(details["beta_radius"])
                     )
                 ),
                 jnp.any(~jnp.isfinite(details["x_center"]) | ~jnp.isfinite(details["y_center"])),
@@ -17464,6 +20890,67 @@ class ClusterJAXEvaluator:
         validity_params = jax.lax.stop_gradient(params) if stop_gradient else params
         _packed_state, details = self._build_packed_lens_state_details(validity_params, z_source)
         return self._packed_lens_validity(details)
+
+    def _apply_independent_free_log_displacements(
+        self,
+        physical_params: jnp.ndarray,
+        scaled_vdisp: jnp.ndarray,
+        scaled_core: jnp.ndarray,
+        scaled_cut: jnp.ndarray,
+        v_disp: jnp.ndarray,
+        core_radius_kpc: jnp.ndarray,
+        cut_radius_kpc: jnp.ndarray,
+        spec_arrays: dict[str, jnp.ndarray],
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        free_role = spec_arrays["independent_branch_role"] == INDEPENDENT_BRANCH_FREE
+        log_displacement_free = free_role & (spec_arrays["independent_free_log_v_disp_delta_unit_param_index"] >= 0)
+        zeros = jnp.zeros_like(spec_arrays["luminosity_ratio"])
+        free_v_delta = self._apply_param_updates(
+            zeros,
+            spec_arrays["independent_free_log_v_disp_delta_unit_param_index"],
+            physical_params,
+        )
+        free_core_delta = self._apply_param_updates(
+            zeros,
+            spec_arrays["independent_free_log_core_radius_delta_unit_param_index"],
+            physical_params,
+        )
+        free_cut_delta = self._apply_param_updates(
+            zeros,
+            spec_arrays["independent_free_log_cut_radius_delta_unit_param_index"],
+            physical_params,
+        )
+        free_v_tau = self._apply_param_updates(
+            zeros,
+            spec_arrays["independent_free_log_v_disp_tau_param_index"],
+            physical_params,
+        )
+        free_core_tau = self._apply_param_updates(
+            zeros,
+            spec_arrays["independent_free_log_core_radius_tau_param_index"],
+            physical_params,
+        )
+        free_cut_tau = self._apply_param_updates(
+            zeros,
+            spec_arrays["independent_free_log_cut_radius_tau_param_index"],
+            physical_params,
+        )
+        v_disp = jnp.where(
+            log_displacement_free,
+            scaled_vdisp * jnp.exp(free_v_tau * free_v_delta),
+            v_disp,
+        )
+        core_radius_kpc = jnp.where(
+            log_displacement_free,
+            scaled_core * jnp.exp(free_core_tau * free_core_delta),
+            core_radius_kpc,
+        )
+        cut_radius_kpc = jnp.where(
+            log_displacement_free,
+            scaled_cut * jnp.exp(free_cut_tau * free_cut_delta),
+            cut_radius_kpc,
+        )
+        return v_disp, core_radius_kpc, cut_radius_kpc
 
     def _build_packed_lens_state_with_validity(
         self,
@@ -17502,6 +20989,7 @@ class ClusterJAXEvaluator:
     ) -> dict[str, Any]:
         pack_start = time.perf_counter()
         spec = self.state.packed_lens_spec
+        spec_jax = self.packed_spec_jax
         transform_kind_log_positive_mask = getattr(self, "transform_kind_log_positive_mask", None)
         if transform_kind_log_positive_mask is None:
             transform_kind_array = np.asarray(
@@ -17522,26 +21010,11 @@ class ClusterJAXEvaluator:
                 [float(getattr(spec_item, "transform_scale", 1.0)) for spec_item in self.state.parameter_specs],
                 dtype=jnp.float64,
             )
-            coupling_arrays = _potfile_mass_size_coupling_arrays(self.state.parameter_specs)
-            potfile_mass_size_mass_indices = jnp.asarray(coupling_arrays["mass_indices"], dtype=jnp.int32)
-            potfile_mass_size_size_indices = jnp.asarray(coupling_arrays["size_indices"], dtype=jnp.int32)
-            potfile_mass_size_mass_centers = jnp.asarray(coupling_arrays["mass_centers"], dtype=jnp.float64)
-            potfile_mass_size_mass_scales = jnp.asarray(coupling_arrays["mass_scales"], dtype=jnp.float64)
-            potfile_mass_size_size_centers = jnp.asarray(coupling_arrays["size_centers"], dtype=jnp.float64)
-            potfile_mass_size_size_scales = jnp.asarray(coupling_arrays["size_scales"], dtype=jnp.float64)
-            potfile_mass_size_cut_offsets = jnp.asarray(coupling_arrays["cut_offsets"], dtype=jnp.float64)
         else:
             transform_kind_log_offset_positive_mask = self.transform_kind_log_offset_positive_mask
             transform_offset_array = self.transform_offset_array
             transform_kind_affine_mask = self.transform_kind_affine_mask
             transform_scale_array = self.transform_scale_array
-            potfile_mass_size_mass_indices = self.potfile_mass_size_mass_indices
-            potfile_mass_size_size_indices = self.potfile_mass_size_size_indices
-            potfile_mass_size_mass_centers = self.potfile_mass_size_mass_centers
-            potfile_mass_size_mass_scales = self.potfile_mass_size_mass_scales
-            potfile_mass_size_size_centers = self.potfile_mass_size_size_centers
-            potfile_mass_size_size_scales = self.potfile_mass_size_size_scales
-            potfile_mass_size_cut_offsets = self.potfile_mass_size_cut_offsets
         physical_params = _apply_parameter_transforms_jax(
             params,
             transform_kind_log_positive_mask,
@@ -17549,13 +21022,6 @@ class ClusterJAXEvaluator:
             transform_offset_array,
             transform_kind_affine_mask,
             transform_scale_array,
-            potfile_mass_size_mass_indices,
-            potfile_mass_size_size_indices,
-            potfile_mass_size_mass_centers,
-            potfile_mass_size_mass_scales,
-            potfile_mass_size_size_centers,
-            potfile_mass_size_size_scales,
-            potfile_mass_size_cut_offsets,
         )
         x_center = self._apply_param_updates(jnp.asarray(spec.x_center_base, dtype=jnp.float64), spec.x_center_param_index, physical_params)
         y_center = self._apply_param_updates(jnp.asarray(spec.y_center_base, dtype=jnp.float64), spec.y_center_param_index, physical_params)
@@ -17587,20 +21053,24 @@ class ClusterJAXEvaluator:
         core_ref = self._apply_param_updates(
             jnp.asarray(spec.core_ref_base, dtype=jnp.float64), spec.core_ref_param_index, physical_params
         )
-        vdslope = self._apply_param_updates(
-            jnp.asarray(spec.vdslope_base, dtype=jnp.float64), spec.vdslope_param_index, physical_params
-        )
-        slope = self._apply_param_updates(
-            jnp.asarray(spec.slope_base, dtype=jnp.float64), spec.slope_param_index, physical_params
-        )
-        safe_vdslope = _safe_signed_min_abs(vdslope, SAFE_SCALING_EXPONENT_ABS_MIN)
-        safe_slope = _safe_signed_min_abs(slope, SAFE_SCALING_EXPONENT_ABS_MIN)
-        scaled_vdisp = sigma_ref * jnp.power(luminosity_ratio, 1.0 / safe_vdslope)
-        scaled_core = core_ref * jnp.power(luminosity_ratio, 0.5)
-        scaled_cut = cut_ref * jnp.power(luminosity_ratio, 2.0 / safe_slope)
+        alpha_sigma, beta_radius, _gamma_ml = self._effective_scaling_exponents_from_physical(spec_jax, physical_params)
+        scaled_vdisp = sigma_ref * jnp.power(luminosity_ratio, alpha_sigma)
+        size_luminosity_scale = jnp.power(luminosity_ratio, beta_radius)
+        scaled_core = core_ref * size_luminosity_scale
+        scaled_cut = cut_ref * size_luminosity_scale
         scaled_vdisp = scaled_vdisp * jnp.exp(jnp.asarray(sigma_log_offset, dtype=jnp.float64))
         scaled_core = scaled_core * jnp.exp(jnp.asarray(core_log_offset, dtype=jnp.float64))
         scaled_cut = scaled_cut * jnp.exp(jnp.asarray(cut_log_offset, dtype=jnp.float64))
+        v_disp, core_radius_kpc, cut_radius_kpc = self._apply_independent_free_log_displacements(
+            physical_params,
+            scaled_vdisp,
+            scaled_core,
+            scaled_cut,
+            v_disp,
+            core_radius_kpc,
+            cut_radius_kpc,
+            spec_jax,
+        )
         v_disp = jnp.where(is_scaling, scaled_vdisp, v_disp)
         core_radius_kpc = jnp.where(is_scaling, scaled_core, core_radius_kpc)
         cut_radius_kpc = jnp.where(is_scaling, scaled_cut, cut_radius_kpc)
@@ -17612,7 +21082,8 @@ class ClusterJAXEvaluator:
         rs = jnp.maximum(rs_raw, ra + SAFE_RADIUS_MARGIN_ARCSEC)
         factor_array = self._dpie_sigma0_factor_for_physical_z_source(physical_params, z_source)
         safe_factor = jnp.where(jnp.isfinite(factor_array), factor_array, 0.0)
-        sigma0 = (v_disp**2) * safe_factor / ra
+        branch_weight = self._independent_branch_weight_from_physical(physical_params)
+        sigma0 = branch_weight * (v_disp**2) * safe_factor / ra
 
         packed_state = {
             "__packed__": True,
@@ -17638,6 +21109,9 @@ class ClusterJAXEvaluator:
         stop_gradient: bool,
         kpc_per_arcsec: jnp.ndarray | None = None,
         dpie_sigma0_factors: jnp.ndarray | None = None,
+        sigma_log_offset: float | jnp.ndarray = 0.0,
+        core_log_offset: float | jnp.ndarray = 0.0,
+        cut_log_offset: float | jnp.ndarray = 0.0,
     ) -> tuple[dict[str, Any], dict[str, jnp.ndarray]]:
         spec_jax = self.packed_spec_jax
         x_center = self._apply_param_updates(spec_jax["x_center_base"], spec_jax["x_center_param_index"], physical_params)
@@ -17670,17 +21144,24 @@ class ClusterJAXEvaluator:
         core_ref = self._apply_param_updates(
             spec_jax["core_ref_base"], spec_jax["core_ref_param_index"], physical_params
         )
-        vdslope = self._apply_param_updates(
-            spec_jax["vdslope_base"], spec_jax["vdslope_param_index"], physical_params
+        alpha_sigma, beta_radius, _gamma_ml = self._effective_scaling_exponents_from_physical(spec_jax, physical_params)
+        scaled_vdisp = sigma_ref * jnp.power(luminosity_ratio, alpha_sigma)
+        size_luminosity_scale = jnp.power(luminosity_ratio, beta_radius)
+        scaled_core = core_ref * size_luminosity_scale
+        scaled_cut = cut_ref * size_luminosity_scale
+        scaled_vdisp = scaled_vdisp * jnp.exp(jnp.asarray(sigma_log_offset, dtype=jnp.float64))
+        scaled_core = scaled_core * jnp.exp(jnp.asarray(core_log_offset, dtype=jnp.float64))
+        scaled_cut = scaled_cut * jnp.exp(jnp.asarray(cut_log_offset, dtype=jnp.float64))
+        v_disp, core_radius_kpc, cut_radius_kpc = self._apply_independent_free_log_displacements(
+            physical_params,
+            scaled_vdisp,
+            scaled_core,
+            scaled_cut,
+            v_disp,
+            core_radius_kpc,
+            cut_radius_kpc,
+            spec_jax,
         )
-        slope = self._apply_param_updates(
-            spec_jax["slope_base"], spec_jax["slope_param_index"], physical_params
-        )
-        safe_vdslope = _safe_signed_min_abs(vdslope, SAFE_SCALING_EXPONENT_ABS_MIN)
-        safe_slope = _safe_signed_min_abs(slope, SAFE_SCALING_EXPONENT_ABS_MIN)
-        scaled_vdisp = sigma_ref * jnp.power(luminosity_ratio, 1.0 / safe_vdslope)
-        scaled_core = core_ref * jnp.power(luminosity_ratio, 0.5)
-        scaled_cut = cut_ref * jnp.power(luminosity_ratio, 2.0 / safe_slope)
         v_disp = jnp.where(is_scaling, scaled_vdisp, v_disp)
         core_radius_kpc = jnp.where(is_scaling, scaled_core, core_radius_kpc)
         cut_radius_kpc = jnp.where(is_scaling, scaled_cut, cut_radius_kpc)
@@ -17705,7 +21186,10 @@ class ClusterJAXEvaluator:
             flat_data.effective_z_index_per_image,
         )
         safe_factor = jnp.where(jnp.isfinite(factor_per_image), factor_per_image, 0.0)
-        sigma0 = (v_disp[:, None] ** 2) * safe_factor[None, :] / ra[:, None]
+        branch_weight = self._independent_branch_weight_from_physical(
+            physical_params,
+        )
+        sigma0 = branch_weight[:, None] * (v_disp[:, None] ** 2) * safe_factor[None, :] / ra[:, None]
 
         packed_state = {
             "__packed__": True,
@@ -17730,10 +21214,8 @@ class ClusterJAXEvaluator:
                 jnp.any(
                     is_scaling
                     & (
-                        ~jnp.isfinite(vdslope)
-                        | ~jnp.isfinite(slope)
-                        | (jnp.abs(vdslope) < SAFE_SCALING_EXPONENT_ABS_MIN)
-                        | (jnp.abs(slope) < SAFE_SCALING_EXPONENT_ABS_MIN)
+                        ~jnp.isfinite(alpha_sigma)
+                        | ~jnp.isfinite(beta_radius)
                     )
                 ),
                 jnp.any(~jnp.isfinite(x_center) | ~jnp.isfinite(y_center)),
@@ -17814,6 +21296,406 @@ class ClusterJAXEvaluator:
         kwargs = self._flat_bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices)
         f_xx, f_xy, f_yx, f_yy = self.flat_lens_model.hessian(x, y, kwargs)
         return 1.0 - f_xx, -f_xy, -f_yx, 1.0 - f_yy
+
+    def _flat_component_alpha_and_jacobian_delta_for_pairs(
+        self,
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        packed_state: dict[str, Any],
+        component_indices: np.ndarray,
+        image_indices: np.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        component_indices_np = np.asarray(component_indices, dtype=np.int32).reshape(-1)
+        if component_indices_np.size == 0:
+            empty = jnp.zeros((0,), dtype=jnp.float64)
+            return empty, empty, empty, empty, empty, empty
+        if int(x.shape[0]) != int(component_indices_np.size) or int(y.shape[0]) != int(component_indices_np.size):
+            raise ValueError("Sparse flat component pair evaluation requires matching x, y, and component lengths.")
+        if image_indices is None:
+            image_indices_np = np.zeros(component_indices_np.shape, dtype=np.int32)
+        else:
+            image_indices_np = np.asarray(image_indices, dtype=np.int32).reshape(-1)
+        if int(image_indices_np.size) != int(component_indices_np.size):
+            raise ValueError("Sparse flat component pair evaluation requires one image index per component.")
+
+        bulk_model = getattr(self.flat_lens_model, "lens_model", None)
+        if bulk_model is None or not all(
+            hasattr(bulk_model, attr)
+            for attr in ("_derivatives_list", "_hessian_list", "_compact_profile_mask", "_compact_skip_factor")
+        ):
+            alpha_x = jnp.zeros_like(x, dtype=jnp.float64)
+            alpha_y = jnp.zeros_like(y, dtype=jnp.float64)
+            jac00 = jnp.zeros_like(x, dtype=jnp.float64)
+            jac01 = jnp.zeros_like(x, dtype=jnp.float64)
+            jac10 = jnp.zeros_like(y, dtype=jnp.float64)
+            jac11 = jnp.zeros_like(y, dtype=jnp.float64)
+            for component_index in sorted(set(int(value) for value in component_indices_np.tolist())):
+                component = np.asarray([component_index], dtype=np.int32)
+                mask = jnp.asarray(component_indices_np == component_index, dtype=bool)
+                beta_x, beta_y = self._flat_ray_shooting_for_components(x, y, packed_state, component)
+                jac_a00, jac_a01, jac_a10, jac_a11 = self._flat_lensing_jacobian_for_components(
+                    x,
+                    y,
+                    packed_state,
+                    component,
+                )
+                alpha_x = jnp.where(mask, x - beta_x, alpha_x)
+                alpha_y = jnp.where(mask, y - beta_y, alpha_y)
+                jac00 = jnp.where(mask, jac_a00 - 1.0, jac00)
+                jac01 = jnp.where(mask, jac_a01, jac01)
+                jac10 = jnp.where(mask, jac_a10, jac10)
+                jac11 = jnp.where(mask, jac_a11 - 1.0, jac11)
+            return alpha_x, alpha_y, jac00, jac01, jac10, jac11
+
+        kwargs = self._flat_bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices_np)
+        all_kwargs = kwargs["all_kwargs"]
+        index_list = kwargs["index_list"]
+        image_indices_jax = jnp.asarray(image_indices_np, dtype=jnp.int32)
+
+        def zero_entries(x_i: jnp.ndarray) -> tuple[
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+        ]:
+            zero = jnp.zeros_like(x_i)
+            return zero, zero, zero, zero, zero, zero
+
+        def body_fun(xs: tuple[dict[str, jnp.ndarray], jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> tuple[
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+        ]:
+            component_kwargs, index, x_i, y_i, image_i = xs[0], xs[1], xs[2], xs[3], xs[4]
+            component_kwargs = {
+                key: (jnp.take(value, image_i, axis=-1) if jnp.ndim(value) > 0 else value)
+                for key, value in component_kwargs.items()
+            }
+            is_compact = bulk_model._compact_profile_mask[index]
+
+            def eval_component(_operand: Any) -> tuple[
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+            ]:
+                x_one = jnp.reshape(x_i, (1,))
+                y_one = jnp.reshape(y_i, (1,))
+                f_x, f_y = jax.lax.switch(index, bulk_model._derivatives_list, x_one, y_one, component_kwargs)
+                f_xx, f_xy, f_yx, f_yy = jax.lax.switch(index, bulk_model._hessian_list, x_one, y_one, component_kwargs)
+                return f_x[0], f_y[0], -f_xx[0], -f_xy[0], -f_yx[0], -f_yy[0]
+
+            def compact_body(_operand: Any) -> tuple[
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+            ]:
+                support_radius = bulk_model._compact_skip_factor[index] * component_kwargs["Rs"]
+                x_shift = x_i - component_kwargs["center_x"]
+                y_shift = y_i - component_kwargs["center_y"]
+                inside_support = jnp.square(x_shift) + jnp.square(y_shift) <= jnp.square(
+                    jnp.maximum(support_radius, 0.0)
+                )
+                return jax.lax.cond(
+                    inside_support,
+                    eval_component,
+                    lambda __operand: zero_entries(x_i),
+                    operand=None,
+                )
+
+            return jax.lax.cond(is_compact, compact_body, eval_component, operand=None)
+
+        return jax.lax.map(body_fun, xs=(all_kwargs, index_list, x, y, image_indices_jax))
+
+    def _flat_component_alpha_and_jacobian_delta_rows_for_components(
+        self,
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        packed_state: dict[str, Any],
+        component_indices: np.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        if component_indices is None:
+            component_indices_np = np.arange(len(self.state.lens_model_list), dtype=np.int32)
+        else:
+            component_indices_np = np.asarray(component_indices, dtype=np.int32).reshape(-1)
+        if component_indices_np.size == 0:
+            empty = jnp.zeros((0, x.shape[0]), dtype=jnp.float64)
+            return empty, empty, empty, empty, empty, empty
+
+        bulk_model = getattr(self.flat_lens_model, "lens_model", None)
+        if bulk_model is None or not all(
+            hasattr(bulk_model, attr)
+            for attr in ("_derivatives_list", "_hessian_list", "_compact_profile_mask", "_compact_skip_factor")
+        ):
+            alpha_x_rows: list[jnp.ndarray] = []
+            alpha_y_rows: list[jnp.ndarray] = []
+            jac00_rows: list[jnp.ndarray] = []
+            jac01_rows: list[jnp.ndarray] = []
+            jac10_rows: list[jnp.ndarray] = []
+            jac11_rows: list[jnp.ndarray] = []
+            for component_index in component_indices_np.tolist():
+                component = np.asarray([int(component_index)], dtype=np.int32)
+                beta_x, beta_y = self._flat_ray_shooting_for_components(x, y, packed_state, component)
+                alpha_x_rows.append(x - beta_x)
+                alpha_y_rows.append(y - beta_y)
+                jac_a00, jac_a01, jac_a10, jac_a11 = self._flat_lensing_jacobian_for_components(
+                    x,
+                    y,
+                    packed_state,
+                    component,
+                )
+                jac00_rows.append(jac_a00 - 1.0)
+                jac01_rows.append(jac_a01)
+                jac10_rows.append(jac_a10)
+                jac11_rows.append(jac_a11 - 1.0)
+            return (
+                jnp.stack(alpha_x_rows, axis=0),
+                jnp.stack(alpha_y_rows, axis=0),
+                jnp.stack(jac00_rows, axis=0),
+                jnp.stack(jac01_rows, axis=0),
+                jnp.stack(jac10_rows, axis=0),
+                jnp.stack(jac11_rows, axis=0),
+            )
+
+        kwargs = self._flat_bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices_np)
+        all_kwargs = kwargs["all_kwargs"]
+        index_list = kwargs["index_list"]
+
+        def zero_entries() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+            zeros = jnp.zeros_like(x)
+            return zeros, zeros, zeros, zeros, zeros, zeros
+
+        def body_fun(xs: tuple[dict[str, jnp.ndarray], jnp.ndarray]) -> tuple[
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+        ]:
+            component_kwargs, index = xs[0], xs[1]
+            is_compact = bulk_model._compact_profile_mask[index]
+
+            def eval_component(_operand: Any) -> tuple[
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+            ]:
+                f_x, f_y = jax.lax.switch(index, bulk_model._derivatives_list, x, y, component_kwargs)
+                f_xx, f_xy, f_yx, f_yy = jax.lax.switch(index, bulk_model._hessian_list, x, y, component_kwargs)
+                return f_x, f_y, -f_xx, -f_xy, -f_yx, -f_yy
+
+            def compact_body(_operand: Any) -> tuple[
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+            ]:
+                support_radius = bulk_model._compact_skip_factor[index] * component_kwargs["Rs"]
+                x_shift = x - component_kwargs["center_x"]
+                y_shift = y - component_kwargs["center_y"]
+                inside_support = jnp.square(x_shift) + jnp.square(y_shift) <= jnp.square(
+                    jnp.maximum(support_radius, 0.0)
+                )
+
+                def eval_compact(__operand: Any) -> tuple[
+                    jnp.ndarray,
+                    jnp.ndarray,
+                    jnp.ndarray,
+                    jnp.ndarray,
+                    jnp.ndarray,
+                    jnp.ndarray,
+                ]:
+                    values = eval_component(None)
+                    zeros = jnp.zeros_like(values[0])
+                    return tuple(jnp.where(inside_support, value, zeros) for value in values)
+
+                return jax.lax.cond(
+                    jnp.any(inside_support),
+                    eval_compact,
+                    lambda __operand: zero_entries(),
+                    operand=None,
+                )
+
+            return jax.lax.cond(is_compact, compact_body, eval_component, operand=None)
+
+        return jax.lax.map(body_fun, xs=(all_kwargs, index_list))
+
+    def _flat_component_alpha_rows_for_components(
+        self,
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        packed_state: dict[str, Any],
+        component_indices: np.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        if component_indices is None:
+            component_indices_np = np.arange(len(self.state.lens_model_list), dtype=np.int32)
+        else:
+            component_indices_np = np.asarray(component_indices, dtype=np.int32).reshape(-1)
+        if component_indices_np.size == 0:
+            empty = jnp.zeros((0, x.shape[0]), dtype=jnp.float64)
+            return empty, empty
+
+        bulk_model = getattr(self.flat_lens_model, "lens_model", None)
+        if bulk_model is None or not all(
+            hasattr(bulk_model, attr)
+            for attr in ("_derivatives_list", "_compact_profile_mask", "_compact_skip_factor")
+        ):
+            raise RuntimeError(
+                "Alpha-only flat component rows require LensModelBulk derivative internals; "
+                "legacy per-component fallback is intentionally unsupported."
+            )
+
+        kwargs = self._flat_bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices_np)
+        all_kwargs = kwargs["all_kwargs"]
+        index_list = kwargs["index_list"]
+
+        def zero_entries() -> tuple[jnp.ndarray, jnp.ndarray]:
+            zeros = jnp.zeros_like(x)
+            return zeros, zeros
+
+        def body_fun(xs: tuple[dict[str, jnp.ndarray], jnp.ndarray]) -> tuple[jnp.ndarray, jnp.ndarray]:
+            component_kwargs, index = xs[0], xs[1]
+            is_compact = bulk_model._compact_profile_mask[index]
+
+            def eval_component(_operand: Any) -> tuple[jnp.ndarray, jnp.ndarray]:
+                return jax.lax.switch(index, bulk_model._derivatives_list, x, y, component_kwargs)
+
+            def compact_body(_operand: Any) -> tuple[jnp.ndarray, jnp.ndarray]:
+                support_radius = bulk_model._compact_skip_factor[index] * component_kwargs["Rs"]
+                x_shift = x - component_kwargs["center_x"]
+                y_shift = y - component_kwargs["center_y"]
+                inside_support = jnp.square(x_shift) + jnp.square(y_shift) <= jnp.square(
+                    jnp.maximum(support_radius, 0.0)
+                )
+
+                def eval_compact(__operand: Any) -> tuple[jnp.ndarray, jnp.ndarray]:
+                    values = eval_component(None)
+                    zeros = jnp.zeros_like(values[0])
+                    return tuple(jnp.where(inside_support, value, zeros) for value in values)
+
+                return jax.lax.cond(
+                    jnp.any(inside_support),
+                    eval_compact,
+                    lambda __operand: zero_entries(),
+                    operand=None,
+                )
+
+            return jax.lax.cond(is_compact, compact_body, eval_component, operand=None)
+
+        return jax.lax.map(body_fun, xs=(all_kwargs, index_list))
+
+    def _flat_ray_shooting_and_lensing_jacobian_for_components(
+        self,
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        packed_state: dict[str, Any],
+        component_indices: np.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        bulk_model = getattr(self.flat_lens_model, "lens_model", None)
+        if bulk_model is None or not all(
+            hasattr(bulk_model, attr)
+            for attr in ("_derivatives_list", "_hessian_list", "_compact_profile_mask", "_compact_skip_factor")
+        ):
+            beta_x, beta_y = self._flat_ray_shooting_for_components(x, y, packed_state, component_indices)
+            jacobian_entries = self._flat_lensing_jacobian_for_components(x, y, packed_state, component_indices)
+            return beta_x, beta_y, *jacobian_entries
+
+        kwargs = self._flat_bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices)
+        all_kwargs = kwargs["all_kwargs"]
+        index_list = kwargs["index_list"]
+
+        def zero_entries() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+            zeros = jnp.zeros_like(x)
+            return zeros, zeros, zeros, zeros, zeros, zeros
+
+        def body_fun(xs: tuple[dict[str, jnp.ndarray], jnp.ndarray]) -> tuple[
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+        ]:
+            component_kwargs, index = xs[0], xs[1]
+            is_compact = bulk_model._compact_profile_mask[index]
+
+            def eval_component(_operand: Any) -> tuple[
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+            ]:
+                f_x, f_y = jax.lax.switch(index, bulk_model._derivatives_list, x, y, component_kwargs)
+                f_xx, f_xy, f_yx, f_yy = jax.lax.switch(index, bulk_model._hessian_list, x, y, component_kwargs)
+                return f_x, f_y, f_xx, f_xy, f_yx, f_yy
+
+            def compact_body(_operand: Any) -> tuple[
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+            ]:
+                support_radius = bulk_model._compact_skip_factor[index] * component_kwargs["Rs"]
+                x_shift = x - component_kwargs["center_x"]
+                y_shift = y - component_kwargs["center_y"]
+                inside_support = jnp.square(x_shift) + jnp.square(y_shift) <= jnp.square(
+                    jnp.maximum(support_radius, 0.0)
+                )
+
+                def eval_compact(__operand: Any) -> tuple[
+                    jnp.ndarray,
+                    jnp.ndarray,
+                    jnp.ndarray,
+                    jnp.ndarray,
+                    jnp.ndarray,
+                    jnp.ndarray,
+                ]:
+                    values = eval_component(None)
+                    zeros = jnp.zeros_like(values[0])
+                    return tuple(jnp.where(inside_support, value, zeros) for value in values)
+
+                return jax.lax.cond(
+                    jnp.any(inside_support),
+                    eval_compact,
+                    lambda __operand: zero_entries(),
+                    operand=None,
+                )
+
+            return jax.lax.cond(
+                is_compact,
+                compact_body,
+                eval_component,
+                operand=None,
+            )
+
+        f_x, f_y, f_xx, f_xy, f_yx, f_yy = jax.lax.map(body_fun, xs=(all_kwargs, index_list))
+        alpha_x = jnp.sum(f_x, axis=0)
+        alpha_y = jnp.sum(f_y, axis=0)
+        h_xx = jnp.sum(f_xx, axis=0)
+        h_xy = jnp.sum(f_xy, axis=0)
+        h_yx = jnp.sum(f_yx, axis=0)
+        h_yy = jnp.sum(f_yy, axis=0)
+        return x - alpha_x, y - alpha_y, 1.0 - h_xx, -h_xy, -h_yx, 1.0 - h_yy
 
     def _cab_morphology_predictions_for_anchors(
         self,
@@ -18204,6 +22086,11 @@ class ClusterJAXEvaluator:
         params = self._replace_surrogate_params(reference_params, surrogate_params)
         packed_state = self._build_packed_lens_state(params, z_source)
         validity = self._packed_lens_validity_from_params(params, z_source, stop_gradient=True)
+        cached_component_indices = getattr(
+            self,
+            "cached_scaling_component_indices",
+            getattr(self, "inactive_scaling_component_indices", np.asarray([], dtype=np.int32)),
+        )
         beta_x, beta_y = jax.lax.cond(
             validity["is_valid"],
             lambda current_state: self._ray_shooting_for_components(
@@ -18211,7 +22098,7 @@ class ClusterJAXEvaluator:
                 x_obs,
                 y_obs,
                 current_state,
-                self.inactive_scaling_component_indices,
+                cached_component_indices,
             ),
             lambda _: (x_obs, y_obs),
             packed_state,
@@ -18227,7 +22114,7 @@ class ClusterJAXEvaluator:
                     x_obs,
                     y_obs,
                     current_state,
-                    self.inactive_scaling_component_indices,
+                    cached_component_indices,
                 ),
                 lambda _: (
                     jnp.ones_like(x_obs),
@@ -18257,6 +22144,195 @@ class ClusterJAXEvaluator:
             y_obs,
             include_jacobian=False,
         )
+
+    def _flat_inactive_surrogate_concat(
+        self,
+        surrogate_params: jnp.ndarray,
+        reference_params: jnp.ndarray,
+        include_jacobian: bool = False,
+    ) -> jnp.ndarray:
+        flat_data = self.flat_critical_arc_data
+        params = self._replace_surrogate_params(reference_params, surrogate_params)
+        physical_params = self._physical_parameter_vector(params)
+        packed_state, validity = self._build_flat_packed_lens_state_with_validity_from_physical(
+            physical_params,
+            flat_data,
+            stop_gradient=True,
+        )
+        cached_component_indices = getattr(
+            self,
+            "cached_scaling_component_indices",
+            getattr(self, "inactive_scaling_component_indices", np.asarray([], dtype=np.int32)),
+        )
+        beta_x, beta_y = jax.lax.cond(
+            validity["is_valid"],
+            lambda current_state: self._flat_ray_shooting_for_components(
+                flat_data.x_obs,
+                flat_data.y_obs,
+                current_state,
+                cached_component_indices,
+            ),
+            lambda _: (flat_data.x_obs, flat_data.y_obs),
+            packed_state,
+        )
+        alpha_x = flat_data.x_obs - beta_x
+        alpha_y = flat_data.y_obs - beta_y
+        pieces = [alpha_x, alpha_y]
+        if include_jacobian:
+            inactive_jacobian = jax.lax.cond(
+                validity["is_valid"],
+                lambda current_state: self._flat_lensing_jacobian_for_components(
+                    flat_data.x_obs,
+                    flat_data.y_obs,
+                    current_state,
+                    cached_component_indices,
+                ),
+                lambda _: (
+                    jnp.ones_like(flat_data.x_obs),
+                    jnp.zeros_like(flat_data.x_obs),
+                    jnp.zeros_like(flat_data.y_obs),
+                    jnp.ones_like(flat_data.y_obs),
+                ),
+                packed_state,
+            )
+            jac_a00, jac_a01, jac_a10, jac_a11 = inactive_jacobian
+            pieces.extend([jac_a00 - 1.0, jac_a01, jac_a10, jac_a11 - 1.0])
+        return jnp.concatenate(pieces)
+
+    def _build_flat_inactive_surrogate_jacobian(
+        self,
+        reference_params: np.ndarray,
+        include_jacobian: bool = False,
+    ) -> dict[str, np.ndarray] | None:
+        reference = np.asarray(reference_params, dtype=float)
+        reference_jax = jnp.asarray(reference, dtype=jnp.float64)
+        surrogate_reference = reference[self.surrogate_param_indices]
+        surrogate_reference_jax = jnp.asarray(surrogate_reference, dtype=jnp.float64)
+        inactive_surrogate_concat = np.asarray(
+            self._flat_inactive_surrogate_concat(
+                surrogate_reference_jax,
+                reference_jax,
+                include_jacobian=include_jacobian,
+            ),
+            dtype=float,
+        )
+        if not np.isfinite(inactive_surrogate_concat).all():
+            return None
+
+        n_obs = int(np.asarray(self.flat_critical_arc_data.x_obs).size)
+        n_surrogate = len(self.surrogate_param_indices)
+        n_blocks = 6 if include_jacobian else 2
+        deriv = np.zeros((n_blocks * n_obs, n_surrogate), dtype=float)
+        x_obs_np = np.asarray(self.flat_critical_arc_data.x_obs, dtype=float)
+        y_obs_np = np.asarray(self.flat_critical_arc_data.y_obs, dtype=float)
+
+        for local_index, param_index in enumerate(self.surrogate_param_indices.tolist()):
+            spec = self.state.parameter_specs[int(param_index)]
+            nominal_step = float(self._inactive_fd_step(spec))
+            theta0 = float(reference[param_index])
+            lower = float(spec.lower)
+            upper = float(spec.upper)
+            minus_room = float(theta0 - lower) if np.isfinite(lower) else float("inf")
+            plus_room = float(upper - theta0) if np.isfinite(upper) else float("inf")
+            minus_step = nominal_step if not np.isfinite(lower) else min(nominal_step, max(0.0, 0.5 * minus_room))
+            plus_step = nominal_step if not np.isfinite(upper) else min(nominal_step, max(0.0, 0.5 * plus_room))
+            can_use_minus = minus_step > 1.0e-12
+            can_use_plus = plus_step > 1.0e-12
+
+            plus_eval: np.ndarray | None = None
+            minus_eval: np.ndarray | None = None
+
+            if can_use_plus:
+                plus_theta = reference.copy()
+                plus_theta[param_index] = _clip_value_to_safe_bounds(theta0 + plus_step, spec, boundary_frac=0.0)
+                plus_physical = self._physical_parameter_vector(jnp.asarray(plus_theta, dtype=jnp.float64))
+                _plus_packed, plus_validity = self._build_flat_packed_lens_state_with_validity_from_physical(
+                    plus_physical,
+                    self.flat_critical_arc_data,
+                    stop_gradient=False,
+                )
+                if not bool(np.asarray(plus_validity["is_valid"], dtype=bool)):
+                    self._record_invalid_state_callback(np.asarray(plus_validity["reason_flags"], dtype=bool))
+                    return None
+                plus_eval = np.asarray(
+                    self._flat_inactive_surrogate_concat(
+                        jnp.asarray(plus_theta[self.surrogate_param_indices], dtype=jnp.float64),
+                        jnp.asarray(plus_theta, dtype=jnp.float64),
+                        include_jacobian=include_jacobian,
+                    ),
+                    dtype=float,
+                )
+                if not np.isfinite(plus_eval).all():
+                    return None
+
+            if can_use_minus:
+                minus_theta = reference.copy()
+                minus_theta[param_index] = _clip_value_to_safe_bounds(theta0 - minus_step, spec, boundary_frac=0.0)
+                minus_physical = self._physical_parameter_vector(jnp.asarray(minus_theta, dtype=jnp.float64))
+                _minus_packed, minus_validity = self._build_flat_packed_lens_state_with_validity_from_physical(
+                    minus_physical,
+                    self.flat_critical_arc_data,
+                    stop_gradient=False,
+                )
+                if not bool(np.asarray(minus_validity["is_valid"], dtype=bool)):
+                    self._record_invalid_state_callback(np.asarray(minus_validity["reason_flags"], dtype=bool))
+                    return None
+                minus_eval = np.asarray(
+                    self._flat_inactive_surrogate_concat(
+                        jnp.asarray(minus_theta[self.surrogate_param_indices], dtype=jnp.float64),
+                        jnp.asarray(minus_theta, dtype=jnp.float64),
+                        include_jacobian=include_jacobian,
+                    ),
+                    dtype=float,
+                )
+                if not np.isfinite(minus_eval).all():
+                    return None
+
+            if plus_eval is not None and minus_eval is not None:
+                delta = float(plus_theta[param_index] - minus_theta[param_index])
+                if delta <= 0.0:
+                    return None
+                deriv[:, local_index] = (plus_eval - minus_eval) / delta
+            elif plus_eval is not None:
+                delta = float(plus_theta[param_index] - theta0)
+                if delta <= 0.0:
+                    return None
+                deriv[:, local_index] = (plus_eval - inactive_surrogate_concat) / delta
+            elif minus_eval is not None:
+                delta = float(theta0 - minus_theta[param_index])
+                if delta <= 0.0:
+                    return None
+                deriv[:, local_index] = (inactive_surrogate_concat - minus_eval) / delta
+            else:
+                return None
+
+        result: dict[str, np.ndarray] = {
+            "inactive_alpha_x": inactive_surrogate_concat[:n_obs],
+            "inactive_alpha_y": inactive_surrogate_concat[n_obs : 2 * n_obs],
+            "inactive_alpha_dx_dparams": deriv[:n_obs, :].T,
+            "inactive_alpha_dy_dparams": deriv[n_obs : 2 * n_obs, :].T,
+        }
+        if include_jacobian:
+            result.update(
+                {
+                    "inactive_jacobian_delta_a00": inactive_surrogate_concat[2 * n_obs : 3 * n_obs],
+                    "inactive_jacobian_delta_a01": inactive_surrogate_concat[3 * n_obs : 4 * n_obs],
+                    "inactive_jacobian_delta_a10": inactive_surrogate_concat[4 * n_obs : 5 * n_obs],
+                    "inactive_jacobian_delta_a11": inactive_surrogate_concat[5 * n_obs : 6 * n_obs],
+                    "inactive_jacobian_delta_da00_dparams": deriv[2 * n_obs : 3 * n_obs, :].T,
+                    "inactive_jacobian_delta_da01_dparams": deriv[3 * n_obs : 4 * n_obs, :].T,
+                    "inactive_jacobian_delta_da10_dparams": deriv[4 * n_obs : 5 * n_obs, :].T,
+                    "inactive_jacobian_delta_da11_dparams": deriv[5 * n_obs : 6 * n_obs, :].T,
+                }
+            )
+
+        if not (
+            all(np.isfinite(value).all() for value in result.values())
+            and np.isfinite(x_obs_np).all()
+            and np.isfinite(y_obs_np).all()
+        ):
+            return None
+        return result
 
     def _build_inactive_surrogate_jacobian(
         self,
@@ -18403,7 +22479,92 @@ class ClusterJAXEvaluator:
             return None
         return result
 
+    def _refresh_flat_surrogate_from_reference(self, reference_params: np.ndarray, reason: str = "manual") -> None:
+        del reason
+        if not self.surrogate_enabled:
+            return
+        reference = np.asarray(reference_params, dtype=float)
+        self.surrogate_reference_params = reference.copy()
+        self.surrogate_reference_param_values = reference[self.surrogate_param_indices].copy()
+        self.surrogate_cache_by_z = {}
+        self.flat_surrogate_cache = None
+        reference_jax = jnp.asarray(reference, dtype=jnp.float64)
+        physical_params = self._physical_parameter_vector(reference_jax)
+        _packed_state, validity = self._build_flat_packed_lens_state_with_validity_from_physical(
+            physical_params,
+            self.flat_critical_arc_data,
+            stop_gradient=False,
+        )
+        if not bool(np.asarray(validity["is_valid"], dtype=bool)):
+            self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+            self.surrogate_reference_params = None
+            self.surrogate_reference_param_values = np.zeros(len(self.surrogate_param_indices), dtype=float)
+            return
+        inactive_surrogate = self._build_flat_inactive_surrogate_jacobian(
+            reference,
+            include_jacobian=_flat_surrogate_refresh_needs_inactive_jacobian(
+                self.sample_likelihood_mode,
+                sampling_engine=self.sampling_engine,
+            ),
+        )
+        if inactive_surrogate is None:
+            self.surrogate_reference_params = None
+            self.surrogate_reference_param_values = np.zeros(len(self.surrogate_param_indices), dtype=float)
+            return
+        self.flat_surrogate_cache = FlatSurrogateCache(
+            inactive_alpha_x=jnp.asarray(inactive_surrogate["inactive_alpha_x"], dtype=jnp.float64),
+            inactive_alpha_y=jnp.asarray(inactive_surrogate["inactive_alpha_y"], dtype=jnp.float64),
+            inactive_alpha_dx_dparams=jnp.asarray(inactive_surrogate["inactive_alpha_dx_dparams"], dtype=jnp.float64),
+            inactive_alpha_dy_dparams=jnp.asarray(inactive_surrogate["inactive_alpha_dy_dparams"], dtype=jnp.float64),
+            inactive_jacobian_delta_a00=(
+                jnp.asarray(inactive_surrogate["inactive_jacobian_delta_a00"], dtype=jnp.float64)
+                if "inactive_jacobian_delta_a00" in inactive_surrogate
+                else None
+            ),
+            inactive_jacobian_delta_a01=(
+                jnp.asarray(inactive_surrogate["inactive_jacobian_delta_a01"], dtype=jnp.float64)
+                if "inactive_jacobian_delta_a01" in inactive_surrogate
+                else None
+            ),
+            inactive_jacobian_delta_a10=(
+                jnp.asarray(inactive_surrogate["inactive_jacobian_delta_a10"], dtype=jnp.float64)
+                if "inactive_jacobian_delta_a10" in inactive_surrogate
+                else None
+            ),
+            inactive_jacobian_delta_a11=(
+                jnp.asarray(inactive_surrogate["inactive_jacobian_delta_a11"], dtype=jnp.float64)
+                if "inactive_jacobian_delta_a11" in inactive_surrogate
+                else None
+            ),
+            inactive_jacobian_delta_da00_dparams=(
+                jnp.asarray(inactive_surrogate["inactive_jacobian_delta_da00_dparams"], dtype=jnp.float64)
+                if "inactive_jacobian_delta_da00_dparams" in inactive_surrogate
+                else None
+            ),
+            inactive_jacobian_delta_da01_dparams=(
+                jnp.asarray(inactive_surrogate["inactive_jacobian_delta_da01_dparams"], dtype=jnp.float64)
+                if "inactive_jacobian_delta_da01_dparams" in inactive_surrogate
+                else None
+            ),
+            inactive_jacobian_delta_da10_dparams=(
+                jnp.asarray(inactive_surrogate["inactive_jacobian_delta_da10_dparams"], dtype=jnp.float64)
+                if "inactive_jacobian_delta_da10_dparams" in inactive_surrogate
+                else None
+            ),
+            inactive_jacobian_delta_da11_dparams=(
+                jnp.asarray(inactive_surrogate["inactive_jacobian_delta_da11_dparams"], dtype=jnp.float64)
+                if "inactive_jacobian_delta_da11_dparams" in inactive_surrogate
+                else None
+            ),
+        )
+        self.surrogate_cache_by_z = self._surrogate_cache_by_z_from_flat_cache(self.flat_surrogate_cache)
+        self.full_refresh_count += 1
+        self._source_loglike_fn = jax.jit(self._source_loglike_impl)
+
     def refresh_surrogate(self, reference_params: np.ndarray, reason: str = "manual") -> None:
+        if self.sampling_engine == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT:
+            self._refresh_flat_surrogate_from_reference(reference_params, reason=reason)
+            return
         if not self.surrogate_enabled:
             return
         reference = np.asarray(reference_params, dtype=float)
@@ -18429,7 +22590,7 @@ class ClusterJAXEvaluator:
                 bin_data.effective_z_source,
                 x_obs,
                 y_obs,
-                include_jacobian=_sample_likelihood_uses_image_plane_jacobian(self.sample_likelihood_mode),
+                include_jacobian=_surrogate_refresh_needs_inactive_jacobian(self.sample_likelihood_mode),
             )
             if inactive_surrogate is None:
                 self.surrogate_cache_by_z = {}
@@ -18803,12 +22964,20 @@ class ClusterJAXEvaluator:
                 return self._flat_refreshing_surrogate_critical_arc_source_loglike_impl(params)
             return jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64)
         if (
-            str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_FULL_FLAT
+            str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
+            in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT}
+            and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_SOURCE
+        ):
+            return self._flat_source_loglike_impl(params)
+        if (
+            str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
+            in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT}
             and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
         ):
             return self._flat_local_jacobian_source_loglike_impl(params)
         if (
-            str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_FULL_FLAT
+            str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
+            in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT}
             and self.sample_likelihood_mode
             in {
                 SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
@@ -20398,6 +24567,7 @@ class ClusterJAXEvaluator:
         self.surrogate_reference_params = None
         self.scaling_scatter_reference_params = None
         self.source_metric_reference_params = None
+        self.flat_surrogate_cache = None
         if hasattr(self, "_conditional_source_inverse_basis_cache"):
             self._conditional_source_inverse_basis_cache.clear()
         clear_caches = getattr(jax, "clear_caches", None)
@@ -20659,10 +24829,78 @@ def _save_plot_bundle_h5(
                 "base_components": state.base_components,
                 "potfiles": _slim_potfiles_for_artifact(state.potfiles),
                 "scaling_component_records": state.scaling_component_records,
-                "potfile_mass_size_reparam": bool(_potfile_mass_size_group_count(state.parameter_specs) > 0),
-                "potfile_mass_size_reparam_group_count": int(_potfile_mass_size_group_count(state.parameter_specs)),
                 "fit_cosmology_flat_wcdm": bool(getattr(state, "fit_cosmology_flat_wcdm", False)),
                 "source_position_parameterization": str(state.source_position_parameterization),
+                "infer_active_scaling": bool(getattr(state, "infer_active_scaling", False)),
+                "active_scaling_inference_likelihood": str(
+                    getattr(
+                        state,
+                        "active_scaling_inference_likelihood",
+                        ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION,
+                    )
+                ),
+                "active_scaling_freeze_threshold": float(
+                    getattr(state, "active_scaling_freeze_threshold", DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD)
+                ),
+                "independent_scaling_model": str(getattr(state, "independent_scaling_model", "log_displacement")),
+                "scaling_relation_mode": str(getattr(state, "scaling_relation_mode", DEFAULT_SCALING_RELATION_MODE)),
+                "core_radius_scaling": (
+                    "shared_beta_radius"
+                    if str(getattr(state, "scaling_relation_mode", DEFAULT_SCALING_RELATION_MODE))
+                    == SCALING_RELATION_MODE_BERGAMINI_ML
+                    else "shared_cut_slope"
+                ),
+                "solver_potfile_positive_prior_coordinate": SOLVER_POTFILE_POSITIVE_PRIOR_COORDINATE,
+                "solver_potfile_positive_prior_note": (
+                    "sigma, cutkpc, and corekpc use log-positive latent priors "
+                    "matched to solver-defined physical scales, not literal physical-space densities"
+                ),
+                "independent_scaling_free_log_vdisp_tau_prior_median": float(
+                    getattr(
+                        state,
+                        "independent_scaling_free_log_vdisp_tau_prior_median",
+                        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+                    )
+                ),
+                "independent_scaling_free_log_core_tau_prior_median": float(
+                    getattr(
+                        state,
+                        "independent_scaling_free_log_core_tau_prior_median",
+                        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
+                    )
+                ),
+                "independent_scaling_free_log_cut_tau_prior_median": float(
+                    getattr(
+                        state,
+                        "independent_scaling_free_log_cut_tau_prior_median",
+                        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+                    )
+                ),
+                "independent_scaling_free_log_tau_prior_sigma": float(
+                    getattr(
+                        state,
+                        "independent_scaling_free_log_tau_prior_sigma",
+                        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+                    )
+                ),
+                "frozen_active_scaling_component_indices": (
+                    None
+                    if getattr(state, "frozen_active_scaling_component_indices", None) is None
+                    else np.asarray(state.frozen_active_scaling_component_indices, dtype=np.int32)
+                ),
+                "active_scaling_frozen_from_previous_stage": bool(
+                    getattr(state, "active_scaling_frozen_from_previous_stage", False)
+                ),
+                "active_scaling_frozen_source_run_dir": getattr(
+                    state,
+                    "active_scaling_frozen_source_run_dir",
+                    None,
+                ),
+                "active_scaling_frozen_source_path": getattr(
+                    state,
+                    "active_scaling_frozen_source_path",
+                    None,
+                ),
                 "geometry_cache": None if state.geometry_cache is None else {
                     "effective_z_source_values": state.geometry_cache.effective_z_source_values,
                     "exact_z_source_values": state.geometry_cache.exact_z_source_values,
@@ -20746,15 +24984,14 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
         if missing_packed_fields:
             joined = ", ".join(missing_packed_fields)
             raise ValueError(
-                f"{path} is missing current packed lens spec fields ({joined}); rerun from Stage1 "
-                "to regenerate artifacts after the direct e1/e2 DPIE shape-coordinate change."
+                f"{path} is missing current packed lens spec fields ({joined}); rerun the solver "
+                "to regenerate artifacts with the current model schema."
             )
-        packed_lens_spec = PackedLensSpec(
-            **{
-                field_name: np.asarray(packed_group[field_name])
-                for field_name in PackedLensSpec.__dataclass_fields__
-            }
-        )
+        packed_payload = {
+            field_name: np.asarray(packed_group[field_name])
+            for field_name in PackedLensSpec.__dataclass_fields__
+        }
+        packed_lens_spec = PackedLensSpec(**packed_payload)
         lens_model_list = [str(name) for name in meta.get("lens_model_list", [])]
         _validate_supported_lens_model_list(lens_model_list, str(path))
         state = BuildState(
@@ -20835,6 +25072,57 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
             ),
             fit_cosmology_flat_wcdm=bool(meta.get("fit_cosmology_flat_wcdm", False)),
             source_position_parameterization=str(meta["source_position_parameterization"]),
+            infer_active_scaling=bool(meta.get("infer_active_scaling", False)),
+            active_scaling_inference_likelihood=str(
+                meta.get("active_scaling_inference_likelihood", ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION)
+            ),
+            active_scaling_freeze_threshold=float(
+                meta.get("active_scaling_freeze_threshold", DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD)
+            ),
+            independent_scaling_model=str(meta.get("independent_scaling_model", "log_displacement")),
+            scaling_relation_mode=str(meta.get("scaling_relation_mode", DEFAULT_SCALING_RELATION_MODE)),
+            independent_scaling_free_log_vdisp_tau_prior_median=float(
+                meta.get(
+                    "independent_scaling_free_log_vdisp_tau_prior_median",
+                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+                )
+            ),
+            independent_scaling_free_log_core_tau_prior_median=float(
+                meta.get(
+                    "independent_scaling_free_log_core_tau_prior_median",
+                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
+                )
+            ),
+            independent_scaling_free_log_cut_tau_prior_median=float(
+                meta.get(
+                    "independent_scaling_free_log_cut_tau_prior_median",
+                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+                )
+            ),
+            independent_scaling_free_log_tau_prior_sigma=float(
+                meta.get(
+                    "independent_scaling_free_log_tau_prior_sigma",
+                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+                )
+            ),
+            frozen_active_scaling_component_indices=(
+                None
+                if meta.get("frozen_active_scaling_component_indices") is None
+                else np.asarray(meta.get("frozen_active_scaling_component_indices"), dtype=np.int32)
+            ),
+            active_scaling_frozen_from_previous_stage=bool(
+                meta.get("active_scaling_frozen_from_previous_stage", False)
+            ),
+            active_scaling_frozen_source_run_dir=(
+                None
+                if meta.get("active_scaling_frozen_source_run_dir") is None
+                else str(meta.get("active_scaling_frozen_source_run_dir"))
+            ),
+            active_scaling_frozen_source_path=(
+                None
+                if meta.get("active_scaling_frozen_source_path") is None
+                else str(meta.get("active_scaling_frozen_source_path"))
+            ),
         )
         cli_args = _read_h5_json(handle, "cli_args_json", default={})
         init_diagnostics = _read_h5_json(handle, "init_diagnostics_json", default={})
@@ -20978,6 +25266,9 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
         refresh_every=int(saved_args.get("refresh_every", DEFAULT_REFRESH_EVERY)),
         refresh_param_drift_frac=float(saved_args.get("refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
         source_plane_covariance_floor=float(saved_args.get("source_plane_covariance_floor", 1.0e-6)),
+        source_plane_covariance_mode=str(
+            saved_args.get("source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION)
+        ),
         source_plane_outlier_sigma_arcsec=float(
             saved_args.get("source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
         ),
@@ -21416,38 +25707,6 @@ def _apply_cosmology_init_overrides(
     return merged
 
 
-def _apply_coupled_physical_init_values(
-    parameter_specs: list[ParameterSpec],
-    init_values: dict[str, float] | None,
-    physical_values: dict[str, float],
-) -> dict[str, float] | None:
-    if not physical_values:
-        return init_values
-    merged = dict(init_values or {})
-    default_physical = _convert_theta_to_physical(_default_theta(parameter_specs), parameter_specs)
-    for site in _parameter_sample_sites(parameter_specs):
-        if len(site.indices) != 2:
-            continue
-        if not all(_is_potfile_mass_size_spec(parameter_specs[idx]) for idx in site.indices):
-            continue
-        if not any(parameter_specs[idx].sample_name in physical_values for idx in site.indices):
-            continue
-        physical_theta = np.asarray(default_physical, dtype=float).copy()
-        for idx in site.indices:
-            spec = parameter_specs[idx]
-            if spec.sample_name in physical_values:
-                physical_theta[idx] = float(physical_values[spec.sample_name])
-        latent_theta = _clip_theta_to_support(
-            _convert_theta_to_latent(physical_theta, parameter_specs),
-            parameter_specs,
-            boundary_frac=DEFAULT_NUTS_INIT_BOUNDARY_FRAC,
-        )
-        for idx in site.indices:
-            spec = parameter_specs[idx]
-            merged[spec.sample_name] = float(latent_theta[idx])
-    return merged or None
-
-
 def _build_state_from_inputs(
     args: argparse.Namespace,
     fit_mode_override: str | None = None,
@@ -21455,6 +25714,10 @@ def _build_state_from_inputs(
     svi_init_physical_values: dict[str, float] | None = None,
     source_position_prior_values: dict[str, tuple[float, float]] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
+    frozen_active_scaling_component_indices: np.ndarray | list[int] | None = None,
+    frozen_active_scaling_source_run_dir: str | Path | None = None,
+    frozen_active_scaling_source_path: str | Path | None = None,
+    topk_discovery_independent_override_by_potfile: list[set[int]] | None = None,
 ) -> BuildState:
     fit_mode = fit_mode_override or args.fit_mode
     model_fit_mode = FIT_MODE_JOINT if fit_mode == FIT_MODE_EVIDENCE_NS else fit_mode
@@ -21511,6 +25774,15 @@ def _build_state_from_inputs(
     )
     if potfile_brightest_summary:
         _log(args, f"[input] potfile_member_brightest_n={json.dumps(potfile_brightest_summary, sort_keys=True)}")
+    independent_importance_images_df = images_df.copy()
+    if not independent_importance_images_df.empty:
+        independent_importance_images_df, _n_skipped, _n_families_skipped, _bad_family_ids = (
+            _filter_non_positive_redshift_families(independent_importance_images_df)
+        )
+        if not independent_importance_images_df.empty:
+            independent_importance_images_df, _n_singleton_skipped, _n_singleton_families_skipped = (
+                _filter_singleton_families(independent_importance_images_df)
+            )
     large_parameter_specs, large_component_param_assignments, large_lens_model_list = _build_parameter_specs(potentials_with_priors)
     if model_fit_mode == "small-only" and large_parameter_specs:
         if stage1_prior_summary is None:
@@ -21530,12 +25802,92 @@ def _build_state_from_inputs(
     base_components = [_serialize_component(potential) for potential in potentials_with_priors]
     scaling_component_assignments: list[dict[str, Any]] = []
     scaling_component_records: list[dict[str, Any]] = []
+    active_selected_counts: dict[str, int] = {}
+    population_active_inference_requested = bool(
+        getattr(args, "infer_active_scaling", False)
+        and str(
+            getattr(
+                args,
+                "active_scaling_inference_likelihood",
+                ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION,
+            )
+        )
+        == ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION
+    )
+    topk_discovery_override_selected_by_potfile = (
+        None
+        if topk_discovery_independent_override_by_potfile is None
+        else _normalize_selected_by_potfile(topk_discovery_independent_override_by_potfile, len(potfiles))
+    )
     if model_fit_mode in {"small-only", FIT_MODE_JOINT}:
+        (
+            active_selected_by_potfile,
+            active_rank_info,
+            active_requested_counts,
+            active_selected_counts,
+        ) = _select_active_scaling_candidates(
+            potfiles,
+            reference,
+            independent_importance_images_df,
+            getattr(args, "active_scaling_galaxies", None),
+            active_scaling_selection=str(getattr(args, "active_scaling_selection", "adaptive")),
+            active_scaling_cumulative_fraction=float(
+                getattr(args, "active_scaling_cumulative_fraction", DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION)
+            ),
+            active_scaling_min=int(getattr(args, "active_scaling_min", DEFAULT_ACTIVE_SCALING_MIN)),
+        )
+        if topk_discovery_override_selected_by_potfile is not None:
+            active_selected_by_potfile = topk_discovery_override_selected_by_potfile
+            active_rank_info = {}
+            active_selected_counts = {
+                str(potfile.get("id", f"potfile{idx}")): int(len(active_selected_by_potfile[idx]))
+                for idx, potfile in enumerate(potfiles)
+                if idx < len(active_selected_by_potfile) and len(active_selected_by_potfile[idx]) > 0
+            }
+            _log(
+                args,
+                (
+                    "[input] topk_discovery_independent_candidates="
+                    f"{json.dumps(active_selected_counts, sort_keys=True)} "
+                    f"total={int(sum(len(values) for values in active_selected_by_potfile))} "
+                    "source=override"
+                ),
+            )
+        elif str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT:
+            active_selected_by_potfile = [set() for _ in potfiles]
+            active_rank_info = {}
+            active_selected_counts = {}
+            _log(
+                args,
+                "[input] topk_discovery_independent_candidates={} total=0 source=exact-svi",
+            )
+        if population_active_inference_requested:
+            if any(active_selected_by_potfile):
+                ignored_counts = {str(key): int(value) for key, value in active_selected_counts.items()}
+                _log(
+                    args,
+                    (
+                        "[input] active_scaling_galaxies ignored for population active inference; "
+                        f"would_have_selected={json.dumps(ignored_counts, sort_keys=True)}"
+                    ),
+                )
+            active_selected_by_potfile = [set() for _ in potfiles]
+            active_selected_counts = {}
+        if active_selected_counts:
+            _log(
+                args,
+                (
+                    "[input] independent_scaling_candidates="
+                    f"{json.dumps(active_selected_counts, sort_keys=True)} "
+                    "source=active_scaling_galaxies "
+                    f"requested={json.dumps(active_requested_counts, sort_keys=True)}"
+                ),
+            )
         scaling_parameter_specs, scaling_param_indices, scaling_lens_model_list = _build_scaling_parameter_specs(
             potfiles,
             start_index=len(parameter_specs),
             kpc_per_arcsec=scaling_kpc_per_arcsec,
-            potfile_mass_size_reparam=bool(getattr(args, "potfile_mass_size_reparam", False)),
+            scaling_relation_mode=str(getattr(args, "scaling_relation_mode", DEFAULT_SCALING_RELATION_MODE)),
         )
         parameter_specs.extend(scaling_parameter_specs)
         scatter_fields = (
@@ -21550,16 +25902,52 @@ def _build_state_from_inputs(
             scatter_max=float(getattr(args, "scaling_scatter_max", 0.5)),
         )
         parameter_specs.extend(scaling_scatter_specs)
+        independent_scaling_specs, independent_scaling_indices = _build_independent_scaling_parameter_specs(
+            potfiles,
+            active_selected_by_potfile,
+            start_index=len(parameter_specs),
+            log_vdisp_tau_prior_median=float(
+                getattr(
+                    args,
+                    "independent_scaling_free_log_vdisp_tau_prior_median",
+                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+                )
+            ),
+            log_core_tau_prior_median=float(
+                getattr(
+                    args,
+                    "independent_scaling_free_log_core_tau_prior_median",
+                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
+                )
+            ),
+            log_cut_tau_prior_median=float(
+                getattr(
+                    args,
+                    "independent_scaling_free_log_cut_tau_prior_median",
+                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+                )
+            ),
+            log_tau_prior_sigma=float(
+                getattr(
+                    args,
+                    "independent_scaling_free_log_tau_prior_sigma",
+                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+                )
+            ),
+        )
+        parameter_specs.extend(independent_scaling_specs)
         scaling_components, scaling_assignments, scaling_component_assignments, scaling_component_records = _build_scaling_components(
             potfiles,
             reference,
             scaling_param_indices,
             scaling_scatter_indices,
+            independent_scaling_indices,
+            active_rank_info,
             start_component_index=len(base_components),
             kpc_per_arcsec=scaling_kpc_per_arcsec,
         )
         component_param_assignments.extend(scaling_assignments)
-        lens_model_list.extend(scaling_lens_model_list)
+        lens_model_list.extend([ORIGINAL_DPIE_PROFILE_NAME for _ in scaling_components])
         base_components.extend(scaling_components)
     packed_lens_spec = _build_packed_lens_spec(base_components, component_param_assignments, scaling_component_assignments)
     family_data: list[FamilyData] = []
@@ -21784,7 +26172,6 @@ def _build_state_from_inputs(
     if svi_init_physical_values or source_position_prior_values:
         if svi_init_values is None:
             svi_init_values = {}
-        coupled_physical_init_values: dict[str, float] = {}
         for spec in parameter_specs:
             physical_value: float | None = None
             if svi_init_physical_values and spec.sample_name in svi_init_physical_values:
@@ -21808,9 +26195,6 @@ def _build_state_from_inputs(
                 )
             if physical_value is None:
                 continue
-            if _is_potfile_mass_size_spec(spec):
-                coupled_physical_init_values[spec.sample_name] = float(physical_value)
-                continue
             if (
                 spec.component_family == "source_position"
                 and str(getattr(args, "source_position_parameterization", SOURCE_POSITION_PARAMETERIZATION_PRIOR_WHITENED))
@@ -21819,12 +26203,52 @@ def _build_state_from_inputs(
                 svi_init_values[spec.sample_name] = 0.0
             else:
                 svi_init_values[spec.sample_name] = _initial_latent_value_from_physical(physical_value, spec)
-        svi_init_values = _apply_coupled_physical_init_values(
-            parameter_specs,
-            svi_init_values,
-            coupled_physical_init_values,
-        )
     svi_init_values = _apply_cosmology_init_overrides(args, parameter_specs, svi_init_values)
+    infer_active_scaling_requested = bool(getattr(args, "infer_active_scaling", False))
+    active_scaling_specs: list[ParameterSpec] = []
+    if infer_active_scaling_requested:
+        fit_method_value = getattr(args, "fit_method", FIT_METHOD_SVI_NUTS)
+        if isinstance(fit_method_value, (list, tuple)):
+            fit_method_value = fit_method_value[0] if fit_method_value else FIT_METHOD_SVI_NUTS
+        if str(fit_method_value) not in {FIT_METHOD_SVI, FIT_METHOD_SVI_NUTS}:
+            raise ValueError("--infer-active-scaling is an SVI-only active-gate prefit and requires --fit-method svi or svi+nuts.")
+        active_scaling_prior_prob = getattr(args, "active_scaling_prior_prob", None)
+        if population_active_inference_requested and active_scaling_prior_prob is None:
+            active_scaling_prior_prob = 0.5
+        active_scaling_specs, active_scaling_indices = _build_active_scaling_parameter_specs(
+            potfiles,
+            scaling_component_records,
+            start_index=len(parameter_specs),
+            prior_prob=active_scaling_prior_prob,
+            logit_prior_sigma=float(
+                getattr(args, "active_scaling_logit_prior_sigma", DEFAULT_ACTIVE_SCALING_LOGIT_PRIOR_SIGMA)
+            ),
+            mag_slope_prior_sigma=float(
+                getattr(args, "active_scaling_mag_slope_prior_sigma", DEFAULT_ACTIVE_SCALING_MAG_SLOPE_PRIOR_SIGMA)
+            ),
+            local_logit_prior_sigma=float(
+                getattr(args, "active_scaling_local_logit_prior_sigma", DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA)
+            ),
+            active_selected_counts=active_selected_counts,
+            freeze_threshold=float(
+                getattr(args, "active_scaling_freeze_threshold", DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD)
+            ),
+        )
+        if active_scaling_specs:
+            parameter_specs.extend(active_scaling_specs)
+            packed_lens_spec, scaling_component_records = _packed_lens_spec_with_active_scaling_gates(
+                packed_lens_spec,
+                scaling_component_records,
+                active_scaling_indices,
+            )
+            _log(
+                args,
+                (
+                    "[input] active_scaling_gate_parameters="
+                    f"{len(active_scaling_specs)} candidates={len(active_scaling_indices)} "
+                    f"appended_after_ordinary_index={len(parameter_specs) - len(active_scaling_specs)}"
+                ),
+            )
     if not family_data and arc_data is not None and int(getattr(arc_data, "n_arcs", 0)) > 0 and not parameter_specs:
         raise ValueError("CAB arc-only runs require at least one model parameter to constrain.")
     geometry_cache = _build_geometry_cache(
@@ -21833,6 +26257,14 @@ def _build_state_from_inputs(
         family_data,
         bin_data,
         family_redshift_binning_sec=family_redshift_binning_sec,
+    )
+    frozen_active_indices = (
+        None
+        if frozen_active_scaling_component_indices is None
+        else np.asarray(
+            sorted({int(value) for value in np.asarray(frozen_active_scaling_component_indices).reshape(-1)}),
+            dtype=np.int32,
+        )
     )
     return BuildState(
         run_name=args.run_name or _make_run_name(args.par_path),
@@ -21857,6 +26289,55 @@ def _build_state_from_inputs(
         previous_stage_best_values=_finite_float_values(previous_stage_best_values),
         fit_cosmology_flat_wcdm=fit_cosmology_flat_wcdm,
         source_position_parameterization=source_position_parameterization,
+        infer_active_scaling=bool(infer_active_scaling_requested and any(active_scaling_specs)),
+        active_scaling_inference_likelihood=str(
+            getattr(
+                args,
+                "active_scaling_inference_likelihood",
+                ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION,
+            )
+        ),
+        active_scaling_freeze_threshold=float(
+            getattr(args, "active_scaling_freeze_threshold", DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD)
+        ),
+        independent_scaling_model="log_displacement",
+        scaling_relation_mode=str(getattr(args, "scaling_relation_mode", DEFAULT_SCALING_RELATION_MODE)),
+        independent_scaling_free_log_vdisp_tau_prior_median=float(
+            getattr(
+                args,
+                "independent_scaling_free_log_vdisp_tau_prior_median",
+                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+            )
+        ),
+        independent_scaling_free_log_core_tau_prior_median=float(
+            getattr(
+                args,
+                "independent_scaling_free_log_core_tau_prior_median",
+                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
+            )
+        ),
+        independent_scaling_free_log_cut_tau_prior_median=float(
+            getattr(
+                args,
+                "independent_scaling_free_log_cut_tau_prior_median",
+                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+            )
+        ),
+        independent_scaling_free_log_tau_prior_sigma=float(
+            getattr(
+                args,
+                "independent_scaling_free_log_tau_prior_sigma",
+                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+            )
+        ),
+        frozen_active_scaling_component_indices=frozen_active_indices,
+        active_scaling_frozen_from_previous_stage=frozen_active_indices is not None,
+        active_scaling_frozen_source_run_dir=(
+            None if frozen_active_scaling_source_run_dir is None else str(frozen_active_scaling_source_run_dir)
+        ),
+        active_scaling_frozen_source_path=(
+            None if frozen_active_scaling_source_path is None else str(frozen_active_scaling_source_path)
+        ),
     )
 
 
@@ -21880,34 +26361,52 @@ def _distribution_for_spec(spec: ParameterSpec):
 def _distribution_for_sample_site(site: _SampleSiteSpec, parameter_specs: list[ParameterSpec]):
     if len(site.indices) == 1:
         return _distribution_for_spec(parameter_specs[site.indices[0]])
-    if len(site.indices) == 2:
-        first_idx, second_idx = site.indices
-        first_spec = parameter_specs[first_idx]
-        second_spec = parameter_specs[second_idx]
-        if _is_potfile_mass_size_spec(first_spec) and _is_potfile_mass_size_spec(second_spec):
-            role_to_spec = {
-                str(first_spec.coupled_role): first_spec,
-                str(second_spec.coupled_role): second_spec,
-            }
-            mass_spec = role_to_spec.get(COUPLED_ROLE_MASS_NORM)
-            size_spec = role_to_spec.get(COUPLED_ROLE_SIZE)
-            if mass_spec is None or size_spec is None:
-                raise ValueError(f"Potfile mass-size sample site {site.name!r} is missing mass or size role.")
-            return _PotfileMassSizeReparamDistribution(
-                _distribution_for_spec(mass_spec),
-                _distribution_for_spec(size_spec),
-                mass_center=float(mass_spec.coupled_mass_center),
-                mass_scale=float(mass_spec.coupled_mass_scale),
-                size_center=float(mass_spec.coupled_size_center),
-                size_scale=float(mass_spec.coupled_size_scale),
-            )
-    raise ValueError(f"Unsupported vector sample site {site.name!r} with {len(site.indices)} components.")
+    specs = [parameter_specs[idx] for idx in site.indices]
+    prior_kinds = {str(spec.prior_kind) for spec in specs}
+    if len(prior_kinds) != 1:
+        raise ValueError(f"Vector sample site {site.name!r} mixes prior kinds {sorted(prior_kinds)}.")
+    prior_kind = next(iter(prior_kinds))
+    if prior_kind == "hierarchical_normal":
+        raise ValueError(f"Hierarchical vector sample site {site.name!r} is unsupported.")
+    if prior_kind == "normal":
+        return dist.Independent(
+            dist.Normal(
+                jnp.asarray([float(spec.mean) for spec in specs], dtype=jnp.float64),
+                jnp.asarray([float(spec.std) for spec in specs], dtype=jnp.float64),
+            ),
+            1,
+        )
+    if prior_kind == "truncated_normal":
+        return dist.Independent(
+            dist.TruncatedNormal(
+                jnp.asarray([float(spec.mean) for spec in specs], dtype=jnp.float64),
+                jnp.asarray([float(spec.std) for spec in specs], dtype=jnp.float64),
+                low=jnp.asarray([float(spec.lower) for spec in specs], dtype=jnp.float64),
+                high=jnp.asarray(
+                    [
+                        np.inf if not np.isfinite(float(spec.upper)) else float(spec.upper)
+                        for spec in specs
+                    ],
+                    dtype=jnp.float64,
+                ),
+                validate_args=True,
+            ),
+            1,
+        )
+    if prior_kind == "uniform":
+        return dist.Independent(
+            dist.Uniform(
+                jnp.asarray([float(spec.lower) for spec in specs], dtype=jnp.float64),
+                jnp.asarray([float(spec.upper) for spec in specs], dtype=jnp.float64),
+            ),
+            1,
+        )
+    raise ValueError(f"Unsupported vector sample site {site.name!r} with prior kind {prior_kind!r}.")
 
 
 def _prior_log_prob(parameter_specs: list[ParameterSpec], theta: jnp.ndarray) -> jnp.ndarray:
     theta_array = jnp.asarray(theta, dtype=jnp.float64)
     transform_kind_array = np.asarray([str(spec.transform_kind) for spec in parameter_specs], dtype=object)
-    coupling_arrays = _potfile_mass_size_coupling_arrays(parameter_specs)
     physical_theta = _apply_parameter_transforms_jax(
         theta_array,
         jnp.asarray(transform_kind_array == "log_positive", dtype=bool),
@@ -21915,13 +26414,6 @@ def _prior_log_prob(parameter_specs: list[ParameterSpec], theta: jnp.ndarray) ->
         jnp.asarray([float(spec.transform_offset) for spec in parameter_specs], dtype=jnp.float64),
         jnp.asarray(transform_kind_array == "affine", dtype=bool),
         jnp.asarray([float(getattr(spec, "transform_scale", 1.0)) for spec in parameter_specs], dtype=jnp.float64),
-        jnp.asarray(coupling_arrays["mass_indices"], dtype=jnp.int32),
-        jnp.asarray(coupling_arrays["size_indices"], dtype=jnp.int32),
-        jnp.asarray(coupling_arrays["mass_centers"], dtype=jnp.float64),
-        jnp.asarray(coupling_arrays["mass_scales"], dtype=jnp.float64),
-        jnp.asarray(coupling_arrays["size_centers"], dtype=jnp.float64),
-        jnp.asarray(coupling_arrays["size_scales"], dtype=jnp.float64),
-        jnp.asarray(coupling_arrays["cut_offsets"], dtype=jnp.float64),
     )
     sample_index = {spec.sample_name: idx for idx, spec in enumerate(parameter_specs)}
     total = jnp.array(0.0, dtype=jnp.float64)
@@ -22094,11 +26586,24 @@ def _build_cluster_evaluator_from_args(
         active_scaling_selection=args.active_scaling_selection,
         active_scaling_cumulative_fraction=args.active_scaling_cumulative_fraction,
         active_scaling_min=args.active_scaling_min,
+        topk_discovery_scaling_galaxies=int(getattr(args, "topk_discovery_scaling_galaxies", 10)),
+        topk_discovery_score=str(getattr(args, "topk_discovery_score", TOPK_DISCOVERY_SCORE_ALPHA_JACOBIAN)),
+        topk_discovery_jacobian_weight=float(getattr(args, "topk_discovery_jacobian_weight", 1.0)),
         refresh_every=args.refresh_every,
         refresh_param_drift_frac=args.refresh_param_drift_frac,
         source_plane_covariance_floor=args.source_plane_covariance_floor,
+        source_plane_covariance_mode=str(
+            getattr(args, "source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION)
+        ),
         source_plane_outlier_sigma_arcsec=args.source_plane_outlier_sigma_arcsec,
         sample_likelihood_mode=sample_likelihood_mode,
+        active_scaling_inference_likelihood=str(
+            getattr(
+                args,
+                "active_scaling_inference_likelihood",
+                getattr(state, "active_scaling_inference_likelihood", ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION),
+            )
+        ),
         image_plane_newton_steps=int(getattr(args, "image_plane_newton_steps", 0)),
         anchored_image_plane_solve_steps=int(
             getattr(args, "anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)
@@ -22229,12 +26734,23 @@ def _prepare_direct_evaluator(
     _log_evaluator_summary(args, evaluator)
     _log_evaluator_memory_shape_diagnostics(args, evaluator, reason="evaluator_built")
     midpoint = _default_theta(state.parameter_specs)
+    if getattr(evaluator, "active_inference_enabled", False):
+        _log(
+            args,
+            (
+                "[active-scaling] initializing SVI active-gate reference cache "
+                f"scaling_components={len(getattr(evaluator, 'scaling_component_indices', []))}"
+            ),
+        )
+        evaluator.refresh_active_inference_cache(midpoint, reason="svi_nuts_initial")
     if evaluator.surrogate_enabled:
         _log(
             args,
             (
-                f"[surrogate] initializing active_scaling={len(evaluator.active_scaling_component_indices)} "
-                f"inactive_scaling={len(evaluator.inactive_scaling_component_indices)}"
+                "[surrogate] initializing "
+                f"exact_scaling={len(getattr(evaluator, 'exact_scaling_component_indices', getattr(evaluator, 'active_scaling_component_indices', [])))} "
+                f"cached_scaling={len(getattr(evaluator, 'cached_scaling_component_indices', getattr(evaluator, 'inactive_scaling_component_indices', [])))} "
+                f"free_correction={len(getattr(evaluator, 'free_correction_scaling_component_indices', []))}"
             ),
         )
         evaluator.refresh_surrogate(midpoint, reason="svi_nuts_initial")
@@ -22286,6 +26802,743 @@ def _output_evaluator_for_validation(
     return output_evaluator
 
 
+def _sampling_refresh_seed_args(args: argparse.Namespace, run_index: int) -> argparse.Namespace:
+    if run_index <= 1:
+        return args
+    base_seed = 0 if getattr(args, "seed", None) is None else int(args.seed)
+    return _clone_args(args, seed=base_seed + 1000003 * (run_index - 1))
+
+
+def _best_fit_from_posterior_log_prob(posterior: PosteriorResults) -> tuple[np.ndarray, int, float | None]:
+    if posterior.samples.ndim != 2 or posterior.samples.shape[0] == 0:
+        raise RuntimeError("NUTS returned no posterior samples.")
+    log_prob = np.asarray(posterior.log_prob, dtype=float)
+    if log_prob.size and np.isfinite(log_prob).any():
+        best_index = int(np.nanargmax(log_prob))
+        best_log_prob: float | None = float(log_prob[best_index])
+    else:
+        best_index = 0
+        best_log_prob = None
+    return np.asarray(posterior.samples[best_index], dtype=float), best_index, best_log_prob
+
+
+def _safe_source_loglike(evaluator: ClusterJAXEvaluator, theta: np.ndarray) -> float | None:
+    try:
+        value = float(evaluator.source_loglike(np.asarray(theta, dtype=float)))
+    except Exception:
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _format_sampling_refresh_status_message(
+    *,
+    reason: str,
+    run_index: int,
+    total_runs: int,
+    center_shift: float,
+    parameter_delta: _SviRefreshParameterDelta,
+    rows: list[_SviRefreshCacheStatus],
+) -> str:
+    parts = [
+        f"[sampling] refresh reason={reason}",
+        f"next_run={run_index}/{total_runs}",
+        f"center_shift={_svi_refresh_float(center_shift)}",
+        f"theta_linf={_svi_refresh_float(parameter_delta.theta_linf)}",
+        f"top={parameter_delta.top_changes}",
+    ]
+    for row in rows:
+        if row.name.endswith("_structure"):
+            parts.append(f"{row.name}=changed")
+            continue
+        parts.extend(
+            [
+                f"{row.name}_status={row.status}",
+                f"{row.name}_rms={row.rms}",
+                f"{row.name}_max={row.max_abs}",
+            ]
+        )
+    return " ".join(parts)
+
+
+def _build_sampling_refresh_status_rich_table(
+    *,
+    run_index: int,
+    total_runs: int,
+    center_shift: float,
+    parameter_delta: _SviRefreshParameterDelta,
+    rows: list[_SviRefreshCacheStatus],
+) -> Any:
+    table = _RichTable(
+        title=f"Sampling refresh: next run {run_index}/{total_runs}",
+        caption=(
+            f"best-fit shift: {_svi_refresh_float(center_shift)}   "
+            f"largest move: {_first_svi_refresh_top_change(parameter_delta.top_changes)}"
+        ),
+        show_header=True,
+        header_style="bold white",
+        expand=False,
+    )
+    table.add_column("cache", style="cyan", no_wrap=True)
+    table.add_column("rms", justify="right")
+    table.add_column("max", justify="right")
+    table.add_column("status", no_wrap=True)
+    table.add_column("meaning")
+    for row in rows:
+        table.add_row(row.name, row.rms, row.max_abs, row.status, row.meaning, style=row.style)
+    return table
+
+
+def _sampling_refresh_status_log_payload(
+    state: BuildState,
+    *,
+    reason: str,
+    run_index: int,
+    total_runs: int,
+    previous_theta: np.ndarray,
+    current_theta: np.ndarray,
+    before: dict[str, _SviRefreshCacheSnapshot],
+    after: dict[str, _SviRefreshCacheSnapshot],
+) -> tuple[str, Any]:
+    previous = np.asarray(previous_theta, dtype=float)
+    current = np.asarray(current_theta, dtype=float)
+    if previous.shape == current.shape:
+        diff = np.where(np.isfinite(current - previous), current - previous, 0.0)
+        center_shift = float(np.sqrt(np.sum(np.square(diff))))
+    else:
+        center_shift = float("nan")
+    before_reference = _first_svi_refresh_reference(before)
+    after_reference = _first_svi_refresh_reference(after)
+    parameter_delta = _svi_refresh_parameter_delta(
+        before_reference if before_reference is not None else previous,
+        after_reference if after_reference is not None else current,
+        state.parameter_specs,
+    )
+    deltas = {
+        label: _svi_refresh_cache_delta(before[label], after[label])
+        for label in ("surrogate", "scaling", "source_metric")
+        if label in before and label in after
+    }
+    rows = _svi_refresh_cache_status_rows(deltas, after)
+    return (
+        _format_sampling_refresh_status_message(
+            reason=reason,
+            run_index=run_index,
+            total_runs=total_runs,
+            center_shift=center_shift,
+            parameter_delta=parameter_delta,
+            rows=rows,
+        ),
+        _build_sampling_refresh_status_rich_table(
+            run_index=run_index,
+            total_runs=total_runs,
+            center_shift=center_shift,
+            parameter_delta=parameter_delta,
+            rows=rows,
+        ),
+    )
+
+
+def _refresh_sampling_caches_between_runs(
+    args: argparse.Namespace,
+    state: BuildState,
+    evaluator: ClusterJAXEvaluator,
+    *,
+    previous_best_fit: np.ndarray,
+    current_best_fit: np.ndarray,
+    next_run_index: int,
+    total_runs: int,
+) -> None:
+    reason = f"sampling_refresh_run_{next_run_index}"
+    before_refresh = _svi_refresh_evaluator_snapshot(evaluator)
+    if getattr(evaluator, "active_inference_enabled", False):
+        evaluator.refresh_active_inference_cache(current_best_fit, reason=reason)
+    if evaluator.surrogate_enabled:
+        evaluator.refresh_surrogate(current_best_fit, reason=reason)
+    evaluator.refresh_scaling_scatter_cache(current_best_fit, reason=reason)
+    evaluator.refresh_source_metric_cache(current_best_fit, reason=reason)
+    after_refresh = _svi_refresh_evaluator_snapshot(evaluator)
+    refresh_message, refresh_renderable = _sampling_refresh_status_log_payload(
+        state,
+        reason=reason,
+        run_index=next_run_index,
+        total_runs=total_runs,
+        previous_theta=previous_best_fit,
+        current_theta=current_best_fit,
+        before=before_refresh,
+        after=after_refresh,
+    )
+    _log(args, refresh_message, renderable=refresh_renderable)
+
+
+def _run_repeated_nuts_sampling(
+    args: argparse.Namespace,
+    state: BuildState,
+    evaluator: ClusterJAXEvaluator,
+    sample_model,
+    initial_best_fit: np.ndarray,
+    *,
+    svi_diagnostics: dict[str, Any] | None = None,
+    svi_chain_seeds: list[ChainSeed] | None = None,
+    svi_fallback_posterior: PosteriorResults | None = None,
+    blocked: bool = False,
+    active_blocked: bool = False,
+) -> tuple[PosteriorResults, np.ndarray]:
+    total_runs = int(getattr(args, "sampling_refresh_runs", DEFAULT_SAMPLING_REFRESH_RUNS))
+    if total_runs <= 0:
+        raise ValueError("--sampling-refresh-runs must be positive.")
+    best_fit = np.asarray(initial_best_fit, dtype=float)
+    previous_best_fit = np.asarray(best_fit, dtype=float)
+    posterior: PosteriorResults | None = None
+    per_run_best_log_prob: list[float | None] = []
+    per_run_best_source_loglike: list[float | None] = []
+    per_run_best_index: list[int] = []
+    per_run_seed: list[int | None] = []
+    cache_refresh_count = 0
+
+    if total_runs > 1:
+        _log(args, f"[sampling] refresh runs requested total={total_runs}; SVI prefit is not repeated")
+    for run_index in range(1, total_runs + 1):
+        if run_index > 1:
+            _refresh_sampling_caches_between_runs(
+                args,
+                state,
+                evaluator,
+                previous_best_fit=previous_best_fit,
+                current_best_fit=best_fit,
+                next_run_index=run_index,
+                total_runs=total_runs,
+            )
+            cache_refresh_count += 1
+            previous_best_fit = np.asarray(best_fit, dtype=float)
+        run_args = _sampling_refresh_seed_args(args, run_index)
+        per_run_seed.append(None if getattr(run_args, "seed", None) is None else int(run_args.seed))
+        if svi_diagnostics is not None and run_index == 1:
+            nuts_init = _nuts_initialization_from_svi_center(
+                run_args,
+                state.parameter_specs,
+                best_fit,
+                svi_diagnostics,
+                chain_seeds=svi_chain_seeds,
+            )
+            init_label = "svi"
+        else:
+            nuts_init = _nuts_initialization_from_reference(run_args, state.parameter_specs, best_fit)
+            init_label = "previous_best" if run_index > 1 else "previous_stage/reference"
+            if svi_diagnostics is not None:
+                nuts_init.diagnostics.update(
+                    {
+                        "strategy_requested": FIT_METHOD_SVI_NUTS,
+                        "svi_used": True,
+                        "sampling_refresh_previous_svi_used": True,
+                    }
+                )
+                nuts_init.diagnostics.update(dict(svi_diagnostics))
+        nuts_init.diagnostics["sampling_refresh_run_index"] = int(run_index)
+        nuts_init.diagnostics["sampling_refresh_runs_requested"] = int(total_runs)
+        nuts_init.diagnostics["sampling_refresh_init"] = init_label
+        _log(
+            run_args,
+            (
+                f"[sampling] run {run_index}/{total_runs} starting sampler="
+                f"{'active_blocked_nuts' if active_blocked else ('blocked_nuts' if blocked else 'nuts')} "
+                f"init={init_label} seed={per_run_seed[-1]}"
+            ),
+        )
+        if active_blocked:
+            run_posterior = _run_active_blocked_numpyro_nuts_sampler(run_args, state, evaluator, nuts_init)
+        elif blocked:
+            run_posterior = _run_blocked_numpyro_nuts_sampler(run_args, state, evaluator, nuts_init)
+        else:
+            run_posterior = _run_numpyro_nuts_sampler(run_args, state, evaluator, sample_model, nuts_init)
+        nuts_usable, nuts_reason = _nuts_posterior_is_usable(run_posterior)
+        if not nuts_usable:
+            if run_index == 1 and total_runs == 1 and svi_fallback_posterior is not None:
+                _log(
+                    args,
+                    (
+                        "[nuts] posterior rejected; falling back to SVI guide posterior "
+                        f"reason={nuts_reason}"
+                    ),
+                )
+                posterior = svi_fallback_posterior
+                posterior.sampler = "svi_fallback_after_failed_nuts"
+                if posterior.init_diagnostics is None:
+                    posterior.init_diagnostics = {}
+                posterior.init_diagnostics["nuts_rejected"] = True
+                posterior.init_diagnostics["nuts_rejection_reason"] = nuts_reason
+                posterior.init_diagnostics["nuts_accept_mean"] = (
+                    float(np.nanmean(run_posterior.accept_prob)) if np.asarray(run_posterior.accept_prob).size else float("nan")
+                )
+                posterior.init_diagnostics["nuts_divergence_fraction"] = (
+                    float(np.mean(run_posterior.diverging)) if np.asarray(run_posterior.diverging).size else float("nan")
+                )
+                return posterior, best_fit
+            raise RuntimeError(f"NUTS posterior is unusable during sampling refresh run {run_index}/{total_runs}: {nuts_reason}")
+        posterior = run_posterior
+        best_fit, best_index, best_log_prob = _best_fit_from_posterior_log_prob(posterior)
+        per_run_best_index.append(int(best_index))
+        per_run_best_log_prob.append(best_log_prob)
+        per_run_best_source_loglike.append(_safe_source_loglike(evaluator, best_fit))
+        _log(
+            args,
+            (
+                f"[sampling] run {run_index}/{total_runs} best_fit index={best_index} "
+                f"log_prob={best_log_prob if best_log_prob is not None else 'nan'} "
+                f"source_loglike={per_run_best_source_loglike[-1] if per_run_best_source_loglike[-1] is not None else 'nan'}"
+            ),
+        )
+    if posterior is None:
+        raise RuntimeError("NUTS sampling did not produce a posterior.")
+    evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_nuts")
+    evaluator.refresh_source_metric_cache(best_fit, reason="post_nuts")
+    if posterior.init_diagnostics is None:
+        posterior.init_diagnostics = {}
+    posterior.init_diagnostics.update(
+        {
+            "sampling_refresh_runs_requested": int(total_runs),
+            "sampling_refresh_runs_completed": int(total_runs),
+            "sampling_refresh_selected_run": int(total_runs),
+            "sampling_refresh_cache_refresh_count": int(cache_refresh_count),
+            "sampling_refresh_per_run_best_log_prob": per_run_best_log_prob,
+            "sampling_refresh_per_run_best_source_loglike": per_run_best_source_loglike,
+            "sampling_refresh_per_run_best_index": per_run_best_index,
+            "sampling_refresh_per_run_seed": per_run_seed,
+        }
+    )
+    return posterior, best_fit
+
+
+def _active_scaling_gate_suffix_start(parameter_specs: list[ParameterSpec]) -> int:
+    active_indices = [
+        idx
+        for idx, spec in enumerate(parameter_specs)
+        if spec.component_family == ACTIVE_SCALING_GATE_COMPONENT_FAMILY
+    ]
+    if not active_indices:
+        return len(parameter_specs)
+    start = int(min(active_indices))
+    expected = list(range(start, len(parameter_specs)))
+    if active_indices != expected:
+        raise ValueError("Active-scaling gate parameters must be a contiguous suffix of the parameter vector.")
+    return start
+
+
+def _packed_lens_spec_without_active_scaling_gates(packed_lens_spec: PackedLensSpec) -> PackedLensSpec:
+    return replace(
+        packed_lens_spec,
+        active_gate_intercept_param_index=np.asarray([], dtype=np.int32),
+        active_gate_mag_slope_param_index=np.asarray([], dtype=np.int32),
+        active_gate_logit_offset_param_index=np.asarray([], dtype=np.int32),
+        active_magnitude_feature=np.asarray([], dtype=float),
+    )
+
+
+def _trim_posterior_results_to_parameter_count(
+    posterior: PosteriorResults,
+    parameter_count: int,
+) -> PosteriorResults:
+    samples = np.asarray(posterior.samples, dtype=float)
+    trimmed_samples = samples[:, :parameter_count] if samples.ndim == 2 else samples
+    grouped_samples = posterior.grouped_samples
+    if grouped_samples is not None:
+        grouped_array = np.asarray(grouped_samples, dtype=float)
+        if grouped_array.ndim >= 3:
+            grouped_samples = grouped_array[..., :parameter_count]
+    return replace(
+        posterior,
+        samples=np.asarray(trimmed_samples, dtype=float),
+        grouped_samples=grouped_samples,
+    )
+
+
+def _state_without_active_scaling_gate_parameters(
+    state: BuildState,
+    *,
+    frozen_active_component_indices: np.ndarray,
+) -> tuple[BuildState, int]:
+    ordinary_count = _active_scaling_gate_suffix_start(state.parameter_specs)
+    ordinary_specs = list(state.parameter_specs[:ordinary_count])
+    allowed_sample_names = {str(spec.sample_name) for spec in ordinary_specs}
+    svi_init_values = (
+        {
+            str(key): float(value)
+            for key, value in dict(state.svi_init_values or {}).items()
+            if str(key) in allowed_sample_names
+        }
+        if state.svi_init_values is not None
+        else None
+    )
+    records: list[dict[str, Any]] = []
+    for record in state.scaling_component_records:
+        item = dict(record)
+        item["active_gate_intercept_param_index"] = -1
+        item["active_gate_mag_slope_param_index"] = -1
+        item["active_gate_logit_offset_param_index"] = -1
+        records.append(item)
+    frozen_indices = np.asarray(sorted({int(value) for value in np.asarray(frozen_active_component_indices).reshape(-1)}), dtype=np.int32)
+    return (
+        replace(
+            state,
+            parameter_specs=ordinary_specs,
+            packed_lens_spec=_packed_lens_spec_without_active_scaling_gates(state.packed_lens_spec),
+            scaling_component_records=records,
+            svi_init_values=svi_init_values,
+            infer_active_scaling=False,
+            frozen_active_scaling_component_indices=frozen_indices,
+        ),
+        ordinary_count,
+    )
+
+
+def _boolean_mask_from_column(values: pd.Series) -> np.ndarray:
+    if pd.api.types.is_bool_dtype(values):
+        return values.fillna(False).to_numpy(dtype=bool)
+    normalized = values.astype(str).str.strip().str.lower()
+    return normalized.isin({"1", "true", "t", "yes", "y"}).to_numpy(dtype=bool)
+
+
+def _active_scaling_record_lookup(
+    state: BuildState,
+) -> tuple[dict[tuple[str, str], int], dict[int, int], set[int]]:
+    by_identity: dict[tuple[str, str], int] = {}
+    by_component_index: dict[int, int] = {}
+    valid_components: set[int] = set()
+    for record in getattr(state, "scaling_component_records", []):
+        try:
+            component_index = int(record.get("component_index", -1))
+        except (TypeError, ValueError):
+            continue
+        if component_index < 0:
+            continue
+        valid_components.add(component_index)
+        by_component_index[component_index] = component_index
+        potfile_id = record.get("potfile_id")
+        catalog_id = record.get("catalog_id")
+        if potfile_id is not None and catalog_id is not None:
+            by_identity[(str(potfile_id), str(catalog_id))] = component_index
+    return by_identity, by_component_index, valid_components
+
+
+def _map_frozen_active_rows_to_state(
+    rows: pd.DataFrame,
+    state: BuildState,
+    *,
+    source_description: str,
+) -> tuple[np.ndarray, list[str]]:
+    by_identity, by_component_index, _valid_components = _active_scaling_record_lookup(state)
+    mapped: list[int] = []
+    missing: list[str] = []
+    for row_number, row in rows.reset_index(drop=True).iterrows():
+        component_index: int | None = None
+        potfile_id = row.get("potfile_id")
+        catalog_id = row.get("catalog_id")
+        if pd.notna(potfile_id) and pd.notna(catalog_id):
+            component_index = by_identity.get((str(potfile_id), str(catalog_id)))
+        if component_index is None and "component_index" in row and pd.notna(row.get("component_index")):
+            try:
+                component_index = by_component_index.get(int(row.get("component_index")))
+            except (TypeError, ValueError):
+                component_index = None
+        if component_index is None:
+            label = f"row={row_number}"
+            if pd.notna(potfile_id) and pd.notna(catalog_id):
+                label += f" potfile_id={potfile_id} catalog_id={catalog_id}"
+            elif "component_index" in row:
+                label += f" component_index={row.get('component_index')}"
+            missing.append(label)
+            continue
+        mapped.append(int(component_index))
+    if missing:
+        missing_preview = ", ".join(missing[:5])
+        if len(missing) > 5:
+            missing_preview += f", ... ({len(missing)} total)"
+        return np.asarray(sorted(set(mapped)), dtype=np.int32), [
+            f"{source_description} frozen active rows could not be mapped into the current state: {missing_preview}"
+        ]
+    return np.asarray(sorted(set(mapped)), dtype=np.int32), []
+
+
+def _load_frozen_active_scaling_from_previous_stage(
+    previous_stage_run_dir: str | Path,
+    current_state: BuildState,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    run_dir = Path(previous_stage_run_dir)
+
+    def load_from_artifact(reason_if_missing: str) -> tuple[np.ndarray | None, dict[str, Any]]:
+        artifact_path = run_dir / "artifacts" / "plot_bundle.h5"
+        if not artifact_path.exists():
+            return None, {
+                "source": "none",
+                "source_path": str(run_dir),
+                "reason": reason_if_missing,
+            }
+        try:
+            previous_state, _saved_args, _arrays, _init_diagnostics = _load_artifacts(run_dir / "artifacts")
+        except Exception as exc:
+            return None, {
+                "source": "plot_bundle_h5",
+                "source_path": str(artifact_path),
+                "reason": f"failed to load artifact bundle: {exc}",
+            }
+        previous_frozen = getattr(previous_state, "frozen_active_scaling_component_indices", None)
+        if previous_frozen is None:
+            return None, {
+                "source": "plot_bundle_h5",
+                "source_path": str(artifact_path),
+                "reason": "artifact state has no frozen active-scaling split",
+            }
+        previous_frozen_set = {int(value) for value in np.asarray(previous_frozen).reshape(-1)}
+        previous_rows = pd.DataFrame(
+            [
+                record
+                for record in getattr(previous_state, "scaling_component_records", [])
+                if int(record.get("component_index", -1)) in previous_frozen_set
+            ]
+        )
+        frozen_indices, mapping_errors = _map_frozen_active_rows_to_state(
+            previous_rows,
+            current_state,
+            source_description=str(artifact_path),
+        )
+        total_candidates = int(len(getattr(previous_state, "scaling_component_records", [])))
+        diagnostics = {
+            "source": "plot_bundle_h5",
+            "source_path": str(artifact_path),
+            "total_candidates": total_candidates,
+            "frozen_active_count": int(len(frozen_indices)),
+            "frozen_inactive_count": int(max(total_candidates - len(frozen_indices), 0)),
+        }
+        if mapping_errors:
+            diagnostics["mapping_errors"] = mapping_errors
+        return frozen_indices, diagnostics
+
+    diagnostics_path = run_dir / "tables" / "active_scaling_diagnostics.csv"
+    if diagnostics_path.exists():
+        try:
+            diagnostics_df = pd.read_csv(diagnostics_path)
+        except Exception as exc:
+            return load_from_artifact(f"failed to read active-scaling diagnostics from {diagnostics_path}: {exc}")
+        if diagnostics_df.empty:
+            return load_from_artifact(f"empty diagnostics CSV at {diagnostics_path}")
+        if "frozen_active" not in diagnostics_df:
+            return load_from_artifact(f"missing frozen_active column in {diagnostics_path}")
+        frozen_rows = diagnostics_df.loc[_boolean_mask_from_column(diagnostics_df["frozen_active"])]
+        frozen_indices, mapping_errors = _map_frozen_active_rows_to_state(
+            frozen_rows,
+            current_state,
+            source_description=str(diagnostics_path),
+        )
+        total_candidates = int(len(diagnostics_df))
+        diagnostics = {
+            "source": "diagnostics_csv",
+            "source_path": str(diagnostics_path),
+            "total_candidates": total_candidates,
+            "frozen_active_count": int(len(frozen_indices)),
+            "frozen_inactive_count": int(max(total_candidates - len(frozen_indices), 0)),
+        }
+        if mapping_errors:
+            diagnostics["mapping_errors"] = mapping_errors
+        return frozen_indices, diagnostics
+    return load_from_artifact(f"missing active-scaling diagnostics CSV at {diagnostics_path}")
+
+
+def _apply_previous_stage_frozen_active_scaling(
+    args: argparse.Namespace,
+    state: BuildState,
+    previous_stage_run_dir: str | Path | None,
+    *,
+    require_frozen_active_scaling: bool,
+) -> BuildState:
+    if previous_stage_run_dir is None:
+        if require_frozen_active_scaling:
+            raise ValueError(
+                "--infer-active-scaling cannot be used directly by stage 4. "
+                "Stage 4 must reuse a frozen active-scaling split from a completed stage 3 run. "
+                "Rerun stage 3 with --infer-active-scaling, or remove --infer-active-scaling and use fixed/adaptive active selection."
+            )
+        return state
+    frozen_indices, diagnostics = _load_frozen_active_scaling_from_previous_stage(previous_stage_run_dir, state)
+    if diagnostics.get("mapping_errors"):
+        raise ValueError("; ".join(str(item) for item in diagnostics["mapping_errors"]))
+    if frozen_indices is None:
+        if require_frozen_active_scaling:
+            reason = str(diagnostics.get("reason", "no frozen active-scaling split was found"))
+            raise ValueError(
+                "--infer-active-scaling cannot be used directly by stage 4. "
+                "Stage 4 must reuse a frozen active-scaling split from a completed stage 3 run. "
+                f"No frozen active-scaling split was available from {previous_stage_run_dir}: {reason}. "
+                "Rerun stage 3 with --infer-active-scaling, or remove --infer-active-scaling and use fixed/adaptive active selection."
+            )
+        return state
+    total_candidates = diagnostics.get("total_candidates")
+    inactive_count = diagnostics.get("frozen_inactive_count")
+    if inactive_count is None and total_candidates is not None:
+        inactive_count = int(total_candidates) - int(len(frozen_indices))
+    _log(
+        args,
+        (
+            "[active-scaling] using frozen split from previous stage "
+            f"source={diagnostics.get('source_path', previous_stage_run_dir)} "
+            f"active={len(frozen_indices)} inactive={inactive_count if inactive_count is not None else 'na'}"
+        ),
+    )
+    return replace(
+        state,
+        infer_active_scaling=False,
+        frozen_active_scaling_component_indices=np.asarray(frozen_indices, dtype=np.int32),
+        active_scaling_frozen_from_previous_stage=True,
+        active_scaling_frozen_source_run_dir=str(previous_stage_run_dir),
+        active_scaling_frozen_source_path=(
+            None if diagnostics.get("source_path") is None else str(diagnostics.get("source_path"))
+        ),
+    )
+
+
+def _append_previous_stage_active_scaling_diagnostics(
+    state: BuildState,
+    posterior: PosteriorResults,
+) -> None:
+    if not bool(getattr(state, "active_scaling_frozen_from_previous_stage", False)):
+        return
+    if posterior.init_diagnostics is None:
+        posterior.init_diagnostics = {}
+    frozen_indices = getattr(state, "frozen_active_scaling_component_indices", None)
+    active_count = int(len(np.asarray(frozen_indices).reshape(-1))) if frozen_indices is not None else 0
+    total_count = int(len(getattr(state, "scaling_component_records", [])))
+    frozen_set = {int(value) for value in np.asarray(frozen_indices if frozen_indices is not None else [], dtype=int).reshape(-1)}
+    active_by_potfile: dict[str, int] = {}
+    inactive_by_potfile: dict[str, int] = {}
+    for record in getattr(state, "scaling_component_records", []):
+        potfile_id = str(record.get("potfile_id", "unknown"))
+        try:
+            component_index = int(record.get("component_index", -1))
+        except (TypeError, ValueError):
+            component_index = -1
+        if component_index in frozen_set:
+            active_by_potfile[potfile_id] = int(active_by_potfile.get(potfile_id, 0) + 1)
+        else:
+            inactive_by_potfile[potfile_id] = int(inactive_by_potfile.get(potfile_id, 0) + 1)
+    posterior.init_diagnostics.update(
+        {
+            "infer_active_scaling": False,
+            "active_scaling_frozen_from_previous_stage": True,
+            "active_scaling_frozen_source_run_dir": getattr(
+                state,
+                "active_scaling_frozen_source_run_dir",
+                None,
+            ),
+            "active_scaling_frozen_source_path": getattr(
+                state,
+                "active_scaling_frozen_source_path",
+                None,
+            ),
+            "active_scaling_freeze_threshold": float(
+                getattr(state, "active_scaling_freeze_threshold", DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD)
+            ),
+            "active_scaling_total_candidates": total_count,
+            "active_scaling_frozen_active_count": active_count,
+            "active_scaling_frozen_inactive_count": int(max(total_count - active_count, 0)),
+            "active_scaling_frozen_active_by_potfile": active_by_potfile,
+            "active_scaling_frozen_inactive_by_potfile": inactive_by_potfile,
+        }
+    )
+
+
+def _write_active_scaling_freeze_diagnostics(
+    args: argparse.Namespace,
+    run_dir: Path,
+    state: BuildState,
+    evaluator: ClusterJAXEvaluator,
+    best_fit: np.ndarray,
+    svi_posterior: PosteriorResults,
+) -> tuple[pd.DataFrame, np.ndarray, dict[str, Any]]:
+    threshold = float(getattr(args, "active_scaling_freeze_threshold", DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD))
+    active_population_diagnostics = evaluator.active_population_diagnostics_for_samples(
+        svi_posterior.samples,
+        best_fit=best_fit,
+    )
+    active_inference_likelihood = str(
+        getattr(
+            evaluator,
+            "active_scaling_inference_likelihood",
+            getattr(state, "active_scaling_inference_likelihood", ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION),
+        )
+    )
+    diagnostics_df = _active_scaling_diagnostics_table(
+        state.parameter_specs,
+        svi_posterior.samples,
+        best_fit,
+        evaluator.scaling_rank_df,
+        state.packed_lens_spec,
+        freeze_threshold=threshold,
+        sample_weights=svi_posterior.sample_weights,
+        active_population_diagnostics=active_population_diagnostics,
+        active_inference_likelihood=active_inference_likelihood,
+    )
+    tables_dir = run_dir / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_df.to_csv(tables_dir / "active_scaling_diagnostics.csv", index=False)
+    _plot_active_scaling_summary(
+        run_dir,
+        diagnostics_df,
+        parameter_specs=state.parameter_specs,
+        freeze_threshold=threshold,
+    )
+    frozen_indices = (
+        diagnostics_df.loc[diagnostics_df["frozen_active"].astype(bool), "component_index"].to_numpy(dtype=np.int32)
+        if not diagnostics_df.empty
+        else np.asarray([], dtype=np.int32)
+    )
+    total_count = int(len(diagnostics_df))
+    frozen_count = int(len(frozen_indices))
+    frozen_by_potfile = (
+        {
+            str(potfile_id): int(np.sum(group["frozen_active"].to_numpy(dtype=bool)))
+            for potfile_id, group in diagnostics_df.groupby("potfile_id", sort=True)
+        }
+        if not diagnostics_df.empty
+        else {}
+    )
+    inactive_by_potfile = (
+        {
+            str(potfile_id): int(np.sum(~group["frozen_active"].to_numpy(dtype=bool)))
+            for potfile_id, group in diagnostics_df.groupby("potfile_id", sort=True)
+        }
+        if not diagnostics_df.empty
+        else {}
+    )
+    diagnostics = {
+        "infer_active_scaling": True,
+        "active_scaling_inference_likelihood": active_inference_likelihood,
+        "active_scaling_freeze_threshold": threshold,
+        "active_scaling_total_candidates": total_count,
+        "active_scaling_frozen_active_count": frozen_count,
+        "active_scaling_frozen_inactive_count": int(total_count - frozen_count),
+        "active_scaling_frozen_active_by_potfile": frozen_by_potfile,
+        "active_scaling_frozen_inactive_by_potfile": inactive_by_potfile,
+        "active_scaling_diagnostics_csv": str(tables_dir / "active_scaling_diagnostics.csv"),
+        "active_scaling_summary_pdf": str(run_dir / "active_scaling_summary.pdf"),
+    }
+    return diagnostics_df, np.asarray(frozen_indices, dtype=np.int32), diagnostics
+
+
+def _rebuild_evaluator_for_frozen_active_scaling(
+    args: argparse.Namespace,
+    state: BuildState,
+    best_fit: np.ndarray,
+) -> ClusterJAXEvaluator:
+    evaluator = _build_cluster_evaluator_from_args(args, state)
+    _log_active_approximation_table(args, evaluator)
+    _log_evaluator_summary(args, evaluator)
+    _log_evaluator_memory_shape_diagnostics(args, evaluator, reason="active_scaling_freeze_evaluator_built")
+    if evaluator.surrogate_enabled:
+        evaluator.refresh_surrogate(best_fit, reason="active_scaling_freeze")
+    evaluator.refresh_scaling_scatter_cache(best_fit, reason="active_scaling_freeze")
+    evaluator.refresh_source_metric_cache(best_fit, reason="active_scaling_freeze")
+    _log_evaluator_memory_shape_diagnostics(args, evaluator, reason="active_scaling_freeze_refresh")
+    return evaluator
+
+
 def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -> None:
     start = time.time()
     _configure_debug_log(args, state.run_name, run_dir)
@@ -22328,6 +27581,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
             grouped_log_prob=np.empty((0, 0), dtype=float),
             sampler="fixed_model",
         )
+        _append_previous_stage_active_scaling_diagnostics(state, posterior)
         _log_posterior_summary(args, "fixed_model", posterior)
         validation_evaluator = _output_evaluator_for_validation(args, state, evaluator, best_fit)
         if args.skip_validation or bool(getattr(args, "quick_diagnostics", False)):
@@ -22444,28 +27698,14 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
             evaluator.refresh_surrogate(best_fit, reason="nuts_initial")
         evaluator.refresh_scaling_scatter_cache(best_fit, reason="nuts_initial")
         evaluator.refresh_source_metric_cache(best_fit, reason="nuts_initial")
-        nuts_init = _nuts_initialization_from_reference(args, state.parameter_specs, best_fit)
-        _log(
+        posterior, best_fit = _run_repeated_nuts_sampling(
             args,
-            (
-                "[nuts:init] from previous-stage/reference "
-                f"distinct_seeds={int(nuts_init.diagnostics.get('distinct_chain_seeds', 0))}"
-            ),
+            state,
+            evaluator,
+            sample_model,
+            best_fit,
+            blocked=False,
         )
-        posterior = _run_numpyro_nuts_sampler(args, state, evaluator, sample_model, nuts_init)
-        nuts_usable, nuts_reason = _nuts_posterior_is_usable(posterior)
-        if not nuts_usable:
-            raise RuntimeError(f"Direct NUTS posterior is unusable: {nuts_reason}")
-        if posterior.samples.ndim != 2 or posterior.samples.shape[0] == 0:
-            raise RuntimeError("Direct NUTS returned no posterior samples.")
-        if np.asarray(posterior.log_prob).size and np.isfinite(posterior.log_prob).any():
-            best_index = int(np.nanargmax(posterior.log_prob))
-        else:
-            best_index = 0
-        best_fit = np.asarray(posterior.samples[best_index], dtype=float)
-        evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_nuts")
-        evaluator.refresh_source_metric_cache(best_fit, reason="post_nuts")
-        _log(args, f"[nuts] best_fit updated from retained posterior sample index={best_index}")
     elif str(args.fit_method) in MICROCANONICAL_FIT_METHODS:
         method = str(args.fit_method)
         best_fit = _reference_theta_from_init_values(state.parameter_specs, state.svi_init_values, _midpoint)
@@ -22488,12 +27728,182 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
         evaluator.refresh_source_metric_cache(best_fit, reason=f"post_{method}")
         _log(args, f"[{method}] best_fit updated from retained posterior sample index={best_index}")
     else:
-        best_fit, posterior, svi_diagnostics = _run_svi_fit(args, state, evaluator, sample_model)
+        svi_fit_result = _run_svi_fit(args, state, evaluator, sample_model)
+        best_fit, posterior, svi_diagnostics = svi_fit_result
+        state = svi_fit_result.state
+        evaluator = svi_fit_result.evaluator
+        sample_model = svi_fit_result.sample_model
         svi_posterior = posterior
-        evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_svi")
-        evaluator.refresh_source_metric_cache(best_fit, reason="post_svi")
+        if str(args.fit_method) == FIT_METHOD_SVI_NUTS and bool(getattr(state, "infer_active_scaling", False)):
+            _active_df, frozen_active_indices, active_freeze_diagnostics = _write_active_scaling_freeze_diagnostics(
+                args,
+                run_dir,
+                state,
+                evaluator,
+                best_fit,
+                svi_posterior,
+            )
+            state, ordinary_parameter_count = _state_without_active_scaling_gate_parameters(
+                state,
+                frozen_active_component_indices=frozen_active_indices,
+            )
+            best_fit = np.asarray(best_fit, dtype=float)[:ordinary_parameter_count]
+            svi_posterior = _trim_posterior_results_to_parameter_count(svi_posterior, ordinary_parameter_count)
+            posterior = svi_posterior
+            svi_diagnostics.update(active_freeze_diagnostics)
+            _log(
+                args,
+                (
+                    "[active-scaling] froze SVI active split "
+                    f"active={active_freeze_diagnostics['active_scaling_frozen_active_count']} "
+                    f"inactive={active_freeze_diagnostics['active_scaling_frozen_inactive_count']} "
+                    f"threshold={active_freeze_diagnostics['active_scaling_freeze_threshold']:.3g}"
+                ),
+            )
+            evaluator.release_runtime_caches()
+            evaluator = _rebuild_evaluator_for_frozen_active_scaling(args, state, best_fit)
+            sample_model = _posterior_model(state.parameter_specs, evaluator)
+        else:
+            evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_svi")
+            evaluator.refresh_source_metric_cache(best_fit, reason="post_svi")
         svi_chain_seeds: list[ChainSeed] | None = None
-        if str(args.fit_method) == FIT_METHOD_SVI_NUTS:
+        if str(args.fit_method) in {FIT_METHOD_SVI_NUTS, FIT_METHOD_ACTIVE_BLOCKED_NUTS}:
+            pre_nuts_refresh_reason = "pre_nuts"
+            topk_discovery_final_enabled = bool(
+                str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT
+            )
+            if topk_discovery_final_enabled:
+                old_state_for_transfer = state
+                old_specs_for_transfer = list(state.parameter_specs)
+                final_polish_steps = max(0, int(getattr(args, "topk_discovery_final_svi_polish_steps", 2000)))
+                final_union, final_union_diag = _topk_discovery_union_from_evaluator(
+                    state,
+                    evaluator,
+                    best_fit,
+                )
+                final_args = argparse.Namespace(**vars(args))
+                final_args.sampling_engine = str(
+                    getattr(args, "topk_discovery_final_engine", SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT)
+                )
+                _log(
+                    args,
+                    _topk_discovery_svi_final_log_message(
+                        final_union_diag,
+                        final_engine=str(final_args.sampling_engine),
+                        final_polish_steps=int(final_polish_steps),
+                        fallback_k=int(getattr(evaluator, "topk_discovery_scaling_galaxies", 10)),
+                    ),
+                )
+                state, evaluator, sample_model, best_fit, final_rebuild_diag = (
+                    _rebuild_topk_discovery_state_from_union(
+                        final_args,
+                        state,
+                        best_fit,
+                        final_union,
+                        reason="topk_discovery_final",
+                    )
+                )
+                final_model_counts = _topk_discovery_final_model_counts(evaluator)
+                svi_posterior = _transfer_posterior_samples_by_sample_name(
+                    svi_posterior,
+                    old_specs_for_transfer,
+                    state.parameter_specs,
+                )
+                posterior = svi_posterior
+                svi_diagnostics.update(
+                    {
+                        "topk_discovery_final_enabled": True,
+                        "topk_discovery_final_engine": str(final_args.sampling_engine),
+                        "topk_discovery_final_candidates": int(final_rebuild_diag["count"]),
+                        "topk_discovery_final_added": int(final_rebuild_diag["added"]),
+                        "topk_discovery_final_removed": int(final_rebuild_diag["removed"]),
+                        "topk_discovery_final_retained": int(final_rebuild_diag["retained"]),
+                        "topk_discovery_final_exact_unique": int(final_union_diag.get("exact_unique", 0)),
+                        "topk_discovery_final_pairs": int(final_union_diag.get("pairs", 0)),
+                        "topk_discovery_final_score_fraction": float(final_union_diag.get("score_fraction", 0.0)),
+                        "topk_discovery_final_strict_active": bool(final_rebuild_diag.get("strict_active", False)),
+                        "topk_discovery_final_active_equals_independent": bool(
+                            final_rebuild_diag.get("active_equals_independent", False)
+                        ),
+                        "topk_discovery_final_svi_polish_steps": int(final_polish_steps),
+                        "topk_discovery_final_svi_polish_enabled": bool(final_polish_steps > 0),
+                        **_topk_discovery_svi_final_diagnostics(
+                            final_union_diag,
+                            final_rebuild_diag,
+                            final_model_counts,
+                            final_engine=str(final_args.sampling_engine),
+                            final_polish_steps=int(final_polish_steps),
+                        ),
+                    }
+                )
+                _log(
+                    args,
+                    _topk_discovery_final_model_log_message(
+                        final_model_counts,
+                        old_parameter_count=len(old_state_for_transfer.parameter_specs),
+                        new_parameter_count=len(state.parameter_specs),
+                    ),
+                )
+                _log_active_approximation_table(args, evaluator)
+                _log(
+                    args,
+                    (
+                        "[topk-discovery:nuts] final_rebuild "
+                        f"candidates={final_rebuild_diag['count']} "
+                        f"added={final_rebuild_diag['added']} "
+                        f"removed={final_rebuild_diag['removed']} "
+                        f"retained={final_rebuild_diag['retained']} "
+                        f"strict_active={'yes' if bool(final_rebuild_diag.get('strict_active', False)) else 'no'} "
+                        f"active_equals_independent={'yes' if bool(final_rebuild_diag.get('active_equals_independent', False)) else 'no'} "
+                        f"exact_unique={int(final_union_diag.get('exact_unique', 0))} "
+                        f"pairs={int(final_union_diag.get('pairs', 0))} "
+                        f"score_fraction={float(final_union_diag.get('score_fraction', 0.0)):.4g} "
+                        f"final_engine={final_args.sampling_engine} "
+                        f"old_parameters={len(old_state_for_transfer.parameter_specs)} "
+                        f"new_parameters={len(state.parameter_specs)}"
+                    ),
+                )
+                args = final_args
+                pre_nuts_refresh_reason = "pre_nuts_topk_discovery_final_rebuilt"
+                if final_polish_steps > 0:
+                    polish_initial_reason = "pre_nuts_topk_discovery_polish_initial"
+                    if getattr(evaluator, "active_inference_enabled", False):
+                        evaluator.refresh_active_inference_cache(best_fit, reason=polish_initial_reason)
+                    if evaluator.surrogate_enabled:
+                        evaluator.refresh_surrogate(best_fit, reason=polish_initial_reason)
+                    evaluator.refresh_scaling_scatter_cache(best_fit, reason=polish_initial_reason)
+                    evaluator.refresh_source_metric_cache(best_fit, reason=polish_initial_reason)
+                    best_fit, polish_posterior, polish_diag = _run_topk_discovery_final_svi_polish(
+                        args,
+                        state,
+                        evaluator,
+                        sample_model,
+                        best_fit,
+                        steps=final_polish_steps,
+                    )
+                    svi_posterior = polish_posterior
+                    posterior = polish_posterior
+                    svi_diagnostics.update(polish_diag)
+                    pre_nuts_refresh_reason = "pre_nuts_topk_discovery_final_polished"
+            before_refresh = _svi_refresh_evaluator_snapshot(evaluator)
+            if getattr(evaluator, "active_inference_enabled", False):
+                evaluator.refresh_active_inference_cache(best_fit, reason=pre_nuts_refresh_reason)
+            if evaluator.surrogate_enabled:
+                evaluator.refresh_surrogate(best_fit, reason=pre_nuts_refresh_reason)
+            evaluator.refresh_scaling_scatter_cache(best_fit, reason=pre_nuts_refresh_reason)
+            evaluator.refresh_source_metric_cache(best_fit, reason=pre_nuts_refresh_reason)
+            after_refresh = _svi_refresh_evaluator_snapshot(evaluator)
+            refresh_message, refresh_renderable = _svi_refresh_status_log_payload(
+                state,
+                reason=pre_nuts_refresh_reason,
+                block_index=int(svi_diagnostics.get("svi_block_count", 0)),
+                remaining_steps=0,
+                center_shift=0.0,
+                current_theta=best_fit,
+                before=before_refresh,
+                after=after_refresh,
+            )
+            _log(args, refresh_message, renderable=refresh_renderable)
             svi_chain_seeds = _prepare_svi_health_for_nuts(
                 args,
                 state.parameter_specs,
@@ -22509,56 +27919,21 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                 f"final_elbo={float(svi_diagnostics.get('svi_final_elbo_loss', float('nan'))):.4g}"
             ),
         )
-        if str(args.fit_method) == FIT_METHOD_SVI_NUTS:
-            nuts_init = _nuts_initialization_from_svi_center(
+        if str(args.fit_method) in {FIT_METHOD_SVI_NUTS, FIT_METHOD_ACTIVE_BLOCKED_NUTS}:
+            posterior, best_fit = _run_repeated_nuts_sampling(
                 args,
-                state.parameter_specs,
+                state,
+                evaluator,
+                sample_model,
                 best_fit,
-                svi_diagnostics,
-                chain_seeds=svi_chain_seeds,
+                svi_diagnostics=svi_diagnostics,
+                svi_chain_seeds=svi_chain_seeds,
+                svi_fallback_posterior=svi_posterior,
+                blocked=_blocked_linearized_stage_enabled(args),
+                active_blocked=str(args.fit_method) == FIT_METHOD_ACTIVE_BLOCKED_NUTS,
             )
-            _log(
-                args,
-                (
-                    "[nuts:init] from svi "
-                    f"distinct_seeds={int(nuts_init.diagnostics.get('distinct_chain_seeds', 0))}"
-                ),
-            )
-            if _blocked_linearized_stage_enabled(args):
-                nuts_posterior = _run_blocked_numpyro_nuts_sampler(args, state, evaluator, nuts_init)
-            else:
-                nuts_posterior = _run_numpyro_nuts_sampler(args, state, evaluator, sample_model, nuts_init)
-            nuts_usable, nuts_reason = _nuts_posterior_is_usable(nuts_posterior)
-            if not nuts_usable:
-                _log(
-                    args,
-                    (
-                        "[nuts] posterior rejected; falling back to SVI guide posterior "
-                        f"reason={nuts_reason}"
-                    ),
-                )
-                posterior = svi_posterior
-                posterior.sampler = "svi_fallback_after_failed_nuts"
-                posterior.init_diagnostics["nuts_rejected"] = True
-                posterior.init_diagnostics["nuts_rejection_reason"] = nuts_reason
-                posterior.init_diagnostics["nuts_accept_mean"] = (
-                    float(np.nanmean(nuts_posterior.accept_prob)) if np.asarray(nuts_posterior.accept_prob).size else float("nan")
-                )
-                posterior.init_diagnostics["nuts_divergence_fraction"] = (
-                    float(np.mean(nuts_posterior.diverging)) if np.asarray(nuts_posterior.diverging).size else float("nan")
-                )
-            elif nuts_posterior.samples.size:
-                posterior = nuts_posterior
-                best_index = int(np.nanargmax(posterior.log_prob))
-                best_fit = np.asarray(posterior.samples[best_index], dtype=float)
-                evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_nuts")
-                evaluator.refresh_source_metric_cache(best_fit, reason="post_nuts")
-                _log(args, f"[nuts] best_fit updated from retained posterior sample index={best_index}")
             if posterior is not svi_posterior:
                 del svi_posterior
-                gc.collect()
-            if "nuts_posterior" in locals() and posterior is not nuts_posterior:
-                del nuts_posterior
                 gc.collect()
     best_fit = _max_likelihood_best_fit_from_posterior(args, evaluator, posterior, best_fit)
     if evaluator.surrogate_enabled:
@@ -22576,6 +27951,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
             )
         except Exception as exc:  # pragma: no cover - diagnostics should never fail the fit
             _log(args, f"[active-subset] failed to compute fit-target diagnostic loglike: {exc}")
+    _append_previous_stage_active_scaling_diagnostics(state, posterior)
     _log_posterior_summary(args, "selected", posterior)
     _artifacts_dir, best_fit_physical, posterior_for_output = _save_inference_checkpoint(
         args,
@@ -22619,7 +27995,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
     else:
         plot_start = time.time()
         _log(args, f"[output] generating plots and tables in {run_dir}")
-        _run_logged_phase(
+        stage_run_summary = _run_logged_phase(
             args,
             "output.generate_plots_and_tables",
             lambda: _generate_plots_and_tables(
@@ -22633,6 +28009,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                 args=args,
             ),
         )
+        _log_stage_fit_quality_table(args, stage_run_summary)
         plot_elapsed = time.time() - plot_start
         validation_evaluator.timing_totals["plot_runtime"] += plot_elapsed
         _log(args, f"[output] complete in {_fmt_seconds(plot_elapsed)} run_dir={run_dir}")
@@ -22677,6 +28054,54 @@ def _infer_previous_stage_best_values_for_plots(args: argparse.Namespace, run_di
         return None
 
 
+def _active_scaling_freeze_threshold_for_resume(
+    state: BuildState,
+    saved_args: dict[str, Any] | None,
+    init_diagnostics: dict[str, Any] | None,
+) -> float:
+    for source in (init_diagnostics or {}, saved_args or {}):
+        value = source.get("active_scaling_freeze_threshold")
+        if value is None:
+            continue
+        try:
+            threshold = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(threshold):
+            return threshold
+    return float(getattr(state, "active_scaling_freeze_threshold", DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD))
+
+
+def _regenerate_active_scaling_summary_from_diagnostics(
+    args: argparse.Namespace,
+    run_dir: Path,
+    state: BuildState,
+    saved_args: dict[str, Any] | None,
+    init_diagnostics: dict[str, Any] | None,
+) -> bool:
+    diagnostics_path = run_dir / "tables" / "active_scaling_diagnostics.csv"
+    if not diagnostics_path.exists():
+        _log(args, f"[plots-only] active-scaling summary skipped; missing {diagnostics_path}")
+        return False
+    try:
+        diagnostics_df = pd.read_csv(diagnostics_path)
+    except Exception as exc:  # pragma: no cover - corrupted CSV compatibility
+        _log(args, f"[plots-only] active-scaling summary skipped; failed to read {diagnostics_path}: {exc}")
+        return False
+    if diagnostics_df.empty:
+        _log(args, f"[plots-only] active-scaling summary skipped; empty {diagnostics_path}")
+        return False
+    threshold = _active_scaling_freeze_threshold_for_resume(state, saved_args, init_diagnostics)
+    _plot_active_scaling_summary(
+        run_dir,
+        diagnostics_df,
+        parameter_specs=state.parameter_specs,
+        freeze_threshold=threshold,
+    )
+    _log(args, f"[plots-only] regenerated active_scaling_summary.pdf from {diagnostics_path}")
+    return True
+
+
 def _rerender_plots(
     args: argparse.Namespace,
     run_dir: Path,
@@ -22697,25 +28122,26 @@ def _rerender_plots(
             state.previous_stage_best_values = inferred_previous_values
     if exact_diagnostics_stage is None:
         exact_diagnostics_stage = _plots_only_exact_diagnostics_stage(run_dir)
-    exact_stage3_diagnostics = _stage3_exact_image_diagnostics_enabled(args, run_dir)
+    exact_stage_diagnostics = _stage_exact_image_diagnostics_enabled(args, run_dir)
     force_quick_diagnostics = (
         _is_sequential_stage_path(run_dir)
-        and not exact_stage3_diagnostics
+        and not exact_stage_diagnostics
         and not _stage_allows_exact_image_diagnostics(run_dir, exact_diagnostics_stage)
     )
     quick_diagnostics = bool(
         getattr(args, "quick_diagnostics", False)
-        or (saved_args.get("quick_diagnostics", False) and not exact_stage3_diagnostics)
+        or (saved_args.get("quick_diagnostics", False) and not exact_stage_diagnostics)
         or force_quick_diagnostics
     )
     if force_quick_diagnostics and not bool(saved_args.get("quick_diagnostics", False)):
         _log(args, "[plots-only] quick diagnostics forced for pre-stage4 sequential stage")
-    if exact_stage3_diagnostics and bool(saved_args.get("quick_diagnostics", False)):
-        _log(args, "[plots-only] exact stage3 image diagnostics requested; ignoring saved quick_diagnostics=True")
+    if exact_stage_diagnostics and bool(saved_args.get("quick_diagnostics", False)):
+        _log(args, "[plots-only] exact stage image diagnostics requested; ignoring saved quick_diagnostics=True")
     plot_saved_args = dict(saved_args)
     plot_saved_args.update(_normalized_saved_likelihood_stabilizer_args(saved_args))
     _drop_legacy_likelihood_stabilizer_args(plot_saved_args)
     plot_saved_args["quick_diagnostics"] = quick_diagnostics
+    plot_saved_args["exact_image_diagnostics_stage2"] = bool(getattr(args, "exact_image_diagnostics_stage2", False))
     plot_saved_args["exact_image_diagnostics_stage3"] = bool(getattr(args, "exact_image_diagnostics_stage3", False))
     plot_saved_args["skip_grid_diagnostics"] = bool(getattr(args, "skip_grid_diagnostics", False))
     plot_saved_args["caustic_source_redshift"] = float(getattr(args, "caustic_source_redshift", 9.0))
@@ -22828,6 +28254,9 @@ def _rerender_plots(
         refresh_every=int(plot_saved_args.get("refresh_every", DEFAULT_REFRESH_EVERY)),
         refresh_param_drift_frac=float(plot_saved_args.get("refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
         source_plane_covariance_floor=float(plot_saved_args.get("source_plane_covariance_floor", 1.0e-6)),
+        source_plane_covariance_mode=str(
+            plot_saved_args.get("source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION)
+        ),
         source_plane_outlier_sigma_arcsec=float(
             plot_saved_args.get("source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
         ),
@@ -23001,6 +28430,17 @@ def _rerender_plots(
             results=posterior,
             runtime_sec=0.0,
             args=plot_args,
+        ),
+    )
+    _run_logged_phase(
+        args,
+        "plots_only.regenerate_active_scaling_summary",
+        lambda: _regenerate_active_scaling_summary_from_diagnostics(
+            args,
+            run_dir,
+            state,
+            saved_args,
+            init_diagnostics,
         ),
     )
     evaluator.timing_totals["plot_runtime"] += time.time() - plot_start
@@ -23216,6 +28656,8 @@ def _run_single_stage(
     svi_init_physical_values: dict[str, float] | None = None,
     source_position_prior_values: dict[str, tuple[float, float]] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
+    frozen_active_scaling_source_run_dir: str | Path | None = None,
+    require_frozen_active_scaling: bool = False,
 ) -> Path:
     _configure_debug_log(args, run_name, None)
     stage_args = _clone_args(args, fit_mode=fit_mode, run_name=run_name, sample_likelihood_mode=sample_likelihood_mode)
@@ -23253,6 +28695,12 @@ def _run_single_stage(
         ),
         detail=f"fit_mode={fit_mode}",
     )
+    state = _apply_previous_stage_frozen_active_scaling(
+        stage_args,
+        state,
+        frozen_active_scaling_source_run_dir,
+        require_frozen_active_scaling=bool(require_frozen_active_scaling),
+    )
     _log_state_summary(stage_args, state)
     _log(stage_args, f"[load] parser complete in {_fmt_seconds(time.time() - load_start)}")
     run_dir = Path(stage_args.output_dir) / state.run_name
@@ -23273,6 +28721,8 @@ def _run_single_stage_spawn_worker(
     svi_init_physical_values: dict[str, float] | None,
     source_position_prior_values: dict[str, tuple[float, float]] | None,
     previous_stage_best_values: dict[str, float] | None,
+    frozen_active_scaling_source_run_dir: str | Path | None,
+    require_frozen_active_scaling: bool,
 ) -> None:
     try:
         run_dir = _run_single_stage(
@@ -23284,6 +28734,8 @@ def _run_single_stage_spawn_worker(
             svi_init_physical_values=svi_init_physical_values,
             source_position_prior_values=source_position_prior_values,
             previous_stage_best_values=previous_stage_best_values,
+            frozen_active_scaling_source_run_dir=frozen_active_scaling_source_run_dir,
+            require_frozen_active_scaling=require_frozen_active_scaling,
         )
     except BaseException:
         result_queue.put({"status": "error", "traceback": traceback.format_exc()})
@@ -23303,6 +28755,8 @@ def _run_single_stage_in_fresh_process(
     svi_init_physical_values: dict[str, float] | None = None,
     source_position_prior_values: dict[str, tuple[float, float]] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
+    frozen_active_scaling_source_run_dir: str | Path | None = None,
+    require_frozen_active_scaling: bool = False,
 ) -> Path:
     _log(
         args,
@@ -23325,6 +28779,8 @@ def _run_single_stage_in_fresh_process(
             svi_init_physical_values,
             source_position_prior_values,
             previous_stage_best_values,
+            frozen_active_scaling_source_run_dir,
+            require_frozen_active_scaling,
         ),
         name=f"lenscluster-{Path(run_name).name}",
     )
@@ -23537,6 +28993,7 @@ def _run_sequential(args: argparse.Namespace) -> None:
             f"stage3_image_plane_mode={_stage3_image_plane_mode(args)} "
             f"stage3={'enabled' if stage3_enabled else 'disabled'} "
             f"stage4={'enabled' if stage4_enabled else 'disabled'} "
+            f"start_at_stage2={bool(getattr(args, 'start_at_stage2', False))} "
             f"start_at_stage3={bool(getattr(args, 'start_at_stage3', False))} "
             f"resume_mode={resume_mode or 'none'}"
         ),
@@ -23554,6 +29011,7 @@ def _run_sequential(args: argparse.Namespace) -> None:
         ),
     )
     resume = resume_mode is not None
+    start_at_stage2 = bool(getattr(args, "start_at_stage2", False))
     start_at_stage3 = bool(getattr(args, "start_at_stage3", False))
     final_stage_name = _final_enabled_sequential_stage_name(
         stage3_enabled=stage3_enabled,
@@ -23605,27 +29063,37 @@ def _run_sequential(args: argparse.Namespace) -> None:
             ),
         )
     else:
-        stage1_run_name = str(Path(root_run_name) / "stage1_large_only")
-        stage1_args = _args_with_fit_controls(
-            args,
-            stage2_controls,
-            fit_method=FIT_METHOD_SVI,
-            **stage_cosmology_updates(fit_stage_cosmology=False),
-        )
-        stage1_args = _force_quick_diagnostics_for_nonfinal_stage(stage1_args, stage1_run_name, exact_diagnostics_stage)
-        if fast_resume:
-            stage1_run_dir = Path(args.output_dir) / stage1_run_name
-            _require_fast_resume_stage1_artifacts(stage1_run_dir)
-            _require_fast_resume_cosmology_compatibility(stage1_args, stage1_run_dir, "stage1_large_only")
-            _log(args, f"[resume fast] skipping stage1 run_name={stage1_run_name} run_dir={stage1_run_dir}")
-        else:
-            stage1_run_dir = maybe_run_stage(
-                stage1_args,
-                "large-only",
-                stage1_run_name,
-                sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        if start_at_stage2:
+            _log(
+                args,
+                (
+                    "[stage] start_at_stage2=True; sequential workflow starts at stage2_joint; "
+                    "skipping stage1_large_only and using base large-halo priors"
+                ),
             )
-        stage1_summary = _load_stage1_summary(stage1_run_dir / "artifacts")
+        else:
+            stage1_run_name = str(Path(root_run_name) / "stage1_large_only")
+            stage1_args = _args_with_fit_controls(
+                args,
+                stage2_controls,
+                fit_method=FIT_METHOD_SVI,
+                sampling_refresh_runs=DEFAULT_SAMPLING_REFRESH_RUNS,
+                **stage_cosmology_updates(fit_stage_cosmology=False),
+            )
+            stage1_args = _force_quick_diagnostics_for_nonfinal_stage(stage1_args, stage1_run_name, exact_diagnostics_stage)
+            if fast_resume:
+                stage1_run_dir = Path(args.output_dir) / stage1_run_name
+                _require_fast_resume_stage1_artifacts(stage1_run_dir)
+                _require_fast_resume_cosmology_compatibility(stage1_args, stage1_run_dir, "stage1_large_only")
+                _log(args, f"[resume fast] skipping stage1 run_name={stage1_run_name} run_dir={stage1_run_dir}")
+            else:
+                stage1_run_dir = maybe_run_stage(
+                    stage1_args,
+                    "large-only",
+                    stage1_run_name,
+                    sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+                )
+            stage1_summary = _load_stage1_summary(stage1_run_dir / "artifacts")
         stage2_run_name = str(Path(root_run_name) / "stage2_joint")
         stage2_args = _args_with_fit_controls(
             args,
@@ -23645,7 +29113,7 @@ def _run_sequential(args: argparse.Namespace) -> None:
                 stage2_run_name,
                 stage1_prior_summary=stage1_summary,
                 sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
-                previous_stage_best_values=stage1_summary.map_values,
+                previous_stage_best_values=None if stage1_summary is None else stage1_summary.map_values,
             )
     stage_fit_controls_payload = {
         "stage2": stage2_controls.to_json(),
@@ -23657,8 +29125,8 @@ def _run_sequential(args: argparse.Namespace) -> None:
         "fit_mode": "sequential",
         "fit_method": stage2_controls.fit_method,
         "image_plane_mode": str(args.image_plane_mode),
-        "potfile_mass_size_reparam": bool(getattr(args, "potfile_mass_size_reparam", False)),
         "resume_mode": str(resume_mode or "none"),
+        "start_at_stage2": bool(start_at_stage2),
         "start_at_stage3": bool(start_at_stage3),
         "stage_fit_controls": stage_fit_controls_payload,
         "stage3_image_plane_mode": _stage3_image_plane_mode(args),
@@ -23938,12 +29406,15 @@ def _run_sequential(args: argparse.Namespace) -> None:
         )
         if requested_stage4_sampling_engine != STAGE4_SAMPLING_ENGINE_INHERIT:
             stage4_updates["sampling_engine"] = requested_stage4_sampling_engine
+        stage4_requires_previous_active_split = bool(getattr(args, "infer_active_scaling", False))
+        if stage4_requires_previous_active_split:
+            stage4_updates["infer_active_scaling"] = False
         stage4_args = _args_with_fit_controls(
             args,
             stage4_controls,
             **stage4_updates,
         )
-        stage4_runs_fresh = bool(getattr(args, "stage4_fresh_process", True)) and not fast_resume
+        stage4_runs_fresh = bool(getattr(args, "stage4_fresh_process", False)) and not fast_resume
         if stage4_runs_fresh:
             _log(
                 args,
@@ -23970,11 +29441,22 @@ def _run_sequential(args: argparse.Namespace) -> None:
             svi_init_physical_values=stage4_init_values,
             source_position_prior_values=source_position_priors,
             previous_stage_best_values=stage4_init_values,
+            frozen_active_scaling_source_run_dir=stage4_init_stage_dir if stage4_requires_previous_active_split else None,
+            require_frozen_active_scaling=stage4_requires_previous_active_split,
         )
         summary_payload["stage4_run_dir"] = str(stage4_run_dir)
         summary_payload["stage4_sampling_engine_requested"] = requested_stage4_sampling_engine
-        summary_payload["stage4_sampling_engine_effective"] = str(getattr(stage4_args, "sampling_engine", args.sampling_engine))
+        summary_payload["stage4_sampling_engine_effective"] = str(
+            getattr(
+                stage4_args,
+                "sampling_engine",
+                getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL),
+            )
+        )
         summary_payload["stage4_fresh_process"] = bool(stage4_runs_fresh)
+        summary_payload["stage4_active_scaling_requires_previous_split"] = bool(stage4_requires_previous_active_split)
+        if stage4_requires_previous_active_split:
+            summary_payload["stage4_active_scaling_source_run_dir"] = str(stage4_init_stage_dir)
     summary_path = Path(args.output_dir) / root_run_name / "sequential_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     with summary_path.open("w", encoding="utf-8") as handle:

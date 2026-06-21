@@ -292,7 +292,7 @@ potfile provides priors, the free scaling hyperparameters are `sigma`, `cutkpc`,
 
 ```text
 sigma_i = sigma_ref * L_i^(1 / vdslope)
-core_i  = core_ref  * L_i^0.5
+core_i  = core_ref  * L_i^(2 / slope)
 cut_i   = cut_ref   * L_i^(2 / slope)
 ```
 
