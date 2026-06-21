@@ -126,36 +126,22 @@ stage2_forward_modes = {
 stage2_forward_mode = stage2_forward_modes[mode]
 stage1_likelihood = "local-jacobian"
 
-fit_method = ["svi+nuts", "svi+nuts"]#, "svi+nuts"]
-refresh_every = 500
-svi_steps = [2000, 2000]#, 4000]
-warmup = [500, 500]#, 2000]
-samples = [250, 250]#, 500]
-sampling_refresh_runs = [1, 1]#, 1]
-max_tree_depth = [8, 8]#, 8]
+fit_method = ["svi+nuts"]
+refresh_every = 1000
+svi_steps = [6000]
+warmup = [1000]
+samples = [250]
+sampling_refresh_runs = [1]
+max_tree_depth = [8]
 quick_diagnostics = False
 target_accept = 0.8
 chains = cores
 z_bin_efficiency_tol = 0.0
 
-# Short conditioning check before a full production run.
-pilot = False
-if pilot:
-    refresh_every = 500
-    target_accept = 0.8
-    svi_steps = [500, 500, 500]
-    fit_method = ["svi+nuts", "mchmc", "mchmc"]
-    fit_method = ["svi+nuts", "svi+nuts", "svi+nuts"]
-    warmup = [200, 5000, 500]
-    samples = [100, 500, 250]
-    max_tree_depth = [6, 8, 8]
-    #quick_diagnostics = True
-    chains = cores
-    z_bin_efficiency_tol = 0.0000001
 
 
 perturbation_discovery_alpha_tol_arcsec = 0.1
-perturbation_discovery_jacobian_tol = 0.1
+perturbation_discovery_jacobian_tol = 0.2
 perturbation_discovery_jacobian_weight = 1.0
 
 OUTPUT_DIR = f"{OUTPUT_DIR}_PD{perturbation_discovery_alpha_tol_arcsec:g}_{perturbation_discovery_jacobian_tol:g}_T{max_tree_depth[-1]}W{warmup[-1]}S{samples[-1]}"
@@ -315,9 +301,11 @@ real_data_args = [
 ]
 
 debug_args = [
+    "--fit-quality-draws", 0,
     "--no-jax-clear-caches-after-svi-refresh",
     #"--quick-diagnostics",
     "--image-catalog-family-cutout-mode", "fast",
+    "--no-image-catalog-family-cutouts",
     "--numpyro-print-summary",
     "--nuts-chain-method", "parallel",
     #"--skip-validation",

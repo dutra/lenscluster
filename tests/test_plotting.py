@@ -247,6 +247,7 @@ def test_scaling_relation_summary_table_preserves_classes_and_free_branch() -> N
             "component_index": [0, 1, 2],
             "free_component_index": [-1, -1, 5],
             "catalog_mag": [21.0, 20.0, 19.0],
+            "catalog_color": [0.8, 1.0, 1.2],
             "selected_active": [False, True, True],
             "selected_independent": [False, False, True],
         }
@@ -300,6 +301,11 @@ def test_scaling_relation_summary_table_preserves_classes_and_free_branch() -> N
 
     assert table["catalog_id"].tolist() == ["free", "active", "inactive"]
     assert table["scaling_relation_class"].tolist() == ["free", "active", "inactive"]
+    assert table.set_index("catalog_id")["catalog_color"].to_dict() == {
+        "free": pytest.approx(1.2),
+        "active": pytest.approx(1.0),
+        "inactive": pytest.approx(0.8),
+    }
     assert np.isfinite(table["scaling_v_disp_median"].to_numpy(dtype=float)).all()
     assert np.isfinite(table["scaling_core_radius_kpc_median"].to_numpy(dtype=float)).all()
     assert np.isfinite(table["scaling_cut_radius_kpc_median"].to_numpy(dtype=float)).all()
@@ -321,6 +327,7 @@ def test_scaling_relation_summary_plot_writes_pdf(tmp_path: Path) -> None:
             "rank": [3, 2, 1],
             "component_index": [0, 1, 2],
             "catalog_mag": [21.0, 20.0, 19.0],
+            "catalog_color": [0.8, 1.0, 1.2],
             "scaling_relation_class": ["inactive", "active", "free"],
             "scaling_v_disp_median": [210.0, 300.0, 420.0],
             "scaling_v_disp_p16": [190.0, 280.0, 390.0],
@@ -357,6 +364,7 @@ def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest
             "rank": [4, 3, 2, 1],
             "component_index": [0, 1, 2, 3],
             "catalog_mag": [22.0, 21.0, 20.0, 19.0],
+            "catalog_color": [0.6, 0.8, 1.0, 1.2],
             "scaling_relation_class": ["inactive", "inactive", "active", "free"],
             "scaling_v_disp_median": [150.0, 210.0, 300.0, 420.0],
             "scaling_v_disp_p16": [140.0, 190.0, 280.0, 390.0],
@@ -380,10 +388,13 @@ def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest
     )
     labels: list[str] = []
     text_values: list[str] = []
+    errorbar_colors: list[Any] = []
+    colorbar_labels: list[str] = []
 
     class FakeAxis:
         def errorbar(self, *_args: Any, **kwargs: Any) -> None:
             labels.append(str(kwargs.get("label", "")))
+            errorbar_colors.append(kwargs.get("color"))
 
         def plot(self, *_args: Any, **kwargs: Any) -> None:
             labels.append(str(kwargs.get("label", "")))
@@ -417,6 +428,13 @@ def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest
             return object()
 
     class FakeFigure:
+        def colorbar(self, *_args: Any, **_kwargs: Any) -> Any:
+            class FakeColorbar:
+                def set_label(self, label: str) -> None:
+                    colorbar_labels.append(label)
+
+            return FakeColorbar()
+
         def savefig(self, path: Path, *_args: Any, **_kwargs: Any) -> None:
             path.write_bytes(b"%PDF-1.4\n")
 
@@ -431,6 +449,11 @@ def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest
     assert "free branch" in labels
     assert "scaling relation" in labels
     assert "free candidate, scaling branch" not in labels
+    assert "tab:orange" not in errorbar_colors
+    assert "tab:red" not in errorbar_colors
+    assert "0.60" not in errorbar_colors
+    assert any(isinstance(color, tuple) and len(color) == 4 for color in errorbar_colors)
+    assert colorbar_labels == ["catalog color (F606W - F814W)"]
     assert text_values == ["total: 4\ninactive: 2\nactive not free: 1\nfree: 1"]
 
 

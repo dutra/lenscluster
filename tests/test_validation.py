@@ -2794,10 +2794,10 @@ def test_build_state_applies_potfile_member_brightest_cut_before_scaling_rank(
     member_catalog_path = tmp_path / "members.cat"
     member_catalog_path.write_text(
         "#REFERENCE 0\n"
-        "faint 10.0000 0.0000 1.0 1.0 0.0 22.0 1.0 nan\n"
-        "bright-b 10.0001 0.0000 1.0 1.0 0.0 18.0 1.0 nan\n"
-        "mid 10.0002 0.0000 1.0 1.0 0.0 20.0 1.0 nan\n"
-        "bright-a 10.0003 0.0000 1.0 1.0 0.0 18.0 1.0 nan\n",
+        "faint 10.0000 0.0000 1.0 1.0 0.0 22.0 1.0 0.2\n"
+        "bright-b 10.0001 0.0000 1.0 1.0 0.0 18.0 1.0 1.1\n"
+        "mid 10.0002 0.0000 1.0 1.0 0.0 20.0 1.0 0.5\n"
+        "bright-a 10.0003 0.0000 1.0 1.0 0.0 18.0 1.0 0.9\n",
         encoding="utf-8",
     )
     par_path = tmp_path / "input.par"
@@ -2863,11 +2863,16 @@ fini
 
     assert state.potfiles[0]["catalog_df"]["id"].astype(str).tolist() == ["bright-a", "bright-b"]
     assert [record["catalog_id"] for record in state.scaling_component_records] == ["bright-a", "bright-b"]
+    assert [record["catalog_color"] for record in state.scaling_component_records] == [pytest.approx(0.9), pytest.approx(1.1)]
     evaluator = cluster_solver.ClusterJAXEvaluator(
         state,
         match_tolerance_arcsec=cluster_solver.DEFAULT_MATCH_TOLERANCE,
     )
     assert set(evaluator.scaling_rank_df["catalog_id"].astype(str).tolist()) == {"bright-a", "bright-b"}
+    np.testing.assert_allclose(
+        sorted(evaluator.scaling_rank_df["catalog_color"].astype(float).tolist()),
+        [0.9, 1.1],
+    )
     assert len(evaluator.exact_scaling_component_indices) == 0
 
 

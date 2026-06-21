@@ -20,6 +20,7 @@ from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.wcs import WCS
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.cm import ScalarMappable
 from matplotlib.colors import LogNorm, Normalize, TwoSlopeNorm, to_rgba
 from matplotlib.lines import Line2D
 from matplotlib.patches import Circle
@@ -2424,6 +2425,7 @@ def _scaling_relation_summary_table(
         "component_index",
         "free_component_index",
         "catalog_mag",
+        "catalog_color",
         "luminosity_ratio",
         "selected_active",
         "selected_independent",
@@ -2552,6 +2554,7 @@ def _scaling_relation_summary_table(
             "component_index": component_index,
             "free_component_index": int(getattr(row, "free_component_index", -1)),
             "catalog_mag": float(getattr(row, "catalog_mag", np.nan)),
+            "catalog_color": float(getattr(row, "catalog_color", np.nan)),
             "luminosity_ratio": lum,
             "selected_active": selected_active,
             "selected_independent": selected_independent,
@@ -5624,6 +5627,19 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
         return
     df = relation_df.copy()
     df["potfile_id"] = df["potfile_id"].astype(str)
+    df["catalog_color"] = pd.to_numeric(df["catalog_color"], errors="coerce")
+    finite_catalog_color = df["catalog_color"].to_numpy(dtype=float)
+    finite_catalog_color = finite_catalog_color[np.isfinite(finite_catalog_color)]
+    if finite_catalog_color.size:
+        color_min = float(np.nanmin(finite_catalog_color))
+        color_max = float(np.nanmax(finite_catalog_color))
+        if color_min == color_max:
+            color_min -= 0.5
+            color_max += 0.5
+    else:
+        color_min, color_max = 0.0, 1.0
+    catalog_color_norm = Normalize(vmin=color_min, vmax=color_max)
+    catalog_color_cmap = plt.get_cmap("RdYlBu_r")
     fields = [
         ("v_disp", "velocity dispersion [km/s]"),
         ("core_radius_kpc", "core radius [kpc]"),
@@ -5652,7 +5668,6 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
         p84_column: str,
         label: str,
         fmt: str,
-        color: str,
         markerfacecolor: str | None = None,
         markeredgecolor: str | None = None,
         markersize: float = 5.0,
@@ -5668,22 +5683,34 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
         finite_err = np.isfinite(y_low) & np.isfinite(y_high) & (y_low <= y) & (y <= y_high)
         yerr = np.vstack([np.maximum(0.0, y - y_low), np.maximum(0.0, y_high - y)])
         yerr[:, ~finite_err] = 0.0
-        ax.errorbar(
-            x,
-            y,
-            yerr=yerr,
-            fmt=fmt,
-            color=color,
-            ecolor=color,
-            elinewidth=0.8,
-            capsize=2.0,
-            markersize=markersize,
-            markerfacecolor=markerfacecolor if markerfacecolor is not None else color,
-            markeredgecolor=markeredgecolor if markeredgecolor is not None else color,
-            alpha=alpha,
-            linestyle="none",
-            label=label,
-        )
+        color_values = pd.to_numeric(finite["catalog_color"], errors="coerce").to_numpy(dtype=float)
+        for point_index, (x_value, y_value, yerr_value, color_value) in enumerate(
+            zip(x, y, yerr.T, color_values, strict=False)
+        ):
+            point_color = (
+                catalog_color_cmap(catalog_color_norm(float(color_value)))
+                if np.isfinite(color_value)
+                else to_rgba("0.55", alpha=alpha)
+            )
+            error_color = (point_color[0], point_color[1], point_color[2], min(alpha, 0.55))
+            face_color = markerfacecolor if markerfacecolor is not None else point_color
+            edge_color = markeredgecolor if markeredgecolor is not None else point_color
+            ax.errorbar(
+                [x_value],
+                [y_value],
+                yerr=np.asarray(yerr_value, dtype=float).reshape(2, 1),
+                fmt=fmt,
+                color=point_color,
+                ecolor=error_color,
+                elinewidth=0.8,
+                capsize=2.0,
+                markersize=markersize,
+                markerfacecolor=face_color,
+                markeredgecolor=edge_color,
+                alpha=alpha,
+                linestyle="none",
+                label=label if point_index == 0 else "_nolegend_",
+            )
 
     for row_idx, potfile_id in enumerate(potfile_ids):
         pot_df = df[df["potfile_id"] == potfile_id].copy()
@@ -5710,7 +5737,6 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
                 p84_column=f"{scaling_prefix}_p84",
                 label="inactive/cached",
                 fmt="o",
-                color="0.60",
                 markersize=4.2,
                 alpha=0.70,
             )
@@ -5722,9 +5748,7 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
                 p84_column=f"{scaling_prefix}_p84",
                 label="active exact",
                 fmt="o",
-                color="tab:orange",
                 markerfacecolor="none",
-                markeredgecolor="tab:orange",
                 markersize=5.2,
                 alpha=0.95,
             )
@@ -5736,8 +5760,7 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
                 p84_column=f"{free_prefix}_p84",
                 label="free branch",
                 fmt="*",
-                color="tab:red",
-                markeredgecolor="tab:red",
+                markeredgecolor="0.10",
                 markersize=7.0,
                 alpha=0.95,
             )
@@ -5775,6 +5798,10 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
                 )
             if row_idx == 0 and col_idx == 0:
                 ax.legend(loc="best", fontsize=7)
+    mappable = ScalarMappable(norm=catalog_color_norm, cmap=catalog_color_cmap)
+    mappable.set_array([])
+    colorbar = fig.colorbar(mappable, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02)
+    colorbar.set_label("catalog color (F606W - F814W)")
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
