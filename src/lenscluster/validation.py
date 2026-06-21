@@ -4346,29 +4346,15 @@ def _recovered_subhalo_mass_table(state: Any, best_fit: np.ndarray, truth: dict[
         getattr(packed, "cut_ref_param_index", np.full(component_family.size, -1, dtype=int)),
         best_fit_values,
     )
-    vdslope = _updated_component_values(
-        getattr(packed, "vdslope_base", np.full(component_family.size, 4.0, dtype=float)),
-        getattr(packed, "vdslope_param_index", np.full(component_family.size, -1, dtype=int)),
-        best_fit_values,
-    )
-    slope = _updated_component_values(
-        getattr(packed, "slope_base", np.full(component_family.size, 4.0, dtype=float)),
-        getattr(packed, "slope_param_index", np.full(component_family.size, -1, dtype=int)),
-        best_fit_values,
-    )
     alpha_sigma = _updated_component_values(
         getattr(packed, "alpha_sigma_base", np.full(component_family.size, 0.25, dtype=float)),
         getattr(packed, "alpha_sigma_param_index", np.full(component_family.size, -1, dtype=int)),
         best_fit_values,
     )
-    gamma_ml = _updated_component_values(
-        getattr(packed, "gamma_ml_base", np.zeros(component_family.size, dtype=float)),
-        getattr(packed, "gamma_ml_param_index", np.full(component_family.size, -1, dtype=int)),
+    beta_radius = _updated_component_values(
+        getattr(packed, "beta_radius_base", np.full(component_family.size, 0.5, dtype=float)),
+        getattr(packed, "beta_radius_param_index", np.full(component_family.size, -1, dtype=int)),
         best_fit_values,
-    )
-    alpha_sigma_param_index = np.asarray(
-        getattr(packed, "alpha_sigma_param_index", np.full(component_family.size, -1, dtype=int)),
-        dtype=int,
     )
     mass_ref = _truth_subhalo_mass_ref(truth)
     rows: list[dict[str, Any]] = []
@@ -4378,17 +4364,9 @@ def _recovered_subhalo_mass_table(state: Any, best_fit: np.ndarray, truth: dict[
         luminosity = float(luminosity_ratio[component_index])
         sigma_value = float(sigma_ref[component_index])
         cut_value = float(cut_ref[component_index])
-        vdslope_value = float(vdslope[component_index])
-        slope_value = float(slope[component_index])
-        uses_bergamini_ml = bool(alpha_sigma_param_index[component_index] >= 0)
         alpha_sigma_value = float(alpha_sigma[component_index])
-        gamma_ml_value = float(gamma_ml[component_index])
-        beta_radius_value = (
-            1.0 + gamma_ml_value - 2.0 * alpha_sigma_value
-            if uses_bergamini_ml
-            else 2.0 / slope_value
-        )
-        alpha_sigma_effective = alpha_sigma_value if uses_bergamini_ml else 1.0 / vdslope_value
+        beta_radius_value = float(beta_radius[component_index])
+        gamma_ml_value = 2.0 * alpha_sigma_value + beta_radius_value - 1.0
         if not (
             np.isfinite(luminosity)
             and luminosity > 0.0
@@ -4396,11 +4374,7 @@ def _recovered_subhalo_mass_table(state: Any, best_fit: np.ndarray, truth: dict[
             and sigma_value > 0.0
             and np.isfinite(cut_value)
             and cut_value > 0.0
-            and np.isfinite(vdslope_value)
-            and vdslope_value > 0.0
-            and np.isfinite(slope_value)
-            and slope_value > 0.0
-            and np.isfinite(alpha_sigma_effective)
+            and np.isfinite(alpha_sigma_value)
             and np.isfinite(beta_radius_value)
         ):
             continue
@@ -4420,7 +4394,7 @@ def _recovered_subhalo_mass_table(state: Any, best_fit: np.ndarray, truth: dict[
             normalization *= (sigma_value / truth_sigma_ref) ** 2
         if np.isfinite(truth_cut_ref) and truth_cut_ref > 0.0:
             normalization *= cut_value / truth_cut_ref
-        exponent = 2.0 * alpha_sigma_effective + beta_radius_value
+        exponent = 2.0 * alpha_sigma_value + beta_radius_value
         mass = mass_ref * normalization * luminosity**exponent
         if not (np.isfinite(mass) and mass > 0.0):
             continue
@@ -4435,11 +4409,9 @@ def _recovered_subhalo_mass_table(state: Any, best_fit: np.ndarray, truth: dict[
                 "luminosity_ratio": luminosity,
                 "sigma_ref": sigma_value,
                 "cut_ref_kpc": cut_value,
-                "vdslope": vdslope_value,
-                "slope": slope_value,
-                "alpha_sigma": alpha_sigma_effective,
+                "alpha_sigma": alpha_sigma_value,
                 "beta_radius": beta_radius_value,
-                "gamma_ml": gamma_ml_value if uses_bergamini_ml else float("nan"),
+                "gamma_ml": gamma_ml_value,
                 "mass_normalization_ratio": float(normalization),
                 "recovered_subhalo_mass_msun": float(mass),
             }
@@ -6286,10 +6258,6 @@ def _validate_validation_args(args: argparse.Namespace) -> None:
 
 def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: argparse.Namespace) -> Path:
     from .cluster_solver import (
-        DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD,
-        DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA,
-        DEFAULT_ACTIVE_SCALING_LOGIT_PRIOR_SIGMA,
-        DEFAULT_ACTIVE_SCALING_MAG_SLOPE_PRIOR_SIGMA,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
@@ -6346,16 +6314,16 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(getattr(args, "likelihood_stabilizer_student_t_nu", DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU)),
         "--sampling-engine",
         str(args.sampling_engine),
-        "--topk-discovery-scaling-galaxies",
-        str(getattr(args, "topk_discovery_scaling_galaxies", 10)),
-        "--topk-discovery-score",
-        str(getattr(args, "topk_discovery_score", "alpha_jacobian")),
-        "--topk-discovery-jacobian-weight",
-        str(getattr(args, "topk_discovery_jacobian_weight", 1.0)),
-        "--topk-discovery-final-engine",
-        str(getattr(args, "topk_discovery_final_engine", "refreshing_surrogate_flat")),
-        "--topk-discovery-final-svi-polish-steps",
-        str(getattr(args, "topk_discovery_final_svi_polish_steps", 2000)),
+        "--perturbation-discovery-alpha-tol-arcsec",
+        str(getattr(args, "perturbation_discovery_alpha_tol_arcsec", 0.01)),
+        "--perturbation-discovery-jacobian-tol",
+        str(getattr(args, "perturbation_discovery_jacobian_tol", 0.01)),
+        "--perturbation-discovery-jacobian-weight",
+        str(getattr(args, "perturbation_discovery_jacobian_weight", 1.0)),
+        "--perturbation-discovery-final-engine",
+        str(getattr(args, "perturbation_discovery_final_engine", "refreshing_surrogate_flat")),
+        "--perturbation-discovery-final-svi-polish-steps",
+        str(getattr(args, "perturbation_discovery_final_svi_polish_steps", 2000)),
         "--source-plane-covariance-floor",
         str(args.source_plane_covariance_floor),
         "--source-plane-covariance-mode",
@@ -6368,20 +6336,6 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(getattr(args, "exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)),
         "--exact-image-num-iter-max",
         str(getattr(args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)),
-        "--active-scaling-selection",
-        str(args.active_scaling_selection),
-        "--active-scaling-cumulative-fraction",
-        str(args.active_scaling_cumulative_fraction),
-        "--active-scaling-min",
-        str(args.active_scaling_min),
-        "--active-scaling-logit-prior-sigma",
-        str(getattr(args, "active_scaling_logit_prior_sigma", DEFAULT_ACTIVE_SCALING_LOGIT_PRIOR_SIGMA)),
-        "--active-scaling-mag-slope-prior-sigma",
-        str(getattr(args, "active_scaling_mag_slope_prior_sigma", DEFAULT_ACTIVE_SCALING_MAG_SLOPE_PRIOR_SIGMA)),
-        "--active-scaling-local-logit-prior-sigma",
-        str(getattr(args, "active_scaling_local_logit_prior_sigma", DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA)),
-        "--active-scaling-freeze-threshold",
-        str(getattr(args, "active_scaling_freeze_threshold", DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD)),
         "--independent-scaling-free-log-vdisp-tau-prior-median",
         str(
             getattr(
@@ -6739,20 +6693,6 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
                 str(getattr(args, "source_position_parameterization", "prior-whitened")),
             ]
         )
-    if args.active_scaling_galaxies is not None:
-        cmd.append("--active-scaling-galaxies")
-        cmd.extend(str(value) for value in args.active_scaling_galaxies)
-    if bool(getattr(args, "infer_active_scaling", False)):
-        cmd.append("--infer-active-scaling")
-        cmd.extend(
-            [
-                "--active-scaling-inference-likelihood",
-                str(getattr(args, "active_scaling_inference_likelihood", "population")),
-            ]
-        )
-    active_scaling_prior_prob = getattr(args, "active_scaling_prior_prob", None)
-    if active_scaling_prior_prob is not None:
-        cmd.extend(["--active-scaling-prior-prob", str(active_scaling_prior_prob)])
     if args.fit_scaling_scatter and int(args.n_subhalos) > 0:
         scatter_fields: list[str] = []
         if float(args.subhalo_sigma_scatter_dex) > 0.0:
@@ -7179,9 +7119,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[FIT_METHOD_SVI_NUTS],
         metavar="{svi,svi+nuts,nuts,ns,smc,mchmc,mclmc}",
         help=(
-            "Sequential solver fit method. Pass one value for all sampled stages, two values for "
-            "stage2_joint and stage3_image_plane, or three values when stage 4 is enabled. "
-            "NUTS-only and SMC are accepted only for non-blocked stage 4 image-plane modes; "
+            "Sequential solver fit method. Pass one value for both production stages or two values "
+            "for stage1_backprojected_centroid_fit and stage2_free_source_forward_fit. "
+            "NUTS-only and SMC are accepted only for explicit forward stages; "
             "MCHMC and MCLMC are accepted for sampled stages. "
             "Ignored for --solver-fit-mode evidence-ns, which always uses nested sampling internally."
         ),
@@ -7192,35 +7132,10 @@ def _build_parser() -> argparse.ArgumentParser:
             IMAGE_PLANE_MODE_NONE,
             IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
             IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
-            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
-            IMAGE_PLANE_MODE_FORWARD_METRIC,
-            IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
             IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
-            IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
-            IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
         ),
         default=IMAGE_PLANE_MODE_NONE,
         help="Optional solver image-plane refinement mode.",
-    )
-    parser.add_argument(
-        "--skip-stage3-image-plane-local-jacobian",
-        action="store_true",
-        help="Skip solver stage 3 before a final stage 4 image-plane mode.",
-    )
-    parser.add_argument(
-        "--start-at-stage2",
-        action="store_true",
-        help="Start sequential solver validation at stage2_joint, skipping stage1_large_only and using base large-halo priors.",
-    )
-    parser.add_argument(
-        "--start-at-stage3",
-        action="store_true",
-        help="Start sequential solver validation at stage3_image_plane; with --resume fast, reuse stage 3 artifacts for later stages.",
-    )
-    parser.add_argument(
-        "--write-stage3-recovery",
-        action="store_true",
-        help="Also write truth recovery plots for stage3_image_plane when running a stage 4 validation workflow.",
     )
     parser.add_argument(
         "--image-plane-newton-steps",
@@ -7597,20 +7512,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "full_flat",
             "refreshing_surrogate",
             "refreshing_surrogate_flat",
-            "topk_discovery_flat",
-            "active_subset",
+            "perturbation_discovery_flat",
         ),
         default="refreshing_surrogate",
     )
-    parser.add_argument("--topk-discovery-scaling-galaxies", type=int, default=10)
-    parser.add_argument("--topk-discovery-score", choices=("alpha_jacobian",), default="alpha_jacobian")
-    parser.add_argument("--topk-discovery-jacobian-weight", type=float, default=1.0)
+    parser.add_argument("--perturbation-discovery-alpha-tol-arcsec", type=float, default=0.01)
+    parser.add_argument("--perturbation-discovery-jacobian-tol", type=float, default=0.01)
+    parser.add_argument("--perturbation-discovery-jacobian-weight", type=float, default=1.0)
     parser.add_argument(
-        "--topk-discovery-final-engine",
+        "--perturbation-discovery-final-engine",
         choices=("refreshing_surrogate_flat", "full_flat"),
         default="refreshing_surrogate_flat",
     )
-    parser.add_argument("--topk-discovery-final-svi-polish-steps", type=_parse_nonnegative_int, default=2000)
+    parser.add_argument("--perturbation-discovery-final-svi-polish-steps", type=_parse_nonnegative_int, default=2000)
     parser.add_argument("--source-plane-covariance-floor", type=float, default=1.0e-6)
     parser.add_argument(
         "--source-plane-covariance-mode",
@@ -7622,39 +7536,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--fit-cosmology-flat-wcdm",
         action="store_true",
         help="Forward solver sampling of flat wCDM Omega_m,w0 in every executed sequential fitting stage.",
-    )
-    parser.add_argument(
-        "--active-scaling-galaxies",
-        type=int,
-        nargs="+",
-        default=None,
-        help="Fixed active counts in fixed mode, or adaptive per-potfile caps in adaptive mode. Negative uses all.",
-    )
-    parser.add_argument("--active-scaling-selection", choices=("fixed", "adaptive"), default="adaptive")
-    parser.add_argument("--active-scaling-cumulative-fraction", type=float, default=0.995)
-    parser.add_argument("--active-scaling-min", type=int, default=4)
-    parser.add_argument("--infer-active-scaling", action="store_true")
-    parser.add_argument("--active-scaling-inference-likelihood", choices=("population", "blend"), default="population")
-    parser.add_argument("--active-scaling-prior-prob", type=float, default=None)
-    parser.add_argument(
-        "--active-scaling-logit-prior-sigma",
-        type=float,
-        default=DEFAULT_ACTIVE_SCALING_LOGIT_PRIOR_SIGMA,
-    )
-    parser.add_argument(
-        "--active-scaling-mag-slope-prior-sigma",
-        type=float,
-        default=DEFAULT_ACTIVE_SCALING_MAG_SLOPE_PRIOR_SIGMA,
-    )
-    parser.add_argument(
-        "--active-scaling-local-logit-prior-sigma",
-        type=float,
-        default=DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA,
-    )
-    parser.add_argument(
-        "--active-scaling-freeze-threshold",
-        type=float,
-        default=DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD,
     )
     parser.add_argument(
         "--independent-scaling-free-log-vdisp-tau-prior-median",

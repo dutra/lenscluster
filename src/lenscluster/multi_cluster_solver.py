@@ -29,7 +29,10 @@ SHARED_COSMOLOGY_SAMPLE_NAMES = (
     single.COSMOLOGY_OM0_SAMPLE_NAME,
     single.COSMOLOGY_W0_SAMPLE_NAME,
 )
-DEFAULT_WARM_STAGE_PRIORITY = ("stage3_image_plane", "stage2_joint")
+DEFAULT_WARM_STAGE_PRIORITY = (
+    single.STAGE2_FREE_SOURCE_FORWARD_FIT_DIR,
+    single.STAGE1_BACKPROJECTED_CENTROID_FIT_DIR,
+)
 SUPPORTED_WARM_STAGES = ("auto", *DEFAULT_WARM_STAGE_PRIORITY)
 CLUSTER_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
@@ -87,7 +90,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--warm-stage",
         choices=SUPPORTED_WARM_STAGES,
         default="auto",
-        help="Warm stage to initialize from. auto prefers stage3_image_plane, then stage2_joint.",
+        help=(
+            "Warm stage to initialize from. auto prefers "
+            "stage2_free_source_forward_fit, then stage1_backprojected_centroid_fit."
+        ),
     )
     parser.add_argument(
         "--image-plane-mode",
@@ -95,7 +101,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             single.IMAGE_PLANE_MODE_NONE,
             single.IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
             single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
-            single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
         ),
         default=single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
         help="Likelihood used for the joint final stage.",
@@ -145,23 +150,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=single.SAMPLING_ENGINE_REFRESHING_SURROGATE,
     )
     parser.add_argument("--source-plane-covariance-floor", type=float, default=1.0e-6)
-    parser.add_argument(
-        "--active-scaling-galaxies",
-        type=int,
-        nargs="+",
-        default=None,
-    )
-    parser.add_argument(
-        "--active-scaling-selection",
-        choices=("fixed", "adaptive"),
-        default="adaptive",
-    )
-    parser.add_argument(
-        "--active-scaling-cumulative-fraction",
-        type=float,
-        default=single.DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
-    )
-    parser.add_argument("--active-scaling-min", type=int, default=single.DEFAULT_ACTIVE_SCALING_MIN)
     parser.add_argument("--scaling-scatter", action="store_true")
     parser.add_argument("--scaling-scatter-fields", default="sigma,core,cut")
     parser.add_argument("--scaling-scatter-max", type=float, default=0.5)
@@ -378,10 +366,7 @@ def _parse_cluster_inputs(cluster_values: list[list[str]]) -> list[ClusterInput]
 
 
 def _sample_likelihood_mode_from_image_plane_mode(image_plane_mode: str) -> str:
-    if str(image_plane_mode) in {
-        single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
-        single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED,
-    }:
+    if str(image_plane_mode) == single.IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA:
         return single.SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
     if str(image_plane_mode) == single.IMAGE_PLANE_MODE_LOCAL_JACOBIAN:
         return single.SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
@@ -395,7 +380,7 @@ def _has_warm_artifacts(artifacts_dir: Path) -> bool:
 def _resolve_warm_stage(cluster: ClusterInput, warm_stage: str) -> WarmStageResolution:
     if not cluster.par_path.is_file():
         raise FileNotFoundError(f"Cluster {cluster.key}: par file does not exist: {cluster.par_path}")
-    stage1_artifacts_dir = cluster.warm_run_dir / "stage1_large_only" / "artifacts"
+    stage1_artifacts_dir = cluster.warm_run_dir / single.STAGE1_BACKPROJECTED_CENTROID_FIT_DIR / "artifacts"
     if not _has_warm_artifacts(stage1_artifacts_dir):
         raise FileNotFoundError(
             f"Cluster {cluster.key}: missing stage1 warm artifacts: {stage1_artifacts_dir}"
@@ -711,10 +696,7 @@ def _run_joint_inference(
             svi_diagnostics,
             chain_seeds=svi_chain_seeds,
         )
-        if single._blocked_linearized_stage_enabled(args):
-            posterior = single._run_blocked_numpyro_nuts_sampler(args, state, evaluator, nuts_init)
-        else:
-            posterior = single._run_numpyro_nuts_sampler(args, state, evaluator, sample_model, nuts_init)
+        posterior = single._run_numpyro_nuts_sampler(args, state, evaluator, sample_model, nuts_init)
         usable, reason = single._nuts_posterior_is_usable(posterior)
         log_prob = np.asarray(posterior.log_prob, dtype=float)
         if usable and posterior.samples.size and log_prob.size and np.isfinite(log_prob).any():

@@ -123,8 +123,8 @@ class SingleBCGMockConfig:
     subhalo_cut_lower_arcsec: float = 8.0
     subhalo_cut_upper_arcsec: float = 80.0
     subhalo_cut_scatter_dex: float = 0.20
-    subhalo_vdslope: float = 4.0
-    subhalo_slope: float = 4.0
+    subhalo_alpha_sigma: float = 0.25
+    subhalo_beta_radius: float = 0.50
     halo: DPIETruth = DPIETruth(
         potential_id="halo",
         x_centre=0.0,
@@ -222,11 +222,9 @@ def _sample_truncated_schechter_luminosities(
 
 
 def _subhalo_mass_luminosity_exponent(config: SingleBCGMockConfig) -> float:
-    vdslope = float(config.subhalo_vdslope)
-    slope = float(config.subhalo_slope)
-    if not np.isfinite(vdslope) or not np.isfinite(slope) or vdslope <= 0.0 or slope <= 0.0:
-        raise ValueError("Subhalo luminosity-mass conversion requires positive finite vdslope and slope.")
-    exponent = 2.0 / vdslope + 2.0 / slope
+    alpha_sigma = float(config.subhalo_alpha_sigma)
+    beta_radius = float(config.subhalo_beta_radius)
+    exponent = 2.0 * alpha_sigma + beta_radius
     if not np.isfinite(exponent) or exponent <= 0.0:
         raise ValueError("Subhalo mass-luminosity exponent must be positive and finite.")
     return float(exponent)
@@ -432,13 +430,13 @@ def _scaled_subhalo_params(row: dict[str, Any], config: SingleBCGMockConfig) -> 
         y_centre=float(row["y_arcsec"]),
         ellipticite=float(row["ellipticite"]),
         angle_pos=float(row["angle_pos"]),
-        core_radius_arcsec=float(config.subhalo_core_radius_arcsec * luminosity_ratio**0.5),
+        core_radius_arcsec=float(config.subhalo_core_radius_arcsec * luminosity_ratio ** config.subhalo_beta_radius),
         cut_radius_arcsec=float(
             config.subhalo_cut_radius_arcsec
-            * luminosity_ratio ** (2.0 / config.subhalo_slope)
+            * luminosity_ratio ** config.subhalo_beta_radius
             * np.exp(cut_log_offset)
         ),
-        v_disp=float(config.subhalo_sigma_ref * luminosity_ratio ** (1.0 / config.subhalo_vdslope) * np.exp(sigma_log_offset)),
+        v_disp=float(config.subhalo_sigma_ref * luminosity_ratio ** config.subhalo_alpha_sigma * np.exp(sigma_log_offset)),
     )
 
 
@@ -555,6 +553,8 @@ def _truth_parameter_values(config: SingleBCGMockConfig, kpc_per_arcsec: float) 
     if config.n_subhalos > 0:
         truth["potfile.sigma"] = float(config.subhalo_sigma_ref)
         truth["potfile.cutkpc"] = float(config.subhalo_cut_radius_arcsec) * float(kpc_per_arcsec)
+        truth["potfile.alpha_sigma"] = float(config.subhalo_alpha_sigma)
+        truth["potfile.beta_radius"] = float(config.subhalo_beta_radius)
         if config.subhalo_sigma_scatter_dex > 0.0:
             truth["potfile.sigma_log_scatter"] = _dex_scatter_to_ln(config.subhalo_sigma_scatter_dex)
         if config.subhalo_cut_scatter_dex > 0.0:
@@ -569,7 +569,7 @@ def _write_member_catalog(path: Path, subhalos: list[dict[str, Any]]) -> None:
             (
                 f"{row['id']:>10s} {row['x_arcsec']: .8f} {row['y_arcsec']: .8f} "
                 f"{row['catalog_a']:.6f} {row['catalog_b']:.6f} {row['catalog_theta']:.4f} "
-                f"{row['catalog_mag']:.6f} {row['catalog_lum']:.8e}"
+                f"{row['catalog_mag']:.6f} {row['catalog_lum']:.8e} nan"
             )
             for row in subhalos
         )
@@ -643,8 +643,6 @@ potfile
     z_lens {config.z_lens:.8f}
     sigma 3 {config.subhalo_sigma_ref:.8f} {config.subhalo_sigma_ref_std:.8f}
     cut 1 {config.subhalo_cut_lower_arcsec:.8f} {config.subhalo_cut_upper_arcsec:.8f}
-    vdslope 0 {config.subhalo_vdslope:.8f} 0
-    slope 0 {config.subhalo_slope:.8f} 0
     end
 """
 

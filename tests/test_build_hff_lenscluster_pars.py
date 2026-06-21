@@ -32,8 +32,6 @@ def _minimal_config() -> dict:
                 "mag0": 20.0,
                 "sigma": 200.0,
                 "cutkpc": 30.0,
-                "vdslope": 4.0,
-                "slope": 4.0,
             },
         },
         "clusters": {

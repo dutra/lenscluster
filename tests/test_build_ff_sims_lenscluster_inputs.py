@@ -125,8 +125,8 @@ def test_resolve_source_root_uses_first_existing_candidate(tmp_path: Path, monke
 
 def test_apply_matched_shapes_requires_same_id_within_tolerance() -> None:
     members = [
-        builder.MemberRow("1", 0.0, 0.0, 1.0, 1.0, 0.0, 18.0, 17.0, 17.0, 1.0),
-        builder.MemberRow("2", 10.0, 0.0, 1.0, 1.0, 0.0, 19.0, 18.0, 18.0, 1.0),
+        builder.MemberRow("1", 0.0, 0.0, 1.0, 1.0, 0.0, 18.0, 17.0, 17.0, 1.0, 1.0),
+        builder.MemberRow("2", 10.0, 0.0, 1.0, 1.0, 0.0, 19.0, 18.0, 18.0, 1.0, 1.0),
     ]
     shapes = [
         builder.MemberShape("1", 0.2, 0.0, 1.8, 1.2, 35.0),
@@ -208,6 +208,8 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     assert {"11", "17", "31"} <= active_ares_ids
     assert active_ares_member_lines[0].split()[:4] == ["1", "-5.00000000", "6.00000000", "1.00000000"]
     assert active_ares_member_lines[0].split()[6] == "18.000000"
+    assert all(len(line.split()) == 9 for line in active_ares_member_lines)
+    assert active_ares_member_lines[0].split()[8] == "1.000000"
 
     hera_members = (output / "hera" / "hera_cluster_members_potfile.cat").read_text(encoding="utf-8").splitlines()
     assert not any("modeled explicitly as G" in line for line in hera_members)
@@ -223,6 +225,8 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
         "1.00000000",
         "0.0000",
     ]
+    assert all(len(line.split()) == 9 for line in active_hera_member_lines)
+    assert active_hera_member_lines[4].split()[8] == "2.000000"
 
     ares_par = output / "ares" / "ares_lenscluster.par"
     parsed, potentials_df, images_df, arcs_df, potentials_with_priors = load_best_par(ares_par)
@@ -254,10 +258,8 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     assert _limit_line(ares_par_text, "O2", "v_disp") == "v_disp 9 950.00000000 175.00000000 600.00000000 1400.00000000"
     assert "sigma 9 100.00000000 15.00000000 70.00000000 500.00000000" in ares_par_text
     assert "cutkpc 9 270.00000000 35.00000000 160.00000000 800.00000000" in ares_par_text
-    assert "# vdslope 0 4.00000000 0" in ares_par_text
-    assert "# slope 0 4.00000000 0" in ares_par_text
-    assert "vdslope 1 2.0 6.0 0.1" in ares_par_text
-    assert "slope   1 1.0 6.0 0.1" in ares_par_text
+    assert "vdslope" not in ares_par_text
+    assert "slope   " not in ares_par_text
     assert "potentiel S1" not in ares_par_text
     assert "profil 14" not in ares_par_text
     assert "potentiel G" not in ares_par_text
@@ -268,7 +270,8 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     ares_scaling_specs, _ares_scaling_indices, _ares_scaling_models = _build_scaling_parameter_specs(
         parsed["potfiles"]
     )
-    assert {"vdslope", "slope"} <= {spec.field for spec in ares_scaling_specs}
+    assert {"alpha_sigma", "beta_radius"} <= {spec.field for spec in ares_scaling_specs}
+    assert {"vdslope", "slope", "gamma_ml"}.isdisjoint({spec.field for spec in ares_scaling_specs})
 
     hera_par = output / "hera" / "hera_lenscluster.par"
     _hera_parsed, _hera_potentials_df, _hera_images_df, _hera_arcs_df, hera_potentials_with_priors = load_best_par(hera_par)
@@ -301,10 +304,8 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     assert hera_par_text.count("core_radius 1 2.00000000 15.00000000 0.10000000") == 2
     assert "sigma 9 96.70000000 40.00000000 30.00000000 250.00000000" in hera_par_text
     assert "cutkpc 9 33.00000000 25.00000000 3.00000000 250.00000000" in hera_par_text
-    assert "# vdslope 0 4.00000000 0" in hera_par_text
-    assert "# slope 0 4.00000000 0" in hera_par_text
-    assert "vdslope 1 2.0 6.0 0.1" in hera_par_text
-    assert "slope   1 1.0 6.0 0.1" in hera_par_text
+    assert "vdslope" not in hera_par_text
+    assert "slope   " not in hera_par_text
     assert {item["id"] for item in hera_potentials_with_priors} == {"O1", "O2"}
     assert len(_hera_parsed["potfiles"][0]["catalog_df"]) == 10
     hera_specs, _hera_assignments, _hera_lens_models = _build_parameter_specs(hera_potentials_with_priors)
@@ -313,7 +314,8 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     hera_scaling_specs, _hera_scaling_indices, _hera_scaling_models = _build_scaling_parameter_specs(
         _hera_parsed["potfiles"]
     )
-    assert {"vdslope", "slope"} <= {spec.field for spec in hera_scaling_specs}
+    assert {"alpha_sigma", "beta_radius"} <= {spec.field for spec in hera_scaling_specs}
+    assert {"vdslope", "slope", "gamma_ml"}.isdisjoint({spec.field for spec in hera_scaling_specs})
     assert not (
         {
             "G1_x_centre",

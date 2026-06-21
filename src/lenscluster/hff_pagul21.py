@@ -896,8 +896,6 @@ potfile
     z_lens {spec.z_lens:.8f}
     sigma 3 248 28.
     cut   1 1 50
-    vdslope 0 3.33333 0
-    slope 0 3.33333 0
     end
 
 fini

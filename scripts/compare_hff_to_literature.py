@@ -191,6 +191,7 @@ def parse_lenstool_catalog(
                     "catalog_theta": _safe_float(parts[5]),
                     "catalog_mag": _safe_float(parts[6]),
                     "catalog_lum": _safe_float(parts[7]),
+                    "catalog_color": _safe_float(parts[8]) if len(parts) > 8 else float("nan"),
                 }
             )
     return pd.DataFrame(records)

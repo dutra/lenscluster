@@ -695,26 +695,14 @@ def _scaling_results_summary_table(
         "log10_m_star_msun_p16",
         "log10_m_star_msun_p84",
         "log10_m_star_msun_map",
-        "alpha_sigma_eff_median",
-        "alpha_sigma_eff_p16",
-        "alpha_sigma_eff_p84",
-        "alpha_sigma_eff_map",
-        "beta_radius_eff_median",
-        "beta_radius_eff_p16",
-        "beta_radius_eff_p84",
-        "beta_radius_eff_map",
-        "vdslope_median",
-        "vdslope_p16",
-        "vdslope_p84",
-        "vdslope_map",
-        "slope_median",
-        "slope_p16",
-        "slope_p84",
-        "slope_map",
         "alpha_sigma_median",
         "alpha_sigma_p16",
         "alpha_sigma_p84",
         "alpha_sigma_map",
+        "beta_radius_median",
+        "beta_radius_p16",
+        "beta_radius_p84",
+        "beta_radius_map",
         "gamma_ml_median",
         "gamma_ml_p16",
         "gamma_ml_p84",
@@ -784,7 +772,7 @@ def _scaling_results_summary_table(
             row[f"{prefix}_map"] = float(map_value) if np.isfinite(float(map_value)) else float("nan")
 
     rows: list[dict[str, Any]] = []
-    mode = str(scaling_relation_mode or "lenstool-denominator")
+    mode = str(scaling_relation_mode or "direct-exponents")
     for potfile_id in sorted(specs_by_potfile):
         field_index = specs_by_potfile[potfile_id]
         sigma = _values(field_index.get("sigma"))
@@ -823,39 +811,20 @@ def _scaling_results_summary_table(
         else:
             _add_summary(row, "log10_m_star_msun", None, float("nan"))
 
-        vdslope = _values(field_index.get("vdslope"))
-        slope = _values(field_index.get("slope"))
         alpha_sigma = _values(field_index.get("alpha_sigma"))
-        gamma_ml = _values(field_index.get("gamma_ml"))
-        if alpha_sigma is not None and gamma_ml is not None:
-            beta_radius = 1.0 + gamma_ml - 2.0 * alpha_sigma
+        beta_radius = _values(field_index.get("beta_radius"))
+        if alpha_sigma is not None and beta_radius is not None:
             alpha_map = _map(field_index.get("alpha_sigma"))
-            gamma_map = _map(field_index.get("gamma_ml"))
-            _add_summary(row, "alpha_sigma_eff", alpha_sigma, alpha_map)
-            _add_summary(row, "beta_radius_eff", beta_radius, 1.0 + gamma_map - 2.0 * alpha_map)
-        elif vdslope is not None and slope is not None:
-            safe_vdslope = np.where(np.abs(vdslope) < 1.0e-12, np.nan, vdslope)
-            safe_slope = np.where(np.abs(slope) < 1.0e-12, np.nan, slope)
-            vdslope_map = _map(field_index.get("vdslope"))
-            slope_map = _map(field_index.get("slope"))
-            _add_summary(
-                row,
-                "alpha_sigma_eff",
-                1.0 / safe_vdslope,
-                1.0 / vdslope_map if abs(vdslope_map) >= 1.0e-12 else float("nan"),
-            )
-            _add_summary(
-                row,
-                "beta_radius_eff",
-                2.0 / safe_slope,
-                2.0 / slope_map if abs(slope_map) >= 1.0e-12 else float("nan"),
-            )
+            beta_map = _map(field_index.get("beta_radius"))
+            gamma_ml = 2.0 * alpha_sigma + beta_radius - 1.0
+            gamma_map = 2.0 * alpha_map + beta_map - 1.0
+            _add_summary(row, "alpha_sigma", alpha_sigma, alpha_map)
+            _add_summary(row, "beta_radius", beta_radius, beta_map)
+            _add_summary(row, "gamma_ml", gamma_ml, gamma_map)
         else:
-            _add_summary(row, "alpha_sigma_eff", None, float("nan"))
-            _add_summary(row, "beta_radius_eff", None, float("nan"))
-
-        for field in ("vdslope", "slope", "alpha_sigma", "gamma_ml"):
-            _add_summary(row, field, _values(field_index.get(field)), _map(field_index.get(field)))
+            _add_summary(row, "alpha_sigma", None, float("nan"))
+            _add_summary(row, "beta_radius", None, float("nan"))
+            _add_summary(row, "gamma_ml", None, float("nan"))
         for prefix, field in (
             ("sigma_log_scatter", "sigma_log_scatter"),
             ("core_log_scatter", "core_log_scatter"),
@@ -892,11 +861,8 @@ def _build_scaling_results_rich_table(summary_df: pd.DataFrame) -> Any:
         ("rcut* [kpc]", "rcut_star_kpc"),
         ("rcore* [kpc]", "rcore_star_kpc"),
         ("log10 M* [Msun]", "log10_m_star_msun"),
-        ("alpha_eff", "alpha_sigma_eff"),
-        ("beta_eff", "beta_radius_eff"),
-        ("vdslope", "vdslope"),
-        ("slope", "slope"),
         ("alpha_sigma", "alpha_sigma"),
+        ("beta_radius", "beta_radius"),
         ("gamma_ml", "gamma_ml"),
         ("sigma scatter", "sigma_log_scatter"),
         ("core scatter", "core_log_scatter"),
@@ -919,11 +885,8 @@ def _build_scaling_results_rich_table(summary_df: pd.DataFrame) -> Any:
             _interval_text(row_series, "rcut_star_kpc"),
             _interval_text(row_series, "rcore_star_kpc"),
             _interval_text(row_series, "log10_m_star_msun"),
-            _interval_text(row_series, "alpha_sigma_eff"),
-            _interval_text(row_series, "beta_radius_eff"),
-            _interval_text(row_series, "vdslope"),
-            _interval_text(row_series, "slope"),
             _interval_text(row_series, "alpha_sigma"),
+            _interval_text(row_series, "beta_radius"),
             _interval_text(row_series, "gamma_ml"),
             _interval_text(row_series, "sigma_log_scatter"),
             _interval_text(row_series, "core_log_scatter"),
@@ -2175,13 +2138,11 @@ def _independent_scaling_diagnostics_table(
     sigma_ref_base = _component_array_from_packed(packed_lens_spec, "sigma_ref_base", n_components, dtype=float, fill_value=0.0)
     cut_ref_base = _component_array_from_packed(packed_lens_spec, "cut_ref_base", n_components, dtype=float, fill_value=0.0)
     core_ref_base = _component_array_from_packed(packed_lens_spec, "core_ref_base", n_components, dtype=float, fill_value=0.0)
-    vdslope_base = _component_array_from_packed(packed_lens_spec, "vdslope_base", n_components, dtype=float, fill_value=4.0)
-    slope_base = _component_array_from_packed(packed_lens_spec, "slope_base", n_components, dtype=float, fill_value=4.0)
     alpha_sigma_base = _component_array_from_packed(
         packed_lens_spec, "alpha_sigma_base", n_components, dtype=float, fill_value=0.25
     )
-    gamma_ml_base = _component_array_from_packed(
-        packed_lens_spec, "gamma_ml_base", n_components, dtype=float, fill_value=0.0
+    beta_radius_base = _component_array_from_packed(
+        packed_lens_spec, "beta_radius_base", n_components, dtype=float, fill_value=0.5
     )
     sigma_ref_indices = _component_array_from_packed(
         packed_lens_spec, "sigma_ref_param_index", n_components, dtype=np.int32, fill_value=-1
@@ -2192,17 +2153,11 @@ def _independent_scaling_diagnostics_table(
     core_ref_indices = _component_array_from_packed(
         packed_lens_spec, "core_ref_param_index", n_components, dtype=np.int32, fill_value=-1
     )
-    vdslope_indices = _component_array_from_packed(
-        packed_lens_spec, "vdslope_param_index", n_components, dtype=np.int32, fill_value=-1
-    )
-    slope_param_indices = _component_array_from_packed(
-        packed_lens_spec, "slope_param_index", n_components, dtype=np.int32, fill_value=-1
-    )
     alpha_sigma_indices = _component_array_from_packed(
         packed_lens_spec, "alpha_sigma_param_index", n_components, dtype=np.int32, fill_value=-1
     )
-    gamma_ml_indices = _component_array_from_packed(
-        packed_lens_spec, "gamma_ml_param_index", n_components, dtype=np.int32, fill_value=-1
+    beta_radius_indices = _component_array_from_packed(
+        packed_lens_spec, "beta_radius_param_index", n_components, dtype=np.int32, fill_value=-1
     )
     v_disp_base = _component_array_from_packed(packed_lens_spec, "v_disp_base", n_components, dtype=float, fill_value=0.0)
     core_base = _component_array_from_packed(packed_lens_spec, "core_radius_kpc_base", n_components, dtype=float, fill_value=0.0)
@@ -2256,34 +2211,11 @@ def _independent_scaling_diagnostics_table(
         row_dict[f"{prefix}_map"] = float(map_value) if np.isfinite(map_value) else float("nan")
 
     def _effective_exponents(component_index: int) -> tuple[np.ndarray, np.ndarray, float, float]:
-        vdslope = _values(vdslope_base, vdslope_indices, component_index)
-        slope_values = _values(slope_base, slope_param_indices, component_index)
-        safe_vdslope = np.where(
-            np.abs(vdslope) < 1.0e-12,
-            np.sign(vdslope) * 1.0e-12 + (vdslope == 0.0) * 1.0e-12,
-            vdslope,
-        )
-        safe_slope = np.where(
-            np.abs(slope_values) < 1.0e-12,
-            np.sign(slope_values) * 1.0e-12 + (slope_values == 0.0) * 1.0e-12,
-            slope_values,
-        )
-        denominator_alpha = 1.0 / safe_vdslope
-        denominator_beta = 2.0 / safe_slope
         alpha_values = _values(alpha_sigma_base, alpha_sigma_indices, component_index)
-        gamma_values = _values(gamma_ml_base, gamma_ml_indices, component_index)
-        bergamini = int(alpha_sigma_indices[component_index]) >= 0
-        effective_alpha = alpha_values if bergamini else denominator_alpha
-        effective_beta = 1.0 + gamma_values - 2.0 * alpha_values if bergamini else denominator_beta
-        vdslope_map = _map_value(vdslope_base, vdslope_indices, component_index)
-        slope_map_value = _map_value(slope_base, slope_param_indices, component_index)
-        safe_vdslope_map = vdslope_map if abs(vdslope_map) >= 1.0e-12 else math.copysign(1.0e-12, vdslope_map or 1.0)
-        safe_slope_map = slope_map_value if abs(slope_map_value) >= 1.0e-12 else math.copysign(1.0e-12, slope_map_value or 1.0)
-        if bergamini:
-            alpha_map = _map_value(alpha_sigma_base, alpha_sigma_indices, component_index)
-            gamma_map = _map_value(gamma_ml_base, gamma_ml_indices, component_index)
-            return effective_alpha, effective_beta, alpha_map, 1.0 + gamma_map - 2.0 * alpha_map
-        return effective_alpha, effective_beta, 1.0 / safe_vdslope_map, 2.0 / safe_slope_map
+        beta_values = _values(beta_radius_base, beta_radius_indices, component_index)
+        alpha_map = _map_value(alpha_sigma_base, alpha_sigma_indices, component_index)
+        beta_map = _map_value(beta_radius_base, beta_radius_indices, component_index)
+        return alpha_values, beta_values, alpha_map, beta_map
 
     rows: list[dict[str, Any]] = []
     for row in selected_df.itertuples(index=False):
@@ -2544,13 +2476,11 @@ def _scaling_relation_summary_table(
     sigma_ref_base = _component_array_from_packed(packed_lens_spec, "sigma_ref_base", n_components, dtype=float, fill_value=0.0)
     cut_ref_base = _component_array_from_packed(packed_lens_spec, "cut_ref_base", n_components, dtype=float, fill_value=0.0)
     core_ref_base = _component_array_from_packed(packed_lens_spec, "core_ref_base", n_components, dtype=float, fill_value=0.0)
-    vdslope_base = _component_array_from_packed(packed_lens_spec, "vdslope_base", n_components, dtype=float, fill_value=4.0)
-    slope_base = _component_array_from_packed(packed_lens_spec, "slope_base", n_components, dtype=float, fill_value=4.0)
     alpha_sigma_base = _component_array_from_packed(
         packed_lens_spec, "alpha_sigma_base", n_components, dtype=float, fill_value=0.25
     )
-    gamma_ml_base = _component_array_from_packed(
-        packed_lens_spec, "gamma_ml_base", n_components, dtype=float, fill_value=0.0
+    beta_radius_base = _component_array_from_packed(
+        packed_lens_spec, "beta_radius_base", n_components, dtype=float, fill_value=0.5
     )
     sigma_ref_indices = _component_array_from_packed(
         packed_lens_spec, "sigma_ref_param_index", n_components, dtype=np.int32, fill_value=-1
@@ -2561,17 +2491,11 @@ def _scaling_relation_summary_table(
     core_ref_indices = _component_array_from_packed(
         packed_lens_spec, "core_ref_param_index", n_components, dtype=np.int32, fill_value=-1
     )
-    vdslope_indices = _component_array_from_packed(
-        packed_lens_spec, "vdslope_param_index", n_components, dtype=np.int32, fill_value=-1
-    )
-    slope_param_indices = _component_array_from_packed(
-        packed_lens_spec, "slope_param_index", n_components, dtype=np.int32, fill_value=-1
-    )
     alpha_sigma_indices = _component_array_from_packed(
         packed_lens_spec, "alpha_sigma_param_index", n_components, dtype=np.int32, fill_value=-1
     )
-    gamma_ml_indices = _component_array_from_packed(
-        packed_lens_spec, "gamma_ml_param_index", n_components, dtype=np.int32, fill_value=-1
+    beta_radius_indices = _component_array_from_packed(
+        packed_lens_spec, "beta_radius_param_index", n_components, dtype=np.int32, fill_value=-1
     )
     weights = _normalized_weights(sample_weights, sample_array.shape[0])
 
@@ -2595,34 +2519,11 @@ def _scaling_relation_summary_table(
         row_dict[f"{prefix}_map"] = float(map_value) if np.isfinite(map_value) else float("nan")
 
     def _effective_exponents(component_index: int) -> tuple[np.ndarray, np.ndarray, float, float]:
-        vdslope = _values(vdslope_base, vdslope_indices, component_index)
-        slope_values = _values(slope_base, slope_param_indices, component_index)
-        safe_vdslope = np.where(
-            np.abs(vdslope) < 1.0e-12,
-            np.sign(vdslope) * 1.0e-12 + (vdslope == 0.0) * 1.0e-12,
-            vdslope,
-        )
-        safe_slope = np.where(
-            np.abs(slope_values) < 1.0e-12,
-            np.sign(slope_values) * 1.0e-12 + (slope_values == 0.0) * 1.0e-12,
-            slope_values,
-        )
-        denominator_alpha = 1.0 / safe_vdslope
-        denominator_beta = 2.0 / safe_slope
         alpha_values = _values(alpha_sigma_base, alpha_sigma_indices, component_index)
-        gamma_values = _values(gamma_ml_base, gamma_ml_indices, component_index)
-        bergamini = int(alpha_sigma_indices[component_index]) >= 0
-        effective_alpha = alpha_values if bergamini else denominator_alpha
-        effective_beta = 1.0 + gamma_values - 2.0 * alpha_values if bergamini else denominator_beta
-        vdslope_map = _map_value(vdslope_base, vdslope_indices, component_index)
-        slope_map_value = _map_value(slope_base, slope_param_indices, component_index)
-        safe_vdslope_map = vdslope_map if abs(vdslope_map) >= 1.0e-12 else math.copysign(1.0e-12, vdslope_map or 1.0)
-        safe_slope_map = slope_map_value if abs(slope_map_value) >= 1.0e-12 else math.copysign(1.0e-12, slope_map_value or 1.0)
-        if bergamini:
-            alpha_map = _map_value(alpha_sigma_base, alpha_sigma_indices, component_index)
-            gamma_map = _map_value(gamma_ml_base, gamma_ml_indices, component_index)
-            return effective_alpha, effective_beta, alpha_map, 1.0 + gamma_map - 2.0 * alpha_map
-        return effective_alpha, effective_beta, 1.0 / safe_vdslope_map, 2.0 / safe_slope_map
+        beta_values = _values(beta_radius_base, beta_radius_indices, component_index)
+        alpha_map = _map_value(alpha_sigma_base, alpha_sigma_indices, component_index)
+        beta_map = _map_value(beta_radius_base, beta_radius_indices, component_index)
+        return alpha_values, beta_values, alpha_map, beta_map
 
     rows: list[dict[str, Any]] = []
     for row in scaling_rank_df.itertuples(index=False):
@@ -10171,12 +10072,27 @@ def _load_image_catalog_cutout_helpers() -> Any:
     return importlib.import_module("plot_literature_family_cutouts")
 
 
-def _image_catalog_family_cutout_enabled(args: argparse.Namespace, run_dir: Path) -> bool:
+def _image_catalog_family_cluster_enabled(args: argparse.Namespace, run_dir: Path) -> bool:
     image_dir = getattr(args, "image_catalog_family_cutout_image_dir", None)
     if image_dir is None or not str(image_dir).strip():
         return False
     stage_name = Path(run_dir).name
-    return stage_name == "stage4_critical_arc_mixture_image_plane"
+    if stage_name in {"stage1_backprojected_centroid_fit", "stage2_free_source_forward_fit"}:
+        return True
+    return not stage_name.startswith("stage")
+
+
+def _image_catalog_family_cutout_enabled(args: argparse.Namespace, run_dir: Path) -> bool:
+    if not _image_catalog_family_cluster_enabled(args, run_dir):
+        return False
+    if not bool(getattr(args, "image_catalog_family_cutouts", True)):
+        return False
+    stage_name = Path(run_dir).name
+    if stage_name == "stage2_free_source_forward_fit":
+        return True
+    if stage_name == "stage1_backprojected_centroid_fit":
+        return str(getattr(args, "stage2_forward_mode", "none")) == "none"
+    return True
 
 
 def _infer_image_catalog_cutout_cluster(state: BuildState) -> str:
@@ -12242,30 +12158,25 @@ def _plot_image_catalog_family_cutouts(
     if not catalog_df.empty:
         catalog_df["arc_recovery_p_arc_threshold"] = arc_recovery_p_arc_threshold
     extra_df = _image_catalog_extra_cutout_rows(state, extra_image_df)
+    detail_cutouts_enabled = _image_catalog_family_cutout_enabled(args, run_dir)
     if catalog_df.empty and extra_df.empty:
-        _write_placeholder_plot(
-            _plot_path(run_dir, "image_catalog_family_cutouts.pdf"),
-            "Image-catalog family cutouts",
-            "No image catalog rows are available.",
-        )
         _write_placeholder_plot(
             _plot_path(run_dir, "image_catalog_family_cluster.pdf"),
             "Image-catalog family cluster",
             "No image catalog rows are available.",
         )
+        if detail_cutouts_enabled:
+            _write_placeholder_plot(
+                _plot_path(run_dir, "image_catalog_family_cutouts.pdf"),
+                "Image-catalog family cutouts",
+                "No image catalog rows are available.",
+            )
         return
 
     output = _plot_path(run_dir, "image_catalog_family_cutouts.pdf")
     cluster_output = _plot_path(run_dir, "image_catalog_family_cluster.pdf")
     output.parent.mkdir(parents=True, exist_ok=True)
     detail_cols = IMAGE_CATALOG_DETAIL_COLUMNS
-    blocks = _image_catalog_family_cutout_blocks(
-        state,
-        catalog_df,
-        extra_df,
-        detail_cols=detail_cols,
-        default_cutout_size_arcsec=cutout_size_arcsec,
-    )
     draw_critical_lines = bool(getattr(render_config, "draw_critical_lines", True))
     if draw_critical_lines:
         try:
@@ -12276,20 +12187,30 @@ def _plot_image_catalog_family_cutouts(
     else:
         best_fit_latent = None
     critical_model_pairs_by_z: dict[float, tuple[Any, list[dict[str, float]]]] = {}
+    fig = _image_catalog_cluster_overview_figure(
+        helpers,
+        band_images,
+        bands,
+        rgb_display,
+        display_image,
+        catalog_df,
+        extra_df,
+        state.reference,
+        detail_cols=detail_cols,
+        render_config=render_config,
+    )
+    fig.savefig(cluster_output, facecolor=fig.get_facecolor(), **savefig_kwargs)
+    if not detail_cutouts_enabled:
+        plt.close(fig)
+        return
+    blocks = _image_catalog_family_cutout_blocks(
+        state,
+        catalog_df,
+        extra_df,
+        detail_cols=detail_cols,
+        default_cutout_size_arcsec=cutout_size_arcsec,
+    )
     with PdfPages(output) as pdf:
-        fig = _image_catalog_cluster_overview_figure(
-            helpers,
-            band_images,
-            bands,
-            rgb_display,
-            display_image,
-            catalog_df,
-            extra_df,
-            state.reference,
-            detail_cols=detail_cols,
-            render_config=render_config,
-        )
-        fig.savefig(cluster_output, facecolor=fig.get_facecolor(), **savefig_kwargs)
         pdf.savefig(fig, facecolor=fig.get_facecolor(), **savefig_kwargs)
         plt.close(fig)
 
@@ -12773,7 +12694,7 @@ def _generate_plots_and_tables(
                     ),
                 )
             ]
-            if _image_catalog_family_cutout_enabled(args, run_dir)
+            if _image_catalog_family_cluster_enabled(args, run_dir)
             else []
         ),
         (

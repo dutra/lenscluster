@@ -304,6 +304,7 @@ def _load_dat_catalog(
                 "catalog_mag",
                 "catalog_z",
                 "catalog_lum",
+                "catalog_color",
             ]
         )
 
@@ -319,13 +320,25 @@ def _load_dat_catalog(
         df = pd.DataFrame(padded_rows, columns=base_columns + extra_columns[: max_columns - len(base_columns)])
         df["lum"] = np.nan
     elif catalog_kind == "potfile_galaxies":
-        df = pd.DataFrame(rows, columns=["id", "coord_1", "coord_2", "a", "b", "theta", "mag", "lum"])
+        expected_columns = ["id", "coord_1", "coord_2", "a", "b", "theta", "mag", "lum", "color"]
+        bad_lengths = sorted({len(row) for row in rows if len(row) != len(expected_columns)})
+        if bad_lengths:
+            raise ValueError(
+                f"Potfile member catalog '{path}' must have {len(expected_columns)} columns "
+                "(id x y a b theta mag lum color); got row widths "
+                f"{', '.join(str(value) for value in bad_lengths)}."
+            )
+        df = pd.DataFrame(rows, columns=expected_columns)
         df["z"] = np.nan
     else:
         raise ValueError(f"Unsupported catalog kind '{catalog_kind}' for '{path}'.")
     df["id"] = df["id"].astype(str)
     for column in ["coord_1", "coord_2", "a", "b", "theta", "mag", "z", "lum"]:
         df[column] = pd.to_numeric(df[column], errors="raise")
+    if "color" in df.columns:
+        df["color"] = pd.to_numeric(df["color"], errors="coerce")
+    else:
+        df["color"] = np.nan
     if "family_reliability" in df.columns:
         df["family_reliability"] = pd.to_numeric(df["family_reliability"], errors="coerce").fillna(1.0).clip(0.0, 1.0)
     else:
@@ -360,6 +373,7 @@ def _load_dat_catalog(
             "mag": "catalog_mag",
             "z": "catalog_z",
             "lum": "catalog_lum",
+            "color": "catalog_color",
         }
     )
 
@@ -375,6 +389,7 @@ def _load_dat_catalog(
         "catalog_mag",
         "catalog_z",
         "catalog_lum",
+        "catalog_color",
         "family_reliability",
     ]
     return df.loc[:, keep_columns].drop_duplicates(subset=["id"], keep="first").reset_index(drop=True)
@@ -846,14 +861,6 @@ def _potfile_nominal_value(value: Any, context: str) -> float:
     return float(value)
 
 
-def _potfile_scaling_exponent_value(potfile: dict[str, Any], field_name: str, potfile_id: str) -> float:
-    value = potfile.get(field_name)
-    if value is None:
-        value = [0, DEFAULT_POTFILE_SCALING_EXPONENT, 0.0]
-        potfile[field_name] = value
-    return _potfile_nominal_value(value, f"{potfile_id}.{field_name}")
-
-
 def _normalize_potfile_blocks(
     parsed: dict[str, Any],
     base_dir: Path,
@@ -905,8 +912,6 @@ def _normalize_potfile_blocks(
             if cut_arcsec_value is not None
             else None
         )
-        potfile["vdslope_nominal"] = _potfile_scaling_exponent_value(potfile, "vdslope", potfile_id)
-        potfile["slope_nominal"] = _potfile_scaling_exponent_value(potfile, "slope", potfile_id)
         normalized.append(potfile)
     return normalized
 

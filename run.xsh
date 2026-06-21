@@ -10,7 +10,7 @@ $JAX_NUM_CPU_DEVICES = cores
 
 PYTHON = "/home/dutra/.conda/envs/lenstronomy/bin/python"
 
-output_dir = f"jun20i_stage3_blend_topksurrogate_freetopk_refresh_faster_tokpsurrogateflat_20topk_hyperscaling_bergamini"
+output_dir = f"jun2b_perturbation_discovery_direct_exponents"
 
 HFF_RGB_BANDS = ["F435W", "F606W", "F814W", "F105W", "F125W", "F140W", "F160W"]
 HFF_RGB_DISPLAY = {"q": 6.4, "stretch": 0.0145, "minimum": -5.5e-4, "red_gain": 0.47, "green_gain": 0.91, "blue_gain": 3.95}
@@ -115,36 +115,30 @@ best_par_overlay_args = ["--corner-overlay-best-par", str(BEST_PAR_PATH)] if BES
 
 # Mirrors the active solver-control settings in run_validation.xsh, but runs the
 # real-data cluster solver directly instead of the mock validation wrapper.
-mode = "none"  # "linear", "metric", "anchored", "critical_arc", or "fold_regularized"
+mode = "none"  # "linear" or "critical_arc"
 run_name = f"{cluster_config['cluster_key']}_{mode}_nuts_nozeff"
 fit_mode = "sequential"
-image_plane_modes = {
+stage2_forward_modes = {
     "none": "none",
-    "linear": "linearized-forward-beta-image-plane",
-    "metric": "forward-metric-image-plane",
-    "anchored": "anchored-solved-forward-beta-image-plane",
-    "critical_arc": "critical-arc-mixture-image-plane",
-    "fold_regularized": "fold-regularized-forward-beta-image-plane",
-    "catastrophe": "catastrophe-normal-form-image-plane",
+    "linear": "linearized",
+    "critical_arc": "critical-arc",
 }
-image_plane_mode = image_plane_modes[mode]
-stage3_mode = "local-jacobian"#"local-jacobian" #"critical-arc-mixture-image-plane"
+stage2_forward_mode = stage2_forward_modes[mode]
+stage1_likelihood = "local-jacobian"
 
 fit_method = ["svi+nuts", "svi+nuts"]#, "svi+nuts"]
-refresh_every = 1000
-svi_steps = [3000, 4000]#, 4000]
-warmup = [500, 1000]#, 2000]
-samples = [150, 250]#, 500]
+refresh_every = 500
+svi_steps = [2000, 2000]#, 4000]
+warmup = [500, 500]#, 2000]
+samples = [250, 250]#, 500]
 sampling_refresh_runs = [1, 1]#, 1]
 max_tree_depth = [8, 8]#, 8]
 quick_diagnostics = False
 target_accept = 0.8
 chains = cores
-active_scaling_galaxies = [25]
 z_bin_efficiency_tol = 0.0
 
-# Short stage4 conditioning check before a full production run: confirm the magnification fold
-# un-sticks the chains (adapted step size recovers, tree saturation drops, chains move) cheaply.
+# Short conditioning check before a full production run.
 pilot = False
 if pilot:
     refresh_every = 500
@@ -157,16 +151,15 @@ if pilot:
     max_tree_depth = [6, 8, 8]
     #quick_diagnostics = True
     chains = cores
-    active_scaling_galaxies = [128]
     z_bin_efficiency_tol = 0.0000001
 
 
-OUTPUT_DIR = f"{OUTPUT_DIR}_ASG{active_scaling_galaxies[-1]}_T{max_tree_depth[-1]}W{warmup[-1]}S{samples[-1]}"
-#OUTPUT_DIR = f"{OUTPUT_DIR}_ASG{active_scaling_galaxies[-1]}_T{max_tree_depth[-2]}W{warmup[-2]}S{samples[-2]}_T{max_tree_depth[-1]}W{warmup[-1]}S{samples[-1]}"
+perturbation_discovery_alpha_tol_arcsec = 0.1
+perturbation_discovery_jacobian_tol = 0.1
+perturbation_discovery_jacobian_weight = 1.0
 
-start_at_stage2 = False
-start_at_stage3 = True
-skip_stage3_image_plane_local_jacobian = False
+OUTPUT_DIR = f"{OUTPUT_DIR}_PD{perturbation_discovery_alpha_tol_arcsec:g}_{perturbation_discovery_jacobian_tol:g}_T{max_tree_depth[-1]}W{warmup[-1]}S{samples[-1]}"
+
 exact_image_diagnostics_stage2 = True
 image_catalog_family_cutout_image_dir = cluster_config.get("image_catalog_family_cutout_image_dir", "data/BUFFALO_Images")
 image_catalog_family_cutout_image_scale = cluster_config.get("image_catalog_family_cutout_image_scale", "30mas")
@@ -201,30 +194,20 @@ image_plane_newton_steps = 0
 linearized_beta_prior_sigma_arcsec = 3.0
 source_position_parameterization = "prior-whitened" #conditional-whitened" #"prior-whitened"
 source_plane_covariance_mode = "magnification"
-sampling_engine = "topk_discovery_flat" # "refreshing_surrogate_flat" # "full" #"refreshing_surrogate"
-stage4_sampling_engine = "topk_discovery_flat" # "refreshing_surrogate_flat" # full_flat
-scaling_relation_mode = "bergamini-ml"
-topk_discovery_scaling_galaxies = 10
-topk_discovery_score = "alpha_jacobian"
-topk_discovery_jacobian_weight = 1.0
-topk_discovery_final_engine = "refreshing_surrogate_flat"
-topk_discovery_final_svi_polish_steps = 2000
+sampling_engine = "perturbation_discovery_flat"
+stage2_sampling_engine = "perturbation_discovery_flat"
+perturbation_discovery_final_engine = "refreshing_surrogate_flat"
+perturbation_discovery_final_svi_polish_steps = 2000
 independent_scaling_free_log_vdisp_tau_prior_median = 0.20
 independent_scaling_free_log_core_tau_prior_median = 0.30
 independent_scaling_free_log_cut_tau_prior_median = 0.30
 independent_scaling_free_log_tau_prior_sigma = 0.40
-pos_sigma_arcsec = 0.01
-anchored_args = [
-    "--anchored-image-plane-solve-steps", 0,
-    "--anchored-image-plane-trust-radius-arcsec", 0.3,
-    "--anchored-image-plane-lm-damping-relative", 1.0e-3,
-    "--anchored-image-plane-lm-damping-absolute", 1.0e-6,
-] if mode == "anchored" else []
+pos_sigma_arcsec = 0.1
 critical_arc_args = [
     "--critical-arc-critical-direction-sigma-arcsec", 10.0,
     "--critical-arc-base-prob", 0.10,
     "--critical-arc-max-prob", 0.85,
-    # Arc-mixture gate only -- the magnification fold uses its own baked-in threshold/softness.
+    # Arc-mixture gate only.
     "--sample-critical-arc-singular-threshold",
     "--critical-arc-singular-threshold", 0.4,
     "--critical-arc-singular-threshold-prior-median", 0.15,
@@ -244,9 +227,6 @@ critical_arc_args = [
     "--arc-aware-max-arclength-arcsec", 10.0,
     "--arc-aware-curve-step-arcsec", 0.01,
 ] if mode == "critical_arc" else []
-fold_regularized_args = [
-    "--fold-curvature-arcsec-inv", 1.0,
-] if mode == "fold_regularized" else []
 smc_args = [
     "--jax-default-device", "cpu",
     "--smc-device", "cpu",
@@ -262,19 +242,16 @@ smc_args = [
 workflow_args = [
     "--potfile-member-mag-max", 22.0,
     "--sampling-refresh-runs", *sampling_refresh_runs,
-    *(["--start-at-stage2"] if start_at_stage2 else []),
-    *(["--start-at-stage3"] if start_at_stage3 else []),
     "--fit-mode", fit_mode,
-    "--stage3-image-plane-mode", stage3_mode,
-    "--image-plane-mode", image_plane_mode,
-    *(["--skip-stage3-image-plane-local-jacobian"] if skip_stage3_image_plane_local_jacobian else []),
+    "--stage1-likelihood", stage1_likelihood,
+    "--stage2-forward-mode", stage2_forward_mode,
     *(["--exact-image-diagnostics-stage2"] if exact_image_diagnostics_stage2 else []),
     "--image-plane-newton-steps", image_plane_newton_steps,
     "--linearized-beta-prior-sigma-arcsec", linearized_beta_prior_sigma_arcsec,
     "--source-position-parameterization", source_position_parameterization,
     "--source-plane-covariance-mode", source_plane_covariance_mode,
-    "--stage4-fresh-process",
-    "--stage4-sampling-engine", stage4_sampling_engine,
+    "--stage2-fresh-process",
+    "--stage2-sampling-engine", stage2_sampling_engine,
     "--fit-method", *fit_method,
     "--warmup", *warmup,
     "--samples", *samples,
@@ -285,33 +262,21 @@ workflow_args = [
     "--max-tree-depth", *max_tree_depth,
     "--z-bin-efficiency-tol", z_bin_efficiency_tol,
 
-    *(anchored_args),
     *(critical_arc_args),
-    *(fold_regularized_args),
     *(smc_args),
 ]
 
-active_scaling_args = [
+discovery_args = [
     "--sampling-engine", sampling_engine,
-    "--scaling-relation-mode", scaling_relation_mode,
-    "--topk-discovery-scaling-galaxies", topk_discovery_scaling_galaxies,
-    "--topk-discovery-score", topk_discovery_score,
-    "--topk-discovery-jacobian-weight", topk_discovery_jacobian_weight,
-    "--topk-discovery-final-engine", topk_discovery_final_engine,
-    "--topk-discovery-final-svi-polish-steps", topk_discovery_final_svi_polish_steps,
+    "--perturbation-discovery-alpha-tol-arcsec", perturbation_discovery_alpha_tol_arcsec,
+    "--perturbation-discovery-jacobian-tol", perturbation_discovery_jacobian_tol,
+    "--perturbation-discovery-jacobian-weight", perturbation_discovery_jacobian_weight,
+    "--perturbation-discovery-final-engine", perturbation_discovery_final_engine,
+    "--perturbation-discovery-final-svi-polish-steps", perturbation_discovery_final_svi_polish_steps,
     "--independent-scaling-free-log-vdisp-tau-prior-median", independent_scaling_free_log_vdisp_tau_prior_median,
     "--independent-scaling-free-log-core-tau-prior-median", independent_scaling_free_log_core_tau_prior_median,
     "--independent-scaling-free-log-cut-tau-prior-median", independent_scaling_free_log_cut_tau_prior_median,
     "--independent-scaling-free-log-tau-prior-sigma", independent_scaling_free_log_tau_prior_sigma,
-    "--active-scaling-galaxies", *active_scaling_galaxies,
-    "--active-scaling-selection", "fixed",
-    "--active-scaling-cumulative-fraction", 0.995,
-    "--active-scaling-min", 4,
-    #"--infer-active-scaling",
-    #"--active-scaling-prior-prob", 0.5,
-    #"--active-scaling-freeze-threshold", 0.5,
-    #"--active-scaling-inference-likelihood", "population",
-    #"--active-scaling-local-logit-prior-sigma", 0.5,
 ]
 
 scatter_and_stabilizer_args = [
@@ -370,30 +335,12 @@ try:
       --run-name @(run_name) \
       @(debug_args) \
       @(workflow_args) \
-      @(active_scaling_args) \
+      @(discovery_args) \
       @(scatter_and_stabilizer_args) \
       @(validation_args) \
       @(real_data_args) \
       @(bayes_overlay_args) \
       @(best_par_overlay_args)
-
- #   --jax-default-device cpu --smc-device gpu \
-
-# --quick-diagnostics \
-
-# --smc-particles 4096 \
-# --smc-mcmc-kernel rmh \
-# --smc-rmh-scale 0.05 \
-# --smc-mcmc-steps 32 \
-# --smc-target-ess-frac 0.95 \
-# --smc-max-temperature-steps 1024 \
-#rmh or mala
-    #   --quick-diagnostics
-    #   --likelihood-stabilizer-max-gain 50 \
-    #   --likelihood-stabilizer-max-residual-arcsec 3 \
-    #   --likelihood-stabilizer-residual-loss student-t \
-    #   --likelihood-stabilizer-student-t-nu 4 \
-
 finally:
     print(f"[timing] elapsed={time.monotonic() - _run_start_monotonic:.2f}s")
     printf '\033[?1000l\033[?1002l\033[?1003l\033[?1005l\033[?1006l\033[?1015l'

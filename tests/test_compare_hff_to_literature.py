@@ -55,7 +55,7 @@ def test_parse_plain_image_catalog_with_id_ra_dec_z(tmp_path: Path) -> None:
 
 def test_parse_lenstool_reference3_member_catalog(tmp_path: Path) -> None:
     path = tmp_path / "members.cat"
-    path.write_text("#REFERENCE 3 10.0 20.0\n1 0.0 3600.0 1.0 1.0 0.0 21.0 1.0\n", encoding="utf-8")
+    path.write_text("#REFERENCE 3 10.0 20.0\n1 0.0 3600.0 1.0 1.0 0.0 21.0 1.0 0.5\n", encoding="utf-8")
 
     catalog = compare.parse_lenstool_catalog(path, catalog_kind="member")
 
@@ -63,6 +63,7 @@ def test_parse_lenstool_reference3_member_catalog(tmp_path: Path) -> None:
     np.testing.assert_allclose(catalog.iloc[0]["ra"], 10.0)
     np.testing.assert_allclose(catalog.iloc[0]["dec"], 21.0)
     np.testing.assert_allclose(catalog.iloc[0]["catalog_mag"], 21.0)
+    np.testing.assert_allclose(catalog.iloc[0]["catalog_color"], 0.5)
 
 
 def test_parse_plain_schuldt_member_table(tmp_path: Path) -> None:

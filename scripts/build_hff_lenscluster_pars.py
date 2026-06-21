@@ -244,8 +244,6 @@ def _render_par(cluster_key: str, cluster: dict[str, Any], output_dir: Path, def
             f"    mag0 {_format_float(potfile.get('mag0', 20.0))}",
             f"    sigma {_format_float(potfile.get('sigma', 200.0))}",
             f"    cutkpc {_format_float(potfile.get('cutkpc', 30.0))}",
-            f"    vdslope {_format_float(potfile.get('vdslope', 4.0))}",
-            f"    slope {_format_float(potfile.get('slope', 4.0))}",
             "    end",
             "cosmologie",
             f"    H0 {_format_float(cosmology.get('H0', 70.0))}",

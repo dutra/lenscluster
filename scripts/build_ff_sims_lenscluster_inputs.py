@@ -72,7 +72,6 @@ class FFSimConfig:
     explicit_galaxy_ids: tuple[str, ...] | None = None
     explicit_galaxy_centers_fixed: bool = False
     explicit_galaxy_sigma_upper_factors: tuple[tuple[str, float], ...] = ()
-    free_potfile_slopes: bool = False
 
 
 @dataclass(frozen=True)
@@ -96,6 +95,7 @@ class MemberRow:
     f160w_mag: float
     scaling_mag: float
     luminosity: float
+    color: float
 
 
 @dataclass(frozen=True)
@@ -138,7 +138,6 @@ CONFIGS = {
         explicit_galaxy_free_core_ids=("1", "2"),
         explicit_galaxy_ids=(),
         explicit_galaxy_centers_fixed=True,
-        free_potfile_slopes=True,
     ),
     "hera": FFSimConfig(
         key="hera",
@@ -163,7 +162,6 @@ CONFIGS = {
         smooth_core_radius_priors=((8.0, 2.0, 15.0), (5.0, 2.0, 15.0)),
         explicit_galaxy_ids=(),
         explicit_galaxy_centers_fixed=True,
-        free_potfile_slopes=True,
     ),
 }
 
@@ -242,6 +240,7 @@ def _read_plain_members(path: Path) -> tuple[list[MemberRow], int]:
         if len(parts) < 10:
             raise ValueError(f"Cluster-member row in {path} has fewer than 10 columns: {parts}")
         object_id = str(parts[0])
+        f606w_mag = float(parts[4])
         f814w_mag = float(parts[5])
         f160w_mag = float(parts[9])
         source_x = _parse_finite_float(parts[1])
@@ -261,6 +260,7 @@ def _read_plain_members(path: Path) -> tuple[list[MemberRow], int]:
                 f160w_mag=f160w_mag,
                 scaling_mag=f160w_mag,
                 luminosity=1.0,
+                color=f606w_mag - f814w_mag,
             )
         )
     return rows, skipped
@@ -384,7 +384,7 @@ def _member_catalog_line(row: MemberRow, *, commented: bool = False) -> str:
     return (
         f"{prefix}{row.object_id:>10s} {row.x_arcsec: .8f} {row.y_arcsec: .8f} "
         f"{row.a_axis:.8f} {row.b_axis:.8f} {row.theta_deg:.4f} "
-        f"{row.scaling_mag:.6f} {row.luminosity:.8e}"
+        f"{row.scaling_mag:.6f} {row.luminosity:.8e} {row.color:.6f}"
     )
 
 
@@ -613,16 +613,6 @@ limit S1
 """
 
 
-def _potfile_slope_block(config: FFSimConfig) -> str:
-    if config.free_potfile_slopes:
-        return """    # vdslope 0 4.00000000 0
-    # slope 0 4.00000000 0
-    vdslope 1 2.0 6.0 0.1
-    slope   1 1.0 6.0 0.1"""
-    return """    vdslope 0 4.00000000 0
-    slope 0 4.00000000 0"""
-
-
 def _write_par(
     path: Path,
     config: FFSimConfig,
@@ -719,7 +709,6 @@ potfile
     z_lens {_format_float(config.z_lens)}
     sigma 9 {_format_float(config.sigma_ref)} {_format_float(config.sigma_ref_uncertainty)} {_format_float(config.sigma_ref_lower)} {_format_float(config.sigma_ref_upper)}
     cutkpc 9 {_format_float(config.cut_radius_ref_kpc)} {_format_float(config.cut_radius_ref_uncertainty_kpc)} {_format_float(config.cut_radius_ref_lower_kpc)} {_format_float(config.cut_radius_ref_upper_kpc)}
-{_potfile_slope_block(config)}
     end
 cosmologie
     H0 70.00000000

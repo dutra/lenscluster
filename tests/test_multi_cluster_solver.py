@@ -155,7 +155,7 @@ def test_parse_args_accepts_repeated_cluster_triples_and_cosmology_init() -> Non
             "--fix-image-sigma-int-arcsec",
             "0.35",
             "--sampling-engine",
-            "active_subset",
+            "perturbation_discovery_flat",
         ]
     )
 
@@ -170,7 +170,7 @@ def test_parse_args_accepts_repeated_cluster_triples_and_cosmology_init() -> Non
     assert args.image_plane_scatter_prior_median_arcsec == pytest.approx(0.25)
     assert args.image_plane_scatter_prior_log_sigma == pytest.approx(0.4)
     assert args.fix_image_sigma_int_arcsec == pytest.approx(0.35)
-    assert args.sampling_engine == "active_subset"
+    assert args.sampling_engine == "perturbation_discovery_flat"
     assert args.dense_mass == "structured"
     assert not hasattr(args, "validate_top_k_families")
     assert not hasattr(args, "validation_approx")
@@ -218,24 +218,22 @@ def test_parse_args_rejects_removed_potfile_mass_size_reparam_flag() -> None:
         multi._parse_args([*base, "--potfile-mass-size-reparam"])
 
 
-def test_parse_args_maps_blocked_linearized_mode_to_explicit_likelihood() -> None:
-    args = multi._parse_args(
-        [
-            "--cluster",
-            "a2744",
-            "a2744.par",
-            "runs/a2744",
-            "--cluster",
-            "m0416",
-            "m0416.par",
-            "runs/m0416",
-            "--image-plane-mode",
-            "linearized-forward-beta-blocked-image-plane",
-        ]
-    )
-
-    assert args.image_plane_mode == "linearized-forward-beta-blocked-image-plane"
-    assert args.sample_likelihood_mode == "linearized-forward-beta-image-plane"
+def test_parse_args_rejects_blocked_linearized_mode() -> None:
+    with pytest.raises(SystemExit):
+        multi._parse_args(
+            [
+                "--cluster",
+                "a2744",
+                "a2744.par",
+                "runs/a2744",
+                "--cluster",
+                "m0416",
+                "m0416.par",
+                "runs/m0416",
+                "--image-plane-mode",
+                "linearized-forward-beta-blocked-image-plane",
+            ]
+        )
 
 
 @pytest.mark.parametrize("flag", ["--validate-top-k-families", "--validation-approx"])
@@ -340,43 +338,41 @@ def test_parse_args_rejects_invalid_image_plane_scatter_support(
         )
 
 
-def test_resolve_warm_stage_auto_prefers_stage3(tmp_path: Path) -> None:
+def test_resolve_warm_stage_auto_prefers_stage2_free_source_forward_fit(tmp_path: Path) -> None:
     par_path = tmp_path / "input.par"
     par_path.write_text("runmode\n", encoding="utf-8")
     warm_run = tmp_path / "warm"
-    _touch_artifact(warm_run / "stage1_large_only" / "artifacts")
-    _touch_artifact(warm_run / "stage2_joint" / "artifacts")
-    _touch_artifact(warm_run / "stage3_image_plane" / "artifacts")
+    _touch_artifact(warm_run / "stage1_backprojected_centroid_fit" / "artifacts")
+    _touch_artifact(warm_run / "stage2_free_source_forward_fit" / "artifacts")
 
     resolved = multi._resolve_warm_stage(
         multi.ClusterInput("c1", par_path, warm_run),
         "auto",
     )
 
-    assert resolved.stage_name == "stage3_image_plane"
-    assert resolved.stage1_artifacts_dir == warm_run / "stage1_large_only" / "artifacts"
+    assert resolved.stage_name == "stage2_free_source_forward_fit"
+    assert resolved.stage1_artifacts_dir == warm_run / "stage1_backprojected_centroid_fit" / "artifacts"
 
 
-def test_resolve_warm_stage_auto_falls_back_to_stage2(tmp_path: Path) -> None:
+def test_resolve_warm_stage_auto_falls_back_to_stage1_backprojected_centroid_fit(tmp_path: Path) -> None:
     par_path = tmp_path / "input.par"
     par_path.write_text("runmode\n", encoding="utf-8")
     warm_run = tmp_path / "warm"
-    _touch_artifact(warm_run / "stage1_large_only" / "artifacts")
-    _touch_artifact(warm_run / "stage2_joint" / "artifacts")
+    _touch_artifact(warm_run / "stage1_backprojected_centroid_fit" / "artifacts")
 
     resolved = multi._resolve_warm_stage(
         multi.ClusterInput("c1", par_path, warm_run),
         "auto",
     )
 
-    assert resolved.stage_name == "stage2_joint"
+    assert resolved.stage_name == "stage1_backprojected_centroid_fit"
 
 
 def test_resolve_warm_stage_requires_stage1_artifacts(tmp_path: Path) -> None:
     par_path = tmp_path / "input.par"
     par_path.write_text("runmode\n", encoding="utf-8")
     warm_run = tmp_path / "warm"
-    _touch_artifact(warm_run / "stage2_joint" / "artifacts")
+    _touch_artifact(warm_run / "stage2_free_source_forward_fit" / "artifacts")
 
     with pytest.raises(FileNotFoundError, match="stage1 warm artifacts"):
         multi._resolve_warm_stage(multi.ClusterInput("c1", par_path, warm_run), "auto")
