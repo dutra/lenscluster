@@ -5191,7 +5191,7 @@ fini
     return par_path
 
 
-def test_perturbation_discovery_svi_build_creates_no_independent_candidates(
+def test_perturbation_discovery_stage0_initial_build_makes_all_members_free(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -5224,10 +5224,12 @@ def test_perturbation_discovery_svi_build_creates_no_independent_candidates(
     )
 
     assert len(state.scaling_component_records) == 3
-    assert not any(bool(record.get("selected_independent", False)) for record in state.scaling_component_records)
-    assert not any(spec.component_family == "independent_scaling" for spec in state.parameter_specs)
-    assert evaluator.independent_scaling_component_indices.size == 0
-    assert evaluator.free_correction_scaling_component_indices.size == 0
+    assert all(bool(record.get("selected_independent", False)) for record in state.scaling_component_records)
+    independent_specs = [spec for spec in state.parameter_specs if spec.component_family == "independent_scaling"]
+    assert len(independent_specs) == 2 + 2 * 3
+    assert evaluator.independent_scaling_component_indices.size == 3
+    assert evaluator.free_correction_scaling_component_indices.size == 3
+    assert evaluator.free_correction_free_component_indices.size == 3
     np.testing.assert_array_equal(evaluator.exact_scaling_component_indices, evaluator.scaling_component_indices)
     assert evaluator.cached_scaling_component_indices.size == 0
 

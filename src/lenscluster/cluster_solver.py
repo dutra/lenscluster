@@ -25596,12 +25596,24 @@ def _build_state_from_inputs(
                 ),
             )
         elif bool(getattr(args, "perturbation_discovery_stage0", False)):
-            active_selected_by_potfile = [set() for _ in potfiles]
+            active_selected_by_potfile = [
+                set(range(len(potfile.get("catalog_df", pd.DataFrame()))))
+                for potfile in potfiles
+            ]
             active_rank_info = {}
-            active_selected_counts = {}
+            active_selected_counts = {
+                str(potfile.get("id", f"potfile{idx}")): int(len(active_selected_by_potfile[idx]))
+                for idx, potfile in enumerate(potfiles)
+                if idx < len(active_selected_by_potfile) and len(active_selected_by_potfile[idx]) > 0
+            }
             _log(
                 args,
-                "[input] perturbation_discovery_independent_candidates={} total=0 source=stage0-full-flat",
+                (
+                    "[input] perturbation_discovery_independent_candidates="
+                    f"{json.dumps(active_selected_counts, sort_keys=True)} "
+                    f"total={int(sum(len(values) for values in active_selected_by_potfile))} "
+                    "source=stage0-all-free-full-flat"
+                ),
             )
         if active_selected_counts:
             _log(

@@ -132,6 +132,19 @@ NUMPYRO_MODEL_ROLE_PRIORITY = (
     "large",
     "other",
 )
+
+
+def _log10_dpie_mass_msun(v_disp: Any, cut_radius_kpc: Any) -> np.ndarray:
+    v_disp_array = np.asarray(v_disp, dtype=float)
+    cut_array = np.asarray(cut_radius_kpc, dtype=float)
+    mass = (
+        math.pi
+        * np.square(v_disp_array)
+        * np.maximum(cut_array, 0.0)
+        / DPiE_MASS_GRAVITATIONAL_CONSTANT_KPC_KMS2_PER_MSUN
+    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(mass > 0.0, np.log10(mass), np.nan)
 NUMPYRO_MODEL_ROLE_STYLE = {
     "critical_arc_hyperparameter": {
         "title": "Critical-arc gate",
@@ -2418,6 +2431,19 @@ def _scaling_relation_summary_table(
         "catalog_mag",
         "catalog_color",
         "luminosity_ratio",
+        "anchor_mag",
+        "alpha_sigma_median",
+        "alpha_sigma_p16",
+        "alpha_sigma_p84",
+        "alpha_sigma_map",
+        "beta_radius_median",
+        "beta_radius_p16",
+        "beta_radius_p84",
+        "beta_radius_map",
+        "gamma_ml_median",
+        "gamma_ml_p16",
+        "gamma_ml_p84",
+        "gamma_ml_map",
         "selected_active",
         "selected_independent",
         "scaling_relation_class",
@@ -2433,6 +2459,10 @@ def _scaling_relation_summary_table(
         "scaling_cut_radius_kpc_p16",
         "scaling_cut_radius_kpc_p84",
         "scaling_cut_radius_kpc_map",
+        "scaling_log10_mass_msun_median",
+        "scaling_log10_mass_msun_p16",
+        "scaling_log10_mass_msun_p84",
+        "scaling_log10_mass_msun_map",
         "free_v_disp_median",
         "free_v_disp_p16",
         "free_v_disp_p84",
@@ -2445,6 +2475,10 @@ def _scaling_relation_summary_table(
         "free_cut_radius_kpc_p16",
         "free_cut_radius_kpc_p84",
         "free_cut_radius_kpc_map",
+        "free_log10_mass_msun_median",
+        "free_log10_mass_msun_p16",
+        "free_log10_mass_msun_p84",
+        "free_log10_mass_msun_map",
     ]
     sample_array = np.asarray(samples, dtype=float)
     best_fit_array = np.asarray(best_fit, dtype=float).reshape(-1)
@@ -2532,27 +2566,40 @@ def _scaling_relation_summary_table(
         cut_ref = _values(cut_ref_base, cut_ref_indices, component_index)
         core_ref = _values(core_ref_base, core_ref_indices, component_index)
         alpha_sigma, beta_radius, alpha_sigma_map, beta_radius_map = _effective_exponents(component_index)
+        gamma_values = _values(gamma_ml_base, gamma_ml_indices, component_index)
+        gamma_map = _map_value(gamma_ml_base, gamma_ml_indices, component_index)
         lum = float(luminosity_ratio[component_index])
         size_luminosity_scale = np.power(lum, beta_radius)
         scaling_v_disp = sigma_ref * np.power(lum, alpha_sigma)
         scaling_core = core_ref * size_luminosity_scale
         scaling_cut = cut_ref * size_luminosity_scale
+        scaling_log10_mass = _log10_dpie_mass_msun(scaling_v_disp, scaling_cut)
         sigma_ref_map = _map_value(sigma_ref_base, sigma_ref_indices, component_index)
         cut_ref_map = _map_value(cut_ref_base, cut_ref_indices, component_index)
         core_ref_map = _map_value(core_ref_base, core_ref_indices, component_index)
+        catalog_mag = float(getattr(row, "catalog_mag", np.nan))
+        anchor_mag = (
+            catalog_mag + 2.5 * math.log10(lum)
+            if np.isfinite(catalog_mag) and np.isfinite(lum) and lum > 0.0
+            else float("nan")
+        )
         row_dict: dict[str, Any] = {
             "potfile_id": str(getattr(row, "potfile_id", "")),
             "catalog_id": str(getattr(row, "catalog_id", "")),
             "rank": int(getattr(row, "rank", -1)),
             "component_index": component_index,
             "free_component_index": int(getattr(row, "free_component_index", -1)),
-            "catalog_mag": float(getattr(row, "catalog_mag", np.nan)),
+            "catalog_mag": catalog_mag,
             "catalog_color": float(getattr(row, "catalog_color", np.nan)),
             "luminosity_ratio": lum,
+            "anchor_mag": anchor_mag,
             "selected_active": selected_active,
             "selected_independent": selected_independent,
             "scaling_relation_class": relation_class,
         }
+        _add_summary(row_dict, "alpha_sigma", alpha_sigma, alpha_sigma_map)
+        _add_summary(row_dict, "beta_radius", beta_radius, beta_radius_map)
+        _add_summary(row_dict, "gamma_ml", gamma_values, gamma_map)
         _add_summary(
             row_dict,
             "scaling_v_disp",
@@ -2566,6 +2613,17 @@ def _scaling_relation_summary_table(
             "scaling_cut_radius_kpc",
             scaling_cut,
             cut_ref_map * size_luminosity_scale_map,
+        )
+        _add_summary(
+            row_dict,
+            "scaling_log10_mass_msun",
+            scaling_log10_mass,
+            float(
+                _log10_dpie_mass_msun(
+                    sigma_ref_map * float(np.power(lum, alpha_sigma_map)),
+                    cut_ref_map * size_luminosity_scale_map,
+                )
+            ),
         )
         rows.append(row_dict)
     if not rows:
@@ -2584,6 +2642,10 @@ def _scaling_relation_summary_table(
         "free_cut_radius_kpc_p16",
         "free_cut_radius_kpc_p84",
         "free_cut_radius_kpc_map",
+        "free_log10_mass_msun_median",
+        "free_log10_mass_msun_p16",
+        "free_log10_mass_msun_p84",
+        "free_log10_mass_msun_map",
     ]
     for column in free_columns:
         result[column] = np.nan
@@ -2601,6 +2663,17 @@ def _scaling_relation_summary_table(
             for column in free_columns:
                 if column not in result:
                     result[column] = np.nan
+    for suffix in ("median", "p16", "p84", "map"):
+        mass_column = f"free_log10_mass_msun_{suffix}"
+        if mass_column in result and np.isfinite(pd.to_numeric(result[mass_column], errors="coerce")).any():
+            continue
+        v_column = f"free_v_disp_{suffix}"
+        cut_column = f"free_cut_radius_kpc_{suffix}"
+        if v_column in result and cut_column in result:
+            result[mass_column] = _log10_dpie_mass_msun(
+                pd.to_numeric(result[v_column], errors="coerce").to_numpy(dtype=float),
+                pd.to_numeric(result[cut_column], errors="coerce").to_numpy(dtype=float),
+            )
     return result.reindex(columns=columns).sort_values(["potfile_id", "rank"]).reset_index(drop=True)
 
 
@@ -5617,19 +5690,22 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
     finite_catalog_color = df["catalog_color"].to_numpy(dtype=float)
     finite_catalog_color = finite_catalog_color[np.isfinite(finite_catalog_color)]
     if finite_catalog_color.size:
-        color_min = float(np.nanmin(finite_catalog_color))
-        color_max = float(np.nanmax(finite_catalog_color))
+        color_min, color_max = (
+            float(value)
+            for value in np.nanpercentile(finite_catalog_color, [5.0, 95.0])
+        )
         if color_min == color_max:
             color_min -= 0.5
             color_max += 0.5
     else:
         color_min, color_max = 0.0, 1.0
-    catalog_color_norm = Normalize(vmin=color_min, vmax=color_max)
-    catalog_color_cmap = plt.get_cmap("RdYlBu_r")
+    catalog_color_norm = Normalize(vmin=color_min, vmax=color_max, clip=True)
+    catalog_color_cmap = plt.get_cmap("coolwarm")
     fields = [
         ("v_disp", "velocity dispersion [km/s]"),
         ("core_radius_kpc", "core radius [kpc]"),
         ("cut_radius_kpc", "cut radius [kpc]"),
+        ("log10_mass_msun", "log10 mass [Msun]"),
     ]
     potfile_ids = df["potfile_id"].drop_duplicates().tolist()
     fig, axes = plt.subplots(
@@ -5755,11 +5831,40 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
             curve_x = pd.to_numeric(curve_df.get("catalog_mag"), errors="coerce").to_numpy(dtype=float)
             positive = np.isfinite(curve_x) & np.isfinite(curve_y) & (curve_y > 0.0)
             if np.sum(positive) >= 2 and float(np.nanmin(curve_x[positive])) < float(np.nanmax(curve_x[positive])):
-                coeff = np.polyfit(curve_x[positive], np.log(curve_y[positive]), deg=1)
                 grid = np.linspace(float(np.nanmin(curve_x[positive])), float(np.nanmax(curve_x[positive])), 160)
-                ax.plot(grid, np.exp(coeff[0] * grid + coeff[1]), color="black", linewidth=1.2, label="scaling relation")
+                if field == "log10_mass_msun":
+                    coeff = np.polyfit(curve_x[positive], curve_y[positive], deg=1)
+                    ax.plot(grid, coeff[0] * grid + coeff[1], color="black", linewidth=1.2, label="scaling relation")
+                else:
+                    coeff = np.polyfit(curve_x[positive], np.log(curve_y[positive]), deg=1)
+                    ax.plot(grid, np.exp(coeff[0] * grid + coeff[1]), color="black", linewidth=1.2, label="scaling relation")
+            if field == "log10_mass_msun":
+                pot_mag = pd.to_numeric(pot_df.get("catalog_mag"), errors="coerce").to_numpy(dtype=float)
+                anchor_values = pd.to_numeric(pot_df.get("anchor_mag"), errors="coerce").to_numpy(dtype=float)
+                lum_values = pd.to_numeric(pot_df.get("luminosity_ratio"), errors="coerce").to_numpy(dtype=float)
+                mass_values = pd.to_numeric(pot_df.get(y_column), errors="coerce").to_numpy(dtype=float)
+                finite_constant = (
+                    np.isfinite(pot_mag)
+                    & np.isfinite(anchor_values)
+                    & np.isfinite(lum_values)
+                    & (lum_values > 0.0)
+                    & np.isfinite(mass_values)
+                )
+                if np.sum(finite_constant) >= 2 and np.sum(positive) >= 2:
+                    anchor_mag = float(np.nanmedian(anchor_values[finite_constant]))
+                    mass_star = float(np.nanmedian(mass_values[finite_constant] - np.log10(lum_values[finite_constant])))
+                    grid = np.linspace(float(np.nanmin(curve_x[positive])), float(np.nanmax(curve_x[positive])), 160)
+                    constant_ml = mass_star - 0.4 * (grid - anchor_mag)
+                    ax.plot(
+                        grid,
+                        constant_ml,
+                        color="0.35",
+                        linewidth=1.0,
+                        linestyle="--",
+                        label="constant M/L",
+                    )
             finite_y = pd.to_numeric(pot_df.get(y_column), errors="coerce").to_numpy(dtype=float)
-            if np.any(np.isfinite(finite_y) & (finite_y > 0.0)):
+            if field != "log10_mass_msun" and np.any(np.isfinite(finite_y) & (finite_y > 0.0)):
                 ax.set_yscale("log")
             ax.invert_xaxis()
             ax.set_xlabel("catalog magnitude")
@@ -5767,6 +5872,37 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
             ax.set_title(f"{potfile_id}: {ylabel}")
             ax.grid(True, color="0.90", linewidth=0.6)
             if col_idx == 0:
+                slope_lines: list[str] = []
+                for label, column in (
+                    ("alpha_sigma", "alpha_sigma_median"),
+                    ("beta_radius", "beta_radius_median"),
+                    ("gamma_ml", "gamma_ml_median"),
+                ):
+                    values = pd.to_numeric(pot_df.get(column), errors="coerce").to_numpy(dtype=float)
+                    values = values[np.isfinite(values)]
+                    if values.size:
+                        slope_lines.append(f"{label}: {float(np.nanmedian(values)):.3g}")
+                values = pd.to_numeric(pot_df.get("gamma_ml_median"), errors="coerce").to_numpy(dtype=float)
+                values = values[np.isfinite(values)]
+                if values.size:
+                    mass_slope = 1.0 + float(np.nanmedian(values))
+                    slope_lines.append(f"dlogM/dlogL: {mass_slope:.3g}")
+                slope_lines.append("constant M/L: gamma_ml = 0, dlogM/dlogL = 1")
+                ax.text(
+                    0.02,
+                    0.96,
+                    "\n".join(slope_lines),
+                    transform=ax.transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=7,
+                    bbox={
+                        "boxstyle": "round,pad=0.25",
+                        "facecolor": "white",
+                        "edgecolor": "0.65",
+                        "alpha": 0.88,
+                    },
+                )
                 ax.text(
                     0.98,
                     0.04,

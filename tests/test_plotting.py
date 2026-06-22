@@ -316,14 +316,29 @@ def test_scaling_relation_summary_table_preserves_classes_and_free_branch() -> N
     assert np.isfinite(table["scaling_v_disp_median"].to_numpy(dtype=float)).all()
     assert np.isfinite(table["scaling_core_radius_kpc_median"].to_numpy(dtype=float)).all()
     assert np.isfinite(table["scaling_cut_radius_kpc_median"].to_numpy(dtype=float)).all()
+    assert np.isfinite(table["scaling_log10_mass_msun_median"].to_numpy(dtype=float)).all()
+    assert np.isfinite(table["alpha_sigma_median"].to_numpy(dtype=float)).all()
+    assert np.isfinite(table["beta_radius_median"].to_numpy(dtype=float)).all()
+    assert np.isfinite(table["gamma_ml_median"].to_numpy(dtype=float)).all()
     core_by_id = table.set_index("catalog_id")["scaling_core_radius_kpc_median"].to_dict()
     assert core_by_id["inactive"] == pytest.approx(0.95)
     assert core_by_id["active"] == pytest.approx(1.9)
     assert core_by_id["free"] == pytest.approx(3.8)
+    active_mass = table.set_index("catalog_id").loc["active", "scaling_log10_mass_msun_median"]
+    _mass_p16, expected_active_mass, _mass_p84 = plotting._weighted_quantile(
+        plotting._log10_dpie_mass_msun(samples[:, 0], samples[:, 1]),
+        np.ones(samples.shape[0], dtype=float) / samples.shape[0],
+        [0.16, 0.5, 0.84],
+    )
+    assert active_mass == pytest.approx(expected_active_mass)
     free_row = table[table["catalog_id"] == "free"].iloc[0]
     assert free_row["free_v_disp_median"] == pytest.approx(420.0)
     assert free_row["free_core_radius_kpc_median"] == pytest.approx(3.5)
     assert free_row["free_cut_radius_kpc_median"] == pytest.approx(80.0)
+    expected_free_mass = math.log10(
+        math.pi * 420.0**2 * 80.0 / plotting.DPiE_MASS_GRAVITATIONAL_CONSTANT_KPC_KMS2_PER_MSUN
+    )
+    assert free_row["free_log10_mass_msun_median"] == pytest.approx(expected_free_mass)
 
 
 def test_scaling_relation_summary_plot_writes_pdf(tmp_path: Path) -> None:
@@ -335,6 +350,11 @@ def test_scaling_relation_summary_plot_writes_pdf(tmp_path: Path) -> None:
             "component_index": [0, 1, 2],
             "catalog_mag": [21.0, 20.0, 19.0],
             "catalog_color": [0.8, 1.0, 1.2],
+            "luminosity_ratio": [0.4, 1.0, 2.5],
+            "anchor_mag": [20.0, 20.0, 20.0],
+            "alpha_sigma_median": [0.25, 0.25, 0.25],
+            "beta_radius_median": [0.5, 0.5, 0.5],
+            "gamma_ml_median": [0.0, 0.0, 0.0],
             "scaling_relation_class": ["inactive", "active", "free"],
             "scaling_v_disp_median": [210.0, 300.0, 420.0],
             "scaling_v_disp_p16": [190.0, 280.0, 390.0],
@@ -345,6 +365,9 @@ def test_scaling_relation_summary_plot_writes_pdf(tmp_path: Path) -> None:
             "scaling_cut_radius_kpc_median": [25.0, 50.0, 100.0],
             "scaling_cut_radius_kpc_p16": [22.0, 45.0, 90.0],
             "scaling_cut_radius_kpc_p84": [28.0, 55.0, 110.0],
+            "scaling_log10_mass_msun_median": [11.2, 12.0, 12.8],
+            "scaling_log10_mass_msun_p16": [11.1, 11.9, 12.7],
+            "scaling_log10_mass_msun_p84": [11.3, 12.1, 12.9],
             "free_v_disp_median": [np.nan, np.nan, 500.0],
             "free_v_disp_p16": [np.nan, np.nan, 470.0],
             "free_v_disp_p84": [np.nan, np.nan, 530.0],
@@ -354,6 +377,9 @@ def test_scaling_relation_summary_plot_writes_pdf(tmp_path: Path) -> None:
             "free_cut_radius_kpc_median": [np.nan, np.nan, 120.0],
             "free_cut_radius_kpc_p16": [np.nan, np.nan, 105.0],
             "free_cut_radius_kpc_p84": [np.nan, np.nan, 135.0],
+            "free_log10_mass_msun_median": [np.nan, np.nan, 13.0],
+            "free_log10_mass_msun_p16": [np.nan, np.nan, 12.9],
+            "free_log10_mass_msun_p84": [np.nan, np.nan, 13.1],
         }
     )
 
@@ -372,6 +398,11 @@ def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest
             "component_index": [0, 1, 2, 3],
             "catalog_mag": [22.0, 21.0, 20.0, 19.0],
             "catalog_color": [0.6, 0.8, 1.0, 1.2],
+            "luminosity_ratio": [0.16, 0.4, 1.0, 2.5],
+            "anchor_mag": [20.0, 20.0, 20.0, 20.0],
+            "alpha_sigma_median": [0.24, 0.24, 0.24, 0.24],
+            "beta_radius_median": [0.52, 0.52, 0.52, 0.52],
+            "gamma_ml_median": [0.0, 0.0, 0.0, 0.0],
             "scaling_relation_class": ["inactive", "inactive", "active", "free"],
             "scaling_v_disp_median": [150.0, 210.0, 300.0, 420.0],
             "scaling_v_disp_p16": [140.0, 190.0, 280.0, 390.0],
@@ -382,6 +413,9 @@ def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest
             "scaling_cut_radius_kpc_median": [18.0, 25.0, 50.0, 100.0],
             "scaling_cut_radius_kpc_p16": [16.0, 22.0, 45.0, 90.0],
             "scaling_cut_radius_kpc_p84": [20.0, 28.0, 55.0, 110.0],
+            "scaling_log10_mass_msun_median": [11.0, 11.4, 12.0, 12.8],
+            "scaling_log10_mass_msun_p16": [10.9, 11.3, 11.9, 12.7],
+            "scaling_log10_mass_msun_p84": [11.1, 11.5, 12.1, 12.9],
             "free_v_disp_median": [np.nan, np.nan, np.nan, 500.0],
             "free_v_disp_p16": [np.nan, np.nan, np.nan, 470.0],
             "free_v_disp_p84": [np.nan, np.nan, np.nan, 530.0],
@@ -391,12 +425,16 @@ def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest
             "free_cut_radius_kpc_median": [np.nan, np.nan, np.nan, 120.0],
             "free_cut_radius_kpc_p16": [np.nan, np.nan, np.nan, 105.0],
             "free_cut_radius_kpc_p84": [np.nan, np.nan, np.nan, 135.0],
+            "free_log10_mass_msun_median": [np.nan, np.nan, np.nan, 13.0],
+            "free_log10_mass_msun_p16": [np.nan, np.nan, np.nan, 12.9],
+            "free_log10_mass_msun_p84": [np.nan, np.nan, np.nan, 13.1],
         }
     )
     labels: list[str] = []
     text_values: list[str] = []
     errorbar_colors: list[Any] = []
     colorbar_labels: list[str] = []
+    colorbar_cmaps: list[str] = []
 
     class FakeAxis:
         def errorbar(self, *_args: Any, **kwargs: Any) -> None:
@@ -435,7 +473,10 @@ def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest
             return object()
 
     class FakeFigure:
-        def colorbar(self, *_args: Any, **_kwargs: Any) -> Any:
+        def colorbar(self, *args: Any, **_kwargs: Any) -> Any:
+            if args:
+                colorbar_cmaps.append(str(getattr(getattr(args[0], "cmap", None), "name", "")))
+
             class FakeColorbar:
                 def set_label(self, label: str) -> None:
                     colorbar_labels.append(label)
@@ -445,7 +486,7 @@ def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest
         def savefig(self, path: Path, *_args: Any, **_kwargs: Any) -> None:
             path.write_bytes(b"%PDF-1.4\n")
 
-    fake_axes = np.asarray([[FakeAxis(), FakeAxis(), FakeAxis()]], dtype=object)
+    fake_axes = np.asarray([[FakeAxis(), FakeAxis(), FakeAxis(), FakeAxis()]], dtype=object)
     monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: (FakeFigure(), fake_axes))
     monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
 
@@ -455,13 +496,16 @@ def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest
     assert "active exact" in labels
     assert "free branch" in labels
     assert "scaling relation" in labels
+    assert "constant M/L" in labels
     assert "free candidate, scaling branch" not in labels
     assert "tab:orange" not in errorbar_colors
     assert "tab:red" not in errorbar_colors
     assert "0.60" not in errorbar_colors
     assert any(isinstance(color, tuple) and len(color) == 4 for color in errorbar_colors)
     assert colorbar_labels == ["catalog color (F606W - F814W)"]
-    assert text_values == ["total: 4\ninactive: 2\nactive not free: 1\nfree: 1"]
+    assert colorbar_cmaps == ["coolwarm"]
+    assert any("alpha_sigma" in value and "constant M/L" in value for value in text_values)
+    assert "total: 4\ninactive: 2\nactive not free: 1\nfree: 1" in text_values
 
 
 def test_image_catalog_family_cutout_stage_eligibility(tmp_path: Path) -> None:
