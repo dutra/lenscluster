@@ -5479,22 +5479,56 @@ def _plot_perturbation_discovery_diagnostics(plot_dir: Path, diagnostics_df: pd.
     selected_pairs = int(df["selected_pair"].sum())
     total_candidates = int(galaxy_df["component_index"].nunique())
 
-    fig, axes = plt.subplots(1, 3, figsize=(17.5, 5.2), constrained_layout=True)
+    fig, axes = plt.subplots(2, 3, figsize=(18.5, 9.2), constrained_layout=True)
+    axes_flat = axes.ravel()
     selected_color = "#d62728"
     unselected_color = "#6f7782"
 
+    def draw_score_boundary(ax: Any, *, xmax: float | None = None) -> None:
+        x_limit = float(xmax) if xmax is not None and np.isfinite(float(xmax)) and float(xmax) > 0.0 else threshold
+        x_limit = max(x_limit, threshold)
+        curve_alpha = np.linspace(0.0, x_limit, 300)
+        if np.isfinite(jacobian_weight) and jacobian_weight > 0.0:
+            valid = curve_alpha <= threshold
+            if np.any(valid):
+                curve_jac = np.sqrt(np.maximum(threshold**2 - curve_alpha[valid] ** 2, 0.0) / jacobian_weight)
+                ax.plot(curve_alpha[valid], curve_jac, color="black", linestyle="--", linewidth=1.0, label="score = 1")
+        else:
+            ax.axvline(threshold, color="black", linestyle="--", linewidth=1.0, label="score = 1")
+
+    def finite_positive_floor(values: np.ndarray) -> float:
+        finite = values[np.isfinite(values) & (values > 0.0)]
+        if finite.size == 0:
+            return 1.0e-3
+        return max(float(np.nanmin(finite)) * 0.5, 1.0e-6)
+
+    def fraction_spans_decade(values: np.ndarray) -> bool:
+        finite = values[np.isfinite(values) & (values > 0.0)]
+        if finite.size < 2:
+            return False
+        return float(np.nanmax(finite)) / max(float(np.nanmin(finite)), 1.0e-12) > 10.0
+
     x = np.arange(len(galaxy_df), dtype=int)
     colors = np.where(galaxy_df["selected_galaxy"].to_numpy(dtype=bool), selected_color, unselected_color)
-    axes[0].scatter(x, galaxy_df["score"], c=colors, s=26, linewidth=0.0)
-    axes[0].axhline(threshold, color="black", linestyle="--", linewidth=1.0, label="threshold score")
-    axes[0].set_yscale("log")
-    axes[0].set_xlabel("galaxies sorted by max score")
-    axes[0].set_ylabel("max image-galaxy score")
-    axes[0].set_title("selection threshold")
-    axes[0].legend(loc="best", fontsize=8)
+    axes_flat[0].scatter(x, galaxy_df["score"], c=colors, s=26, linewidth=0.0)
+    axes_flat[0].axhline(threshold, color="black", linestyle="--", linewidth=1.0, label="score = 1")
+    axes_flat[0].set_yscale("log")
+    axes_flat[0].set_xlabel("galaxies sorted by max score")
+    axes_flat[0].set_ylabel("max image-galaxy score")
+    axes_flat[0].set_title("selection threshold")
+    axes_flat[0].legend(loc="best", fontsize=8)
+
+    axes_flat[1].plot(x, galaxy_df["alpha_norm"], color="#4c78a8", linewidth=1.2, label="alpha fraction")
+    axes_flat[1].plot(x, galaxy_df["jacobian_norm"], color="#f58518", linewidth=1.2, label="Jacobian fraction")
+    axes_flat[1].axhline(threshold, color="black", linestyle="--", linewidth=1.0, label="unit tolerance")
+    axes_flat[1].set_yscale("log")
+    axes_flat[1].set_xlabel("galaxies sorted by max score")
+    axes_flat[1].set_ylabel("fraction of tolerance")
+    axes_flat[1].set_title("worst-image fractions")
+    axes_flat[1].legend(loc="best", fontsize=8)
 
     selected_mask = galaxy_df["selected_galaxy"].to_numpy(dtype=bool)
-    axes[1].scatter(
+    axes_flat[2].scatter(
         galaxy_df.loc[~selected_mask, "alpha_norm"],
         galaxy_df.loc[~selected_mask, "jacobian_norm"],
         color=unselected_color,
@@ -5502,7 +5536,7 @@ def _plot_perturbation_discovery_diagnostics(plot_dir: Path, diagnostics_df: pd.
         alpha=0.65,
         label="not selected",
     )
-    axes[1].scatter(
+    axes_flat[2].scatter(
         galaxy_df.loc[selected_mask, "alpha_norm"],
         galaxy_df.loc[selected_mask, "jacobian_norm"],
         color=selected_color,
@@ -5512,29 +5546,57 @@ def _plot_perturbation_discovery_diagnostics(plot_dir: Path, diagnostics_df: pd.
         alpha=0.9,
         label="selected",
     )
-    curve_alpha = np.linspace(0.0, threshold, 200)
-    if np.isfinite(jacobian_weight) and jacobian_weight > 0.0:
-        curve_jac = np.sqrt(np.maximum(threshold**2 - curve_alpha**2, 0.0) / jacobian_weight)
-        axes[1].plot(curve_alpha, curve_jac, color="black", linestyle="--", linewidth=1.0, label="score = 1")
+    draw_score_boundary(axes_flat[2], xmax=float(np.nanmax(galaxy_df["alpha_norm"])) if len(galaxy_df) else threshold)
+    axes_flat[2].set_xlabel("alpha fraction = |alpha| / alpha_tol")
+    axes_flat[2].set_ylabel("Jacobian fraction = ||Delta A||_F / jacobian_tol")
+    axes_flat[2].set_title("worst image per galaxy")
+    axes_flat[2].legend(loc="best", fontsize=8)
+
+    alpha_all = np.asarray(df["alpha_norm"], dtype=float)
+    jac_all = np.asarray(df["jacobian_norm"], dtype=float)
+    heatmap_mask = np.isfinite(alpha_all) & np.isfinite(jac_all)
+    alpha_heat = np.maximum(alpha_all[heatmap_mask], finite_positive_floor(alpha_all))
+    jac_heat = np.maximum(jac_all[heatmap_mask], finite_positive_floor(jac_all))
+    if alpha_heat.size and jac_heat.size:
+        use_log_x = fraction_spans_decade(alpha_heat)
+        use_log_y = fraction_spans_decade(jac_heat)
+        x_max = max(float(np.nanmax(alpha_heat)) * 1.05, threshold * 1.05)
+        y_max = max(float(np.nanmax(jac_heat)) * 1.05, threshold * 1.05)
+        x_min = finite_positive_floor(alpha_heat) if use_log_x else 0.0
+        y_min = finite_positive_floor(jac_heat) if use_log_y else 0.0
+        x_bins = np.geomspace(x_min, x_max, 48) if use_log_x else np.linspace(x_min, x_max, 48)
+        y_bins = np.geomspace(y_min, y_max, 48) if use_log_y else np.linspace(y_min, y_max, 48)
+        hist = axes_flat[3].hist2d(
+            alpha_heat,
+            jac_heat,
+            bins=(x_bins, y_bins),
+            cmap="magma",
+            norm=LogNorm(),
+        )
+        fig.colorbar(hist[3], ax=axes_flat[3], label="image-galaxy pairs")
+        if use_log_x:
+            axes_flat[3].set_xscale("log")
+        if use_log_y:
+            axes_flat[3].set_yscale("log")
+        draw_score_boundary(axes_flat[3], xmax=x_max)
     else:
-        axes[1].axvline(threshold, color="black", linestyle="--", linewidth=1.0, label="score = 1")
-    axes[1].set_xlabel(r"$|\alpha| / \alpha_{\rm tol}$")
-    axes[1].set_ylabel(r"$||\Delta A||_F / J_{\rm tol}$")
-    axes[1].set_title("worst image per galaxy")
-    axes[1].legend(loc="best", fontsize=8)
+        axes_flat[3].text(0.5, 0.5, "No finite alpha/Jacobian fractions", ha="center", va="center")
+    axes_flat[3].set_xlabel("alpha fraction = |alpha| / alpha_tol")
+    axes_flat[3].set_ylabel("Jacobian fraction = ||Delta A||_F / jacobian_tol")
+    axes_flat[3].set_title("all image-galaxy pairs")
 
     image_x = np.arange(len(image_df), dtype=int)
-    axes[2].bar(image_x, image_df["selected_pairs"].to_numpy(dtype=float), color="#4c78a8", alpha=0.85)
-    axes[2].set_xlabel("image")
-    axes[2].set_ylabel("selected galaxy pairs")
-    axes[2].set_title("selected pairs by image")
+    axes_flat[4].bar(image_x, image_df["selected_pairs"].to_numpy(dtype=float), color="#4c78a8", alpha=0.85)
+    axes_flat[4].set_xlabel("image")
+    axes_flat[4].set_ylabel("selected galaxy pairs")
+    axes_flat[4].set_title("selected pairs by image")
     if len(image_df) <= 24:
         labels = [
             f"{row.family_id}:{row.image_label}" if str(row.family_id) else str(row.image_index)
             for row in image_df.itertuples(index=False)
         ]
-        axes[2].set_xticks(image_x)
-        axes[2].set_xticklabels(labels, rotation=60, ha="right", fontsize=7)
+        axes_flat[4].set_xticks(image_x)
+        axes_flat[4].set_xticklabels(labels, rotation=60, ha="right", fontsize=7)
 
     annotation = (
         f"alpha_tol = {alpha_tol:.4g} arcsec\n"
@@ -5544,14 +5606,15 @@ def _plot_perturbation_discovery_diagnostics(plot_dir: Path, diagnostics_df: pd.
         f"selected galaxies = {selected_galaxies}\n"
         f"selected pairs = {selected_pairs}"
     )
-    axes[0].text(
+    axes_flat[5].axis("off")
+    axes_flat[5].text(
         0.02,
         0.98,
         annotation,
-        transform=axes[0].transAxes,
+        transform=axes_flat[5].transAxes,
         va="top",
         ha="left",
-        fontsize=8,
+        fontsize=10,
         bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "0.6", "alpha": 0.92},
     )
     fig.suptitle("Perturbation discovery diagnostics", fontsize=14)

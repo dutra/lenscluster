@@ -392,32 +392,96 @@ def test_scaling_relation_summary_plot_writes_pdf(tmp_path: Path) -> None:
 def test_perturbation_discovery_diagnostics_plot_writes_pdf(tmp_path: Path) -> None:
     diagnostics_df = pd.DataFrame(
         {
-            "potfile_id": ["members", "members", "members", "members"],
-            "potfile_order": [0, 0, 0, 0],
-            "catalog_id": ["g1", "g1", "g2", "g2"],
-            "catalog_row_index": [0, 0, 1, 1],
-            "component_index": [10, 10, 11, 11],
-            "image_index": [0, 1, 0, 1],
-            "family_id": ["1", "1", "1", "1"],
-            "image_label": ["a", "b", "a", "b"],
-            "alpha_x_arcsec": [0.2, 0.0, 0.05, 0.0],
-            "alpha_y_arcsec": [0.0, 0.0, 0.0, 0.0],
-            "alpha_arcsec": [0.2, 0.0, 0.05, 0.0],
-            "jacobian_frobenius": [0.0, 0.6, 0.0, 0.0],
-            "alpha_tol_arcsec": [0.1, 0.1, 0.1, 0.1],
-            "jacobian_tol": [0.5, 0.5, 0.5, 0.5],
-            "jacobian_weight": [1.0, 1.0, 1.0, 1.0],
-            "alpha_norm": [2.0, 0.0, 0.5, 0.0],
-            "jacobian_norm": [0.0, 1.2, 0.0, 0.0],
-            "score": [2.0, 1.2, 0.5, 0.0],
-            "threshold_score": [1.0, 1.0, 1.0, 1.0],
-            "selected_pair": [True, True, False, False],
-            "selected_galaxy": [True, True, False, False],
+            "potfile_id": ["members"] * 6,
+            "potfile_order": [0] * 6,
+            "catalog_id": ["g1", "g1", "g2", "g2", "g3", "g3"],
+            "catalog_row_index": [0, 0, 1, 1, 2, 2],
+            "component_index": [10, 10, 11, 11, 12, 12],
+            "image_index": [0, 1, 0, 1, 0, 1],
+            "family_id": ["1"] * 6,
+            "image_label": ["a", "b", "a", "b", "a", "b"],
+            "alpha_x_arcsec": [0.2, 0.0, 0.05, 0.0, 0.004, 0.0],
+            "alpha_y_arcsec": [0.0] * 6,
+            "alpha_arcsec": [0.2, 0.0, 0.05, 0.0, 0.004, 0.0],
+            "jacobian_frobenius": [0.0, 0.6, 0.0, 0.0, 0.0, 0.02],
+            "alpha_tol_arcsec": [0.1] * 6,
+            "jacobian_tol": [0.5] * 6,
+            "jacobian_weight": [1.0] * 6,
+            "alpha_norm": [2.0, 0.0, 0.5, 0.0, 0.04, 0.0],
+            "jacobian_norm": [0.0, 1.2, 0.0, 0.0, 0.0, 0.04],
+            "score": [2.0, 1.2, 0.5, 0.0, 0.04, 0.04],
+            "threshold_score": [1.0] * 6,
+            "selected_pair": [True, True, False, False, False, False],
+            "selected_galaxy": [True, True, False, False, False, False],
         }
     )
 
     plotting._plot_perturbation_discovery_diagnostics(tmp_path, diagnostics_df)
 
+    assert plotting._plot_path(tmp_path, "perturbation_discovery_diagnostics.pdf").is_file()
+
+
+def test_perturbation_discovery_diagnostics_plot_fraction_labels_and_heatmap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    diagnostics_df = pd.DataFrame(
+        {
+            "potfile_id": ["members"] * 4,
+            "potfile_order": [0] * 4,
+            "catalog_id": ["g1", "g1", "g2", "g2"],
+            "catalog_row_index": [0, 0, 1, 1],
+            "component_index": [10, 10, 11, 11],
+            "image_index": [0, 1, 0, 1],
+            "family_id": ["1"] * 4,
+            "image_label": ["a", "b", "a", "b"],
+            "score": [2.0, 0.2, 0.5, 0.05],
+            "alpha_norm": [2.0, 0.2, 0.5, 0.05],
+            "jacobian_norm": [0.1, 1.2, 0.05, 0.04],
+            "selected_pair": [True, True, False, False],
+            "selected_galaxy": [True, True, False, False],
+            "alpha_tol_arcsec": [0.1] * 4,
+            "jacobian_tol": [0.5] * 4,
+            "jacobian_weight": [1.0] * 4,
+            "threshold_score": [1.0] * 4,
+        }
+    )
+    labels: list[str] = []
+    plot_labels: list[str] = []
+    hist2d_calls: list[int] = []
+    original_set_xlabel = plotting.plt.Axes.set_xlabel
+    original_set_ylabel = plotting.plt.Axes.set_ylabel
+    original_plot = plotting.plt.Axes.plot
+    original_hist2d = plotting.plt.Axes.hist2d
+
+    def spy_set_xlabel(self, xlabel, *args, **kwargs):
+        labels.append(str(xlabel))
+        return original_set_xlabel(self, xlabel, *args, **kwargs)
+
+    def spy_set_ylabel(self, ylabel, *args, **kwargs):
+        labels.append(str(ylabel))
+        return original_set_ylabel(self, ylabel, *args, **kwargs)
+
+    def spy_plot(self, *args, **kwargs):
+        if kwargs.get("label") is not None:
+            plot_labels.append(str(kwargs["label"]))
+        return original_plot(self, *args, **kwargs)
+
+    def spy_hist2d(self, *args, **kwargs):
+        hist2d_calls.append(1)
+        return original_hist2d(self, *args, **kwargs)
+
+    monkeypatch.setattr(plotting.plt.Axes, "set_xlabel", spy_set_xlabel)
+    monkeypatch.setattr(plotting.plt.Axes, "set_ylabel", spy_set_ylabel)
+    monkeypatch.setattr(plotting.plt.Axes, "plot", spy_plot)
+    monkeypatch.setattr(plotting.plt.Axes, "hist2d", spy_hist2d)
+
+    plotting._plot_perturbation_discovery_diagnostics(tmp_path, diagnostics_df)
+
+    assert any("alpha fraction" in label for label in labels)
+    assert any("Jacobian fraction" in label for label in labels)
+    assert "score = 1" in plot_labels
+    assert hist2d_calls
     assert plotting._plot_path(tmp_path, "perturbation_discovery_diagnostics.pdf").is_file()
 
 
