@@ -109,7 +109,7 @@ from .plotting import (
     _image_catalog_effective_recovery_statuses,
     _image_catalog_point_recovered,
     _plot_potfile_corner,
-    _scaling_parameter_subset,
+    _potfile_corner_parameter_subset,
 )
 from .utils import (
     close_debug_log as _close_debug_log,
@@ -139,6 +139,7 @@ DEFAULT_MATCH_TOLERANCE = 1.5
 DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC = 0.2
 DEFAULT_EXACT_IMAGE_PRECISION_LIMIT = 1.0e-8
 DEFAULT_EXACT_IMAGE_NUM_ITER_MAX = 200
+DEFAULT_REFRESH_EVERY = 250
 JAX_DEVICE_AUTO = "auto"
 JAX_DEVICE_CPU = "cpu"
 JAX_DEVICE_GPU = "gpu"
@@ -479,14 +480,16 @@ CHIRES_COLUMNS = (
 class ValidationStageFitControls:
     fit_method: str
     svi_steps: int
+    refresh_every: int | None
     warmup: int
     samples: int
     max_tree_depth: int
 
-    def to_json(self) -> dict[str, str | int]:
+    def to_json(self) -> dict[str, str | int | None]:
         return {
             "fit_method": self.fit_method,
             "svi_steps": self.svi_steps,
+            "refresh_every": self.refresh_every,
             "warmup": self.warmup,
             "samples": self.samples,
             "max_tree_depth": self.max_tree_depth,
@@ -804,7 +807,7 @@ def _recovered_model_tables(
             _artifact_arg(artifact_args, "active_scaling_cumulative_fraction", DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION)
         ),
         active_scaling_min=int(_artifact_arg(artifact_args, "active_scaling_min", DEFAULT_ACTIVE_SCALING_MIN)),
-        refresh_every=int(_artifact_arg(artifact_args, "refresh_every", DEFAULT_REFRESH_EVERY)),
+        refresh_every=_parse_refresh_every_value(_artifact_arg(artifact_args, "refresh_every", DEFAULT_REFRESH_EVERY)),
         refresh_param_drift_frac=float(_artifact_arg(artifact_args, "refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
         source_plane_covariance_floor=float(_artifact_arg(artifact_args, "source_plane_covariance_floor", 1.0e-6)),
         source_plane_covariance_mode=str(
@@ -1444,7 +1447,7 @@ def _posterior_prediction_uncertainty_tables(
                 _artifact_arg(artifact_args, "active_scaling_cumulative_fraction", DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION)
             ),
             active_scaling_min=int(_artifact_arg(artifact_args, "active_scaling_min", DEFAULT_ACTIVE_SCALING_MIN)),
-            refresh_every=int(_artifact_arg(artifact_args, "refresh_every", DEFAULT_REFRESH_EVERY)),
+            refresh_every=_parse_refresh_every_value(_artifact_arg(artifact_args, "refresh_every", DEFAULT_REFRESH_EVERY)),
             refresh_param_drift_frac=float(_artifact_arg(artifact_args, "refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
             source_plane_covariance_floor=float(_artifact_arg(artifact_args, "source_plane_covariance_floor", 1.0e-6)),
             source_plane_covariance_mode=str(
@@ -2848,7 +2851,7 @@ def write_recovery_outputs(
         scaling_specs, scaling_samples, scaling_best_fit = run_recovery_phase(
             "scaling subset",
             "validation.recovery.scaling_subset",
-            lambda: _scaling_parameter_subset(
+            lambda: _potfile_corner_parameter_subset(
                 state.parameter_specs,
                 samples,
                 best_fit,
@@ -4935,6 +4938,23 @@ def _validation_stage_arg_values(value: Any, *, flag_name: str) -> list[Any]:
     return values
 
 
+def _parse_refresh_every_value(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lower() in {"none", "null"}:
+            return None
+        value = text
+    try:
+        cadence = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("--refresh-every values must be positive integers, 0, or None.") from exc
+    if cadence < 0:
+        raise argparse.ArgumentTypeError("--refresh-every values must be positive integers, 0, or None.")
+    return None if cadence == 0 else cadence
+
+
 def _validation_linearized_stage_enabled(args: argparse.Namespace) -> bool:
     return str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) in {
         IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
@@ -5452,6 +5472,7 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             "stage2": ValidationStageFitControls(
                 fit_method=FIT_METHOD_NS,
                 svi_steps=0,
+                refresh_every=DEFAULT_REFRESH_EVERY,
                 warmup=0,
                 samples=0,
                 max_tree_depth=int(max_tree_depths[0]),
@@ -5459,6 +5480,7 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             "stage3": ValidationStageFitControls(
                 fit_method=FIT_METHOD_NS,
                 svi_steps=0,
+                refresh_every=DEFAULT_REFRESH_EVERY,
                 warmup=0,
                 samples=0,
                 max_tree_depth=int(max_tree_depths[0]),
@@ -5466,6 +5488,7 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             "stage4": ValidationStageFitControls(
                 fit_method=FIT_METHOD_NS,
                 svi_steps=0,
+                refresh_every=DEFAULT_REFRESH_EVERY,
                 warmup=0,
                 samples=0,
                 max_tree_depth=int(max_tree_depths[0]),
@@ -5512,6 +5535,13 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             flag_name="--svi-steps",
         )
     ]
+    refresh_every_values = [
+        _parse_refresh_every_value(value)
+        for value in _validation_stage_arg_values(
+            getattr(args, "refresh_every", DEFAULT_REFRESH_EVERY),
+            flag_name="--refresh-every",
+        )
+    ]
     warmups = [
         int(value)
         for value in _validation_stage_arg_values(
@@ -5555,7 +5585,14 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     if getattr(args, "blocked_nuts_pilot_warmup", None) is not None and int(args.blocked_nuts_pilot_warmup) < 0:
         raise SystemExit("--blocked-nuts-pilot-warmup must be non-negative when provided.")
 
-    max_value_count = max(len(fit_methods), len(svi_steps), len(warmups), len(samples), len(max_tree_depths))
+    max_value_count = max(
+        len(fit_methods),
+        len(svi_steps),
+        len(refresh_every_values),
+        len(warmups),
+        len(samples),
+        len(max_tree_depths),
+    )
     has_stage_specific_values = max_value_count >= 2
     has_three_stage_values = max_value_count == 3
     has_stage3_or_stage4 = mode in {
@@ -5596,12 +5633,12 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         )
     if has_stage_specific_values and not has_stage3_or_stage4:
         raise SystemExit(
-            "Two-value --fit-method, --svi-steps, --warmup, --samples, or --max-tree-depth is only valid with "
+            "Two-value --fit-method, --svi-steps, --refresh-every, --warmup, --samples, or --max-tree-depth is only valid with "
             "an image-plane mode."
         )
     if has_three_stage_values and not has_stage4:
         raise SystemExit(
-            "Three-value --fit-method, --svi-steps, --warmup, --samples, or --max-tree-depth is only valid with "
+            "Three-value --fit-method, --svi-steps, --refresh-every, --warmup, --samples, or --max-tree-depth is only valid with "
             "a final stage-4 image-plane mode."
         )
     if float(getattr(args, "linearized_beta_prior_sigma_arcsec", DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC)) <= 0.0:
@@ -5622,6 +5659,7 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         "stage2": ValidationStageFitControls(
             fit_method=str(stage_value(fit_methods, 0)),
             svi_steps=int(stage_value(svi_steps, 0)),
+            refresh_every=stage_value(refresh_every_values, 0),
             warmup=int(stage_value(warmups, 0)),
             samples=int(stage_value(samples, 0)),
             max_tree_depth=int(stage_value(max_tree_depths, 0)),
@@ -5629,6 +5667,7 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         "stage3": ValidationStageFitControls(
             fit_method=str(stage_value(fit_methods, 1)),
             svi_steps=int(stage_value(svi_steps, 1)),
+            refresh_every=stage_value(refresh_every_values, 1),
             warmup=int(stage_value(warmups, 1)),
             samples=int(stage_value(samples, 1)),
             max_tree_depth=int(stage_value(max_tree_depths, 1)),
@@ -5636,6 +5675,7 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         "stage4": ValidationStageFitControls(
             fit_method=str(stage4_value(fit_methods)),
             svi_steps=int(stage4_value(svi_steps)),
+            refresh_every=stage4_value(refresh_every_values),
             warmup=int(stage4_value(warmups)),
             samples=int(stage4_value(samples)),
             max_tree_depth=int(stage4_value(max_tree_depths)),
@@ -5991,11 +6031,11 @@ def write_validation_results_json(
 
 def _format_stage_controls_for_log(controls: dict[str, ValidationStageFitControls]) -> str:
     return (
-        f"stage2={controls['stage2'].fit_method}/svi_steps={controls['stage2'].svi_steps}/warmup={controls['stage2'].warmup}/"
+        f"stage2={controls['stage2'].fit_method}/svi_steps={controls['stage2'].svi_steps}/refresh_every={controls['stage2'].refresh_every}/warmup={controls['stage2'].warmup}/"
         f"samples={controls['stage2'].samples}/max_tree_depth={controls['stage2'].max_tree_depth} "
-        f"stage3={controls['stage3'].fit_method}/svi_steps={controls['stage3'].svi_steps}/warmup={controls['stage3'].warmup}/"
+        f"stage3={controls['stage3'].fit_method}/svi_steps={controls['stage3'].svi_steps}/refresh_every={controls['stage3'].refresh_every}/warmup={controls['stage3'].warmup}/"
         f"samples={controls['stage3'].samples}/max_tree_depth={controls['stage3'].max_tree_depth} "
-        f"stage4={controls['stage4'].fit_method}/svi_steps={controls['stage4'].svi_steps}/warmup={controls['stage4'].warmup}/"
+        f"stage4={controls['stage4'].fit_method}/svi_steps={controls['stage4'].svi_steps}/refresh_every={controls['stage4'].refresh_every}/warmup={controls['stage4'].warmup}/"
         f"samples={controls['stage4'].samples}/max_tree_depth={controls['stage4'].max_tree_depth}"
     )
 
@@ -6260,6 +6300,7 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+        DEFAULT_REFRESH_EVERY,
     )
 
     controls = _normalize_validation_stage_fit_controls(args)
@@ -6420,6 +6461,7 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
     else:
         cmd.append("--no-mchmc-random-trajectory-length")
     _append_stage_option(cmd, "--svi-steps", args.svi_steps)
+    _append_stage_option(cmd, "--refresh-every", args.refresh_every)
     _append_stage_option(cmd, "--max-tree-depth", args.max_tree_depth)
     if getattr(args, "fix_image_sigma_int_arcsec", None) is not None:
         cmd.extend(["--fix-image-sigma-int-arcsec", str(float(args.fix_image_sigma_int_arcsec))])
@@ -6649,6 +6691,7 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         cmd.append("--exact-image-diagnostics-stage2")
     if bool(getattr(args, "exact_image_diagnostics_stage3", False)):
         cmd.append("--exact-image-diagnostics-stage3")
+    cmd.extend(["--best-value", str(getattr(args, "best_value", "map"))])
     if solver_fit_mode == SOLVER_FIT_MODE_EVIDENCE_NS:
         evidence_likelihood_mode = str(
             getattr(args, "evidence_likelihood_mode", DEFAULT_EVIDENCE_LIKELIHOOD_MODE)
@@ -6684,26 +6727,8 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
             ]
         )
     if args.fit_scaling_scatter and int(args.n_subhalos) > 0:
-        scatter_fields: list[str] = []
-        if float(args.subhalo_sigma_scatter_dex) > 0.0:
-            scatter_fields.append("sigma")
-        if float(args.subhalo_cut_scatter_dex) > 0.0:
-            scatter_fields.append("cut")
-        if scatter_fields:
-            scatter_max = max(
-                float(args.scaling_scatter_max),
-                1.25 * _dex_scatter_to_ln(float(args.subhalo_sigma_scatter_dex)),
-                1.25 * _dex_scatter_to_ln(float(args.subhalo_cut_scatter_dex)),
-            )
-            cmd.extend(
-                [
-                    "--scaling-scatter",
-                    "--scaling-scatter-fields",
-                    ",".join(scatter_fields),
-                    "--scaling-scatter-max",
-                    f"{scatter_max:.8g}",
-                ]
-            )
+        if float(args.subhalo_sigma_scatter_dex) > 0.0 or float(args.subhalo_cut_scatter_dex) > 0.0:
+            cmd.append("--scaling-scatter")
     if args.skip_plots:
         cmd.append("--skip-plots")
     resume_mode = _resume_mode(args)
@@ -6969,6 +6994,8 @@ def _parse_source_redshifts(raw: str | None, *, fallback: float) -> tuple[float,
 
 def _build_parser() -> argparse.ArgumentParser:
     from .cluster_solver import (
+        BEST_VALUE_CHOICES,
+        DEFAULT_BEST_VALUE,
         DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD,
         DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA,
         DEFAULT_ACTIVE_SCALING_LOGIT_PRIOR_SIGMA,
@@ -6976,6 +7003,7 @@ def _build_parser() -> argparse.ArgumentParser:
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+        DEFAULT_REFRESH_EVERY,
     )
 
     parser = argparse.ArgumentParser(description="Mock-recovery validation suite for lenscluster.")
@@ -7440,6 +7468,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Solver SVI steps. Accepts one value or staged values through optional stage 3/stage 4.",
     )
     parser.add_argument(
+        "--refresh-every",
+        type=_parse_refresh_every_value,
+        nargs="+",
+        default=[DEFAULT_REFRESH_EVERY],
+        help="Solver SVI refresh cadence. Accepts one value or staged values through optional stage 3/stage 4.",
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         nargs="+",
@@ -7551,12 +7586,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Fit scaling-relation scatter hyperparameters when subhalos with injected scatter are present.",
     )
     parser.add_argument(
-        "--scaling-scatter-max",
-        type=float,
-        default=0.5,
-        help="Upper bound, in natural-log units, for fitted scaling-scatter hyperparameters.",
-    )
-    parser.add_argument(
         "--posterior-diagnostic-draws",
         type=int,
         default=8,
@@ -7651,6 +7680,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--skip-plots",
         action="store_true",
         help="Skip the standard solver plot suite. Validation recovery figures are still written as PDFs.",
+    )
+    parser.add_argument(
+        "--best-value",
+        choices=BEST_VALUE_CHOICES,
+        default=DEFAULT_BEST_VALUE,
+        help="Pass-through selected posterior sample convention for solver validation and lensing plots.",
     )
     parser.add_argument("--quiet", action="store_true", help="Suppress validation wrapper logs while keeping solver output.")
     return parser

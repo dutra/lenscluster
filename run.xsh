@@ -10,7 +10,7 @@ $JAX_NUM_CPU_DEVICES = cores
 
 PYTHON = "/home/dutra/.conda/envs/lenstronomy/bin/python"
 
-output_dir = f"jun2i_perturbation_discovery_direct_exponents_bergamini"
+output_dir = f"jun22d_mag22_scatter_arespriors"
 
 HFF_RGB_BANDS = ["F435W", "F606W", "F814W", "F105W", "F125W", "F140W", "F160W"]
 HFF_RGB_DISPLAY = {"q": 6.4, "stretch": 0.0145, "minimum": -5.5e-4, "red_gain": 0.47, "green_gain": 0.91, "blue_gain": 3.95}
@@ -116,8 +116,6 @@ best_par_overlay_args = ["--corner-overlay-best-par", str(BEST_PAR_PATH)] if BES
 # Mirrors the active solver-control settings in run_validation.xsh, but runs the
 # real-data cluster solver directly instead of the mock validation wrapper.
 mode = "none"  # "linear" or "critical_arc"
-run_name = f"{cluster_config['cluster_key']}_{mode}_nuts_nozeff"
-fit_mode = "sequential"
 stage2_forward_modes = {
     "none": "none",
     "linear": "linearized",
@@ -126,11 +124,14 @@ stage2_forward_modes = {
 stage2_forward_mode = stage2_forward_modes[mode]
 stage1_likelihood = "local-jacobian"
 
-fit_method = ["nuts"]
-refresh_every = 2000000
-svi_steps = [5000]
-warmup = [1000]
-samples = [250]
+run_name = f"{cluster_config['cluster_key']}_S1{stage1_likelihood}_S2{mode}"
+fit_mode = "sequential"
+
+fit_method = ["svi+nuts"]
+refresh_every = [None, 1000]
+svi_steps = [5000, 5000]
+warmup = [2000]
+samples = [500]
 sampling_refresh_runs = [1]
 max_tree_depth = [8]
 quick_diagnostics = False
@@ -138,13 +139,19 @@ target_accept = 0.8
 chains = cores
 z_bin_efficiency_tol = 0.0
 
+if mode != "none":
+    fit_method += ["svi+nuts"]
+    refresh_every += [1000]
+    svi_steps += [10000]
+    warmup += [2000]
+    samples += [500]
+    max_tree_depth += [8]
+
 
 
 perturbation_discovery_alpha_tol_arcsec = 0.1
-perturbation_discovery_jacobian_tol = 0.2
+perturbation_discovery_jacobian_tol = 0.3
 perturbation_discovery_jacobian_weight = 1.0
-
-OUTPUT_DIR = f"{OUTPUT_DIR}_PD{perturbation_discovery_alpha_tol_arcsec:g}_{perturbation_discovery_jacobian_tol:g}_T{max_tree_depth[-1]}W{warmup[-1]}S{samples[-1]}"
 
 exact_image_diagnostics_stage2 = True
 image_catalog_family_cutout_image_dir = cluster_config.get("image_catalog_family_cutout_image_dir", "data/BUFFALO_Images")
@@ -182,10 +189,23 @@ source_position_parameterization = "prior-whitened" #conditional-whitened" #"pri
 source_plane_covariance_mode = "magnification"
 stage1_sampling_engine = "refreshing_surrogate_flat"
 stage2_sampling_engine = "refreshing_surrogate_flat"
-independent_scaling_free_log_sigma_tau_prior_median = 0.10
-independent_scaling_free_log_mass_tau_prior_median = 0.20
-independent_scaling_free_log_tau_prior_sigma = 0.25
+
+# independent_scaling_free_log_sigma_tau_prior_median = 0.65
+# independent_scaling_free_log_mass_tau_prior_median = 1.10
+# independent_scaling_free_log_tau_prior_sigma = 0.35
+
+# Hera Best
+# independent_scaling_free_log_sigma_tau_prior_median = 0.60
+# independent_scaling_free_log_mass_tau_prior_median = 0.90
+# independent_scaling_free_log_tau_prior_sigma = 0.35
+
+# Ares best
+independent_scaling_free_log_sigma_tau_prior_median = 0.45
+independent_scaling_free_log_mass_tau_prior_median = 0.55
+independent_scaling_free_log_tau_prior_sigma = 0.30
+
 pos_sigma_arcsec = 0.1
+
 critical_arc_args = [
     "--critical-arc-critical-direction-sigma-arcsec", 10.0,
     "--critical-arc-base-prob", 0.10,
@@ -223,6 +243,7 @@ smc_args = [
 
 
 workflow_args = [
+    "--best-value", "maximum-likelihood",
     "--potfile-member-mag-max", 22.0,
     "--sampling-refresh-runs", *sampling_refresh_runs,
     "--fit-mode", fit_mode,
@@ -239,7 +260,7 @@ workflow_args = [
     "--fit-method", *fit_method,
     "--warmup", *warmup,
     "--samples", *samples,
-    "--refresh-every", refresh_every,
+    "--refresh-every", *refresh_every,
     "--svi-steps", *svi_steps,
     "--chains", chains,
     "--target-accept", target_accept,
@@ -268,7 +289,6 @@ scatter_and_stabilizer_args = [
     "--image-plane-scatter-floor-arcsec", 0.01,
     "--image-plane-scatter-upper-arcsec", 1.0,
     "--scaling-scatter",
-    "--scaling-scatter-fields", "sigma,cut",
     #"--likelihood-stabilizer-max-gain", "50",
     # "--likelihood-stabilizer-max-residual-arcsec", "5",
     # "--likelihood-stabilizer-residual-loss", "student-t",
@@ -279,9 +299,9 @@ scatter_and_stabilizer_args = [
 
 validation_args = [
     *(["--quick-diagnostics"] if quick_diagnostics else []),
-    "--exact-image-min-distance-arcsec", 0.5,
-    "--exact-image-precision-limit", 1.0e-2,
-    "--exact-image-num-iter-max", 50,
+    "--exact-image-min-distance-arcsec", 0.2,
+    "--exact-image-precision-limit", 1.0e-4,
+    "--exact-image-num-iter-max", 200,
     "--match-tolerance-arcsec", 2.0,
     "--caustic-source-redshift", 9.0,
     *(image_catalog_family_cutout_args),
@@ -309,9 +329,11 @@ debug_args = [
     #"--fix-image-sigma-int-arcsec", "0.5",
 ]
 
+OUTPUT_DIR = f"{OUTPUT_DIR}_PD{perturbation_discovery_alpha_tol_arcsec:g}_{perturbation_discovery_jacobian_tol:g}_T{max_tree_depth[-1]}W{warmup[-1]}S{samples[-1]}"
+
 _run_start_monotonic = time.monotonic()
 try:
-    @(PYTHON) -m lenscluster.cluster_solver \
+    @(PYTHON) -m lenscluster.cluster_solver --resume fast \
       --par-path @(PAR_PATH) \
       --output-dir @(OUTPUT_DIR) \
       --run-name @(run_name) \

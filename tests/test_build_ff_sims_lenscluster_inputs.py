@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from lenscluster.cluster_solver import _build_parameter_specs, _build_scaling_parameter_specs
+from lenscluster.jax_cosmology import cosmology_config_from_parsed
 from lenscluster.lenstool_parser import load_best_par
 
 
@@ -258,6 +259,14 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     assert _limit_line(ares_par_text, "O2", "v_disp") == "v_disp 9 950.00000000 175.00000000 600.00000000 1400.00000000"
     assert "sigma 9 100.00000000 15.00000000 70.00000000 500.00000000" in ares_par_text
     assert "cutkpc 9 270.00000000 35.00000000 160.00000000 800.00000000" in ares_par_text
+    assert "\n    H0 70.40000000\n    omega 0.27200000\n    lambda 0.72800000" in ares_par_text
+    assert parsed["cosmologie"]["H0"] == pytest.approx(70.4)
+    assert parsed["cosmologie"]["omega"] == pytest.approx(0.272)
+    assert parsed["cosmologie"]["lambda"] == pytest.approx(0.728)
+    ares_cosmo = cosmology_config_from_parsed(parsed)
+    assert ares_cosmo["H0"] == pytest.approx(70.4)
+    assert ares_cosmo["Om0"] == pytest.approx(0.272)
+    assert ares_cosmo["Ode0"] == pytest.approx(0.728)
     assert "vdslope" not in ares_par_text
     assert "slope   " not in ares_par_text
     assert "potentiel S1" not in ares_par_text
@@ -270,8 +279,8 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     ares_scaling_specs, _ares_scaling_indices, _ares_scaling_models = _build_scaling_parameter_specs(
         parsed["potfiles"]
     )
-    assert {"alpha_sigma", "beta_radius"} <= {spec.field for spec in ares_scaling_specs}
-    assert {"vdslope", "slope", "gamma_ml"}.isdisjoint({spec.field for spec in ares_scaling_specs})
+    assert {"alpha_sigma", "gamma_ml"} <= {spec.field for spec in ares_scaling_specs}
+    assert {"vdslope", "slope", "beta_radius"}.isdisjoint({spec.field for spec in ares_scaling_specs})
 
     hera_par = output / "hera" / "hera_lenscluster.par"
     _hera_parsed, _hera_potentials_df, _hera_images_df, _hera_arcs_df, hera_potentials_with_priors = load_best_par(hera_par)
@@ -304,6 +313,14 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     assert hera_par_text.count("core_radius 1 2.00000000 15.00000000 0.10000000") == 2
     assert "sigma 9 96.70000000 40.00000000 30.00000000 250.00000000" in hera_par_text
     assert "cutkpc 9 33.00000000 25.00000000 3.00000000 250.00000000" in hera_par_text
+    assert "\n    H0 72.00000000\n    omega 0.24000000\n    lambda 0.76000000" in hera_par_text
+    assert _hera_parsed["cosmologie"]["H0"] == pytest.approx(72.0)
+    assert _hera_parsed["cosmologie"]["omega"] == pytest.approx(0.24)
+    assert _hera_parsed["cosmologie"]["lambda"] == pytest.approx(0.76)
+    hera_cosmo = cosmology_config_from_parsed(_hera_parsed)
+    assert hera_cosmo["H0"] == pytest.approx(72.0)
+    assert hera_cosmo["Om0"] == pytest.approx(0.24)
+    assert hera_cosmo["Ode0"] == pytest.approx(0.76)
     assert "vdslope" not in hera_par_text
     assert "slope   " not in hera_par_text
     assert {item["id"] for item in hera_potentials_with_priors} == {"O1", "O2"}
@@ -314,8 +331,8 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     hera_scaling_specs, _hera_scaling_indices, _hera_scaling_models = _build_scaling_parameter_specs(
         _hera_parsed["potfiles"]
     )
-    assert {"alpha_sigma", "beta_radius"} <= {spec.field for spec in hera_scaling_specs}
-    assert {"vdslope", "slope", "gamma_ml"}.isdisjoint({spec.field for spec in hera_scaling_specs})
+    assert {"alpha_sigma", "gamma_ml"} <= {spec.field for spec in hera_scaling_specs}
+    assert {"vdslope", "slope", "beta_radius"}.isdisjoint({spec.field for spec in hera_scaling_specs})
     assert not (
         {
             "G1_x_centre",

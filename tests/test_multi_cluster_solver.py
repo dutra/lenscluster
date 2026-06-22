@@ -155,7 +155,7 @@ def test_parse_args_accepts_repeated_cluster_triples_and_cosmology_init() -> Non
             "--fix-image-sigma-int-arcsec",
             "0.35",
             "--sampling-engine",
-            "perturbation_discovery_flat",
+            "refreshing_surrogate_flat",
         ]
     )
 
@@ -170,10 +170,30 @@ def test_parse_args_accepts_repeated_cluster_triples_and_cosmology_init() -> Non
     assert args.image_plane_scatter_prior_median_arcsec == pytest.approx(0.25)
     assert args.image_plane_scatter_prior_log_sigma == pytest.approx(0.4)
     assert args.fix_image_sigma_int_arcsec == pytest.approx(0.35)
-    assert args.sampling_engine == "perturbation_discovery_flat"
+    assert args.sampling_engine == "refreshing_surrogate_flat"
     assert args.dense_mass == "structured"
     assert not hasattr(args, "validate_top_k_families")
     assert not hasattr(args, "validation_approx")
+
+
+def test_parse_args_accepts_disabled_refresh_every() -> None:
+    args = multi._parse_args(
+        [
+            "--cluster",
+            "a2744",
+            "a2744.par",
+            "runs/a2744",
+            "--cluster",
+            "m0416",
+            "m0416.par",
+            "runs/m0416",
+            "--refresh-every",
+            "None",
+            "1000",
+        ]
+    )
+
+    assert args.refresh_every == [None, 1000]
 
 
 def test_parse_args_dense_mass_choices() -> None:
@@ -236,7 +256,15 @@ def test_parse_args_rejects_blocked_linearized_mode() -> None:
         )
 
 
-@pytest.mark.parametrize("flag", ["--validate-top-k-families", "--validation-approx"])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--validate-top-k-families",
+        "--validation-approx",
+        "--scaling-scatter-fields",
+        "--scaling-scatter-max",
+    ],
+)
 def test_parse_args_rejects_removed_main_validation_flags(flag: str) -> None:
     with pytest.raises(SystemExit):
         multi._parse_args(
@@ -756,12 +784,13 @@ def test_load_plot_bundle_for_plots_rebuilds_minimal_state(tmp_path: Path) -> No
         grouped_samples=grouped,
     )
 
-    state, loaded_samples, loaded_best, loaded_grouped = multi._load_plot_bundle_for_plots(bundle_path)
+    state, loaded_samples, loaded_best, loaded_grouped, loaded_log_prob = multi._load_plot_bundle_for_plots(bundle_path)
 
     assert [context.cluster.key for context in state.contexts] == ["a2744", "m0416"]
     np.testing.assert_allclose(loaded_samples, samples)
     np.testing.assert_allclose(loaded_best, best_fit)
     np.testing.assert_allclose(loaded_grouped, grouped)
+    assert loaded_log_prob is None
     subset_specs, subset_samples, subset_best = multi._cluster_corner_parameter_subset(
         state.contexts[1],
         state.parameter_specs,

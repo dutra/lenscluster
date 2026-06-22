@@ -72,8 +72,7 @@ class PackedLensSpec:
     cut_ref_param_index: np.ndarray
     core_ref_param_index: np.ndarray
     sigma_log_scatter_param_index: np.ndarray
-    core_log_scatter_param_index: np.ndarray
-    cut_log_scatter_param_index: np.ndarray
+    mass_log_scatter_param_index: np.ndarray
     alpha_sigma_base: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
     gamma_ml_base: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
     alpha_sigma_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
@@ -84,8 +83,6 @@ class PackedLensSpec:
     independent_free_log_mass_delta_unit_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     independent_free_log_sigma_tau_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     independent_free_log_mass_tau_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
-    frozen_log_sigma_delta: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
-    frozen_log_mass_delta: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
     active_gate_intercept_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     active_gate_mag_slope_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     active_gate_logit_offset_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
@@ -246,6 +243,8 @@ class PosteriorResults:
     ess_history: np.ndarray | None = None
     move_acceptance_history: np.ndarray | None = None
     ns_diagnostics: dict[str, np.ndarray] | None = None
+    map_fit: np.ndarray | None = None
+    maximum_likelihood_fit: np.ndarray | None = None
 
 
 @dataclass(frozen=True)

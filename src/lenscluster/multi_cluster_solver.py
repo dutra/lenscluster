@@ -22,7 +22,14 @@ Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
 
 from . import cluster_solver as single
 from .model import BuildState, ParameterSpec, PosteriorResults
-from .plotting import _best_fit_values_for_specs, _plot_corner, _plot_cosmology_corner, _plot_trace, _summary_table
+from .plotting import (
+    _best_fit_values_for_specs,
+    _map_values_for_specs,
+    _plot_corner,
+    _plot_cosmology_corner,
+    _plot_trace,
+    _summary_table,
+)
 
 
 SHARED_COSMOLOGY_SAMPLE_NAMES = (
@@ -151,9 +158,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--source-plane-covariance-floor", type=float, default=1.0e-6)
     parser.add_argument("--scaling-scatter", action="store_true")
-    parser.add_argument("--scaling-scatter-fields", default="sigma,core,cut")
-    parser.add_argument("--scaling-scatter-max", type=float, default=0.5)
-    parser.add_argument("--refresh-every", type=int, default=single.DEFAULT_REFRESH_EVERY)
+    parser.add_argument("--refresh-every", type=single._parse_refresh_every_value, nargs="+", default=[single.DEFAULT_REFRESH_EVERY])
     parser.add_argument(
         "--refresh-param-drift-frac",
         type=float,
@@ -267,7 +272,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--blocked-nuts-pilot-warmup", type=int, default=None)
     parser.add_argument("--nuts-init-boundary-frac", type=float, default=single.DEFAULT_NUTS_INIT_BOUNDARY_FRAC)
     parser.add_argument("--nuts-init-jitter-frac", type=float, default=single.DEFAULT_NUTS_INIT_JITTER_FRAC)
-    parser.add_argument("--svi-steps", type=int, default=single.DEFAULT_SVI_STEPS)
+    parser.add_argument("--svi-steps", type=int, nargs="+", default=[single.DEFAULT_SVI_STEPS])
     parser.add_argument("--svi-learning-rate", type=float, default=single.DEFAULT_SVI_LEARNING_RATE)
     parser.add_argument("--quick-diagnostics", action="store_true")
     parser.set_defaults(
@@ -843,7 +848,9 @@ def _parameter_spec_from_payload(payload: dict[str, Any]) -> ParameterSpec:
     return ParameterSpec(**payload)
 
 
-def _load_plot_bundle_for_plots(path: Path) -> tuple[MultiClusterState, np.ndarray, np.ndarray, np.ndarray | None]:
+def _load_plot_bundle_for_plots(
+    path: Path,
+) -> tuple[MultiClusterState, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
     if not path.is_file():
         raise FileNotFoundError(f"Saved multi-cluster plot bundle does not exist: {path}")
     with h5py.File(path, "r") as handle:
@@ -857,6 +864,11 @@ def _load_plot_bundle_for_plots(path: Path) -> tuple[MultiClusterState, np.ndarr
                 raise ValueError(f"Saved multi-cluster plot bundle is missing posterior/{dataset_name}.")
         samples = np.asarray(posterior_group["samples"], dtype=float)
         best_fit = np.asarray(posterior_group["best_fit"], dtype=float)
+        log_prob = (
+            np.asarray(posterior_group["log_prob"], dtype=float)
+            if "log_prob" in posterior_group
+            else None
+        )
         grouped_samples = (
             np.asarray(posterior_group["grouped_samples"], dtype=float)
             if "grouped_samples" in posterior_group
@@ -929,7 +941,7 @@ def _load_plot_bundle_for_plots(path: Path) -> tuple[MultiClusterState, np.ndarr
         svi_init_values=None,
         contexts=contexts,
     )
-    return state, samples, best_fit, grouped_samples
+    return state, samples, best_fit, grouped_samples, log_prob
 
 
 def _cosmology_parameter_subset(
@@ -1088,6 +1100,7 @@ def _plot_multi_cluster_corners(
     state: MultiClusterState,
     samples: np.ndarray,
     best_fit: np.ndarray,
+    log_prob: np.ndarray | None = None,
 ) -> None:
     sample_array = np.asarray(samples, dtype=float)
     best_fit_array = np.asarray(best_fit, dtype=float)
@@ -1096,6 +1109,7 @@ def _plot_multi_cluster_corners(
         sample_array,
         state.parameter_specs,
         best_fit_values=_best_fit_values_for_specs(state.parameter_specs, best_fit_array),
+        map_values=_map_values_for_specs(state.parameter_specs, sample_array, log_prob),
         output_name="corner.pdf",
     )
     for context in state.contexts:
@@ -1112,6 +1126,7 @@ def _plot_multi_cluster_corners(
             subset_samples,
             subset_specs,
             best_fit_values=_best_fit_values_for_specs(subset_specs, subset_best),
+            map_values=_map_values_for_specs(subset_specs, subset_samples, log_prob),
             output_name=f"{context.cluster.key}_cluster_cosmology_corner.pdf",
         )
 
@@ -1131,7 +1146,9 @@ def _plot_cosmology_trace(
 
 
 def _rerender_plots_from_bundle(args: argparse.Namespace, run_dir: Path) -> None:
-    state, samples, best_fit, grouped_samples = _load_plot_bundle_for_plots(run_dir / "artifacts" / "plot_bundle.h5")
+    state, samples, best_fit, grouped_samples, log_prob = _load_plot_bundle_for_plots(
+        run_dir / "artifacts" / "plot_bundle.h5"
+    )
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     cosmo_specs, cosmo_samples, cosmo_best = _cosmology_parameter_subset(state.parameter_specs, samples, best_fit)
@@ -1140,9 +1157,10 @@ def _rerender_plots_from_bundle(args: argparse.Namespace, run_dir: Path) -> None
         cosmo_samples,
         cosmo_specs,
         best_fit_values=_best_fit_values_for_specs(cosmo_specs, cosmo_best),
+        map_values=_map_values_for_specs(cosmo_specs, cosmo_samples, log_prob),
     )
     _plot_cosmology_prior_histograms(plots_dir, cosmo_specs, cosmo_samples, cosmo_best)
-    _plot_multi_cluster_corners(plots_dir, state, samples, best_fit)
+    _plot_multi_cluster_corners(plots_dir, state, samples, best_fit, log_prob=log_prob)
     _plot_cosmology_trace(plots_dir, state.parameter_specs, grouped_samples)
     _write_fallback_cosmology_plot_if_needed(plots_dir, cosmo_specs, cosmo_samples, cosmo_best)
     if not bool(getattr(args, "quiet", False)):
@@ -1209,6 +1227,7 @@ def _write_outputs(
             cosmo_samples,
             cosmo_specs,
             best_fit_values=_best_fit_values_for_specs(cosmo_specs, cosmo_best),
+            map_values=_map_values_for_specs(cosmo_specs, cosmo_samples, posterior_physical.log_prob),
         )
         _plot_cosmology_prior_histograms(plots_dir, cosmo_specs, cosmo_samples, cosmo_best)
         _plot_multi_cluster_corners(
@@ -1216,6 +1235,7 @@ def _write_outputs(
             state,
             np.asarray(posterior_physical.samples, dtype=float),
             np.asarray(best_fit_physical, dtype=float),
+            log_prob=posterior_physical.log_prob,
         )
         _plot_cosmology_trace(
             plots_dir,

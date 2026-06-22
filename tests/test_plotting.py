@@ -120,15 +120,18 @@ def test_scaling_results_summary_table_reports_bergamini_reference_values_and_ma
         / plotting.DPiE_MASS_GRAVITATIONAL_CONSTANT_KPC_KMS2_PER_MSUN
     )
     _mass_p16, expected_mass_median, _mass_p84 = plotting._weighted_quantile(np.log10(mass), weights, [0.16, 0.5, 0.84])
+    expected_alpha_median = plotting._weighted_quantile(samples[:, 3], weights, [0.5])[0]
+    expected_gamma_median = plotting._weighted_quantile(samples[:, 4], weights, [0.5])[0]
+    expected_beta_median = plotting._weighted_quantile(1.0 + samples[:, 4] - 2.0 * samples[:, 3], weights, [0.5])[0]
 
     assert row["potfile_id"] == "members"
     assert row["scaling_relation_mode"] == "direct-exponents"
     assert row["vdisp_star_median"] == pytest.approx(expected_sigma_median)
     assert row["vdisp_star_p16"] == pytest.approx(expected_sigma_p16)
     assert row["vdisp_star_p84"] == pytest.approx(expected_sigma_p84)
-    assert row["alpha_sigma_median"] == pytest.approx(0.25)
-    assert row["gamma_ml_median"] == pytest.approx(0.0)
-    assert row["beta_radius_median"] == pytest.approx(0.5)
+    assert row["alpha_sigma_median"] == pytest.approx(expected_alpha_median)
+    assert row["gamma_ml_median"] == pytest.approx(expected_gamma_median)
+    assert row["beta_radius_median"] == pytest.approx(expected_beta_median)
     assert row["log10_m_star_msun_median"] == pytest.approx(expected_mass_median)
     assert row["sigma_log_scatter_median"] == pytest.approx(
         plotting._weighted_quantile(samples[:, 5], weights, [0.5])[0]
@@ -266,12 +269,15 @@ def test_scaling_relation_summary_table_preserves_classes_and_free_branch() -> N
             "free_v_disp_median": [420.0],
             "free_v_disp_p16": [390.0],
             "free_v_disp_p84": [450.0],
+            "free_v_disp_map": [430.0],
             "free_core_radius_kpc_median": [3.5],
             "free_core_radius_kpc_p16": [3.0],
             "free_core_radius_kpc_p84": [4.0],
+            "free_core_radius_kpc_map": [3.6],
             "free_cut_radius_kpc_median": [80.0],
             "free_cut_radius_kpc_p16": [70.0],
             "free_cut_radius_kpc_p84": [90.0],
+            "free_cut_radius_kpc_map": [82.0],
         }
     )
     packed = SimpleNamespace(
@@ -304,9 +310,16 @@ def test_scaling_relation_summary_table_preserves_classes_and_free_branch() -> N
         np.asarray([300.0, 50.0, 2.0, 0.25, 0.0], dtype=float),
         packed,
         independent_scaling_df=independent_df,
+        best_value="maximum-likelihood",
+        best_value_requested="maximum-likelihood",
     )
 
     assert table["catalog_id"].tolist() == ["free", "active", "inactive"]
+    assert not any(str(column).endswith("_map") for column in table.columns)
+    assert "scaling_v_disp_best" in table.columns
+    assert "free_v_disp_best" in table.columns
+    assert set(table["best_value"]) == {"maximum-likelihood"}
+    assert set(table["best_value_requested"]) == {"maximum-likelihood"}
     assert table["scaling_relation_class"].tolist() == ["free", "active", "inactive"]
     assert table.set_index("catalog_id")["catalog_color"].to_dict() == {
         "free": pytest.approx(1.2),
@@ -333,8 +346,11 @@ def test_scaling_relation_summary_table_preserves_classes_and_free_branch() -> N
     assert active_mass == pytest.approx(expected_active_mass)
     free_row = table[table["catalog_id"] == "free"].iloc[0]
     assert free_row["free_v_disp_median"] == pytest.approx(420.0)
+    assert free_row["free_v_disp_best"] == pytest.approx(430.0)
     assert free_row["free_core_radius_kpc_median"] == pytest.approx(3.5)
+    assert free_row["free_core_radius_kpc_best"] == pytest.approx(3.6)
     assert free_row["free_cut_radius_kpc_median"] == pytest.approx(80.0)
+    assert free_row["free_cut_radius_kpc_best"] == pytest.approx(82.0)
     expected_free_mass = math.log10(
         math.pi * 420.0**2 * 80.0 / plotting.DPiE_MASS_GRAVITATIONAL_CONSTANT_KPC_KMS2_PER_MSUN
     )
@@ -355,29 +371,40 @@ def test_scaling_relation_summary_plot_writes_pdf(tmp_path: Path) -> None:
             "alpha_sigma_median": [0.25, 0.25, 0.25],
             "beta_radius_median": [0.5, 0.5, 0.5],
             "gamma_ml_median": [0.0, 0.0, 0.0],
+            "alpha_sigma_best": [0.25, 0.25, 0.25],
+            "beta_radius_best": [0.5, 0.5, 0.5],
+            "gamma_ml_best": [0.0, 0.0, 0.0],
             "scaling_relation_class": ["inactive", "active", "free"],
             "scaling_v_disp_median": [210.0, 300.0, 420.0],
+            "scaling_v_disp_best": [215.0, 305.0, 425.0],
             "scaling_v_disp_p16": [190.0, 280.0, 390.0],
             "scaling_v_disp_p84": [230.0, 320.0, 450.0],
             "scaling_core_radius_kpc_median": [1.0, 2.0, 4.0],
+            "scaling_core_radius_kpc_best": [1.1, 2.1, 4.1],
             "scaling_core_radius_kpc_p16": [0.8, 1.8, 3.6],
             "scaling_core_radius_kpc_p84": [1.2, 2.2, 4.4],
             "scaling_cut_radius_kpc_median": [25.0, 50.0, 100.0],
+            "scaling_cut_radius_kpc_best": [26.0, 51.0, 101.0],
             "scaling_cut_radius_kpc_p16": [22.0, 45.0, 90.0],
             "scaling_cut_radius_kpc_p84": [28.0, 55.0, 110.0],
             "scaling_log10_mass_msun_median": [11.2, 12.0, 12.8],
+            "scaling_log10_mass_msun_best": [11.25, 12.05, 12.85],
             "scaling_log10_mass_msun_p16": [11.1, 11.9, 12.7],
             "scaling_log10_mass_msun_p84": [11.3, 12.1, 12.9],
             "free_v_disp_median": [np.nan, np.nan, 500.0],
+            "free_v_disp_best": [np.nan, np.nan, 510.0],
             "free_v_disp_p16": [np.nan, np.nan, 470.0],
             "free_v_disp_p84": [np.nan, np.nan, 530.0],
             "free_core_radius_kpc_median": [np.nan, np.nan, 5.0],
+            "free_core_radius_kpc_best": [np.nan, np.nan, 5.2],
             "free_core_radius_kpc_p16": [np.nan, np.nan, 4.5],
             "free_core_radius_kpc_p84": [np.nan, np.nan, 5.5],
             "free_cut_radius_kpc_median": [np.nan, np.nan, 120.0],
+            "free_cut_radius_kpc_best": [np.nan, np.nan, 123.0],
             "free_cut_radius_kpc_p16": [np.nan, np.nan, 105.0],
             "free_cut_radius_kpc_p84": [np.nan, np.nan, 135.0],
             "free_log10_mass_msun_median": [np.nan, np.nan, 13.0],
+            "free_log10_mass_msun_best": [np.nan, np.nan, 13.05],
             "free_log10_mass_msun_p16": [np.nan, np.nan, 12.9],
             "free_log10_mass_msun_p84": [np.nan, np.nan, 13.1],
         }
@@ -499,29 +526,40 @@ def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest
             "alpha_sigma_median": [0.24, 0.24, 0.24, 0.24],
             "beta_radius_median": [0.52, 0.52, 0.52, 0.52],
             "gamma_ml_median": [0.0, 0.0, 0.0, 0.0],
+            "alpha_sigma_best": [0.31, 0.31, 0.31, 0.31],
+            "beta_radius_best": [0.44, 0.44, 0.44, 0.44],
+            "gamma_ml_best": [0.12, 0.12, 0.12, 0.12],
             "scaling_relation_class": ["inactive", "inactive", "active", "free"],
             "scaling_v_disp_median": [150.0, 210.0, 300.0, 420.0],
+            "scaling_v_disp_best": [151.0, 211.0, 301.0, 421.0],
             "scaling_v_disp_p16": [140.0, 190.0, 280.0, 390.0],
             "scaling_v_disp_p84": [160.0, 230.0, 320.0, 450.0],
             "scaling_core_radius_kpc_median": [0.7, 1.0, 2.0, 4.0],
+            "scaling_core_radius_kpc_best": [0.75, 1.05, 2.05, 4.05],
             "scaling_core_radius_kpc_p16": [0.6, 0.8, 1.8, 3.6],
             "scaling_core_radius_kpc_p84": [0.8, 1.2, 2.2, 4.4],
             "scaling_cut_radius_kpc_median": [18.0, 25.0, 50.0, 100.0],
+            "scaling_cut_radius_kpc_best": [19.0, 26.0, 51.0, 101.0],
             "scaling_cut_radius_kpc_p16": [16.0, 22.0, 45.0, 90.0],
             "scaling_cut_radius_kpc_p84": [20.0, 28.0, 55.0, 110.0],
             "scaling_log10_mass_msun_median": [11.0, 11.4, 12.0, 12.8],
+            "scaling_log10_mass_msun_best": [11.05, 11.45, 12.05, 12.85],
             "scaling_log10_mass_msun_p16": [10.9, 11.3, 11.9, 12.7],
             "scaling_log10_mass_msun_p84": [11.1, 11.5, 12.1, 12.9],
             "free_v_disp_median": [np.nan, np.nan, np.nan, 500.0],
+            "free_v_disp_best": [np.nan, np.nan, np.nan, 510.0],
             "free_v_disp_p16": [np.nan, np.nan, np.nan, 470.0],
             "free_v_disp_p84": [np.nan, np.nan, np.nan, 530.0],
             "free_core_radius_kpc_median": [np.nan, np.nan, np.nan, 5.0],
+            "free_core_radius_kpc_best": [np.nan, np.nan, np.nan, 5.2],
             "free_core_radius_kpc_p16": [np.nan, np.nan, np.nan, 4.5],
             "free_core_radius_kpc_p84": [np.nan, np.nan, np.nan, 5.5],
             "free_cut_radius_kpc_median": [np.nan, np.nan, np.nan, 120.0],
+            "free_cut_radius_kpc_best": [np.nan, np.nan, np.nan, 123.0],
             "free_cut_radius_kpc_p16": [np.nan, np.nan, np.nan, 105.0],
             "free_cut_radius_kpc_p84": [np.nan, np.nan, np.nan, 135.0],
             "free_log10_mass_msun_median": [np.nan, np.nan, np.nan, 13.0],
+            "free_log10_mass_msun_best": [np.nan, np.nan, np.nan, 13.05],
             "free_log10_mass_msun_p16": [np.nan, np.nan, np.nan, 12.9],
             "free_log10_mass_msun_p84": [np.nan, np.nan, np.nan, 13.1],
         }
@@ -529,16 +567,23 @@ def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest
     labels: list[str] = []
     text_values: list[str] = []
     errorbar_colors: list[Any] = []
+    errorbar_y_values: list[float] = []
+    interval_y_values: list[tuple[float, float]] = []
     colorbar_labels: list[str] = []
     colorbar_cmaps: list[str] = []
 
     class FakeAxis:
-        def errorbar(self, *_args: Any, **kwargs: Any) -> None:
+        def errorbar(self, *args: Any, **kwargs: Any) -> None:
             labels.append(str(kwargs.get("label", "")))
             errorbar_colors.append(kwargs.get("color"))
+            errorbar_y_values.extend(float(value) for value in np.asarray(args[1], dtype=float).reshape(-1))
 
-        def plot(self, *_args: Any, **kwargs: Any) -> None:
+        def plot(self, *args: Any, **kwargs: Any) -> None:
             labels.append(str(kwargs.get("label", "")))
+            if kwargs.get("label") == "_nolegend_" and len(args) >= 2:
+                y_values = np.asarray(args[1], dtype=float).reshape(-1)
+                if y_values.size == 2:
+                    interval_y_values.append((float(y_values[0]), float(y_values[1])))
 
         def text(self, *_args: Any, **_kwargs: Any) -> None:
             text_values.append(str(_args[2]))
@@ -600,7 +645,20 @@ def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest
     assert any(isinstance(color, tuple) and len(color) == 4 for color in errorbar_colors)
     assert colorbar_labels == ["catalog color (F606W - F814W)"]
     assert colorbar_cmaps == ["coolwarm"]
-    assert any("alpha_sigma" in value and "constant M/L" in value for value in text_values)
+    assert 151.0 in errorbar_y_values
+    assert 150.0 not in errorbar_y_values
+    assert 510.0 in errorbar_y_values
+    assert 500.0 not in errorbar_y_values
+    assert (140.0, 160.0) in interval_y_values
+    assert any(
+        "points: best fit; bars: 16-84% posterior" in value
+        and "alpha_sigma: 0.31" in value
+        and "beta_radius: 0.44" in value
+        and "gamma_ml: 0.12" in value
+        and "dlogM/dlogL: 1.12" in value
+        and "constant M/L" in value
+        for value in text_values
+    )
     assert "total: 4\ninactive: 2\nactive not free: 1\nfree: 1" in text_values
 
 
@@ -608,25 +666,32 @@ def test_image_catalog_family_cutout_stage_eligibility(tmp_path: Path) -> None:
     args = SimpleNamespace(
         image_catalog_family_cutout_image_dir=tmp_path / "images",
         exact_image_diagnostics_stage3=False,
+        image_catalog_family_cutouts=True,
+        stage2_forward_mode="linearized",
     )
 
     assert plotting._image_catalog_family_cutout_enabled(
         args,
-        tmp_path / "fit" / "stage4_critical_arc_mixture_image_plane",
+        tmp_path / "fit" / "stage2_free_source_forward_fit",
     )
     assert not plotting._image_catalog_family_cutout_enabled(
         args,
-        tmp_path / "fit" / "stage3_image_plane",
+        tmp_path / "fit" / "stage1_backprojected_centroid_fit",
     )
-    args.exact_image_diagnostics_stage3 = True
+    args.stage2_forward_mode = "none"
+    assert plotting._image_catalog_family_cutout_enabled(
+        args,
+        tmp_path / "fit" / "stage1_backprojected_centroid_fit",
+    )
+    args.image_catalog_family_cutouts = False
     assert not plotting._image_catalog_family_cutout_enabled(
         args,
-        tmp_path / "fit" / "stage3_image_plane",
+        tmp_path / "fit" / "stage2_free_source_forward_fit",
     )
     args.image_catalog_family_cutout_image_dir = None
     assert not plotting._image_catalog_family_cutout_enabled(
         args,
-        tmp_path / "fit" / "stage4_critical_arc_mixture_image_plane",
+        tmp_path / "fit" / "stage2_free_source_forward_fit",
     )
 
 
@@ -668,19 +733,19 @@ def test_run_plot_tasks_with_progress_tracks_plot_names(monkeypatch: Any) -> Non
 
     tasks: list[plotting.PlotTask] = [
         ("corner", "plots.corner", lambda: calls.append("corner")),
-        ("image_plane_fit", "plots.image_plane_fit", lambda: calls.append("image_plane_fit")),
+        ("timing_profile", "plots.timing_profile", lambda: calls.append("timing_profile")),
     ]
 
     plotting._run_plot_tasks_with_progress(argparse.Namespace(quiet=False), tasks)
 
-    assert calls == ["corner", "image_plane_fit"]
-    assert phases == ["plots.corner", "plots.image_plane_fit"]
+    assert calls == ["corner", "timing_profile"]
+    assert phases == ["plots.corner", "plots.timing_profile"]
     assert len(progress_instances) == 1
     assert progress_instances[0].total == 2
     assert progress_instances[0].descriptions == [
         "plots",
         "plots: corner",
-        "plots: image_plane_fit",
+        "plots: timing_profile",
         "plots: complete",
     ]
 
@@ -1071,7 +1136,7 @@ potentiel 102
     ellipticite 0
     angle_pos 0
     core_radius 0.1
-    core_radius_kpc {2 * np.sqrt(lum2):.12g}
+    core_radius_kpc {2 * lum2:.12g}
     cut_radius 10
     cut_radius_kpc {50 * lum2:.12g}
     v_disp {300 * lum2 ** 0.25:.12g}
@@ -1314,6 +1379,8 @@ def test_corner_overlays_gold_best_fit_and_preserves_truths(tmp_path: Path, monk
         _corner_test_specs(),
         truth_values={"x": 0.5, "y": 2.5},
         best_fit_values={"x": 1.5, "y": 3.5},
+        map_values={"x": 2.0, "y": 4.0},
+        maximum_likelihood_values={"x": 1.75, "y": 3.75},
         previous_stage_best_values={"x": 1.25, "y": 3.25},
     )
 
@@ -1331,14 +1398,44 @@ def test_corner_overlays_gold_best_fit_and_preserves_truths(tmp_path: Path, monk
     )
     assert calls[2] == (
         "points",
-        [[1.5, 3.5]],
+        [[2.0, 4.0]],
         {
             "marker": "x",
-            "color": plotting.CORNER_BEST_FIT_COLOR,
+            "color": plotting.CORNER_MAP_COLOR,
             "markersize": 5,
             "markeredgewidth": 1.2,
         },
     )
+    assert calls[3] == (
+        "points",
+        [[1.75, 3.75]],
+        {
+            "marker": "x",
+            "color": plotting.CORNER_MAXIMUM_LIKELIHOOD_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
+    )
+    assert all(call[1] != [[1.5, 3.5]] for call in calls if call[0] == "points")
+
+
+def test_map_values_for_specs_uses_max_log_prob_sample() -> None:
+    samples = np.asarray([[0.0, 1.0], [1.0, 2.0], [2.0, 4.0]], dtype=float)
+    log_prob = np.asarray([-1.0, 3.0, 2.0], dtype=float)
+
+    assert plotting._map_values_for_specs(_corner_test_specs(), samples, log_prob) == {
+        "x": 1.0,
+        "y": 2.0,
+    }
+
+
+def test_map_values_for_specs_rejects_missing_or_bad_log_prob() -> None:
+    samples = np.asarray([[0.0, 1.0], [1.0, 2.0]], dtype=float)
+    specs = _corner_test_specs()
+
+    assert plotting._map_values_for_specs(specs, samples, None) == {}
+    assert plotting._map_values_for_specs(specs, samples, np.asarray([np.nan, np.nan])) == {}
+    assert plotting._map_values_for_specs(specs, samples, np.asarray([1.0])) == {}
 
 
 def test_corner_excludes_source_positions_before_finite_filtering(tmp_path: Path, monkeypatch: Any) -> None:
@@ -1425,6 +1522,8 @@ def test_corner_excludes_source_positions_before_finite_filtering(tmp_path: Path
         specs,
         truth_values={"x": 0.5, "y": 2.5, "source.1.beta_x": 9.0, "source.1.beta_y": 9.5},
         best_fit_values={"x": 1.5, "y": 3.5, "source.1.beta_x": 10.0, "source.1.beta_y": 10.5},
+        map_values={"x": 2.0, "y": 4.0, "source.1.beta_x": 12.0, "source.1.beta_y": 12.5},
+        maximum_likelihood_values={"x": 1.75, "y": 3.75, "source.1.beta_x": 11.0, "source.1.beta_y": 11.5},
     )
 
     assert calls[0][0] == "corner"
@@ -1433,17 +1532,27 @@ def test_corner_excludes_source_positions_before_finite_filtering(tmp_path: Path
     assert calls[0][2]["truths"] == [0.5, 2.5]
     assert calls[1] == (
         "points",
-        [[1.5, 3.5]],
+        [[2.0, 4.0]],
         {
             "marker": "x",
-            "color": plotting.CORNER_BEST_FIT_COLOR,
+            "color": plotting.CORNER_MAP_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
+    )
+    assert calls[2] == (
+        "points",
+        [[1.75, 3.75]],
+        {
+            "marker": "x",
+            "color": plotting.CORNER_MAXIMUM_LIKELIHOOD_COLOR,
             "markersize": 5,
             "markeredgewidth": 1.2,
         },
     )
 
 
-def test_potfile_corner_uses_scaling_best_fit_values(tmp_path: Path, monkeypatch: Any) -> None:
+def test_potfile_corner_includes_shared_free_hyperparameters(tmp_path: Path, monkeypatch: Any) -> None:
     calls: list[tuple[str, Any, dict[str, Any]]] = []
 
     class FakeFig:
@@ -1464,19 +1573,159 @@ def test_potfile_corner_uses_scaling_best_fit_values(tmp_path: Path, monkeypatch
     monkeypatch.setattr(plotting, "corner", FakeCorner())
     monkeypatch.setattr(plotting.plt, "close", lambda _fig: None)
 
-    plotting._plot_potfile_corner(
-        tmp_path,
-        np.asarray([[10.0, 20.0], [11.0, 22.0], [13.0, 24.0]], dtype=float),
-        _corner_test_specs(component_family="scaling"),
-        truth_values={"x": 10.5, "y": 22.5},
-        best_fit_values={"x": 12.0, "y": 23.0},
-        previous_stage_best_values={"x": 11.5, "y": 22.0},
+    specs = [
+        ParameterSpec(
+            name="members.sigma_star",
+            sample_name="members_sigma_star",
+            potential_id="members",
+            profile_type=81,
+            field="sigma_ref",
+            prior_kind="uniform",
+            lower=20.0,
+            upper=500.0,
+            step=1.0,
+            component_family="scaling",
+        ),
+        ParameterSpec(
+            name="members.alpha_sigma",
+            sample_name="members_alpha_sigma",
+            potential_id="members",
+            profile_type=81,
+            field="alpha_sigma",
+            prior_kind="uniform",
+            lower=0.05,
+            upper=0.6,
+            step=0.01,
+            component_family="scaling",
+        ),
+        ParameterSpec(
+            name="members.independent_free_log_sigma_tau",
+            sample_name="members_independent_free_log_sigma_tau",
+            potential_id="members",
+            profile_type=81,
+            field="independent_free_log_sigma_tau",
+            prior_kind="lognormal",
+            lower=0.0,
+            upper=10.0,
+            physical_mean=0.15,
+            std=0.3,
+            step=0.01,
+            component_family="independent_scaling",
+        ),
+        ParameterSpec(
+            name="members.independent_free_log_mass_tau",
+            sample_name="members_independent_free_log_mass_tau",
+            potential_id="members",
+            profile_type=81,
+            field="independent_free_log_mass_tau",
+            prior_kind="lognormal",
+            lower=0.0,
+            upper=10.0,
+            physical_mean=0.35,
+            std=0.3,
+            step=0.01,
+            component_family="independent_scaling",
+        ),
+        ParameterSpec(
+            name="members.g1.independent_free_log_sigma_delta_unit",
+            sample_name="members_g1_independent_free_log_sigma_delta_unit",
+            potential_id="members",
+            profile_type=81,
+            field="independent_free_log_sigma_delta_unit",
+            prior_kind="normal",
+            lower=-np.inf,
+            upper=np.inf,
+            physical_mean=0.0,
+            std=1.0,
+            step=0.01,
+            component_family="independent_scaling",
+        ),
+        ParameterSpec(
+            name="halo.x",
+            sample_name="halo_x",
+            potential_id="halo",
+            profile_type=81,
+            field="x",
+            prior_kind="uniform",
+            lower=-5.0,
+            upper=5.0,
+            step=0.1,
+            component_family="large",
+        ),
+    ]
+    samples = np.asarray(
+        [
+            [10.0, 0.20, 0.10, 0.30, -1.0, 4.0],
+            [11.0, 0.21, 0.11, 0.31, -0.5, 4.5],
+            [12.0, 0.22, 0.12, 0.32, 0.0, 5.0],
+            [13.0, 0.23, 0.13, 0.33, 0.5, 5.5],
+            [14.0, 0.24, 0.14, 0.34, 1.0, 6.0],
+        ],
+        dtype=float,
+    )
+    best_fit = np.asarray([12.0, 0.22, 0.12, 0.32, 0.0, 5.0], dtype=float)
+    subset_specs, subset_samples, subset_best_fit = plotting._potfile_corner_parameter_subset(
+        specs,
+        samples,
+        best_fit,
     )
 
-    assert calls[0][2]["truths"] == [10.5, 22.5]
+    assert [spec.field for spec in subset_specs] == [
+        "sigma_ref",
+        "alpha_sigma",
+        "independent_free_log_sigma_tau",
+        "independent_free_log_mass_tau",
+    ]
+    np.testing.assert_allclose(subset_samples, samples[:, [0, 1, 2, 3]])
+    np.testing.assert_allclose(subset_best_fit, best_fit[[0, 1, 2, 3]])
+
+    plotting._plot_potfile_corner(
+        tmp_path,
+        subset_samples,
+        subset_specs,
+        truth_values={
+            "members_sigma_star": 10.5,
+            "members_alpha_sigma": 0.205,
+            "members_independent_free_log_sigma_tau": 0.105,
+            "members_independent_free_log_mass_tau": 0.305,
+        },
+        best_fit_values={
+            "members_sigma_star": 12.0,
+            "members_alpha_sigma": 0.22,
+            "members_independent_free_log_sigma_tau": 0.12,
+            "members_independent_free_log_mass_tau": 0.32,
+        },
+        map_values={
+            "members_sigma_star": 13.0,
+            "members_alpha_sigma": 0.23,
+            "members_independent_free_log_sigma_tau": 0.13,
+            "members_independent_free_log_mass_tau": 0.33,
+        },
+        maximum_likelihood_values={
+            "members_sigma_star": 12.5,
+            "members_alpha_sigma": 0.225,
+            "members_independent_free_log_sigma_tau": 0.125,
+            "members_independent_free_log_mass_tau": 0.325,
+        },
+        previous_stage_best_values={
+            "members_sigma_star": 11.5,
+            "members_alpha_sigma": 0.215,
+            "members_independent_free_log_sigma_tau": 0.115,
+            "members_independent_free_log_mass_tau": 0.315,
+        },
+    )
+
+    assert calls[0][1].shape == (5, 4)
+    assert calls[0][2]["labels"] == [
+        "members.sigma_star",
+        "members.alpha_sigma",
+        "members.independent_free_log_sigma_tau",
+        "members.independent_free_log_mass_tau",
+    ]
+    assert calls[0][2]["truths"] == [10.5, 0.205, 0.105, 0.305]
     assert calls[1] == (
         "points",
-        [[11.5, 22.0]],
+        [[11.5, 0.215, 0.115, 0.315]],
         {
             "marker": "x",
             "color": plotting.CORNER_PREVIOUS_STAGE_COLOR,
@@ -1486,10 +1735,20 @@ def test_potfile_corner_uses_scaling_best_fit_values(tmp_path: Path, monkeypatch
     )
     assert calls[2] == (
         "points",
-        [[12.0, 23.0]],
+        [[13.0, 0.23, 0.13, 0.33]],
         {
             "marker": "x",
-            "color": plotting.CORNER_BEST_FIT_COLOR,
+            "color": plotting.CORNER_MAP_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
+    )
+    assert calls[3] == (
+        "points",
+        [[12.5, 0.225, 0.125, 0.325]],
+        {
+            "marker": "x",
+            "color": plotting.CORNER_MAXIMUM_LIKELIHOOD_COLOR,
             "markersize": 5,
             "markeredgewidth": 1.2,
         },
@@ -1537,6 +1796,8 @@ def test_cosmology_corner_uses_sample_name_truths_and_best_fit(tmp_path: Path, m
         cosmology_specs,
         truth_values={"cosmology_Om0": 0.3, "cosmology_w0": -1.0},
         best_fit_values=plotting._best_fit_values_for_specs(cosmology_specs, cosmology_best_fit),
+        map_values={"cosmology_Om0": 0.32, "cosmology_w0": -0.9},
+        maximum_likelihood_values={"cosmology_Om0": 0.315, "cosmology_w0": -0.92},
         previous_stage_best_values={"cosmology_Om0": 0.29, "cosmology_w0": -1.05},
     )
 
@@ -1556,10 +1817,20 @@ def test_cosmology_corner_uses_sample_name_truths_and_best_fit(tmp_path: Path, m
     )
     assert calls[2] == (
         "points",
-        [[0.31, -0.95]],
+        [[0.32, -0.9]],
         {
             "marker": "x",
-            "color": plotting.CORNER_BEST_FIT_COLOR,
+            "color": plotting.CORNER_MAP_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
+    )
+    assert calls[3] == (
+        "points",
+        [[0.315, -0.92]],
+        {
+            "marker": "x",
+            "color": plotting.CORNER_MAXIMUM_LIKELIHOOD_COLOR,
             "markersize": 5,
             "markeredgewidth": 1.2,
         },
@@ -2259,7 +2530,11 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     monkeypatch.setattr(plotting, "_fit_quality_tables", lambda *_args, **_kwargs: (image_df, magnification_df, extra_image_df))
     monkeypatch.setattr(plotting, "_run_summary", lambda *_args, **_kwargs: {"ok": True})
     monkeypatch.setattr(plotting, "_potfile_constraint_diagnostics_table", lambda *_args, **_kwargs: pd.DataFrame())
-    monkeypatch.setattr(plotting, "_scaling_parameter_subset", lambda *_args, **_kwargs: ([], np.empty((1, 0)), np.empty((0,))))
+    monkeypatch.setattr(
+        plotting,
+        "_potfile_corner_parameter_subset",
+        lambda *_args, **_kwargs: ([], np.empty((1, 0)), np.empty((0,))),
+    )
     monkeypatch.setattr(plotting, "_cosmology_parameter_subset", lambda *_args, **_kwargs: ([], np.empty((1, 0)), np.empty((0,))))
     monkeypatch.setattr(plotting, "_scaling_grouped_subset", lambda *_args, **_kwargs: ([], np.empty((0, 0, 0))))
     monkeypatch.setattr(plotting, "_best_fit_values_for_specs", lambda *_args, **_kwargs: {})
@@ -2329,7 +2604,6 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert "image_residual_histogram" in captured_tasks
     assert "residual_vs_magnification" in captured_tasks
     assert "residual_geometry_trends" in captured_tasks
-    assert "posterior_predictive_coverage" in captured_tasks
     assert "perturbation_discovery_diagnostics" in captured_tasks
     assert "subhalo_mass_function" in captured_tasks
     assert "subhalo_radial_distribution" in captured_tasks
@@ -2475,6 +2749,92 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert "mu_truth_diagnostics" in captured_tasks
     assert "absolute_magnification" in captured_tasks
     assert "caustic_overlay" in captured_tasks
+
+
+def test_generate_plots_and_tables_stage0_minimal_outputs(tmp_path: Path, monkeypatch: Any) -> None:
+    captured_tasks: list[str] = []
+    scaling_relation_df = pd.DataFrame(
+        {
+            "potfile_id": ["members"],
+            "catalog_id": ["1"],
+            "scaling_relation_class": ["inactive"],
+            "catalog_mag": [20.0],
+            "catalog_color": [1.2],
+        }
+    )
+    tables_dir = tmp_path / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "component_index": [10],
+            "evaluation_component_index": [11],
+            "catalog_id": ["g1"],
+            "image_index": [0],
+            "family_id": ["1"],
+            "image_label": ["a"],
+            "score": [2.0],
+            "alpha_norm": [2.0],
+            "jacobian_norm": [0.0],
+            "selected_pair": [True],
+            "selected_galaxy": [True],
+            "alpha_tol_arcsec": [0.1],
+            "jacobian_tol": [0.5],
+            "jacobian_weight": [1.0],
+            "threshold_score": [1.0],
+        }
+    ).to_csv(tables_dir / "perturbation_discovery_diagnostics.csv", index=False)
+
+    def fail_if_called(*_args: Any, **_kwargs: Any) -> pd.DataFrame:
+        raise AssertionError("stage0 minimal outputs should not build validation or recovery tables")
+
+    monkeypatch.setattr(plotting, "_fit_quality_tables", fail_if_called)
+    monkeypatch.setattr(plotting, "_image_count_recovery_table", fail_if_called)
+    monkeypatch.setattr(plotting, "_subhalo_properties_table", fail_if_called)
+    monkeypatch.setattr(plotting, "_summary_table", fail_if_called)
+    monkeypatch.setattr(plotting, "_independent_scaling_diagnostics_table", lambda *_args, **_kwargs: pd.DataFrame())
+    monkeypatch.setattr(plotting, "_scaling_relation_summary_table", lambda *_args, **_kwargs: scaling_relation_df)
+    monkeypatch.setattr(plotting, "_run_summary", lambda *_args, **_kwargs: {"run_name": "stage0"})
+
+    def capture_tasks(_args: argparse.Namespace, plot_tasks: list[plotting.PlotTask]) -> None:
+        captured_tasks.extend(task[0] for task in plot_tasks)
+
+    monkeypatch.setattr(plotting, "_run_plot_tasks_with_progress", capture_tasks)
+    state = SimpleNamespace(
+        parameter_specs=[],
+        family_data=[],
+        fit_mode="joint",
+        perturbation_discovery_stage0=True,
+    )
+    evaluator = SimpleNamespace(scaling_rank_df=pd.DataFrame())
+    results = PosteriorResults(
+        samples=np.empty((1, 0), dtype=float),
+        log_prob=np.asarray([0.0]),
+        accept_prob=np.asarray([1.0]),
+        diverging=np.asarray([False]),
+        num_steps=np.asarray([1.0]),
+        warmup_steps=0,
+        sample_steps=1,
+        num_chains=1,
+    )
+
+    run_summary = plotting._generate_plots_and_tables(
+        run_dir=tmp_path,
+        state=state,
+        evaluator=evaluator,
+        best_fit=np.empty((0,), dtype=float),
+        best_eval=SimpleNamespace(loglike=float("nan")),
+        results=results,
+        runtime_sec=0.0,
+        args=argparse.Namespace(quiet=True),
+    )
+
+    assert captured_tasks == ["scaling_relation_summary", "perturbation_discovery_diagnostics"]
+    assert run_summary["stage0_minimal_outputs"] is True
+    assert (tables_dir / "scaling_relation_summary.csv").exists()
+    assert (tables_dir / "run_summary.json").exists()
+    assert not (tables_dir / "image_fit_quality.csv").exists()
+    assert not (tables_dir / "image_count_recovery.csv").exists()
+    assert not (tables_dir / "image_recovery_extra_images.csv").exists()
 
 
 def test_compact_numpyro_model_graph_groups_sample_sites_by_role() -> None:
@@ -3236,47 +3596,12 @@ def test_chain_parameter_diagnostics_table_reports_per_chain_quantiles() -> None
     assert sigma_row["chain_median_standardized_spread"] > 1.0
 
 
-def test_ranked_chain_trace_subset_prefers_worst_non_source_parameters_when_sources_dominate() -> None:
-    posterior, base_specs = _synthetic_stuck_chain_posterior()
-    source_specs = [_source_position_test_spec(index) for index in range(8)]
-    specs = [*base_specs, *source_specs]
-    source_values = np.zeros((posterior.grouped_samples.shape[0], posterior.grouped_samples.shape[1], len(source_specs)))
-    for source_index in range(len(source_specs)):
-        source_values[:, :, source_index] = source_index + np.asarray([0.0, 0.2, 0.4, 0.6])[:, None]
-    grouped = np.concatenate([posterior.grouped_samples, source_values], axis=2)
-    table = plotting._chain_parameter_diagnostics_table(
-        PosteriorResults(
-            samples=grouped.reshape((-1, grouped.shape[-1])),
-            log_prob=posterior.log_prob,
-            accept_prob=posterior.accept_prob,
-            diverging=posterior.diverging,
-            num_steps=posterior.num_steps,
-            warmup_steps=0,
-            sample_steps=grouped.shape[1],
-            num_chains=grouped.shape[0],
-            grouped_samples=grouped,
-            grouped_log_prob=posterior.grouped_log_prob,
-        ),
-        specs,
-    )
-
-    subset = plotting._ranked_chain_trace_subset(grouped, specs, table, max_params=3)
-
-    assert subset is not None
-    _subset_samples, subset_specs = subset
-    assert "image_sigma_int" in {spec.sample_name for spec in subset_specs}
-    assert all(spec.component_family != "source_position" for spec in subset_specs)
-
-
-def test_chain_diagnostic_plots_create_pdfs_and_skip_missing_grouped_samples(tmp_path: Path) -> None:
+def test_chain_health_plot_creates_pdf_and_skips_missing_grouped_samples(tmp_path: Path) -> None:
     posterior, specs = _synthetic_stuck_chain_posterior()
-    diagnostics = plotting._chain_parameter_diagnostics_table(posterior, specs)
 
     plotting._plot_chain_health(tmp_path, posterior, specs, max_tree_depth=8)
-    plotting._plot_chain_ranked_trace(tmp_path, posterior.grouped_samples, specs, diagnostics)
 
     assert (tmp_path / "chain_health.pdf").exists()
-    assert (tmp_path / "chain_ranked_trace.pdf").exists()
 
     skip_dir = tmp_path / "skip"
     missing_grouped = PosteriorResults(
@@ -3290,10 +3615,8 @@ def test_chain_diagnostic_plots_create_pdfs_and_skip_missing_grouped_samples(tmp
         num_chains=posterior.num_chains,
     )
     plotting._plot_chain_health(skip_dir, missing_grouped, specs, max_tree_depth=8)
-    plotting._plot_chain_ranked_trace(skip_dir, None, specs, diagnostics)
 
     assert not (skip_dir / "chain_health.pdf").exists()
-    assert not (skip_dir / "chain_ranked_trace.pdf").exists()
 
 
 def test_format_run_summary_text_contains_lensing_and_quality_sections() -> None:
@@ -4358,6 +4681,7 @@ def test_plot_absolute_mu_truth_diagnostics_samples_every_pixel_and_writes_outpu
     assert (tmp_path / "mu_model.pdf").exists()
     assert (tmp_path / "mu_fractional_residual.pdf").exists()
     assert (tmp_path / "mu_recovery.pdf").exists()
+    assert (tmp_path / "critical_line_recovery.pdf").exists()
     binned = pd.read_csv(tmp_path / "tables" / "mu_recovery_binned.csv")
     summary = pd.read_csv(tmp_path / "tables" / "mu_recovery_summary.csv")
     assert list(binned.columns) == [
@@ -4375,6 +4699,47 @@ def test_plot_absolute_mu_truth_diagnostics_samples_every_pixel_and_writes_outpu
     assert evaluator.model.input_sizes == [9]
     assert evaluator.model_z == [9.0]
     assert evaluator.packed_z == [9.0]
+
+
+def test_plot_critical_line_recovery_contours_truth_and_model(monkeypatch: Any, tmp_path: Path) -> None:
+    from matplotlib.axes import Axes
+
+    x_arcsec, y_arcsec = np.meshgrid(
+        np.asarray([-1.0, 0.0, 1.0], dtype=float),
+        np.asarray([-1.0, 0.0, 1.0], dtype=float),
+    )
+    truth_determinant = x_arcsec.copy()
+    model_determinant = y_arcsec.copy()
+    contour_calls: list[dict[str, Any]] = []
+    original_contour = Axes.contour
+
+    def record_contour(self: Axes, *args: Any, **kwargs: Any) -> Any:
+        contour_calls.append(
+            {
+                "levels": list(kwargs.get("levels", [])),
+                "colors": list(kwargs.get("colors", [])),
+                "linestyles": list(kwargs.get("linestyles", [])),
+            }
+        )
+        return original_contour(self, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "contour", record_contour)
+
+    plotting._plot_critical_line_recovery_from_grid(
+        tmp_path,
+        truth_determinant,
+        model_determinant,
+        x_arcsec,
+        y_arcsec,
+        z_source=9.0,
+    )
+
+    assert (tmp_path / "critical_line_recovery.pdf").exists()
+    assert (tmp_path / "critical_line_recovery.pdf").stat().st_size > 0
+    assert contour_calls == [
+        {"levels": [0.0], "colors": ["black"], "linestyles": ["-"]},
+        {"levels": [0.0], "colors": ["tab:blue"], "linestyles": ["--"]},
+    ]
 
 
 def test_absolute_mu_recovery_overlays_observed_image_points(monkeypatch: Any, tmp_path: Path) -> None:
@@ -4838,120 +5203,6 @@ def test_quantity_recovery_plot_overlays_observed_image_points(monkeypatch: Any,
     assert scatter_kwargs["edgecolors"] == "black"
 
 
-def test_image_plane_fit_uses_family_colored_observed_cross_and_model_point(monkeypatch: Any, tmp_path: Path) -> None:
-    class FakeAxis:
-        def __init__(self) -> None:
-            self.scatters: list[tuple[Any, Any, dict[str, Any]]] = []
-            self.plots: list[tuple[Any, Any, dict[str, Any]]] = []
-
-        def scatter(self, x: Any, y: Any, **kwargs: Any) -> None:
-            self.scatters.append((x, y, kwargs))
-
-        def plot(self, x: Any, y: Any, **kwargs: Any) -> None:
-            self.plots.append((x, y, kwargs))
-
-        def invert_xaxis(self) -> None:
-            return None
-
-        def set_xlabel(self, _label: str) -> None:
-            return None
-
-        def set_ylabel(self, _label: str) -> None:
-            return None
-
-        def set_title(self, _title: str) -> None:
-            return None
-
-        def legend(self, **_kwargs: Any) -> None:
-            return None
-
-    class FakeFig:
-        def tight_layout(self) -> None:
-            return None
-
-        def savefig(self, path: Path, **_kwargs: Any) -> None:
-            Path(path).touch()
-
-    axis = FakeAxis()
-    monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: (FakeFig(), axis))
-    monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
-
-    family = SimpleNamespace(
-        family_id="1",
-        x_obs=np.asarray([0.0, 1.0], dtype=float),
-        y_obs=np.asarray([2.0, 3.0], dtype=float),
-    )
-    state = SimpleNamespace(family_data=[family])
-    best_eval = SimpleNamespace(
-        family_predictions={"1": {"x_pred": np.asarray([0.1, 1.1]), "y_pred": np.asarray([2.1, 3.1])}}
-    )
-
-    plotting._plot_image_plane_fit(tmp_path, state, best_eval)
-
-    assert (tmp_path / "image_plane_fit.pdf").exists()
-    observed_kwargs = axis.scatters[0][2]
-    model_kwargs = axis.scatters[1][2]
-    assert observed_kwargs["marker"] == "x"
-    assert model_kwargs["marker"] == "o"
-    assert model_kwargs["alpha"] < 1.0
-    assert observed_kwargs["color"] == model_kwargs["color"]
-
-
-def test_image_plane_fit_handles_missing_model_predictions(monkeypatch: Any, tmp_path: Path) -> None:
-    class FakeAxis:
-        def __init__(self) -> None:
-            self.scatters: list[tuple[Any, Any, dict[str, Any]]] = []
-            self.plots: list[tuple[Any, Any, dict[str, Any]]] = []
-
-        def scatter(self, x: Any, y: Any, **kwargs: Any) -> None:
-            self.scatters.append((x, y, kwargs))
-
-        def plot(self, x: Any, y: Any, **kwargs: Any) -> None:
-            self.plots.append((x, y, kwargs))
-
-        def invert_xaxis(self) -> None:
-            return None
-
-        def set_xlabel(self, _label: str) -> None:
-            return None
-
-        def set_ylabel(self, _label: str) -> None:
-            return None
-
-        def set_title(self, _title: str) -> None:
-            return None
-
-        def legend(self, **_kwargs: Any) -> None:
-            return None
-
-    class FakeFig:
-        def tight_layout(self) -> None:
-            return None
-
-        def savefig(self, path: Path, **_kwargs: Any) -> None:
-            Path(path).touch()
-
-    axis = FakeAxis()
-    monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: (FakeFig(), axis))
-    monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
-
-    family = SimpleNamespace(
-        family_id="1",
-        n_images=2,
-        x_obs=np.asarray([0.0, 1.0], dtype=float),
-        y_obs=np.asarray([2.0, 3.0], dtype=float),
-    )
-    state = SimpleNamespace(family_data=[family])
-    best_eval = SimpleNamespace(family_predictions={"1": {"failed": True}})
-
-    plotting._plot_image_plane_fit(tmp_path, state, best_eval)
-
-    assert (tmp_path / "image_plane_fit.pdf").exists()
-    assert len(axis.scatters) == 1
-    assert axis.scatters[0][2]["marker"] == "x"
-    assert axis.plots == []
-
-
 def test_image_recovery_uses_status_colors_and_small_points(monkeypatch: Any, tmp_path: Path) -> None:
     class FakeAxis:
         def __init__(self) -> None:
@@ -5099,13 +5350,11 @@ def test_fit_quality_diagnostic_plots_write_pdfs_and_merge_tables(tmp_path: Path
     plotting._plot_normalized_image_residuals(image_df, tmp_path / "normalized_image_residuals.pdf")
     plotting._plot_residual_vs_magnification(image_df, magnification_df, tmp_path / "residual_vs_magnification.pdf")
     plotting._plot_residual_geometry_trends(image_df, tmp_path / "residual_geometry_trends.pdf")
-    plotting._plot_posterior_predictive_coverage(image_df, tmp_path / "posterior_predictive_coverage.pdf")
 
     for filename in [
         "normalized_image_residuals.pdf",
         "residual_vs_magnification.pdf",
         "residual_geometry_trends.pdf",
-        "posterior_predictive_coverage.pdf",
     ]:
         path = tmp_path / filename
         assert path.exists()
@@ -5432,6 +5681,8 @@ def test_smc_corner_uses_particle_weights_and_overlays(tmp_path: Path, monkeypat
         _mixed_cosmology_test_specs(),
         posterior.sample_weights,
         best_fit_values={"halo.x": 13.0, "cosmology.Om0": 0.33, "cosmology.w0": -0.9},
+        map_values={"halo.x": 12.0, "cosmology.Om0": 0.32, "cosmology.w0": -0.95},
+        maximum_likelihood_values={"halo.x": 12.5, "cosmology.Om0": 0.325, "cosmology.w0": -0.93},
         previous_stage_best_values={"halo.x": 11.0, "cosmology.Om0": 0.30, "cosmology.w0": -1.0},
     )
 
@@ -5452,10 +5703,20 @@ def test_smc_corner_uses_particle_weights_and_overlays(tmp_path: Path, monkeypat
     )
     assert calls[2] == (
         "points",
-        [[0.33, -0.9, 13.0]],
+        [[0.32, -0.95, 12.0]],
         {
             "marker": "x",
-            "color": plotting.CORNER_BEST_FIT_COLOR,
+            "color": plotting.CORNER_MAP_COLOR,
+            "markersize": 5,
+            "markeredgewidth": 1.2,
+        },
+    )
+    assert calls[3] == (
+        "points",
+        [[0.325, -0.93, 12.5]],
+        {
+            "marker": "x",
+            "color": plotting.CORNER_MAXIMUM_LIKELIHOOD_COLOR,
             "markersize": 5,
             "markeredgewidth": 1.2,
         },

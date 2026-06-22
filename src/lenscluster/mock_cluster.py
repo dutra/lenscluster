@@ -558,7 +558,7 @@ def _truth_parameter_values(config: SingleBCGMockConfig, kpc_per_arcsec: float) 
         if config.subhalo_sigma_scatter_dex > 0.0:
             truth["potfile.sigma_log_scatter"] = _dex_scatter_to_ln(config.subhalo_sigma_scatter_dex)
         if config.subhalo_cut_scatter_dex > 0.0:
-            truth["potfile.cut_log_scatter"] = _dex_scatter_to_ln(config.subhalo_cut_scatter_dex)
+            truth["potfile.mass_log_scatter"] = _dex_scatter_to_ln(config.subhalo_cut_scatter_dex)
     return truth
 
 

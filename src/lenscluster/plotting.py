@@ -78,6 +78,8 @@ CORNER_PLOT_KWARGS = {
 }
 CORNER_PLOT_DPI = 300
 CORNER_BEST_FIT_COLOR = "#d4a017"
+CORNER_MAP_COLOR = "#d4a017"
+CORNER_MAXIMUM_LIKELIHOOD_COLOR = "tab:orange"
 CORNER_BEST_PAR_COLOR = "tab:red"
 CORNER_PREVIOUS_STAGE_COLOR = "tab:green"
 CORNER_BAYES_OVERLAY_COLOR = "tab:red"
@@ -724,12 +726,9 @@ def _scaling_results_summary_table(
         "sigma_log_scatter_median",
         "sigma_log_scatter_p16",
         "sigma_log_scatter_p84",
-        "core_log_scatter_median",
-        "core_log_scatter_p16",
-        "core_log_scatter_p84",
-        "cut_log_scatter_median",
-        "cut_log_scatter_p16",
-        "cut_log_scatter_p84",
+        "mass_log_scatter_median",
+        "mass_log_scatter_p16",
+        "mass_log_scatter_p84",
         "free_log_sigma_tau_median",
         "free_log_sigma_tau_p16",
         "free_log_sigma_tau_p84",
@@ -838,8 +837,7 @@ def _scaling_results_summary_table(
             _add_summary(row, "gamma_ml", None, float("nan"))
         for prefix, field in (
             ("sigma_log_scatter", "sigma_log_scatter"),
-            ("core_log_scatter", "core_log_scatter"),
-            ("cut_log_scatter", "cut_log_scatter"),
+            ("mass_log_scatter", "mass_log_scatter"),
             ("free_log_sigma_tau", "independent_free_log_sigma_tau"),
             ("free_log_mass_tau", "independent_free_log_mass_tau"),
         ):
@@ -875,8 +873,7 @@ def _build_scaling_results_rich_table(summary_df: pd.DataFrame) -> Any:
         ("beta_radius", "beta_radius"),
         ("gamma_ml", "gamma_ml"),
         ("sigma scatter", "sigma_log_scatter"),
-        ("core scatter", "core_log_scatter"),
-        ("cut scatter", "cut_log_scatter"),
+        ("mass scatter", "mass_log_scatter"),
         ("tau_sigma", "free_log_sigma_tau"),
         ("tau_mass", "free_log_mass_tau"),
     ]
@@ -898,8 +895,7 @@ def _build_scaling_results_rich_table(summary_df: pd.DataFrame) -> Any:
             _interval_text(row_series, "beta_radius"),
             _interval_text(row_series, "gamma_ml"),
             _interval_text(row_series, "sigma_log_scatter"),
-            _interval_text(row_series, "core_log_scatter"),
-            _interval_text(row_series, "cut_log_scatter"),
+            _interval_text(row_series, "mass_log_scatter"),
             _interval_text(row_series, "free_log_sigma_tau"),
             _interval_text(row_series, "free_log_mass_tau"),
         )
@@ -2421,69 +2417,68 @@ def _scaling_relation_summary_table(
     *,
     sample_weights: np.ndarray | None = None,
     independent_scaling_df: pd.DataFrame | None = None,
+    best_value: str | None = None,
+    best_value_requested: str | None = None,
 ) -> pd.DataFrame:
     columns = [
         "potfile_id",
         "catalog_id",
+        "best_value",
+        "best_value_requested",
         "rank",
         "component_index",
         "free_component_index",
         "catalog_mag",
         "catalog_color",
-        "frozen_delta_log_sigma",
-        "frozen_delta_log_mass",
-        "frozen_sigma_ratio",
-        "frozen_mass_ratio",
-        "frozen_radius_ratio",
         "luminosity_ratio",
         "anchor_mag",
         "alpha_sigma_median",
         "alpha_sigma_p16",
         "alpha_sigma_p84",
-        "alpha_sigma_map",
+        "alpha_sigma_best",
         "beta_radius_median",
         "beta_radius_p16",
         "beta_radius_p84",
-        "beta_radius_map",
+        "beta_radius_best",
         "gamma_ml_median",
         "gamma_ml_p16",
         "gamma_ml_p84",
-        "gamma_ml_map",
+        "gamma_ml_best",
         "selected_active",
         "selected_independent",
         "scaling_relation_class",
         "scaling_v_disp_median",
         "scaling_v_disp_p16",
         "scaling_v_disp_p84",
-        "scaling_v_disp_map",
+        "scaling_v_disp_best",
         "scaling_core_radius_kpc_median",
         "scaling_core_radius_kpc_p16",
         "scaling_core_radius_kpc_p84",
-        "scaling_core_radius_kpc_map",
+        "scaling_core_radius_kpc_best",
         "scaling_cut_radius_kpc_median",
         "scaling_cut_radius_kpc_p16",
         "scaling_cut_radius_kpc_p84",
-        "scaling_cut_radius_kpc_map",
+        "scaling_cut_radius_kpc_best",
         "scaling_log10_mass_msun_median",
         "scaling_log10_mass_msun_p16",
         "scaling_log10_mass_msun_p84",
-        "scaling_log10_mass_msun_map",
+        "scaling_log10_mass_msun_best",
         "free_v_disp_median",
         "free_v_disp_p16",
         "free_v_disp_p84",
-        "free_v_disp_map",
+        "free_v_disp_best",
         "free_core_radius_kpc_median",
         "free_core_radius_kpc_p16",
         "free_core_radius_kpc_p84",
-        "free_core_radius_kpc_map",
+        "free_core_radius_kpc_best",
         "free_cut_radius_kpc_median",
         "free_cut_radius_kpc_p16",
         "free_cut_radius_kpc_p84",
-        "free_cut_radius_kpc_map",
+        "free_cut_radius_kpc_best",
         "free_log10_mass_msun_median",
         "free_log10_mass_msun_p16",
         "free_log10_mass_msun_p84",
-        "free_log10_mass_msun_map",
+        "free_log10_mass_msun_best",
     ]
     sample_array = np.asarray(samples, dtype=float)
     best_fit_array = np.asarray(best_fit, dtype=float).reshape(-1)
@@ -2537,27 +2532,29 @@ def _scaling_relation_summary_table(
             return sample_array[:, idx]
         return np.full(sample_array.shape[0], float(base_array[component_index]), dtype=float)
 
-    def _map_value(base_array: np.ndarray, index_array: np.ndarray, component_index: int) -> float:
+    def _best_value(base_array: np.ndarray, index_array: np.ndarray, component_index: int) -> float:
         idx = int(index_array[component_index])
         if 0 <= idx < best_fit_array.size:
             return float(best_fit_array[idx])
         return float(base_array[component_index])
 
-    def _add_summary(row_dict: dict[str, Any], prefix: str, values: np.ndarray, map_value: float) -> None:
+    def _add_summary(row_dict: dict[str, Any], prefix: str, values: np.ndarray, selected_best_value: float) -> None:
         summary = _finite_weighted_summary(values, weights)
         row_dict[f"{prefix}_median"] = summary["median"]
         row_dict[f"{prefix}_p16"] = summary["p16"]
         row_dict[f"{prefix}_p84"] = summary["p84"]
-        row_dict[f"{prefix}_map"] = float(map_value) if np.isfinite(map_value) else float("nan")
+        row_dict[f"{prefix}_best"] = (
+            float(selected_best_value) if np.isfinite(selected_best_value) else float("nan")
+        )
 
     def _effective_exponents(component_index: int) -> tuple[np.ndarray, np.ndarray, float, float]:
         alpha_values = _values(alpha_sigma_base, alpha_sigma_indices, component_index)
         gamma_values = _values(gamma_ml_base, gamma_ml_indices, component_index)
-        alpha_map = _map_value(alpha_sigma_base, alpha_sigma_indices, component_index)
-        gamma_map = _map_value(gamma_ml_base, gamma_ml_indices, component_index)
+        alpha_best = _best_value(alpha_sigma_base, alpha_sigma_indices, component_index)
+        gamma_best = _best_value(gamma_ml_base, gamma_ml_indices, component_index)
         beta_values = 1.0 + gamma_values - 2.0 * alpha_values
-        beta_map = 1.0 + gamma_map - 2.0 * alpha_map
-        return alpha_values, beta_values, alpha_map, beta_map
+        beta_best = 1.0 + gamma_best - 2.0 * alpha_best
+        return alpha_values, beta_values, alpha_best, beta_best
 
     rows: list[dict[str, Any]] = []
     for row in scaling_rank_df.itertuples(index=False):
@@ -2570,27 +2567,18 @@ def _scaling_relation_summary_table(
         sigma_ref = _values(sigma_ref_base, sigma_ref_indices, component_index)
         cut_ref = _values(cut_ref_base, cut_ref_indices, component_index)
         core_ref = _values(core_ref_base, core_ref_indices, component_index)
-        alpha_sigma, beta_radius, alpha_sigma_map, beta_radius_map = _effective_exponents(component_index)
+        alpha_sigma, beta_radius, alpha_sigma_best, beta_radius_best = _effective_exponents(component_index)
         gamma_values = _values(gamma_ml_base, gamma_ml_indices, component_index)
-        gamma_map = _map_value(gamma_ml_base, gamma_ml_indices, component_index)
+        gamma_best = _best_value(gamma_ml_base, gamma_ml_indices, component_index)
         lum = float(luminosity_ratio[component_index])
-        frozen_delta_log_sigma = float(getattr(row, "frozen_delta_log_sigma", 0.0))
-        frozen_delta_log_mass = float(getattr(row, "frozen_delta_log_mass", 0.0))
-        if not np.isfinite(frozen_delta_log_sigma):
-            frozen_delta_log_sigma = 0.0
-        if not np.isfinite(frozen_delta_log_mass):
-            frozen_delta_log_mass = 0.0
-        frozen_sigma_ratio = float(np.exp(frozen_delta_log_sigma))
-        frozen_mass_ratio = float(np.exp(frozen_delta_log_mass))
-        frozen_radius_ratio = float(np.exp(frozen_delta_log_mass - 2.0 * frozen_delta_log_sigma))
         size_luminosity_scale = np.power(lum, beta_radius)
-        scaling_v_disp = sigma_ref * np.power(lum, alpha_sigma) * frozen_sigma_ratio
-        scaling_core = core_ref * size_luminosity_scale * frozen_radius_ratio
-        scaling_cut = cut_ref * size_luminosity_scale * frozen_radius_ratio
+        scaling_v_disp = sigma_ref * np.power(lum, alpha_sigma)
+        scaling_core = core_ref * size_luminosity_scale
+        scaling_cut = cut_ref * size_luminosity_scale
         scaling_log10_mass = _log10_dpie_mass_msun(scaling_v_disp, scaling_cut)
-        sigma_ref_map = _map_value(sigma_ref_base, sigma_ref_indices, component_index)
-        cut_ref_map = _map_value(cut_ref_base, cut_ref_indices, component_index)
-        core_ref_map = _map_value(core_ref_base, core_ref_indices, component_index)
+        sigma_ref_best = _best_value(sigma_ref_base, sigma_ref_indices, component_index)
+        cut_ref_best = _best_value(cut_ref_base, cut_ref_indices, component_index)
+        core_ref_best = _best_value(core_ref_base, core_ref_indices, component_index)
         catalog_mag = float(getattr(row, "catalog_mag", np.nan))
         anchor_mag = (
             catalog_mag + 2.5 * math.log10(lum)
@@ -2600,43 +2588,40 @@ def _scaling_relation_summary_table(
         row_dict: dict[str, Any] = {
             "potfile_id": str(getattr(row, "potfile_id", "")),
             "catalog_id": str(getattr(row, "catalog_id", "")),
+            "best_value": "" if best_value is None else str(best_value),
+            "best_value_requested": "" if best_value_requested is None else str(best_value_requested),
             "rank": int(getattr(row, "rank", -1)),
             "component_index": component_index,
             "free_component_index": int(getattr(row, "free_component_index", -1)),
             "catalog_mag": catalog_mag,
             "catalog_color": float(getattr(row, "catalog_color", np.nan)),
-            "frozen_delta_log_sigma": frozen_delta_log_sigma,
-            "frozen_delta_log_mass": frozen_delta_log_mass,
-            "frozen_sigma_ratio": frozen_sigma_ratio,
-            "frozen_mass_ratio": frozen_mass_ratio,
-            "frozen_radius_ratio": frozen_radius_ratio,
             "luminosity_ratio": lum,
             "anchor_mag": anchor_mag,
             "selected_active": selected_active,
             "selected_independent": selected_independent,
             "scaling_relation_class": relation_class,
         }
-        _add_summary(row_dict, "alpha_sigma", alpha_sigma, alpha_sigma_map)
-        _add_summary(row_dict, "beta_radius", beta_radius, beta_radius_map)
-        _add_summary(row_dict, "gamma_ml", gamma_values, gamma_map)
+        _add_summary(row_dict, "alpha_sigma", alpha_sigma, alpha_sigma_best)
+        _add_summary(row_dict, "beta_radius", beta_radius, beta_radius_best)
+        _add_summary(row_dict, "gamma_ml", gamma_values, gamma_best)
         _add_summary(
             row_dict,
             "scaling_v_disp",
             scaling_v_disp,
-            sigma_ref_map * float(np.power(lum, alpha_sigma_map)) * frozen_sigma_ratio,
+            sigma_ref_best * float(np.power(lum, alpha_sigma_best)),
         )
-        size_luminosity_scale_map = float(np.power(lum, beta_radius_map))
+        size_luminosity_scale_best = float(np.power(lum, beta_radius_best))
         _add_summary(
             row_dict,
             "scaling_core_radius_kpc",
             scaling_core,
-            core_ref_map * size_luminosity_scale_map * frozen_radius_ratio,
+            core_ref_best * size_luminosity_scale_best,
         )
         _add_summary(
             row_dict,
             "scaling_cut_radius_kpc",
             scaling_cut,
-            cut_ref_map * size_luminosity_scale_map * frozen_radius_ratio,
+            cut_ref_best * size_luminosity_scale_best,
         )
         _add_summary(
             row_dict,
@@ -2644,8 +2629,8 @@ def _scaling_relation_summary_table(
             scaling_log10_mass,
             float(
                 _log10_dpie_mass_msun(
-                    sigma_ref_map * float(np.power(lum, alpha_sigma_map)) * frozen_sigma_ratio,
-                    cut_ref_map * size_luminosity_scale_map * frozen_radius_ratio,
+                    sigma_ref_best * float(np.power(lum, alpha_sigma_best)),
+                    cut_ref_best * size_luminosity_scale_best,
                 )
             ),
         )
@@ -2657,19 +2642,19 @@ def _scaling_relation_summary_table(
         "free_v_disp_median",
         "free_v_disp_p16",
         "free_v_disp_p84",
-        "free_v_disp_map",
+        "free_v_disp_best",
         "free_core_radius_kpc_median",
         "free_core_radius_kpc_p16",
         "free_core_radius_kpc_p84",
-        "free_core_radius_kpc_map",
+        "free_core_radius_kpc_best",
         "free_cut_radius_kpc_median",
         "free_cut_radius_kpc_p16",
         "free_cut_radius_kpc_p84",
-        "free_cut_radius_kpc_map",
+        "free_cut_radius_kpc_best",
         "free_log10_mass_msun_median",
         "free_log10_mass_msun_p16",
         "free_log10_mass_msun_p84",
-        "free_log10_mass_msun_map",
+        "free_log10_mass_msun_best",
     ]
     for column in free_columns:
         result[column] = np.nan
@@ -2678,6 +2663,13 @@ def _scaling_relation_summary_table(
         if {"potfile_id", "component_index"}.issubset(diag_df.columns):
             diag_df["potfile_id"] = diag_df["potfile_id"].astype(str)
             diag_df["component_index"] = diag_df["component_index"].astype(int)
+            rename_free_map_columns = {
+                column: column.removesuffix("_map") + "_best"
+                for column in diag_df.columns
+                if column.startswith("free_") and column.endswith("_map")
+            }
+            if rename_free_map_columns:
+                diag_df = diag_df.rename(columns=rename_free_map_columns)
             merge_columns = ["potfile_id", "component_index"] + [column for column in free_columns if column in diag_df.columns]
             result = result.drop(columns=[column for column in free_columns if column in result.columns]).merge(
                 diag_df[merge_columns],
@@ -2687,7 +2679,7 @@ def _scaling_relation_summary_table(
             for column in free_columns:
                 if column not in result:
                     result[column] = np.nan
-    for suffix in ("median", "p16", "p84", "map"):
+    for suffix in ("median", "p16", "p84", "best"):
         mass_column = f"free_log10_mass_msun_{suffix}"
         if mass_column in result and np.isfinite(pd.to_numeric(result[mass_column], errors="coerce")).any():
             continue
@@ -2830,39 +2822,6 @@ def _plot_potfile_prior_posterior(
         fig.legend(handles, labels, loc="upper right")
     fig.tight_layout()
     fig.savefig(_plot_path(plot_dir, "potfile_prior_posterior.png"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_potfile_constraint_strength(plot_dir: Path, potfile_diag_df: pd.DataFrame) -> None:
-    if potfile_diag_df.empty:
-        return
-    plot_df = potfile_diag_df.copy().sort_values("posterior_std_over_prior_std", ascending=False)
-    fig, ax = plt.subplots(1, 1, figsize=(10, max(4, 0.6 * len(plot_df))))
-    labels = plot_df["label"].astype(str).tolist()
-    values = np.asarray(plot_df["posterior_std_over_prior_std"], dtype=float)
-    ax.barh(labels, values, color="tab:green", alpha=0.8)
-    ax.axvline(1.0, color="black", linestyle="--", linewidth=1.0)
-    ax.set_xlabel("posterior std / prior std")
-    ax.set_title("Potfile Constraint Brightness")
-    fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "potfile_constraint_strength.png"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_potfile_prior_shift(plot_dir: Path, potfile_diag_df: pd.DataFrame) -> None:
-    if potfile_diag_df.empty:
-        return
-    plot_df = potfile_diag_df.copy().sort_values("posterior_mean_minus_prior_mean_over_prior_std", ascending=True)
-    fig, ax = plt.subplots(1, 1, figsize=(10, max(4, 0.6 * len(plot_df))))
-    labels = plot_df["label"].astype(str).tolist()
-    values = np.asarray(plot_df["posterior_mean_minus_prior_mean_over_prior_std"], dtype=float)
-    colors = ["tab:red" if value < 0.0 else "tab:blue" for value in values]
-    ax.barh(labels, values, color=colors, alpha=0.8)
-    ax.axvline(0.0, color="black", linewidth=1.0)
-    ax.set_xlabel("(posterior mean - prior mean) / prior std")
-    ax.set_title("Potfile Prior Shift")
-    fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "potfile_prior_shift.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -3596,93 +3555,6 @@ def _chain_parameter_diagnostics_table(
             row[f"chain_{chain_idx}_q84"] = q84
         rows.append(row)
     return pd.DataFrame(rows)
-
-
-def _chain_parameter_rank_key(row: Any) -> tuple[float, float, float]:
-    rhat = getattr(row, "rhat", float("nan"))
-    standardized = getattr(row, "chain_median_standardized_spread", float("nan"))
-    spread = getattr(row, "chain_median_spread", float("nan"))
-    rhat_rank = float(rhat) if np.isfinite(float(rhat)) else -float("inf")
-    standardized_rank = float(standardized) if np.isfinite(float(standardized)) else -float("inf")
-    spread_rank = abs(float(spread)) if np.isfinite(float(spread)) else -float("inf")
-    return (rhat_rank, standardized_rank, spread_rank)
-
-
-def _ranked_chain_trace_subset(
-    grouped_samples: np.ndarray | None,
-    parameter_specs: list[ParameterSpec],
-    parameter_diagnostics: pd.DataFrame | None = None,
-    *,
-    max_params: int = 8,
-) -> tuple[np.ndarray, list[ParameterSpec]] | None:
-    if grouped_samples is None or not parameter_specs or max_params <= 0:
-        return None
-    grouped_array = np.asarray(grouped_samples, dtype=float)
-    if grouped_array.ndim != 3 or grouped_array.shape[0] == 0 or grouped_array.shape[1] == 0 or grouped_array.shape[2] == 0:
-        return None
-    if parameter_diagnostics is None or parameter_diagnostics.empty:
-        parameter_diagnostics = _chain_parameter_diagnostics_table(
-            PosteriorResults(
-                samples=grouped_array.reshape((-1, grouped_array.shape[-1])),
-                log_prob=np.empty((0,), dtype=float),
-                accept_prob=np.empty((0,), dtype=float),
-                diverging=np.empty((0,), dtype=bool),
-                num_steps=np.empty((0,), dtype=float),
-                warmup_steps=0,
-                sample_steps=grouped_array.shape[1],
-                num_chains=grouped_array.shape[0],
-                grouped_samples=grouped_array,
-            ),
-            parameter_specs,
-        )
-    if parameter_diagnostics.empty or "parameter_index" not in parameter_diagnostics.columns:
-        return None
-    rows = [
-        row
-        for row in parameter_diagnostics.itertuples(index=False)
-        if 0 <= int(getattr(row, "parameter_index")) < min(grouped_array.shape[2], len(parameter_specs))
-    ]
-    if not rows:
-        return None
-    source_count = sum(
-        str(getattr(parameter_specs[int(getattr(row, "parameter_index"))], "component_family", "")) == "source_position"
-        for row in rows
-    )
-    prefer_non_source = source_count > max_params and len(rows) > max_params
-    if prefer_non_source:
-        non_source_rows = [
-            row
-            for row in rows
-            if str(getattr(parameter_specs[int(getattr(row, "parameter_index"))], "component_family", "")) != "source_position"
-        ]
-        source_rows = [
-            row
-            for row in rows
-            if str(getattr(parameter_specs[int(getattr(row, "parameter_index"))], "component_family", "")) == "source_position"
-        ]
-        ranked_rows = sorted(
-            non_source_rows,
-            key=lambda row: _chain_parameter_rank_key(row),
-            reverse=True,
-        )
-        if len(ranked_rows) < max_params:
-            ranked_rows.extend(
-                sorted(
-                    source_rows,
-                    key=lambda row: _chain_parameter_rank_key(row),
-                    reverse=True,
-                )
-            )
-    else:
-        ranked_rows = sorted(
-            rows,
-            key=lambda row: _chain_parameter_rank_key(row),
-            reverse=True,
-        )
-    selected_indices = [int(getattr(row, "parameter_index")) for row in ranked_rows[:max_params]]
-    if not selected_indices:
-        return None
-    return grouped_array[:, :, selected_indices], [parameter_specs[idx] for idx in selected_indices]
 
 
 def _run_summary(
@@ -4461,6 +4333,8 @@ def _plot_corner(
     parameter_specs: list[ParameterSpec],
     truth_values: dict[str, float] | None = None,
     best_fit_values: dict[str, float] | None = None,
+    map_values: dict[str, float] | None = None,
+    maximum_likelihood_values: dict[str, float] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
     bayes_corner_overlay: BayesCornerOverlay | None = None,
     best_par_marker_values: dict[str, float] | None = None,
@@ -4496,7 +4370,8 @@ def _plot_corner(
     )
     _overplot_bayes_corner_contours(fig, subset_specs, bayes_corner_overlay, output_name)
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
-    _overplot_corner_best_fit(fig, subset_specs, best_fit_values)
+    _overplot_corner_map(fig, subset_specs, map_values)
+    _overplot_corner_maximum_likelihood(fig, subset_specs, maximum_likelihood_values)
     _overplot_corner_best_par_marker(fig, subset_specs, best_par_marker_values, output_name)
     fig.savefig(_plot_path(plot_dir, output_name), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -4511,6 +4386,77 @@ def _best_fit_values_for_specs(
         spec.name: float(best_fit_array[idx])
         for idx, spec in enumerate(parameter_specs)
         if idx < best_fit_array.size
+    }
+
+
+def _map_values_for_specs(
+    parameter_specs: list[ParameterSpec],
+    samples: np.ndarray,
+    log_prob: np.ndarray | None,
+) -> dict[str, float]:
+    if log_prob is None:
+        return {}
+    sample_array = np.asarray(samples, dtype=float)
+    log_prob_array = np.asarray(log_prob, dtype=float).reshape(-1)
+    if sample_array.ndim != 2 or sample_array.shape[0] == 0:
+        return {}
+    if log_prob_array.size != sample_array.shape[0] or not np.isfinite(log_prob_array).any():
+        return {}
+    best_index = int(np.nanargmax(log_prob_array))
+    map_row = sample_array[best_index]
+    return {
+        spec.name: float(map_row[idx])
+        for idx, spec in enumerate(parameter_specs)
+        if idx < map_row.size
+    }
+
+
+def _fit_vector_values_for_specs(
+    parameter_specs: list[ParameterSpec],
+    fit_vector: np.ndarray | None,
+) -> dict[str, float]:
+    if fit_vector is None:
+        return {}
+    fit_array = np.asarray(fit_vector, dtype=float).reshape(-1)
+    if fit_array.size == 0:
+        return {}
+    return {
+        spec.name: float(fit_array[idx])
+        for idx, spec in enumerate(parameter_specs)
+        if idx < fit_array.size and np.isfinite(fit_array[idx])
+    }
+
+
+def _sample_index_values_for_specs(
+    parameter_specs: list[ParameterSpec],
+    samples: np.ndarray,
+    sample_index: Any,
+) -> dict[str, float]:
+    try:
+        index = int(sample_index)
+    except (TypeError, ValueError):
+        return {}
+    sample_array = np.asarray(samples, dtype=float)
+    if sample_array.ndim != 2 or not (0 <= index < sample_array.shape[0]):
+        return {}
+    row = sample_array[index]
+    return {
+        spec.name: float(row[idx])
+        for idx, spec in enumerate(parameter_specs)
+        if idx < row.size and np.isfinite(row[idx])
+    }
+
+
+def _subset_values_for_specs(
+    parameter_specs: list[ParameterSpec],
+    values: dict[str, float],
+) -> dict[str, float]:
+    if not values:
+        return {}
+    return {
+        spec.name: float(values[spec.name])
+        for spec in parameter_specs
+        if spec.name in values and np.isfinite(values[spec.name])
     }
 
 
@@ -4927,14 +4873,14 @@ def _overplot_corner_best_par_marker(
     )
 
 
-def _overplot_corner_best_fit(
+def _overplot_corner_map(
     fig: Any,
     parameter_specs: list[ParameterSpec],
-    best_fit_values: dict[str, float] | None,
+    map_values: dict[str, float] | None,
 ) -> None:
-    if corner is None or not best_fit_values:
+    if corner is None or not map_values:
         return
-    xs = _corner_values_for_specs(parameter_specs, best_fit_values)
+    xs = _corner_values_for_specs(parameter_specs, map_values)
     if not xs or not any(np.isfinite(xs)):
         return
     point_xs = [[float(value) if np.isfinite(value) else np.nan for value in xs]]
@@ -4942,7 +4888,28 @@ def _overplot_corner_best_fit(
         fig,
         point_xs,
         marker="x",
-        color=CORNER_BEST_FIT_COLOR,
+        color=CORNER_MAP_COLOR,
+        markersize=5,
+        markeredgewidth=1.2,
+    )
+
+
+def _overplot_corner_maximum_likelihood(
+    fig: Any,
+    parameter_specs: list[ParameterSpec],
+    maximum_likelihood_values: dict[str, float] | None,
+) -> None:
+    if corner is None or not maximum_likelihood_values:
+        return
+    xs = _corner_values_for_specs(parameter_specs, maximum_likelihood_values)
+    if not xs or not any(np.isfinite(xs)):
+        return
+    point_xs = [[float(value) if np.isfinite(value) else np.nan for value in xs]]
+    corner.overplot_points(
+        fig,
+        point_xs,
+        marker="x",
+        color=CORNER_MAXIMUM_LIKELIHOOD_COLOR,
         markersize=5,
         markeredgewidth=1.2,
     )
@@ -4969,17 +4936,31 @@ def _overplot_corner_previous_stage_best_fit(
     )
 
 
-def _scaling_parameter_subset(
+_POTFILE_CORNER_INDEPENDENT_FIELDS = {
+    "independent_free_log_sigma_tau",
+    "independent_free_log_mass_tau",
+}
+
+
+def _potfile_corner_parameter_subset(
     parameter_specs: list[ParameterSpec],
     samples: np.ndarray,
     best_fit: np.ndarray,
 ) -> tuple[list[ParameterSpec], np.ndarray, np.ndarray]:
-    scaling_indices = [idx for idx, spec in enumerate(parameter_specs) if spec.component_family == "scaling"]
-    if not scaling_indices:
+    potfile_indices = [
+        idx
+        for idx, spec in enumerate(parameter_specs)
+        if getattr(spec, "component_family", None) == "scaling"
+        or (
+            getattr(spec, "component_family", None) == "independent_scaling"
+            and getattr(spec, "field", None) in _POTFILE_CORNER_INDEPENDENT_FIELDS
+        )
+    ]
+    if not potfile_indices:
         return [], np.empty((samples.shape[0], 0), dtype=float), np.empty((0,), dtype=float)
-    subset_specs = [parameter_specs[idx] for idx in scaling_indices]
-    subset_samples = np.asarray(samples[:, scaling_indices], dtype=float)
-    subset_best_fit = np.asarray(best_fit[scaling_indices], dtype=float)
+    subset_specs = [parameter_specs[idx] for idx in potfile_indices]
+    subset_samples = np.asarray(samples[:, potfile_indices], dtype=float)
+    subset_best_fit = np.asarray(best_fit[potfile_indices], dtype=float)
     return subset_specs, subset_samples, subset_best_fit
 
 
@@ -5020,6 +5001,8 @@ def _plot_potfile_corner(
     parameter_specs: list[ParameterSpec],
     truth_values: dict[str, float] | None = None,
     best_fit_values: dict[str, float] | None = None,
+    map_values: dict[str, float] | None = None,
+    maximum_likelihood_values: dict[str, float] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
     bayes_corner_overlay: BayesCornerOverlay | None = None,
     best_par_marker_values: dict[str, float] | None = None,
@@ -5048,7 +5031,8 @@ def _plot_potfile_corner(
     )
     _overplot_bayes_corner_contours(fig, subset_specs, bayes_corner_overlay, "potfile_corner.pdf")
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
-    _overplot_corner_best_fit(fig, subset_specs, best_fit_values)
+    _overplot_corner_map(fig, subset_specs, map_values)
+    _overplot_corner_maximum_likelihood(fig, subset_specs, maximum_likelihood_values)
     _overplot_corner_best_par_marker(fig, subset_specs, best_par_marker_values, "potfile_corner.pdf")
     fig.savefig(_plot_path(plot_dir, "potfile_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -5060,6 +5044,8 @@ def _plot_cosmology_corner(
     parameter_specs: list[ParameterSpec],
     truth_values: dict[str, float] | None = None,
     best_fit_values: dict[str, float] | None = None,
+    map_values: dict[str, float] | None = None,
+    maximum_likelihood_values: dict[str, float] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
     bayes_corner_overlay: BayesCornerOverlay | None = None,
     best_par_marker_values: dict[str, float] | None = None,
@@ -5091,7 +5077,8 @@ def _plot_cosmology_corner(
     )
     _overplot_bayes_corner_contours(fig, subset_specs, bayes_corner_overlay, "cosmology_corner.pdf")
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
-    _overplot_corner_best_fit(fig, subset_specs, best_fit_values)
+    _overplot_corner_map(fig, subset_specs, map_values)
+    _overplot_corner_maximum_likelihood(fig, subset_specs, maximum_likelihood_values)
     _overplot_corner_best_par_marker(fig, subset_specs, best_par_marker_values, "cosmology_corner.pdf")
     fig.savefig(_plot_path(plot_dir, "cosmology_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -5334,32 +5321,6 @@ def _plot_ns_weight_diagnostics(plot_dir: Path, ns_diagnostics: dict[str, np.nda
     axes[1].set_xscale("log")
     fig.tight_layout()
     fig.savefig(_plot_path(plot_dir, "ns_weight_diagnostics.pdf"), dpi=220, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_scaling_rank_bars(plot_dir: Path, scaling_rank_df: pd.DataFrame) -> None:
-    if scaling_rank_df.empty:
-        return
-    potfile_ids = scaling_rank_df["potfile_id"].drop_duplicates().tolist()
-    fig, axes = plt.subplots(len(potfile_ids), 1, figsize=(12, max(4, 3.0 * len(potfile_ids))), sharex=False)
-    if len(potfile_ids) == 1:
-        axes = [axes]
-    for ax, potfile_id in zip(axes, potfile_ids):
-        pot_df = scaling_rank_df[scaling_rank_df["potfile_id"] == potfile_id].copy().sort_values("rank")
-        requested = int(pot_df["requested_active_count"].iloc[0]) if not pot_df.empty else 0
-        top_n = min(len(pot_df), max(12, min(40, max(3 * max(requested, 1), requested + 8))))
-        top_df = pot_df.head(top_n)
-        top_importance, _ = _logsafe_importance_values(top_df["importance"])
-        colors = ["tab:orange" if active else "tab:gray" for active in top_df["selected_active"].tolist()]
-        ax.bar(top_df["rank"].astype(int), top_importance, color=colors)
-        if requested > 0:
-            ax.axvline(requested + 0.5, color="black", linestyle="--", linewidth=1.0)
-        ax.set_title(f"{potfile_id}: top scaling-galaxy ranks")
-        ax.set_xlabel("rank")
-        ax.set_ylabel("importance")
-        _apply_log_importance_axis(ax, top_df["importance"])
-    fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "scaling_rank_bars.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -5622,285 +5583,6 @@ def _plot_perturbation_discovery_diagnostics(plot_dir: Path, diagnostics_df: pd.
     plt.close(fig)
 
 
-def _independent_scaling_candidates(plot_df: pd.DataFrame) -> pd.DataFrame:
-    return plot_df[plot_df.get("selected_independent", pd.Series(False, index=plot_df.index)).astype(bool)].copy()
-
-
-def _numeric_frame_column(frame: pd.DataFrame, column_name: str, default: float = np.nan) -> np.ndarray:
-    if column_name not in frame:
-        return np.full(len(frame), float(default), dtype=float)
-    return pd.to_numeric(frame[column_name], errors="coerce").to_numpy(dtype=float)
-
-
-def _draw_independent_scaling_galaxy_map(
-    ax: Any,
-    pot_df: pd.DataFrame,
-    *,
-    potfile_id: str,
-    norm: Normalize,
-    cmap: Any,
-    observed_image_points: np.ndarray | None = None,
-    show_legend: bool = True,
-) -> Any:
-    not_sampled = pot_df[pot_df["independent_plot_class"] == "not_sampled"]
-    active_not_independent = pot_df[pot_df["independent_plot_class"] == "active_not_independent"]
-    independent = pot_df[pot_df["independent_plot_class"] == "independent_candidate"]
-    ax.scatter(
-        not_sampled["x_centre"],
-        not_sampled["y_centre"],
-        s=16,
-        color="0.78",
-        alpha=0.65,
-        label="not sampled for independence",
-    )
-    ax.scatter(
-        active_not_independent["x_centre"],
-        active_not_independent["y_centre"],
-        s=42,
-        facecolors="none",
-        edgecolors="tab:orange",
-        linewidths=1.2,
-        label="active exact, not independent candidate",
-    )
-    del norm, cmap
-    if not independent.empty:
-        ax.scatter(
-            independent["x_centre"],
-            independent["y_centre"],
-            marker="D",
-            s=58,
-            facecolors="tab:blue",
-            edgecolors="black",
-            linewidths=0.7,
-            label="independent/free candidate",
-        )
-    image_points = np.asarray(observed_image_points, dtype=float) if observed_image_points is not None else np.empty((0, 2))
-    if image_points.ndim == 2 and image_points.shape[1] == 2 and image_points.size:
-        finite_images = np.isfinite(image_points[:, 0]) & np.isfinite(image_points[:, 1])
-        image_points = image_points[finite_images]
-        if image_points.size:
-            ax.scatter(
-                image_points[:, 0],
-                image_points[:, 1],
-                marker="x",
-                s=42,
-                color="0.05",
-                linewidths=1.2,
-                alpha=0.9,
-                label="observed images",
-            )
-
-    annotate_parts = [active_not_independent, independent]
-    if len(pot_df) <= 60:
-        annotate_parts.insert(0, not_sampled)
-    nonempty_annotate_parts = [part for part in annotate_parts if not part.empty]
-    annotate_df = (
-        pd.concat(nonempty_annotate_parts, ignore_index=True)
-        if nonempty_annotate_parts
-        else pot_df.iloc[0:0].copy()
-    )
-    if not annotate_df.empty and "rank" in annotate_df.columns:
-        annotate_df = annotate_df.sort_values("rank", na_position="last")
-    for row in annotate_df.itertuples(index=False):
-        x = getattr(row, "x_centre", np.nan)
-        y = getattr(row, "y_centre", np.nan)
-        catalog_id = getattr(row, "catalog_id", "")
-        if not np.isfinite(float(x)) or not np.isfinite(float(y)) or pd.isna(catalog_id):
-            continue
-        label = str(catalog_id)
-        if not label:
-            continue
-        plot_class = getattr(row, "independent_plot_class", "")
-        if plot_class == "independent_candidate":
-            text_kwargs = {"fontsize": 7, "color": "black", "alpha": 0.92, "fontweight": "semibold"}
-        elif plot_class == "active_not_independent":
-            text_kwargs = {"fontsize": 7, "color": "0.20", "alpha": 0.85}
-        else:
-            text_kwargs = {"fontsize": 6, "color": "0.45", "alpha": 0.65}
-        ax.annotate(
-            label,
-            (x, y),
-            xytext=(3, 3),
-            textcoords="offset points",
-            **text_kwargs,
-        )
-    ax.set_title(f"{potfile_id}: modeled scaling galaxies")
-    ax.set_xlabel("x [arcsec]")
-    ax.set_ylabel("y [arcsec]")
-    ax.set_aspect("equal", adjustable="datalim")
-    if show_legend:
-        ax.legend(loc="best", fontsize=7)
-    return None
-
-
-def _observed_image_points_from_fit_quality(image_fit_quality_df: pd.DataFrame | None) -> np.ndarray:
-    if image_fit_quality_df is None or image_fit_quality_df.empty:
-        return np.empty((0, 2), dtype=float)
-    required = {"x_obs_arcsec", "y_obs_arcsec"}
-    if not required.issubset(set(image_fit_quality_df.columns)):
-        return np.empty((0, 2), dtype=float)
-    x = pd.to_numeric(image_fit_quality_df["x_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
-    y = pd.to_numeric(image_fit_quality_df["y_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
-    finite = np.isfinite(x) & np.isfinite(y)
-    if not np.any(finite):
-        return np.empty((0, 2), dtype=float)
-    return np.column_stack([x[finite], y[finite]])
-
-
-def _draw_independent_scaling_ratios(ax: Any, pot_df: pd.DataFrame, *, potfile_id: str) -> None:
-    any_plotted = False
-    for label, color, prefix, x_offset in (
-        ("sigma free/scaling", "tab:purple", "sigma_ratio", -0.18),
-        ("mass free/scaling", "tab:red", "mass_ratio", 0.0),
-        ("radius free/scaling", "tab:blue", "radius_ratio", 0.18),
-    ):
-        median_col = f"{prefix}_median"
-        p16_col = f"{prefix}_p16"
-        p84_col = f"{prefix}_p84"
-        finite = (
-            np.isfinite(pot_df[median_col].to_numpy(dtype=float))
-            & np.isfinite(pot_df[p16_col].to_numpy(dtype=float))
-            & np.isfinite(pot_df[p84_col].to_numpy(dtype=float))
-            & (pot_df[median_col].to_numpy(dtype=float) > 0.0)
-        )
-        finite_df = pot_df[finite]
-        if finite_df.empty:
-            continue
-        x = finite_df["rank"].to_numpy(dtype=float) + x_offset
-        y = finite_df[median_col].to_numpy(dtype=float)
-        y_low = np.maximum(finite_df[p16_col].to_numpy(dtype=float), np.nextafter(0.0, 1.0))
-        y_high = np.maximum(finite_df[p84_col].to_numpy(dtype=float), y_low)
-        yerr = np.vstack([np.maximum(0.0, y - y_low), np.maximum(0.0, y_high - y)])
-        ax.errorbar(
-            x,
-            y,
-            yerr=yerr,
-            fmt="o",
-            color=color,
-            ecolor=color,
-            elinewidth=1.0,
-            capsize=2.5,
-            markersize=4.5,
-            label=label,
-        )
-        any_plotted = True
-    if not any_plotted:
-        ax.text(0.5, 0.5, "candidate ratios unavailable", transform=ax.transAxes, ha="center", va="center")
-    ax.axhline(1.0, color="0.35", linestyle=":", linewidth=1.0)
-    ax.set_yscale("log")
-    ax.set_title(f"{potfile_id}: free/scaling branch ratios")
-    ax.set_xlabel("importance rank")
-    ax.set_ylabel("free/scaling parameter ratio")
-    ax.legend(loc="best", fontsize=8)
-
-
-def _plot_independent_scaling_galaxy_map(plot_dir: Path, plot_df: pd.DataFrame) -> None:
-    output_path = _plot_path(plot_dir, "independent_scaling_galaxy_map.png")
-    if plot_df.empty:
-        _write_placeholder_plot(
-            output_path,
-            "Independent-scaling galaxy map",
-            "No modeled scaling galaxies are available.",
-        )
-        return
-    potfile_ids = plot_df["potfile_id"].drop_duplicates().tolist()
-    fig, axes = plt.subplots(
-        len(potfile_ids),
-        1,
-        figsize=(7.5, max(5.0, 5.0 * len(potfile_ids))),
-        squeeze=False,
-        constrained_layout=True,
-    )
-    axes_flat = axes.reshape(-1)
-    norm = Normalize(vmin=0.0, vmax=1.0)
-    cmap = plt.get_cmap("viridis")
-    for ax, potfile_id in zip(axes_flat, potfile_ids):
-        pot_df = plot_df[plot_df["potfile_id"] == potfile_id].copy()
-        _draw_independent_scaling_galaxy_map(
-            ax,
-            pot_df,
-            potfile_id=str(potfile_id),
-            norm=norm,
-            cmap=cmap,
-        )
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_independent_scaling_rank_probability(plot_dir: Path, plot_df: pd.DataFrame) -> None:
-    output_path = _plot_path(plot_dir, "independent_scaling_rank_probability.png")
-    candidates = _independent_scaling_candidates(plot_df)
-    if candidates.empty:
-        _write_placeholder_plot(
-            output_path,
-            "Independent/free candidates by magnitude",
-            "No independent-scaling candidates are available.",
-        )
-        return
-    potfile_ids = candidates["potfile_id"].drop_duplicates().tolist()
-    fig, axes = plt.subplots(len(potfile_ids), 1, figsize=(8.5, max(4.0, 3.2 * len(potfile_ids))), squeeze=False)
-    for ax, potfile_id in zip(axes.reshape(-1), potfile_ids):
-        pot_df = candidates[candidates["potfile_id"] == potfile_id].copy().sort_values("rank")
-        x = pd.to_numeric(pot_df.get("catalog_mag"), errors="coerce").to_numpy(dtype=float)
-        y = pd.to_numeric(pot_df.get("rank"), errors="coerce").to_numpy(dtype=float)
-        finite = np.isfinite(x) & np.isfinite(y)
-        if bool(np.any(finite)):
-            ax.scatter(
-                x[finite],
-                y[finite],
-                marker="D",
-                s=42,
-                facecolors="tab:blue",
-                edgecolors="black",
-                linewidths=0.6,
-                label="deterministic free candidate",
-            )
-            for row in pot_df.loc[finite].itertuples(index=False):
-                catalog_id = getattr(row, "catalog_id", "")
-                if pd.isna(catalog_id) or not str(catalog_id):
-                    continue
-                ax.annotate(
-                    str(catalog_id),
-                    (float(getattr(row, "catalog_mag")), float(getattr(row, "rank"))),
-                    xytext=(3, 3),
-                    textcoords="offset points",
-                    fontsize=7,
-                    color="0.25",
-                    alpha=0.8,
-                )
-        else:
-            ax.text(0.5, 0.5, "candidate ranks unavailable", transform=ax.transAxes, ha="center", va="center")
-        ax.set_title(f"{potfile_id}: deterministic independent/free candidates")
-        ax.set_xlabel("catalog magnitude")
-        ax.set_ylabel("importance rank")
-        ax.invert_xaxis()
-        ax.invert_yaxis()
-        ax.legend(loc="best", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_independent_scaling_multiplier_summary(plot_dir: Path, plot_df: pd.DataFrame) -> None:
-    output_path = _plot_path(plot_dir, "independent_scaling_multiplier_summary.png")
-    candidates = _independent_scaling_candidates(plot_df)
-    if candidates.empty:
-        _write_placeholder_plot(
-            output_path,
-            "Independent-scaling free/scaling ratios",
-            "No independent-scaling candidates are available.",
-        )
-        return
-    potfile_ids = candidates["potfile_id"].drop_duplicates().tolist()
-    fig, axes = plt.subplots(len(potfile_ids), 1, figsize=(9.5, max(4.0, 3.4 * len(potfile_ids))), squeeze=False)
-    for ax, potfile_id in zip(axes.reshape(-1), potfile_ids):
-        pot_df = candidates[candidates["potfile_id"] == potfile_id].copy().sort_values("rank")
-        _draw_independent_scaling_ratios(ax, pot_df, potfile_id=str(potfile_id))
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
 def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) -> None:
     output_path = _plot_path(plot_dir, "scaling_relation_summary.pdf")
     if relation_df.empty:
@@ -5968,12 +5650,10 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
         y = finite[y_column].to_numpy(dtype=float)
         y_low = pd.to_numeric(finite.get(p16_column), errors="coerce").to_numpy(dtype=float)
         y_high = pd.to_numeric(finite.get(p84_column), errors="coerce").to_numpy(dtype=float)
-        finite_err = np.isfinite(y_low) & np.isfinite(y_high) & (y_low <= y) & (y <= y_high)
-        yerr = np.vstack([np.maximum(0.0, y - y_low), np.maximum(0.0, y_high - y)])
-        yerr[:, ~finite_err] = 0.0
+        finite_err = np.isfinite(y_low) & np.isfinite(y_high) & (y_low <= y_high)
         color_values = pd.to_numeric(finite["catalog_color"], errors="coerce").to_numpy(dtype=float)
-        for point_index, (x_value, y_value, yerr_value, color_value) in enumerate(
-            zip(x, y, yerr.T, color_values, strict=False)
+        for point_index, (x_value, y_value, y_low_value, y_high_value, has_err, color_value) in enumerate(
+            zip(x, y, y_low, y_high, finite_err, color_values, strict=False)
         ):
             point_color = (
                 catalog_color_cmap(catalog_color_norm(float(color_value)))
@@ -5983,15 +5663,21 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
             error_color = (point_color[0], point_color[1], point_color[2], min(alpha, 0.55))
             face_color = markerfacecolor if markerfacecolor is not None else point_color
             edge_color = markeredgecolor if markeredgecolor is not None else point_color
+            if bool(has_err):
+                ax.plot(
+                    [x_value, x_value],
+                    [float(y_low_value), float(y_high_value)],
+                    color=error_color,
+                    linewidth=0.8,
+                    alpha=min(alpha, 0.55),
+                    linestyle="-",
+                    label="_nolegend_",
+                )
             ax.errorbar(
                 [x_value],
                 [y_value],
-                yerr=np.asarray(yerr_value, dtype=float).reshape(2, 1),
                 fmt=fmt,
                 color=point_color,
-                ecolor=error_color,
-                elinewidth=0.8,
-                capsize=2.0,
                 markersize=markersize,
                 markerfacecolor=face_color,
                 markeredgecolor=edge_color,
@@ -6016,7 +5702,7 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
             ax = axes[row_idx, col_idx]
             scaling_prefix = f"scaling_{field}"
             free_prefix = f"free_{field}"
-            y_column = f"{scaling_prefix}_median"
+            y_column = f"{scaling_prefix}_best"
             _errorbar_points(
                 ax,
                 inactive,
@@ -6043,7 +5729,7 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
             _errorbar_points(
                 ax,
                 free,
-                y_column=f"{free_prefix}_median",
+                y_column=f"{free_prefix}_best",
                 p16_column=f"{free_prefix}_p16",
                 p84_column=f"{free_prefix}_p84",
                 label="free branch",
@@ -6098,17 +5784,17 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
             ax.set_title(f"{potfile_id}: {ylabel}")
             ax.grid(True, color="0.90", linewidth=0.6)
             if col_idx == 0:
-                slope_lines: list[str] = []
+                slope_lines: list[str] = ["points: best fit; bars: 16-84% posterior"]
                 for label, column in (
-                    ("alpha_sigma", "alpha_sigma_median"),
-                    ("beta_radius", "beta_radius_median"),
-                    ("gamma_ml", "gamma_ml_median"),
+                    ("alpha_sigma", "alpha_sigma_best"),
+                    ("beta_radius", "beta_radius_best"),
+                    ("gamma_ml", "gamma_ml_best"),
                 ):
                     values = pd.to_numeric(pot_df.get(column), errors="coerce").to_numpy(dtype=float)
                     values = values[np.isfinite(values)]
                     if values.size:
                         slope_lines.append(f"{label}: {float(np.nanmedian(values)):.3g}")
-                values = pd.to_numeric(pot_df.get("gamma_ml_median"), errors="coerce").to_numpy(dtype=float)
+                values = pd.to_numeric(pot_df.get("gamma_ml_best"), errors="coerce").to_numpy(dtype=float)
                 values = values[np.isfinite(values)]
                 if values.size:
                     mass_slope = 1.0 + float(np.nanmedian(values))
@@ -6151,132 +5837,6 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
     colorbar = fig.colorbar(mappable, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02)
     colorbar.set_label("catalog color (F606W - F814W)")
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_independent_scaling_summary(
-    plot_dir: Path,
-    plot_df: pd.DataFrame,
-    independent_df: pd.DataFrame,
-    samples: np.ndarray,
-    best_fit: np.ndarray | None = None,
-    sample_weights: np.ndarray | None = None,
-    parameter_specs: list[ParameterSpec] | None = None,
-    image_fit_quality_df: pd.DataFrame | None = None,
-) -> None:
-    del best_fit
-    output_path = _plot_path(plot_dir, "independent_scaling_summary.pdf")
-    if plot_df.empty:
-        _write_placeholder_plot(
-            output_path,
-            "Independent-scaling summary",
-            "No modeled scaling galaxies are available.",
-        )
-        return
-    potfile_ids = plot_df["potfile_id"].drop_duplicates().tolist()
-    fig, axes = plt.subplots(
-        len(potfile_ids),
-        3,
-        figsize=(19.0, max(5.2, 4.8 * len(potfile_ids))),
-        squeeze=False,
-        constrained_layout=True,
-    )
-    norm = Normalize(vmin=0.0, vmax=1.0)
-    cmap = plt.get_cmap("viridis")
-    candidates_all = _independent_scaling_candidates(plot_df)
-    observed_image_points = _observed_image_points_from_fit_quality(image_fit_quality_df)
-    for row_idx, potfile_id in enumerate(potfile_ids):
-        all_pot_df = plot_df[plot_df["potfile_id"] == potfile_id].copy()
-        candidate_df = candidates_all[candidates_all["potfile_id"] == potfile_id].copy().sort_values("rank")
-        _draw_independent_scaling_galaxy_map(
-            axes[row_idx, 0],
-            all_pot_df,
-            potfile_id=str(potfile_id),
-            norm=norm,
-            cmap=cmap,
-            observed_image_points=observed_image_points,
-            show_legend=row_idx == 0,
-        )
-        if candidate_df.empty:
-            axes[row_idx, 1].text(0.5, 0.5, "No independent-scaling candidates", transform=axes[row_idx, 1].transAxes, ha="center", va="center")
-            axes[row_idx, 1].set_title(f"{potfile_id}: deterministic free candidates")
-            axes[row_idx, 1].axis("off")
-            axes[row_idx, 2].text(0.5, 0.5, "No independent-scaling candidates", transform=axes[row_idx, 2].transAxes, ha="center", va="center")
-            axes[row_idx, 2].set_title(f"{potfile_id}: free/scaling branch ratios")
-            axes[row_idx, 2].set_xlabel("importance rank")
-            axes[row_idx, 2].set_ylabel("free/scaling parameter ratio")
-            continue
-        axes[row_idx, 1].axis("off")
-        axes[row_idx, 1].set_title(f"{potfile_id}: deterministic free candidates")
-        axes[row_idx, 1].text(
-            0.5,
-            0.5,
-            f"independent/free candidates: {len(candidate_df):d}\nmode: log displacement",
-            transform=axes[row_idx, 1].transAxes,
-            ha="center",
-            va="center",
-        )
-        _draw_independent_scaling_ratios(axes[row_idx, 2], candidate_df, potfile_id=str(potfile_id))
-    with PdfPages(output_path) as pdf:
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
-
-
-def _plot_run_diagnostics(plot_dir: Path, results: PosteriorResults) -> None:
-    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=False)
-    axes[0].plot(results.accept_prob.ravel(), color="tab:green")
-    axes[0].set_xlabel("Posterior draw")
-    axes[0].set_ylabel("Accept prob")
-    axes[0].set_title("NUTS Acceptance Probability")
-    axes[1].axis("off")
-    init_diag = results.init_diagnostics or {}
-    summary_lines = [
-        f"Init requested: {init_diag.get('strategy_requested', 'unknown')}",
-        f"Init used: {init_diag.get('strategy_used', 'unknown')}",
-        (
-            "Seeds: "
-            f"distinct_chains={int(init_diag.get('distinct_chain_seeds', 0))}"
-        ),
-        (
-            "Chain quality: "
-            f"retained={int(init_diag.get('retained_finite_chains', results.num_chains))}/"
-            f"{int(init_diag.get('requested_chains', results.num_chains))} "
-            f"dropped={int(init_diag.get('dropped_nonfinite_chains', 0))}"
-        ),
-    ]
-    if init_diag.get("svi_used", False):
-        summary_lines.append(
-            "SVI: "
-            f"steps={int(init_diag.get('svi_steps', 0))} "
-            f"lr={float(init_diag.get('svi_learning_rate', 0.0)):.3g} "
-            f"final_loss={float(init_diag.get('svi_final_elbo_loss', float('nan'))):.4g}"
-        )
-    if "invalid_state_rejection_count" in init_diag:
-        summary_lines.append(
-            "Invalid states: "
-            f"rejected={int(init_diag.get('invalid_state_rejection_count', 0))}"
-        )
-    labels = list(init_diag.get("chain_seed_labels", []))
-    if labels:
-        summary_lines.append("Chain sources: " + ", ".join(str(label) for label in labels))
-    axes[1].text(0.01, 0.98, "\n".join(summary_lines), va="top", ha="left", fontsize=9, family="monospace")
-    axes[1].set_title("Sampler Initialization")
-    fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "run_diagnostics.png"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_weights_logl(plot_dir: Path, results: PosteriorResults) -> None:
-    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-    axes[0].plot(results.log_prob, color="tab:red")
-    axes[0].set_ylabel("log posterior")
-    axes[0].set_title("Posterior Log Probability")
-    axes[1].plot(results.num_steps.ravel(), color="tab:blue")
-    axes[1].set_ylabel("NUTS steps")
-    axes[1].set_xlabel("Posterior draw")
-    axes[1].set_title("NUTS Integrator Steps")
-    fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "weights_logl.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -6390,56 +5950,6 @@ def _plot_chain_health(
         fig.legend(handles, labels, loc="upper right")
     fig.tight_layout()
     fig.savefig(_plot_path(plot_dir, "chain_health.pdf"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_chain_ranked_trace(
-    plot_dir: Path,
-    grouped_samples: np.ndarray | None,
-    parameter_specs: list[ParameterSpec],
-    parameter_diagnostics: pd.DataFrame | None = None,
-    *,
-    max_params: int = 8,
-) -> None:
-    subset = _ranked_chain_trace_subset(
-        grouped_samples,
-        parameter_specs,
-        parameter_diagnostics,
-        max_params=max_params,
-    )
-    if subset is None:
-        return
-    grouped_array, subset_specs = subset
-    if grouped_array.ndim != 3 or grouped_array.shape[0] == 0 or grouped_array.shape[1] == 0 or grouped_array.shape[2] == 0:
-        return
-    n_chains, n_draws, _n_params = grouped_array.shape
-    draw_index = np.arange(n_draws, dtype=int)
-    cmap = plt.get_cmap("tab10", n_chains)
-    nrows = len(subset_specs)
-    fig, axes = plt.subplots(nrows, 1, figsize=(12, max(4, 2.0 * nrows)), sharex=True)
-    if nrows == 1:
-        axes = [axes]
-    for param_index, (ax, spec) in enumerate(zip(axes, subset_specs)):
-        for chain_index in range(n_chains):
-            values = grouped_array[chain_index, :, param_index]
-            finite = np.isfinite(values)
-            if finite.any():
-                ax.plot(
-                    draw_index[finite],
-                    values[finite],
-                    linewidth=1.0,
-                    alpha=0.85,
-                    color=cmap(chain_index),
-                    label=f"chain {chain_index + 1}" if param_index == 0 else None,
-                )
-        ax.set_ylabel(spec.name)
-    axes[0].set_title("Worst Chain-Mixing Parameter Traces")
-    axes[-1].set_xlabel("posterior draw")
-    handles, labels = axes[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="upper right")
-    fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "chain_ranked_trace.pdf"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -6671,6 +6181,8 @@ def _plot_smc_corner(
     parameter_specs: list[ParameterSpec],
     sample_weights: np.ndarray | None,
     best_fit_values: dict[str, float] | None = None,
+    map_values: dict[str, float] | None = None,
+    maximum_likelihood_values: dict[str, float] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
 ) -> None:
     if corner is None:
@@ -6687,21 +6199,9 @@ def _plot_smc_corner(
     corner_kwargs = {**CORNER_PLOT_KWARGS, "plot_datapoints": True}
     fig = corner.corner(subset_samples, labels=labels, weights=subset_weights, **corner_kwargs)
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
-    _overplot_corner_best_fit(fig, subset_specs, best_fit_values)
+    _overplot_corner_map(fig, subset_specs, map_values)
+    _overplot_corner_maximum_likelihood(fig, subset_specs, maximum_likelihood_values)
     fig.savefig(_plot_path(plot_dir, "smc_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_residuals_by_family(plot_dir: Path, family_df: pd.DataFrame) -> None:
-    fig, ax = plt.subplots(1, 1, figsize=(12, 5))
-    values = family_df["source_plane_rms_arcsec"].fillna(family_df["rms_residual_arcsec"])
-    ax.bar(family_df["family_id"].astype(str), values, color="tab:purple")
-    ax.set_xlabel("Family")
-    ax.set_ylabel("RMS residual [arcsec]")
-    ax.set_title("Source-Plane RMS Residual by Family")
-    ax.tick_params(axis="x", rotation=90)
-    fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "residuals_by_family.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -6830,44 +6330,6 @@ def _plot_source_plane_residual_histogram(
     axes[2].legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(_plot_path(plot_dir, "source_plane_residual_histogram.png"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_image_plane_fit(plot_dir: Path, state: BuildState, best_eval: EvaluationResult) -> None:
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-    colors = _family_color_map([family.family_id for family in state.family_data])
-    for family in state.family_data:
-        color = colors[str(family.family_id)]
-        pred = best_eval.family_predictions.get(
-            str(family.family_id),
-            best_eval.family_predictions.get(family.family_id, {}),
-        )
-        n_images = int(getattr(family, "n_images", len(family.x_obs)))
-        x_pred = np.asarray(pred.get("x_pred", np.full(n_images, np.nan)), dtype=float).reshape(-1)
-        y_pred = np.asarray(pred.get("y_pred", np.full(n_images, np.nan)), dtype=float).reshape(-1)
-        if x_pred.shape != (n_images,):
-            resized = np.full(n_images, np.nan, dtype=float)
-            resized[: min(n_images, x_pred.size)] = x_pred[: min(n_images, x_pred.size)]
-            x_pred = resized
-        if y_pred.shape != (n_images,):
-            resized = np.full(n_images, np.nan, dtype=float)
-            resized[: min(n_images, y_pred.size)] = y_pred[: min(n_images, y_pred.size)]
-            y_pred = resized
-        ax.scatter(family.x_obs, family.y_obs, marker="x", color=color, label=f"{family.family_id} obs")
-        finite_model = np.isfinite(x_pred) & np.isfinite(y_pred)
-        if finite_model.any():
-            ax.scatter(x_pred[finite_model], y_pred[finite_model], marker="o", color=color, s=36, alpha=0.65)
-            for x0, y0, x1, y1 in zip(family.x_obs, family.y_obs, x_pred, y_pred):
-                if np.isfinite(x1) and np.isfinite(y1):
-                    ax.plot([x0, x1], [y0, y1], color=color, alpha=0.35, linewidth=0.8)
-    ax.invert_xaxis()
-    ax.set_xlabel("x [arcsec]")
-    ax.set_ylabel("y [arcsec]")
-    ax.set_title("Observed vs Exact-Validated Image Positions")
-    if len(state.family_data) <= 15:
-        ax.legend(fontsize=7, ncol=2)
-    fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "image_plane_fit.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -8815,40 +8277,6 @@ def _plot_residual_geometry_trends(image_df: pd.DataFrame, path: Path) -> None:
     plt.close(fig)
 
 
-def _plot_posterior_predictive_coverage(image_df: pd.DataFrame, path: Path) -> None:
-    if image_df.empty or not {"covered_x_1sigma", "covered_y_1sigma", "covered_xy_1sigma"}.issubset(image_df.columns):
-        return
-    labels = image_df["image_label"].astype(str).to_numpy()
-    coverage = np.vstack(
-        [
-            image_df["covered_x_1sigma"].astype(bool).to_numpy(),
-            image_df["covered_y_1sigma"].astype(bool).to_numpy(),
-            image_df["covered_xy_1sigma"].astype(bool).to_numpy(),
-        ]
-    )
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.2), gridspec_kw={"width_ratios": [2.2, 1.0]})
-    axes[0].imshow(coverage.astype(float), aspect="auto", vmin=0.0, vmax=1.0, cmap="RdYlGn")
-    axes[0].set_yticks([0, 1, 2])
-    axes[0].set_yticklabels(["x", "y", "x and y"])
-    axes[0].set_xlabel("image")
-    axes[0].set_title("1 Sigma Predictive Coverage")
-    if len(image_df) <= 80:
-        x_index = np.arange(len(image_df))
-        axes[0].set_xticks(x_index)
-        axes[0].set_xticklabels(labels, rotation=90, fontsize=7)
-
-    fractions = coverage.mean(axis=1) if coverage.shape[1] else np.zeros(3, dtype=float)
-    axes[1].bar(["x", "y", "x and y"], fractions, color=["tab:blue", "tab:orange", "tab:green"])
-    axes[1].set_ylim(0.0, 1.0)
-    axes[1].set_ylabel("covered fraction")
-    axes[1].set_title("Coverage Summary")
-    for index, value in enumerate(fractions):
-        axes[1].text(index, min(0.98, float(value) + 0.03), f"{value:.2f}", ha="center", va="bottom", fontsize=9)
-    fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
 def _plot_exact_vs_approx_prediction_error(family_df: pd.DataFrame, path: Path) -> None:
     if family_df.empty or not {"exact_image_rms_arcsec", "approx_image_rms_arcsec"}.issubset(family_df.columns):
         return
@@ -8892,23 +8320,6 @@ def _plot_exact_vs_approx_prediction_error(family_df: pd.DataFrame, path: Path) 
             ax.set_xlabel("family")
     fig.tight_layout()
     fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_source_plane_scatter(plot_dir: Path, state: BuildState, best_eval: EvaluationResult) -> None:
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-    cmap = plt.get_cmap("tab20", len(state.family_data))
-    for idx, family in enumerate(state.family_data):
-        color = cmap(idx)
-        pred = best_eval.family_predictions[family.family_id]
-        ax.scatter(pred["source_x"], pred["source_y"], color=color, s=40, label=family.family_id)
-    ax.set_xlabel(r"$\beta_x$ [arcsec]")
-    ax.set_ylabel(r"$\beta_y$ [arcsec]")
-    ax.set_title("Back-Projected Source Positions")
-    if len(state.family_data) <= 20:
-        ax.legend(fontsize=7, ncol=2)
-    fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "source_plane_scatter.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -8972,23 +8383,6 @@ def _plot_per_potential_summary(
         fig.legend(handles, labels, loc="upper right")
     fig.tight_layout()
     fig.savefig(_plot_path(plot_dir, "per_potential_summary.png"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_refresh_diagnostics(plot_dir: Path, family_df: pd.DataFrame) -> None:
-    fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
-    families = family_df["family_id"].astype(str)
-    axes[0].bar(families, family_df["exact_validation_count"], color="tab:blue")
-    axes[0].set_ylabel("Exact validations")
-    axes[1].bar(families, family_df["source_plane_rms_arcsec"], color="tab:orange")
-    axes[1].set_ylabel("Source RMS")
-    mismatch = family_df["multiplicity_mismatch_count"] + family_df["match_failure_count"]
-    axes[2].bar(families, mismatch, color="tab:red")
-    axes[2].set_ylabel("Match failures")
-    axes[2].set_xlabel("Family")
-    axes[2].tick_params(axis="x", rotation=90)
-    fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "refresh_diagnostics.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -9245,6 +8639,13 @@ def _signed_magnification_from_kappa_gamma(kappa: np.ndarray, gamma_x: np.ndarra
     denominator = (1.0 - kappa) ** 2 - gamma_x**2 - gamma_y**2
     with np.errstate(divide="ignore", invalid="ignore"):
         return 1.0 / denominator
+
+
+def _critical_determinant_from_kappa_gamma(kappa: np.ndarray, gamma_x: np.ndarray, gamma_y: np.ndarray) -> np.ndarray:
+    kappa = np.asarray(kappa, dtype=float)
+    gamma_x = np.asarray(gamma_x, dtype=float)
+    gamma_y = np.asarray(gamma_y, dtype=float)
+    return (1.0 - kappa) ** 2 - gamma_x**2 - gamma_y**2
 
 
 def _capped_absolute_magnification(values: np.ndarray, cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP) -> np.ndarray:
@@ -10136,6 +9537,67 @@ def _plot_abs_mu_true_comparison_from_grid(
     )
 
 
+def _has_zero_contour(field: np.ndarray) -> bool:
+    finite = np.asarray(field, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return False
+    return float(np.nanmin(finite)) <= 0.0 <= float(np.nanmax(finite))
+
+
+def _plot_critical_line_recovery_from_grid(
+    plot_dir: Path,
+    truth_determinant: np.ndarray,
+    model_determinant: np.ndarray,
+    x_arcsec: np.ndarray,
+    y_arcsec: np.ndarray,
+    z_source: float,
+) -> None:
+    output_path = _plot_path(plot_dir, "critical_line_recovery.pdf")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6.0, 5.2))
+    legend_handles: list[Line2D] = []
+    contour_specs = [
+        (
+            np.asarray(truth_determinant, dtype=float),
+            "black",
+            "-",
+            "truth critical line",
+        ),
+        (
+            np.asarray(model_determinant, dtype=float),
+            "tab:blue",
+            "--",
+            "model critical line",
+        ),
+    ]
+    for determinant, color, linestyle, label in contour_specs:
+        if not _has_zero_contour(determinant):
+            continue
+        ax.contour(
+            x_arcsec,
+            y_arcsec,
+            determinant,
+            levels=[0.0],
+            colors=[color],
+            linestyles=[linestyle],
+            linewidths=[1.1],
+        )
+        legend_handles.append(Line2D([0], [0], color=color, linestyle=linestyle, linewidth=1.1, label=label))
+    if not legend_handles:
+        ax.text(0.5, 0.5, "No zero-determinant critical line in grid.", ha="center", va="center", transform=ax.transAxes)
+    ax.invert_xaxis()
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x [arcsec]")
+    ax.set_ylabel("y [arcsec]")
+    ax.set_title(fr"Critical-line recovery ($z_s={float(z_source):g}$)")
+    if legend_handles:
+        ax.legend(handles=legend_handles, loc="best", fontsize=8, frameon=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _plot_abs_mu_truth_diagnostics(
     plot_dir: Path,
     evaluator: ClusterJAXEvaluator,
@@ -10174,6 +9636,20 @@ def _plot_abs_mu_truth_diagnostics(
         "magnification",
     )
     abs_mu_model = np.abs(np.asarray(model_mu, dtype=float))
+    kappa_true, _kappa_wcs = _load_kappa_true_fits(kappa_true_fits)
+    gammax_true, _gammax_wcs = _load_kappa_true_fits(gammax_true_fits)
+    gammay_true, _gammay_wcs = _load_kappa_true_fits(gammay_true_fits)
+    truth_determinant = _critical_determinant_from_kappa_gamma(kappa_true, gammax_true, gammay_true)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        model_determinant = 1.0 / np.asarray(model_mu, dtype=float)
+    _plot_critical_line_recovery_from_grid(
+        plot_dir,
+        truth_determinant,
+        model_determinant,
+        x_arcsec,
+        y_arcsec,
+        z_source,
+    )
     _plot_abs_mu_true_comparison_from_grid(
         plot_dir,
         abs_mu_true,
@@ -12658,6 +12134,18 @@ def _generate_plots_and_tables(
 ) -> dict[str, Any]:
     tables_dir = run_dir / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
+    if bool(getattr(state, "perturbation_discovery_stage0", False)):
+        return _generate_stage0_minimal_plots_and_tables(
+            run_dir=run_dir,
+            tables_dir=tables_dir,
+            state=state,
+            evaluator=evaluator,
+            best_fit=best_fit,
+            best_eval=best_eval,
+            results=results,
+            runtime_sec=runtime_sec,
+            args=args,
+        )
     sample_likelihood_mode = _active_sample_likelihood_mode(evaluator, args)
     use_arc_aware_diagnostics = _uses_arc_aware_diagnostics(sample_likelihood_mode)
     summary_df = _run_logged_phase(
@@ -12729,8 +12217,8 @@ def _generate_plots_and_tables(
     run_summary_text = _format_run_summary_text(run_summary)
     scaling_specs, scaling_samples, scaling_best_fit = _run_logged_phase(
         args,
-        "plots.scaling_subset",
-        lambda: _scaling_parameter_subset(state.parameter_specs, results.samples, best_fit),
+        "plots.potfile_corner_subset",
+        lambda: _potfile_corner_parameter_subset(state.parameter_specs, results.samples, best_fit),
     )
     cosmology_specs, cosmology_samples, cosmology_best_fit = _run_logged_phase(
         args,
@@ -12750,6 +12238,23 @@ def _generate_plots_and_tables(
     best_fit_values = _best_fit_values_for_specs(state.parameter_specs, best_fit)
     scaling_best_fit_values = _best_fit_values_for_specs(scaling_specs, scaling_best_fit)
     cosmology_best_fit_values = _best_fit_values_for_specs(cosmology_specs, cosmology_best_fit)
+    map_values = _fit_vector_values_for_specs(state.parameter_specs, results.map_fit)
+    if not map_values:
+        map_values = _map_values_for_specs(state.parameter_specs, results.samples, results.log_prob)
+    maximum_likelihood_values = _fit_vector_values_for_specs(
+        state.parameter_specs,
+        results.maximum_likelihood_fit,
+    )
+    if not maximum_likelihood_values:
+        maximum_likelihood_values = _sample_index_values_for_specs(
+            state.parameter_specs,
+            results.samples,
+            (results.init_diagnostics or {}).get("maximum_likelihood_sample_index"),
+        )
+    scaling_map_values = _subset_values_for_specs(scaling_specs, map_values)
+    cosmology_map_values = _subset_values_for_specs(cosmology_specs, map_values)
+    scaling_maximum_likelihood_values = _subset_values_for_specs(scaling_specs, maximum_likelihood_values)
+    cosmology_maximum_likelihood_values = _subset_values_for_specs(cosmology_specs, maximum_likelihood_values)
     best_fit_latent = _reported_physical_to_latent_vector(evaluator, np.asarray(best_fit, dtype=float))
     critical_arc_singular_threshold_best_fit = _fit_quality_critical_arc_singular_threshold(
         evaluator,
@@ -12799,6 +12304,8 @@ def _generate_plots_and_tables(
         "plots.independent_scaling_plot_table",
         lambda: _independent_scaling_plot_table(evaluator.scaling_rank_df, independent_scaling_df),
     )
+    best_value_selected = str((results.init_diagnostics or {}).get("best_value_selected", "") or "")
+    best_value_requested = str((results.init_diagnostics or {}).get("best_value_requested", "") or "")
     scaling_relation_df = _run_logged_phase(
         args,
         "plots.scaling_relation_table",
@@ -12810,6 +12317,8 @@ def _generate_plots_and_tables(
             getattr(state, "packed_lens_spec", None),
             sample_weights=results.sample_weights,
             independent_scaling_df=independent_scaling_df,
+            best_value=best_value_selected or None,
+            best_value_requested=best_value_requested or None,
         ),
     )
     trace_specs, trace_grouped_samples = _run_logged_phase(
@@ -12945,6 +12454,8 @@ def _generate_plots_and_tables(
                 results.samples,
                 state.parameter_specs,
                 best_fit_values=best_fit_values,
+                map_values=map_values,
+                maximum_likelihood_values=maximum_likelihood_values,
                 previous_stage_best_values=previous_stage_best_values,
                 bayes_corner_overlay=bayes_corner_overlay,
                 best_par_marker_values=best_par_marker_values,
@@ -12958,6 +12469,8 @@ def _generate_plots_and_tables(
                 scaling_samples,
                 scaling_specs,
                 best_fit_values=scaling_best_fit_values,
+                map_values=scaling_map_values,
+                maximum_likelihood_values=scaling_maximum_likelihood_values,
                 previous_stage_best_values=previous_stage_best_values,
                 bayes_corner_overlay=bayes_corner_overlay,
                 best_par_marker_values=best_par_marker_values,
@@ -12969,18 +12482,11 @@ def _generate_plots_and_tables(
             lambda: _plot_potfile_prior_posterior(run_dir, potfile_constraint_df, results.samples, state.parameter_specs),
         ),
         (
-            "potfile_constraint_strength",
-            "plots.potfile_constraint_strength",
-            lambda: _plot_potfile_constraint_strength(run_dir, potfile_constraint_df),
-        ),
-        ("potfile_prior_shift", "plots.potfile_prior_shift", lambda: _plot_potfile_prior_shift(run_dir, potfile_constraint_df)),
-        (
             "potfile_leverage_summary",
             "plots.potfile_leverage_summary",
             lambda: _plot_potfile_leverage_summary(run_dir, potfile_constraint_df),
         ),
         ("trace", "plots.trace", lambda: _plot_trace(run_dir, trace_grouped_samples, trace_specs)),
-        ("scaling_rank_bars", "plots.scaling_rank_bars", lambda: _plot_scaling_rank_bars(run_dir, evaluator.scaling_rank_df)),
         (
             "scaling_rank_scatter",
             "plots.scaling_rank_scatter",
@@ -13003,37 +12509,6 @@ def _generate_plots_and_tables(
             else []
         ),
         (
-            "independent_scaling_galaxy_map",
-            "plots.independent_scaling_galaxy_map",
-            lambda: _plot_independent_scaling_galaxy_map(run_dir, independent_scaling_plot_df),
-        ),
-        (
-            "independent_scaling_summary",
-            "plots.independent_scaling_summary",
-            lambda: _plot_independent_scaling_summary(
-                run_dir,
-                independent_scaling_plot_df,
-                independent_scaling_df,
-                results.samples,
-                best_fit,
-                results.sample_weights,
-                parameter_specs=state.parameter_specs,
-                image_fit_quality_df=image_fit_quality_df,
-            ),
-        ),
-        (
-            "independent_scaling_rank_probability",
-            "plots.independent_scaling_rank_probability",
-            lambda: _plot_independent_scaling_rank_probability(run_dir, independent_scaling_plot_df),
-        ),
-        (
-            "independent_scaling_multiplier_summary",
-            "plots.independent_scaling_multiplier_summary",
-            lambda: _plot_independent_scaling_multiplier_summary(run_dir, independent_scaling_plot_df),
-        ),
-        ("run_diagnostics", "plots.run_diagnostics", lambda: _plot_run_diagnostics(run_dir, results)),
-        ("weights_logl", "plots.weights_logl", lambda: _plot_weights_logl(run_dir, results)),
-        (
             "chain_health",
             "plots.chain_health",
             lambda: _plot_chain_health(
@@ -13043,17 +12518,6 @@ def _generate_plots_and_tables(
                 max_tree_depth=max_tree_depth,
             ),
         ),
-        (
-            "chain_ranked_trace",
-            "plots.chain_ranked_trace",
-            lambda: _plot_chain_ranked_trace(
-                run_dir,
-                results.grouped_samples,
-                state.parameter_specs,
-                chain_parameter_diagnostics_df,
-            ),
-        ),
-        ("residuals_by_family", "plots.residuals_by_family", lambda: _plot_residuals_by_family(run_dir, family_df)),
         (
             "source_plane_residual_histogram",
             "plots.source_plane_residual_histogram",
@@ -13131,16 +12595,6 @@ def _generate_plots_and_tables(
             lambda: _plot_residual_geometry_trends(image_fit_quality_df, _plot_path(run_dir, "residual_geometry_trends.pdf")),
         ),
         (
-            "posterior_predictive_coverage",
-            "plots.posterior_predictive_coverage",
-            lambda: _plot_posterior_predictive_coverage(
-                image_fit_quality_df,
-                _plot_path(run_dir, "posterior_predictive_coverage.pdf"),
-            ),
-        ),
-        ("image_plane_fit", "plots.image_plane_fit", lambda: _plot_image_plane_fit(run_dir, state, best_eval)),
-        ("source_plane_scatter", "plots.source_plane_scatter", lambda: _plot_source_plane_scatter(run_dir, state, best_eval)),
-        (
             "subhalo_mass_function",
             "plots.subhalo_mass_function",
             lambda: _plot_subhalo_mass_function(subhalo_df, _plot_path(run_dir, "subhalo_mass_function.pdf")),
@@ -13161,7 +12615,6 @@ def _generate_plots_and_tables(
                 parameter_specs=state.parameter_specs,
             ),
         ),
-        ("refresh_diagnostics", "plots.refresh_diagnostics", lambda: _plot_refresh_diagnostics(run_dir, family_df)),
         ("timing_profile", "plots.timing_profile", lambda: _plot_timing_profile(run_dir, evaluator)),
     ]
     if use_arc_aware_diagnostics:
@@ -13218,6 +12671,8 @@ def _generate_plots_and_tables(
                     cosmology_samples,
                     cosmology_specs,
                     best_fit_values=cosmology_best_fit_values,
+                    map_values=cosmology_map_values,
+                    maximum_likelihood_values=cosmology_maximum_likelihood_values,
                     previous_stage_best_values=previous_stage_best_values,
                     bayes_corner_overlay=bayes_corner_overlay,
                     best_par_marker_values=best_par_marker_values,
@@ -13246,6 +12701,8 @@ def _generate_plots_and_tables(
                         state.parameter_specs,
                         results.sample_weights,
                         best_fit_values=best_fit_values,
+                        map_values=map_values,
+                        maximum_likelihood_values=maximum_likelihood_values,
                         previous_stage_best_values=previous_stage_best_values,
                     ),
                 ),
@@ -13328,6 +12785,116 @@ def _generate_plots_and_tables(
         )
     _run_plot_tasks_with_progress(args, plot_tasks)
     _log(args, "[done] run summary\n" + run_summary_text.rstrip())
+    return run_summary
+
+
+def _generate_stage0_minimal_plots_and_tables(
+    *,
+    run_dir: Path,
+    tables_dir: Path,
+    state: BuildState,
+    evaluator: ClusterJAXEvaluator,
+    best_fit: np.ndarray,
+    best_eval: EvaluationResult,
+    results: PosteriorResults,
+    runtime_sec: float,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    independent_scaling_df = _run_logged_phase(
+        args,
+        "plots.stage0.independent_scaling_table",
+        lambda: _independent_scaling_diagnostics_table(
+            state.parameter_specs,
+            results.samples,
+            best_fit,
+            evaluator.scaling_rank_df,
+            getattr(state, "packed_lens_spec", None),
+            sample_weights=results.sample_weights,
+        ),
+    )
+    best_value_selected = str((results.init_diagnostics or {}).get("best_value_selected", "") or "")
+    best_value_requested = str((results.init_diagnostics or {}).get("best_value_requested", "") or "")
+    scaling_relation_df = _run_logged_phase(
+        args,
+        "plots.stage0.scaling_relation_table",
+        lambda: _scaling_relation_summary_table(
+            evaluator.scaling_rank_df,
+            state.parameter_specs,
+            results.samples,
+            best_fit,
+            getattr(state, "packed_lens_spec", None),
+            sample_weights=results.sample_weights,
+            independent_scaling_df=independent_scaling_df,
+            best_value=best_value_selected or None,
+            best_value_requested=best_value_requested or None,
+        ),
+    )
+    perturbation_discovery_df = _run_logged_phase(
+        args,
+        "plots.stage0.perturbation_discovery_diagnostics_table",
+        lambda: _load_perturbation_discovery_diagnostics_table(tables_dir),
+    )
+    run_summary = _run_logged_phase(
+        args,
+        "plots.stage0.run_summary",
+        lambda: _run_summary(
+            args,
+            state,
+            runtime_sec,
+            results,
+            best_eval.loglike,
+            evaluator,
+            image_fit_quality_df=None,
+            image_count_recovery_df=None,
+        ),
+    )
+    run_summary["stage0_minimal_outputs"] = True
+    run_summary["stage0_plot_outputs"] = [
+        "scaling_relation_summary.pdf",
+        *(
+            ["perturbation_discovery_diagnostics.pdf"]
+            if not perturbation_discovery_df.empty
+            else []
+        ),
+    ]
+    run_summary_text = _format_run_summary_text(run_summary)
+
+    _run_logged_phase(
+        args,
+        "plots.stage0.write_scaling_relation_csv",
+        lambda: scaling_relation_df.to_csv(tables_dir / "scaling_relation_summary.csv", index=False),
+    )
+    _run_logged_phase(
+        args,
+        "plots.stage0.write_run_summary_json",
+        lambda: (tables_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2), encoding="utf-8"),
+    )
+    _run_logged_phase(
+        args,
+        "plots.stage0.write_run_summary_txt",
+        lambda: (tables_dir / "run_summary.txt").write_text(run_summary_text, encoding="utf-8"),
+    )
+
+    plot_tasks: list[PlotTask] = [
+        (
+            "scaling_relation_summary",
+            "plots.stage0.scaling_relation_summary",
+            lambda: _plot_scaling_relation_summary(run_dir, scaling_relation_df),
+        ),
+        *(
+            [
+                (
+                    "perturbation_discovery_diagnostics",
+                    "plots.stage0.perturbation_discovery_diagnostics",
+                    lambda: _plot_perturbation_discovery_diagnostics(run_dir, perturbation_discovery_df),
+                )
+            ]
+            if not perturbation_discovery_df.empty
+            else []
+        ),
+    ]
+    _run_plot_tasks_with_progress(args, plot_tasks)
+    _log(args, "[done] stage0 minimal run summary\n" + run_summary_text.rstrip())
     return run_summary
 
 
