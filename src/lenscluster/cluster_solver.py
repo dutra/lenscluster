@@ -1378,12 +1378,6 @@ def _parse_args() -> argparse.Namespace:
         help="Relative nonnegative weight of Jacobian perturbations in the stage-0 perturbation score.",
     )
     parser.add_argument(
-        "--perturbation-discovery-final-svi-polish-steps",
-        type=_nonnegative_int_arg,
-        default=2000,
-        help="Fixed-candidate SVI polish steps after final perturbation discovery discovery rebuild. Zero disables polishing.",
-    )
-    parser.add_argument(
         "--source-plane-covariance-floor",
         type=float,
         default=1.0e-6,
@@ -3195,6 +3189,152 @@ def _log_stage_fit_quality_table(args: argparse.Namespace | None, summary: dict[
         args,
         _format_stage_fit_quality_table(summary),
         renderable=_stage_fit_quality_table(summary),
+    )
+
+
+def _stage1_frozen_residual_counts(evaluator: Any) -> tuple[int, int]:
+    cached_indices = np.asarray(
+        getattr(
+            evaluator,
+            "cached_scaling_component_indices",
+            getattr(evaluator, "inactive_scaling_component_indices", []),
+        ),
+        dtype=int,
+    ).reshape(-1)
+    state = getattr(evaluator, "state", None)
+    packed = getattr(state, "packed_lens_spec", None)
+    sigma_delta = np.asarray(getattr(packed, "frozen_log_sigma_delta", []), dtype=float).reshape(-1)
+    mass_delta = np.asarray(getattr(packed, "frozen_log_mass_delta", []), dtype=float).reshape(-1)
+    if cached_indices.size == 0 or sigma_delta.size == 0 or mass_delta.size == 0:
+        return 0, int(cached_indices.size)
+    max_size = min(int(sigma_delta.size), int(mass_delta.size))
+    valid = cached_indices[(cached_indices >= 0) & (cached_indices < max_size)]
+    if valid.size == 0:
+        return 0, int(cached_indices.size)
+    has_frozen = (np.abs(sigma_delta[valid]) > 1.0e-12) | (np.abs(mass_delta[valid]) > 1.0e-12)
+    frozen_count = int(np.count_nonzero(has_frozen))
+    zero_count = int(cached_indices.size - frozen_count)
+    return frozen_count, zero_count
+
+
+def _source_metric_cache_status(evaluator: Any) -> str:
+    source_covariance_mode = str(
+        getattr(evaluator, "source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION)
+    )
+    sample_likelihood_mode = str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))
+    if (
+        source_covariance_mode == SOURCE_PLANE_COVARIANCE_MODE_UNIT
+        and sample_likelihood_mode == SAMPLE_LIKELIHOOD_SOURCE
+    ):
+        return "unit"
+    if bool(getattr(getattr(evaluator, "state", None), "perturbation_discovery_stage0", False)):
+        return "current_exact"
+    if _count_items(getattr(evaluator, "source_metric_cache_by_z", {})) > 0:
+        return "refreshed"
+    return "disabled"
+
+
+def _stage1_model_summary_rows(evaluator: Any) -> list[ApproximationRow]:
+    exact_scaling = _count_items(
+        getattr(
+            evaluator,
+            "exact_scaling_component_indices",
+            getattr(evaluator, "active_scaling_component_indices", []),
+        )
+    )
+    cached_scaling = _count_items(
+        getattr(
+            evaluator,
+            "cached_scaling_component_indices",
+            getattr(evaluator, "inactive_scaling_component_indices", []),
+        )
+    )
+    free_scaling = _count_items(getattr(evaluator, "free_correction_scaling_component_indices", []))
+    excluded_scaling = _count_items(getattr(evaluator, "excluded_scaling_component_indices", []))
+    total_scaling = _count_items(getattr(evaluator, "scaling_component_indices", []))
+    frozen_count, zero_count = _stage1_frozen_residual_counts(evaluator)
+    sample_likelihood_mode = str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))
+    source_covariance_mode = str(
+        getattr(evaluator, "source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION)
+    )
+    rows: list[ApproximationRow] = [
+        ("sampling_engine", _format_approximation_value(getattr(evaluator, "sampling_engine", "unknown")), "engine"),
+        ("sample_likelihood", _format_approximation_value(sample_likelihood_mode), "likelihood"),
+        ("source_plane_covariance_mode", _format_approximation_value(source_covariance_mode), "likelihood"),
+        (
+            "large_exact",
+            _format_approximation_value(_count_items(getattr(evaluator, "large_component_indices", []))),
+            "active",
+        ),
+        ("total_scaling", _format_approximation_value(total_scaling), "active"),
+        ("selected_exact_scaling", f"{exact_scaling}/{total_scaling}", "active"),
+        ("free_scaling", _format_approximation_value(free_scaling), "active"),
+        ("cached_inactive_scaling", _format_approximation_value(cached_scaling), "active"),
+        ("excluded_scaling", _format_approximation_value(excluded_scaling), "active"),
+        ("frozen_residual_inactive", _format_approximation_value(frozen_count), "selection"),
+        ("zero_residual_inactive", _format_approximation_value(zero_count), "selection"),
+    ]
+    if sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
+        rows.append(("local_jacobian_metric", _format_approximation_value(_local_jacobian_metric_mode(evaluator)), "likelihood"))
+    if _count_items(getattr(evaluator, "scaling_scatter_param_indices", [])) > 0:
+        rows.append(("scaling_scatter_cache", "linearized", "cache"))
+    else:
+        rows.append(("scaling_scatter_cache", "disabled", "cache"))
+    rows.append(("source_metric_cache", _source_metric_cache_status(evaluator), "cache"))
+    return rows
+
+
+def _build_stage1_model_summary_rich_table(rows: list[ApproximationRow]) -> Any:
+    table = _RichTable(
+        title="Stage 1 model summary",
+        title_style="bold cyan",
+        header_style="bold white",
+        border_style="cyan",
+        show_lines=False,
+        expand=False,
+    )
+    table.add_column("name", style="dim", no_wrap=True)
+    table.add_column("value", overflow="fold")
+    for row in rows:
+        name, value, category = row[:3]
+        style = _APPROXIMATION_CATEGORY_STYLES.get(category, "white")
+        value_style = row[3] if len(row) > 3 else style
+        table.add_row(_rich_style_cell(name, style), _rich_style_cell(value, value_style))
+    return table
+
+
+def _format_stage1_model_summary_table_from_rows(rows: list[ApproximationRow]) -> str:
+    row_lines = ["[stage1-model-summary]", "| name | value |"]
+    row_lines.extend(f"| {row[0]} | {row[1]} |" for row in rows)
+    return "\n".join(row_lines)
+
+
+def _write_stage1_model_summary_csv(run_dir: Path, rows: list[ApproximationRow]) -> Path:
+    tables_dir = run_dir / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    path = tables_dir / "stage1_model_summary.csv"
+    pd.DataFrame(
+        [
+            {"name": str(row[0]), "value": str(row[1]), "category": str(row[2])}
+            for row in rows
+        ]
+    ).to_csv(path, index=False)
+    return path
+
+
+def _log_stage1_model_summary_table(
+    args: argparse.Namespace | None,
+    evaluator: Any,
+    run_dir: Path,
+) -> None:
+    if _sequential_stage_name(run_dir) != STAGE1_BACKPROJECTED_CENTROID_FIT_DIR:
+        return
+    rows = _stage1_model_summary_rows(evaluator)
+    path = _write_stage1_model_summary_csv(run_dir, rows)
+    _log(
+        args,
+        _format_stage1_model_summary_table_from_rows(rows) + f"\npath={path}",
+        renderable=_build_stage1_model_summary_rich_table(rows),
     )
 
 
@@ -9513,14 +9653,194 @@ def _component_set_to_selected_by_potfile(
     return selected_by_potfile
 
 
+PERTURBATION_DISCOVERY_DIAGNOSTIC_COLUMNS: tuple[str, ...] = (
+    "potfile_id",
+    "potfile_order",
+    "catalog_id",
+    "catalog_row_index",
+    "component_index",
+    "evaluation_component_index",
+    "image_index",
+    "family_id",
+    "image_label",
+    "alpha_x_arcsec",
+    "alpha_y_arcsec",
+    "alpha_arcsec",
+    "jacobian_frobenius",
+    "alpha_tol_arcsec",
+    "jacobian_tol",
+    "jacobian_weight",
+    "alpha_norm",
+    "jacobian_norm",
+    "score",
+    "threshold_score",
+    "selected_pair",
+    "selected_galaxy",
+)
+
+
+def _empty_perturbation_discovery_diagnostics_table() -> pd.DataFrame:
+    return pd.DataFrame(columns=list(PERTURBATION_DISCOVERY_DIAGNOSTIC_COLUMNS))
+
+
+def _perturbation_discovery_image_metadata(
+    state: BuildState,
+    flat_data: Any,
+    n_images: int,
+) -> list[dict[str, str]]:
+    family_by_id = {str(getattr(family, "family_id", "")): family for family in getattr(state, "family_data", [])}
+    family_ids = tuple(str(value) for value in getattr(flat_data, "family_ids", ()))
+    global_family_index = np.asarray(getattr(flat_data, "global_family_index_per_image", []), dtype=int).reshape(-1)
+    local_image_index = np.asarray(getattr(flat_data, "local_image_index_per_image", []), dtype=int).reshape(-1)
+    metadata: list[dict[str, str]] = []
+    for image_index in range(int(n_images)):
+        family_id = ""
+        image_label = str(image_index)
+        if image_index < global_family_index.size:
+            family_slot = int(global_family_index[image_index])
+            if 0 <= family_slot < len(family_ids):
+                family_id = str(family_ids[family_slot])
+                family = family_by_id.get(family_id)
+                label_index = int(local_image_index[image_index]) if image_index < local_image_index.size else -1
+                labels = getattr(family, "image_labels", ()) if family is not None else ()
+                if 0 <= label_index < len(labels):
+                    image_label = str(labels[label_index])
+        metadata.append({"family_id": family_id, "image_label": image_label})
+    return metadata
+
+
+def _perturbation_discovery_score_table(
+    state: BuildState,
+    flat_data: Any,
+    candidates: np.ndarray,
+    evaluation_candidates: np.ndarray,
+    alpha_x: np.ndarray,
+    alpha_y: np.ndarray,
+    jac00: np.ndarray,
+    jac01: np.ndarray,
+    jac10: np.ndarray,
+    jac11: np.ndarray,
+    *,
+    alpha_tol: float,
+    jacobian_tol: float,
+    jacobian_weight: float,
+    threshold_score: float = 1.0,
+) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
+    candidates = np.asarray(candidates, dtype=np.int32).reshape(-1)
+    evaluation_candidates = np.asarray(evaluation_candidates, dtype=np.int32).reshape(-1)
+    if evaluation_candidates.size != candidates.size:
+        raise ValueError(
+            "Perturbation discovery candidate identity and evaluation arrays must have the same length."
+        )
+    alpha_x = np.asarray(alpha_x, dtype=float)
+    alpha_y = np.asarray(alpha_y, dtype=float)
+    jac00 = np.asarray(jac00, dtype=float)
+    jac01 = np.asarray(jac01, dtype=float)
+    jac10 = np.asarray(jac10, dtype=float)
+    jac11 = np.asarray(jac11, dtype=float)
+    if candidates.size == 0 or alpha_x.size == 0:
+        empty = np.zeros((int(candidates.size), 0), dtype=float)
+        return _empty_perturbation_discovery_diagnostics_table(), empty, empty, np.zeros(candidates.size, dtype=bool)
+    alpha_arcsec = np.sqrt(np.square(alpha_x) + np.square(alpha_y))
+    jacobian_frobenius = np.sqrt(np.square(jac00) + np.square(jac01) + np.square(jac10) + np.square(jac11))
+    alpha_norm = alpha_arcsec / float(alpha_tol)
+    jacobian_norm = jacobian_frobenius / float(jacobian_tol)
+    score = np.sqrt(np.square(alpha_norm) + float(jacobian_weight) * np.square(jacobian_norm))
+    score = np.where(np.isfinite(score), np.maximum(score, 0.0), 0.0)
+    selected_pair = score > float(threshold_score)
+    selected_galaxy = np.any(selected_pair, axis=1)
+
+    component_to_record = {
+        int(record.get("component_index", -1)): dict(record)
+        for record in getattr(state, "scaling_component_records", [])
+    }
+    image_metadata = _perturbation_discovery_image_metadata(state, flat_data, int(score.shape[1]))
+    rows: list[dict[str, Any]] = []
+    for candidate_position, component_index in enumerate(candidates.tolist()):
+        record = component_to_record.get(int(component_index), {})
+        evaluation_component_index = int(evaluation_candidates[candidate_position])
+        for image_index in range(int(score.shape[1])):
+            metadata = image_metadata[image_index] if image_index < len(image_metadata) else {}
+            rows.append(
+                {
+                    "potfile_id": str(record.get("potfile_id", "")),
+                    "potfile_order": int(record.get("potfile_order", -1)),
+                    "catalog_id": str(record.get("catalog_id", "")),
+                    "catalog_row_index": int(record.get("catalog_row_index", -1)),
+                    "component_index": int(component_index),
+                    "evaluation_component_index": int(evaluation_component_index),
+                    "image_index": int(image_index),
+                    "family_id": str(metadata.get("family_id", "")),
+                    "image_label": str(metadata.get("image_label", image_index)),
+                    "alpha_x_arcsec": float(alpha_x[candidate_position, image_index]),
+                    "alpha_y_arcsec": float(alpha_y[candidate_position, image_index]),
+                    "alpha_arcsec": float(alpha_arcsec[candidate_position, image_index]),
+                    "jacobian_frobenius": float(jacobian_frobenius[candidate_position, image_index]),
+                    "alpha_tol_arcsec": float(alpha_tol),
+                    "jacobian_tol": float(jacobian_tol),
+                    "jacobian_weight": float(jacobian_weight),
+                    "alpha_norm": float(alpha_norm[candidate_position, image_index]),
+                    "jacobian_norm": float(jacobian_norm[candidate_position, image_index]),
+                    "score": float(score[candidate_position, image_index]),
+                    "threshold_score": float(threshold_score),
+                    "selected_pair": bool(selected_pair[candidate_position, image_index]),
+                    "selected_galaxy": bool(selected_galaxy[candidate_position]),
+                }
+            )
+    return pd.DataFrame(rows, columns=list(PERTURBATION_DISCOVERY_DIAGNOSTIC_COLUMNS)), score, selected_pair, selected_galaxy
+
+
+def _perturbation_discovery_identity_and_evaluation_components(
+    state: BuildState,
+    evaluator: ClusterJAXEvaluator,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    scaling_candidates = np.asarray(
+        getattr(evaluator, "scaling_component_indices", np.asarray([], dtype=np.int32)),
+        dtype=np.int32,
+    ).reshape(-1)
+    if scaling_candidates.size == 0:
+        empty = np.asarray([], dtype=np.int32)
+        return empty, empty, 0
+    scaling_set = {int(value) for value in scaling_candidates.tolist()}
+    identity_components: list[int] = []
+    evaluation_components: list[int] = []
+    free_evaluation_count = 0
+    seen: set[int] = set()
+    for record in getattr(state, "scaling_component_records", []):
+        component_index = int(record.get("component_index", -1))
+        if component_index < 0 or component_index not in scaling_set or component_index in seen:
+            continue
+        free_component_index = int(record.get("free_component_index", -1))
+        evaluation_component_index = free_component_index if free_component_index >= 0 else component_index
+        identity_components.append(component_index)
+        evaluation_components.append(evaluation_component_index)
+        if evaluation_component_index != component_index:
+            free_evaluation_count += 1
+        seen.add(component_index)
+    for component_index in scaling_candidates.tolist():
+        component_index = int(component_index)
+        if component_index in seen:
+            continue
+        identity_components.append(component_index)
+        evaluation_components.append(component_index)
+        seen.add(component_index)
+    return (
+        np.asarray(identity_components, dtype=np.int32),
+        np.asarray(evaluation_components, dtype=np.int32),
+        int(free_evaluation_count),
+    )
+
+
 def _perturbation_discovery_union_from_evaluator(
     state: BuildState,
     evaluator: ClusterJAXEvaluator,
     reference_params: np.ndarray,
-) -> tuple[list[set[int]], dict[str, Any]]:
+) -> tuple[list[set[int]], dict[str, Any], pd.DataFrame]:
     selected_by_potfile = _empty_selected_by_potfile(state)
-    candidates = np.asarray(getattr(evaluator, "scaling_component_indices", np.asarray([], dtype=np.int32)), dtype=np.int32)
-    candidates = candidates.reshape(-1)
+    candidates, evaluation_candidates, free_evaluation_count = _perturbation_discovery_identity_and_evaluation_components(
+        state,
+        evaluator,
+    )
     flat_data = getattr(evaluator, "flat_critical_arc_data", None)
     n_images = 0 if flat_data is None else int(np.asarray(flat_data.x_obs).shape[0])
     if candidates.size == 0 or flat_data is None or n_images == 0:
@@ -9531,13 +9851,14 @@ def _perturbation_discovery_union_from_evaluator(
             "source": "full_scaling",
             "score_fraction": 0.0,
             "candidate_galaxies": int(candidates.size),
+            "evaluated_free_branch_galaxies": int(free_evaluation_count),
             "n_images": int(n_images),
             "alpha_tol_arcsec": float(getattr(evaluator, "perturbation_discovery_alpha_tol_arcsec", DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC)),
             "jacobian_tol": float(getattr(evaluator, "perturbation_discovery_jacobian_tol", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL)),
             "jacobian_weight": float(getattr(evaluator, "perturbation_discovery_jacobian_weight", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_WEIGHT)),
             "max_selected_score": 0.0,
             "max_unselected_score": 0.0,
-        }
+        }, _empty_perturbation_discovery_diagnostics_table()
     reference = np.asarray(reference_params, dtype=float)
     reference_jax = jnp.asarray(reference, dtype=jnp.float64)
     physical_params = evaluator._physical_parameter_vector(reference_jax)
@@ -9556,18 +9877,19 @@ def _perturbation_discovery_union_from_evaluator(
             "refresh_failed": True,
             "score_fraction": 0.0,
             "candidate_galaxies": int(candidates.size),
+            "evaluated_free_branch_galaxies": int(free_evaluation_count),
             "n_images": int(n_images),
             "alpha_tol_arcsec": float(getattr(evaluator, "perturbation_discovery_alpha_tol_arcsec", DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC)),
             "jacobian_tol": float(getattr(evaluator, "perturbation_discovery_jacobian_tol", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL)),
             "jacobian_weight": float(getattr(evaluator, "perturbation_discovery_jacobian_weight", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_WEIGHT)),
             "max_selected_score": 0.0,
             "max_unselected_score": 0.0,
-        }
+        }, _empty_perturbation_discovery_diagnostics_table()
     rows = evaluator._flat_component_alpha_and_jacobian_delta_rows_for_components(
         flat_data.x_obs,
         flat_data.y_obs,
         packed_state,
-        candidates,
+        evaluation_candidates,
     )
     arrays = [np.asarray(value, dtype=float) for value in rows]
     if not all(np.isfinite(array).all() for array in arrays):
@@ -9579,13 +9901,14 @@ def _perturbation_discovery_union_from_evaluator(
             "refresh_failed": True,
             "score_fraction": 0.0,
             "candidate_galaxies": int(candidates.size),
+            "evaluated_free_branch_galaxies": int(free_evaluation_count),
             "n_images": int(n_images),
             "alpha_tol_arcsec": float(getattr(evaluator, "perturbation_discovery_alpha_tol_arcsec", DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC)),
             "jacobian_tol": float(getattr(evaluator, "perturbation_discovery_jacobian_tol", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL)),
             "jacobian_weight": float(getattr(evaluator, "perturbation_discovery_jacobian_weight", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_WEIGHT)),
             "max_selected_score": 0.0,
             "max_unselected_score": 0.0,
-        }
+        }, _empty_perturbation_discovery_diagnostics_table()
     alpha_x, alpha_y, jac00, jac01, jac10, jac11 = arrays
     alpha_tol = float(getattr(evaluator, "perturbation_discovery_alpha_tol_arcsec", DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC))
     jacobian_tol = float(getattr(evaluator, "perturbation_discovery_jacobian_tol", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL))
@@ -9596,12 +9919,22 @@ def _perturbation_discovery_union_from_evaluator(
         raise ValueError("perturbation_discovery_jacobian_tol must be finite and positive.")
     if not np.isfinite(jacobian_weight) or jacobian_weight < 0.0:
         raise ValueError("perturbation_discovery_jacobian_weight must be finite and non-negative.")
-    alpha_norm = np.sqrt(np.square(alpha_x) + np.square(alpha_y)) / alpha_tol
-    jac_norm = np.sqrt(np.square(jac00) + np.square(jac01) + np.square(jac10) + np.square(jac11)) / jacobian_tol
-    score = np.sqrt(np.square(alpha_norm) + jacobian_weight * np.square(jac_norm))
-    score = np.where(np.isfinite(score), np.maximum(score, 0.0), 0.0)
-    above_threshold = score > 1.0
-    selected_per_candidate = np.any(above_threshold, axis=1)
+    detail_df, score, above_threshold, selected_per_candidate = _perturbation_discovery_score_table(
+        state,
+        flat_data,
+        candidates,
+        evaluation_candidates,
+        alpha_x,
+        alpha_y,
+        jac00,
+        jac01,
+        jac10,
+        jac11,
+        alpha_tol=alpha_tol,
+        jacobian_tol=jacobian_tol,
+        jacobian_weight=jacobian_weight,
+        threshold_score=1.0,
+    )
     valid_components = {int(value) for value in candidates[selected_per_candidate].reshape(-1).tolist() if int(value) >= 0}
     component_to_record = {
         int(record.get("component_index", -1)): (
@@ -9630,6 +9963,7 @@ def _perturbation_discovery_union_from_evaluator(
         "source": "perturbation_discovery_full_scaling",
         "score_fraction": float(score_fraction),
         "candidate_galaxies": int(candidates.size),
+        "evaluated_free_branch_galaxies": int(free_evaluation_count),
         "n_images": int(n_images),
         "alpha_tol_arcsec": float(alpha_tol),
         "jacobian_tol": float(jacobian_tol),
@@ -9637,15 +9971,13 @@ def _perturbation_discovery_union_from_evaluator(
         "max_selected_score": float(np.max(selected_scores)) if selected_scores.size else 0.0,
         "max_unselected_score": float(np.max(unselected_scores)) if unselected_scores.size else 0.0,
         "threshold_score": 1.0,
-    }
+    }, detail_df
 
 
 def _perturbation_discovery_svi_final_log_message(
     final_union_diag: Mapping[str, Any],
     *,
-    polish_engine: str,
     stage1_engine: str,
-    final_polish_steps: int,
 ) -> str:
     return (
         "[perturbation-discovery:svi-final] "
@@ -9660,9 +9992,8 @@ def _perturbation_discovery_svi_final_log_message(
         f"max_selected_score={float(final_union_diag.get('max_selected_score', 0.0)):.4g} "
         f"max_unselected_score={float(final_union_diag.get('max_unselected_score', 0.0)):.4g} "
         f"score_fraction={float(final_union_diag.get('score_fraction', 0.0)):.4g} "
-        f"polish_engine={polish_engine} "
-        f"stage1_engine={stage1_engine} "
-        f"final_svi_polish_steps={int(final_polish_steps)}"
+        "stage0_final_rebuild=full_flat "
+        f"stage1_engine={stage1_engine}"
     )
 
 
@@ -9697,7 +10028,9 @@ def _perturbation_discovery_final_model_log_message(
     *,
     old_parameter_count: int,
     new_parameter_count: int,
+    rebuild_diag: Mapping[str, Any] | None = None,
 ) -> str:
+    rebuild_diag = rebuild_diag or {}
     strict_active = "yes" if bool(counts.get("perturbation_discovery_final_strict_active", False)) else "no"
     active_equals_independent = "yes" if bool(counts.get("active_equals_independent", False)) else "no"
     return (
@@ -9711,6 +10044,9 @@ def _perturbation_discovery_final_model_log_message(
         f"total_scaling={int(counts.get('total_scaling', 0))} "
         f"perturbation_discovery_final_strict_active={strict_active} "
         f"active_equals_independent={active_equals_independent} "
+        f"sampled_free_members={int(counts.get('free_correction_candidates', 0))} "
+        f"frozen_residual_inactive_members={int(rebuild_diag.get('frozen_residual_inactive_members', 0))} "
+        f"zero_residual_inactive_members={int(rebuild_diag.get('zero_residual_inactive_members', 0))} "
         f"old_parameters={int(old_parameter_count)} "
         f"new_parameters={int(new_parameter_count)}"
     )
@@ -9721,9 +10057,7 @@ def _perturbation_discovery_svi_final_diagnostics(
     final_rebuild_diag: Mapping[str, Any],
     final_model_counts: Mapping[str, Any],
     *,
-    polish_engine: str,
     stage1_engine: str,
-    final_polish_steps: int,
 ) -> dict[str, Any]:
     return {
         "perturbation_discovery_svi_final_candidate_galaxies": int(final_union_diag.get("candidate_galaxies", 0)),
@@ -9737,9 +10071,14 @@ def _perturbation_discovery_svi_final_diagnostics(
         "perturbation_discovery_svi_final_jacobian_weight": float(final_union_diag.get("jacobian_weight", 0.0)),
         "perturbation_discovery_svi_final_max_selected_score": float(final_union_diag.get("max_selected_score", 0.0)),
         "perturbation_discovery_svi_final_max_unselected_score": float(final_union_diag.get("max_unselected_score", 0.0)),
-        "perturbation_discovery_svi_polish_engine": str(polish_engine),
+        "perturbation_discovery_svi_final_rebuild_engine": SAMPLING_ENGINE_FULL_FLAT,
         "perturbation_discovery_svi_final_stage1_engine": str(stage1_engine),
-        "perturbation_discovery_svi_final_polish_steps": int(final_polish_steps),
+        "perturbation_discovery_final_frozen_residual_inactive_members": int(
+            final_rebuild_diag.get("frozen_residual_inactive_members", 0)
+        ),
+        "perturbation_discovery_final_zero_residual_inactive_members": int(
+            final_rebuild_diag.get("zero_residual_inactive_members", 0)
+        ),
         "perturbation_discovery_final_strict_active": bool(
             final_model_counts.get("perturbation_discovery_final_strict_active", False)
         ),
@@ -9864,6 +10203,78 @@ def _source_position_prior_values_from_state(state: BuildState) -> dict[str, tup
     return priors
 
 
+def _stage0_frozen_residuals_from_all_free_state(
+    state: BuildState,
+    theta: np.ndarray,
+    selected_by_potfile: list[set[int]],
+) -> tuple[list[dict[int, tuple[float, float]]], dict[str, int]]:
+    potfiles = list(getattr(state, "potfiles", []))
+    frozen_by_potfile: list[dict[int, tuple[float, float]]] = [{} for _ in potfiles]
+    packed = getattr(state, "packed_lens_spec", None)
+    if packed is None or not getattr(state, "scaling_component_records", None):
+        return frozen_by_potfile, {
+            "frozen_residual_inactive_members": 0,
+            "zero_residual_inactive_members": 0,
+        }
+    physical = np.asarray(_convert_theta_to_physical(np.asarray(theta, dtype=float), state.parameter_specs), dtype=float)
+    sigma_unit_indices = np.asarray(getattr(packed, "independent_free_log_sigma_delta_unit_param_index", []), dtype=int)
+    mass_unit_indices = np.asarray(getattr(packed, "independent_free_log_mass_delta_unit_param_index", []), dtype=int)
+    sigma_tau_indices = np.asarray(getattr(packed, "independent_free_log_sigma_tau_param_index", []), dtype=int)
+    mass_tau_indices = np.asarray(getattr(packed, "independent_free_log_mass_tau_param_index", []), dtype=int)
+    n_components = int(np.asarray(getattr(packed, "profile_type", [])).size)
+    if not (
+        sigma_unit_indices.size == mass_unit_indices.size == sigma_tau_indices.size == mass_tau_indices.size == n_components
+    ):
+        return frozen_by_potfile, {
+            "frozen_residual_inactive_members": 0,
+            "zero_residual_inactive_members": 0,
+        }
+    frozen_count = 0
+    zero_count = 0
+    for record in getattr(state, "scaling_component_records", []):
+        potfile_order = int(record.get("potfile_order", -1))
+        row_index = int(record.get("catalog_row_index", -1))
+        if potfile_order < 0 or potfile_order >= len(frozen_by_potfile) or row_index < 0:
+            continue
+        if potfile_order < len(selected_by_potfile) and row_index in selected_by_potfile[potfile_order]:
+            continue
+        free_component_index = int(record.get("free_component_index", -1))
+        if free_component_index < 0 or free_component_index >= n_components:
+            frozen_by_potfile[potfile_order][row_index] = (0.0, 0.0)
+            zero_count += 1
+            continue
+        sigma_unit_index = int(sigma_unit_indices[free_component_index])
+        mass_unit_index = int(mass_unit_indices[free_component_index])
+        sigma_tau_index = int(sigma_tau_indices[free_component_index])
+        mass_tau_index = int(mass_tau_indices[free_component_index])
+        if min(sigma_unit_index, mass_unit_index, sigma_tau_index, mass_tau_index) < 0:
+            frozen_by_potfile[potfile_order][row_index] = (0.0, 0.0)
+            zero_count += 1
+            continue
+        try:
+            delta_log_sigma = float(physical[sigma_tau_index] * physical[sigma_unit_index])
+            delta_log_mass = float(physical[mass_tau_index] * physical[mass_unit_index])
+        except IndexError as exc:
+            raise ValueError(
+                "Cannot extract stage0 frozen residuals: independent/free residual parameter "
+                f"indices for potfile_order={potfile_order} row={row_index} are out of range."
+            ) from exc
+        if not np.isfinite(delta_log_sigma) or not np.isfinite(delta_log_mass):
+            raise ValueError(
+                "Cannot extract stage0 frozen residuals: non-finite residual for "
+                f"potfile_order={potfile_order} row={row_index}."
+            )
+        frozen_by_potfile[potfile_order][row_index] = (delta_log_sigma, delta_log_mass)
+        if abs(delta_log_sigma) > 0.0 or abs(delta_log_mass) > 0.0:
+            frozen_count += 1
+        else:
+            zero_count += 1
+    return frozen_by_potfile, {
+        "frozen_residual_inactive_members": int(frozen_count),
+        "zero_residual_inactive_members": int(zero_count),
+    }
+
+
 def _rebuild_perturbation_discovery_state_from_union(
     args: argparse.Namespace,
     old_state: BuildState,
@@ -9875,6 +10286,11 @@ def _rebuild_perturbation_discovery_state_from_union(
     normalized = _normalize_selected_by_potfile(selected_by_potfile, len(getattr(old_state, "potfiles", [])))
     old_components = _selected_component_set_from_state(old_state)
     source_position_prior_values = _source_position_prior_values_from_state(old_state)
+    frozen_residuals_by_potfile, frozen_residual_diag = _stage0_frozen_residuals_from_all_free_state(
+        old_state,
+        old_theta,
+        normalized,
+    )
     new_state = _build_state_from_inputs(
         args,
         fit_mode_override=str(getattr(old_state, "fit_mode", getattr(args, "fit_mode", FIT_MODE_JOINT))),
@@ -9882,6 +10298,7 @@ def _rebuild_perturbation_discovery_state_from_union(
         source_position_prior_values=source_position_prior_values,
         frozen_active_scaling_component_indices=getattr(old_state, "frozen_active_scaling_component_indices", None),
         perturbation_discovery_independent_override_by_potfile=normalized,
+        perturbation_discovery_frozen_residuals_by_potfile=frozen_residuals_by_potfile,
     )
     requested_components = _selected_by_potfile_component_set(new_state, normalized)
     if str(reason) == "perturbation_discovery_final":
@@ -9925,6 +10342,7 @@ def _rebuild_perturbation_discovery_state_from_union(
         "requested_components": int(len(requested_components)),
         "counts_by_potfile": _selected_by_potfile_counts(new_state, normalized),
         "source_position_prior_families": int(len(source_position_prior_values or {})),
+        **frozen_residual_diag,
         "strict_active": bool(strict_diag.get("strict_active", False)),
         "active_equals_independent": bool(strict_diag.get("active_equals_independent", False)),
         **{f"theta_transfer_{key}": value for key, value in transfer_diag.items()},
@@ -11259,102 +11677,6 @@ def _run_svi_fit(
         evaluator=evaluator,
         sample_model=sample_model,
     )
-
-
-def _run_perturbation_discovery_final_svi_polish(
-    args: argparse.Namespace,
-    state: BuildState,
-    evaluator: ClusterJAXEvaluator,
-    sample_model: Any,
-    initial_theta: np.ndarray,
-    *,
-    steps: int,
-) -> tuple[np.ndarray, PosteriorResults, dict[str, Any]]:
-    polish_steps = max(0, int(steps))
-    if polish_steps <= 0:
-        raise ValueError("perturbation discovery discovery final SVI polish requires a positive step count.")
-    initial = _clip_theta_to_support(
-        np.asarray(initial_theta, dtype=float),
-        state.parameter_specs,
-        boundary_frac=float(getattr(args, "nuts_init_boundary_frac", DEFAULT_NUTS_INIT_BOUNDARY_FRAC)),
-    )
-    init_values = {
-        str(spec.sample_name): float(initial[idx])
-        for idx, spec in enumerate(state.parameter_specs)
-        if idx < initial.size
-    }
-    _log(args, f"[perturbation-discovery:nuts] final_svi_polish start steps={polish_steps}")
-    guide = _make_auto_normal_guide(sample_model, state.parameter_specs, init_values)
-    svi = SVI(sample_model, guide, numpyro_optim.Adam(float(args.svi_learning_rate)), Trace_ELBO())
-    svi_result = _run_logged_phase(
-        args,
-        "perturbation_discovery.final_svi_polish",
-        lambda: svi.run(
-            jax.random.PRNGKey(0 if args.seed is None else int(args.seed) + 606),
-            int(polish_steps),
-            progress_bar=True,
-        ),
-    )
-    params = svi.get_params(svi_result.state)
-    median_values = guide.median(params)
-    polished_theta = _clip_theta_to_support(
-        _values_dict_to_theta(state.parameter_specs, median_values),
-        state.parameter_specs,
-        boundary_frac=float(getattr(args, "nuts_init_boundary_frac", DEFAULT_NUTS_INIT_BOUNDARY_FRAC)),
-    )
-    if not np.all(np.isfinite(polished_theta)):
-        raise ValueError("perturbation discovery discovery final SVI polish produced non-finite guide median values.")
-    total_draws = max(1, int(args.samples) * max(1, int(args.chains)))
-    guide_samples_dict = _run_logged_phase(
-        args,
-        "perturbation_discovery.final_svi_polish.sample_posterior",
-        lambda: guide.sample_posterior(
-            jax.random.PRNGKey(0 if args.seed is None else int(args.seed) + 607),
-            params,
-            sample_shape=(total_draws,),
-        ),
-    )
-    guide_samples = np.stack(
-        [_site_array_for_spec(guide_samples_dict, spec) for spec in state.parameter_specs],
-        axis=-1,
-    )
-    guide_samples = _clip_theta_matrix_to_support(np.asarray(guide_samples, dtype=float), state.parameter_specs)
-    log_prob = _run_logged_phase(
-        args,
-        "perturbation_discovery.final_svi_polish.posterior_logprob",
-        lambda: _posterior_logprob_matrix(state.parameter_specs, evaluator, guide_samples),
-    )
-    losses = np.asarray(getattr(svi_result, "losses", np.empty((0,), dtype=float)), dtype=float)
-    center_shift = float(np.linalg.norm(polished_theta - initial))
-    diagnostics = {
-        "perturbation_discovery_final_svi_polish_enabled": True,
-        "perturbation_discovery_final_svi_polish_steps": int(polish_steps),
-        "perturbation_discovery_final_svi_polish_final_loss": float(losses[-1]) if losses.size else float("nan"),
-        "perturbation_discovery_final_svi_polish_center_shift": center_shift,
-    }
-    posterior = PosteriorResults(
-        samples=guide_samples,
-        log_prob=np.asarray(log_prob, dtype=float),
-        accept_prob=np.empty((0,), dtype=float),
-        diverging=np.empty((0,), dtype=bool),
-        num_steps=np.empty((0,), dtype=float),
-        warmup_steps=0,
-        sample_steps=total_draws,
-        num_chains=0,
-        init_diagnostics=diagnostics.copy(),
-        grouped_samples=None,
-        grouped_log_prob=None,
-        sampler="svi_polish",
-    )
-    _log(
-        args,
-        (
-            "[perturbation-discovery:nuts] final_svi_polish complete "
-            f"steps={polish_steps} final_loss={diagnostics['perturbation_discovery_final_svi_polish_final_loss']:.4g} "
-            f"center_shift={center_shift:.4g}"
-        ),
-    )
-    return np.asarray(polished_theta, dtype=float), posterior, diagnostics
 
 
 def _clip_theta_matrix_to_support(
@@ -16070,6 +16392,8 @@ def _build_packed_lens_spec(
     independent_free_log_mass_delta_unit_param_index = np.full(n_components, -1, dtype=np.int32)
     independent_free_log_sigma_tau_param_index = np.full(n_components, -1, dtype=np.int32)
     independent_free_log_mass_tau_param_index = np.full(n_components, -1, dtype=np.int32)
+    frozen_log_sigma_delta = np.zeros(n_components, dtype=float)
+    frozen_log_mass_delta = np.zeros(n_components, dtype=float)
 
     for idx, (component, assignments) in enumerate(zip(base_components, component_param_assignments)):
         profile_type[idx] = int(component["profil"])
@@ -16122,6 +16446,8 @@ def _build_packed_lens_spec(
         independent_free_log_mass_delta_unit_param_index[idx] = int(item.get("independent_free_log_mass_delta_unit_param_index", -1))
         independent_free_log_sigma_tau_param_index[idx] = int(item.get("independent_free_log_sigma_tau_param_index", -1))
         independent_free_log_mass_tau_param_index[idx] = int(item.get("independent_free_log_mass_tau_param_index", -1))
+        frozen_log_sigma_delta[idx] = float(item.get("frozen_log_sigma_delta", 0.0))
+        frozen_log_mass_delta[idx] = float(item.get("frozen_log_mass_delta", 0.0))
 
     for idx, component in enumerate(base_components):
         if int(component.get("component_family_code", COMPONENT_FAMILY_LARGE)) != COMPONENT_FAMILY_INDEPENDENT_FREE:
@@ -16143,6 +16469,8 @@ def _build_packed_lens_spec(
         independent_free_log_mass_delta_unit_param_index[idx] = int(component.get("independent_free_log_mass_delta_unit_param_index", -1))
         independent_free_log_sigma_tau_param_index[idx] = int(component.get("independent_free_log_sigma_tau_param_index", -1))
         independent_free_log_mass_tau_param_index[idx] = int(component.get("independent_free_log_mass_tau_param_index", -1))
+        frozen_log_sigma_delta[idx] = 0.0
+        frozen_log_mass_delta[idx] = 0.0
 
     return PackedLensSpec(
         profile_type=profile_type,
@@ -16185,6 +16513,8 @@ def _build_packed_lens_spec(
         independent_free_log_mass_delta_unit_param_index=independent_free_log_mass_delta_unit_param_index,
         independent_free_log_sigma_tau_param_index=independent_free_log_sigma_tau_param_index,
         independent_free_log_mass_tau_param_index=independent_free_log_mass_tau_param_index,
+        frozen_log_sigma_delta=frozen_log_sigma_delta,
+        frozen_log_mass_delta=frozen_log_mass_delta,
     )
 
 
@@ -16211,6 +16541,7 @@ def _build_scaling_components(
     scaling_param_indices: list[dict[str, int]],
     scaling_scatter_indices: list[dict[str, int]] | None,
     independent_scaling_indices: list[dict[int, dict[str, int]]] | None,
+    frozen_residuals_by_potfile: list[dict[int, tuple[float, float]]] | None,
     independent_rank_info: dict[tuple[int, int], dict[str, Any]] | None,
     start_component_index: int,
     kpc_per_arcsec: float = 1.0,
@@ -16222,9 +16553,22 @@ def _build_scaling_components(
     scaling_component_records: list[dict[str, Any]] = []
     scaling_scatter_indices = scaling_scatter_indices or [{} for _ in potfiles]
     independent_scaling_indices = independent_scaling_indices or [{} for _ in potfiles]
+    frozen_residuals_by_potfile = frozen_residuals_by_potfile or [{} for _ in potfiles]
     independent_rank_info = independent_rank_info or {}
-    for potfile_order, (potfile, param_index_lookup, scatter_index_lookup, independent_index_lookup) in enumerate(
-        zip(potfiles, scaling_param_indices, scaling_scatter_indices, independent_scaling_indices)
+    for potfile_order, (
+        potfile,
+        param_index_lookup,
+        scatter_index_lookup,
+        independent_index_lookup,
+        frozen_residual_lookup,
+    ) in enumerate(
+        zip(
+            potfiles,
+            scaling_param_indices,
+            scaling_scatter_indices,
+            independent_scaling_indices,
+            frozen_residuals_by_potfile,
+        )
     ):
         catalog_df = potfile["catalog_df"]
         if catalog_df.empty:
@@ -16257,6 +16601,14 @@ def _build_scaling_components(
             ellipticite, angle_pos = _catalog_shape_to_ellipticity(row.catalog_a, row.catalog_b, row.catalog_theta)
             component_index = start_component_index + len(components)
             independent_lookup = independent_index_lookup.get(int(row_index), {})
+            raw_frozen_sigma_delta, raw_frozen_mass_delta = frozen_residual_lookup.get(int(row_index), (0.0, 0.0))
+            frozen_log_sigma_delta = 0.0 if independent_lookup else float(raw_frozen_sigma_delta)
+            frozen_log_mass_delta = 0.0 if independent_lookup else float(raw_frozen_mass_delta)
+            if not np.isfinite(frozen_log_sigma_delta) or not np.isfinite(frozen_log_mass_delta):
+                raise ValueError(
+                    "Frozen perturbation residuals must be finite for "
+                    f"potfile={potfile.get('id', potfile_order)!r} row={row_index}."
+                )
             components.append(
                 {
                     "id": f"{potfile['id']}.{row.id}",
@@ -16294,6 +16646,8 @@ def _build_scaling_components(
                     "cut_log_scatter_param_index": int(scatter_index_lookup.get("cut", -1)),
                     "independent_branch_role": int(branch_role),
                     "independent_magnitude_feature": float(magnitude_feature[row_index]),
+                    "frozen_log_sigma_delta": float(frozen_log_sigma_delta),
+                    "frozen_log_mass_delta": float(frozen_log_mass_delta),
                 }
             )
             if independent_lookup:
@@ -16342,6 +16696,11 @@ def _build_scaling_components(
                     "catalog_mag": float(row.catalog_mag),
                     "catalog_color": float(getattr(row, "catalog_color", np.nan)),
                     "independent_magnitude_feature": float(magnitude_feature[row_index]),
+                    "frozen_delta_log_sigma": float(frozen_log_sigma_delta),
+                    "frozen_delta_log_mass": float(frozen_log_mass_delta),
+                    "frozen_sigma_ratio": float(np.exp(frozen_log_sigma_delta)),
+                    "frozen_mass_ratio": float(np.exp(frozen_log_mass_delta)),
+                    "frozen_radius_ratio": float(np.exp(frozen_log_mass_delta - 2.0 * frozen_log_sigma_delta)),
                     "x_centre": float(x_offsets[row_index]),
                     "y_centre": float(y_offsets[row_index]),
                     "selected_independent": bool(independent_lookup),
@@ -18056,6 +18415,8 @@ class ClusterJAXEvaluator:
             "independent_free_log_mass_delta_unit_param_index": int_component_array("independent_free_log_mass_delta_unit_param_index"),
             "independent_free_log_sigma_tau_param_index": int_component_array("independent_free_log_sigma_tau_param_index"),
             "independent_free_log_mass_tau_param_index": int_component_array("independent_free_log_mass_tau_param_index"),
+            "frozen_log_sigma_delta": float_component_array("frozen_log_sigma_delta"),
+            "frozen_log_mass_delta": float_component_array("frozen_log_mass_delta"),
             "active_gate_intercept_param_index": int_component_array("active_gate_intercept_param_index"),
             "active_gate_mag_slope_param_index": int_component_array("active_gate_mag_slope_param_index"),
             "active_gate_logit_offset_param_index": int_component_array("active_gate_logit_offset_param_index"),
@@ -20250,6 +20611,11 @@ class ClusterJAXEvaluator:
                     "catalog_mag",
                     "catalog_color",
                     "independent_magnitude_feature",
+                    "frozen_delta_log_sigma",
+                    "frozen_delta_log_mass",
+                    "frozen_sigma_ratio",
+                    "frozen_mass_ratio",
+                    "frozen_radius_ratio",
                     "x_centre",
                     "y_centre",
                 ]
@@ -20331,6 +20697,11 @@ class ClusterJAXEvaluator:
                         "catalog_mag": float(record["catalog_mag"]),
                         "catalog_color": float(record["catalog_color"]),
                         "independent_magnitude_feature": float(record.get("independent_magnitude_feature", 0.0)),
+                        "frozen_delta_log_sigma": float(record.get("frozen_delta_log_sigma", 0.0)),
+                        "frozen_delta_log_mass": float(record.get("frozen_delta_log_mass", 0.0)),
+                        "frozen_sigma_ratio": float(record.get("frozen_sigma_ratio", 1.0)),
+                        "frozen_mass_ratio": float(record.get("frozen_mass_ratio", 1.0)),
+                        "frozen_radius_ratio": float(record.get("frozen_radius_ratio", 1.0)),
                         "x_centre": float(record["x_centre"]),
                         "y_centre": float(record["y_centre"]),
                     }
@@ -20519,6 +20890,12 @@ class ClusterJAXEvaluator:
         size_luminosity_scale = jnp.power(luminosity_ratio, beta_radius)
         scaled_core = core_ref * size_luminosity_scale
         scaled_cut = cut_ref * size_luminosity_scale
+        scaled_vdisp, scaled_core, scaled_cut = self._apply_frozen_scaling_residuals(
+            scaled_vdisp,
+            scaled_core,
+            scaled_cut,
+            spec_jax,
+        )
         free_role = spec_jax["independent_branch_role"] == INDEPENDENT_BRANCH_FREE
         log_displacement_free = free_role & (spec_jax["independent_free_log_sigma_delta_unit_param_index"] >= 0)
         free_sigma_delta_unit = self._apply_param_updates(
@@ -20667,6 +21044,22 @@ class ClusterJAXEvaluator:
         validity_params = jax.lax.stop_gradient(params) if stop_gradient else params
         _packed_state, details = self._build_packed_lens_state_details(validity_params, z_source)
         return self._packed_lens_validity(details)
+
+    def _apply_frozen_scaling_residuals(
+        self,
+        scaled_vdisp: jnp.ndarray,
+        scaled_core: jnp.ndarray,
+        scaled_cut: jnp.ndarray,
+        spec_arrays: dict[str, jnp.ndarray],
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        frozen_log_sigma_delta = spec_arrays["frozen_log_sigma_delta"]
+        frozen_log_mass_delta = spec_arrays["frozen_log_mass_delta"]
+        frozen_log_radius_delta = frozen_log_mass_delta - 2.0 * frozen_log_sigma_delta
+        return (
+            scaled_vdisp * jnp.exp(frozen_log_sigma_delta),
+            scaled_core * jnp.exp(frozen_log_radius_delta),
+            scaled_cut * jnp.exp(frozen_log_radius_delta),
+        )
 
     def _apply_independent_free_log_displacements(
         self,
@@ -20831,6 +21224,12 @@ class ClusterJAXEvaluator:
         scaled_vdisp = scaled_vdisp * jnp.exp(jnp.asarray(sigma_log_offset, dtype=jnp.float64))
         scaled_core = scaled_core * jnp.exp(jnp.asarray(core_log_offset, dtype=jnp.float64))
         scaled_cut = scaled_cut * jnp.exp(jnp.asarray(cut_log_offset, dtype=jnp.float64))
+        scaled_vdisp, scaled_core, scaled_cut = self._apply_frozen_scaling_residuals(
+            scaled_vdisp,
+            scaled_core,
+            scaled_cut,
+            spec_jax,
+        )
         v_disp, core_radius_kpc, cut_radius_kpc = self._apply_independent_free_log_displacements(
             physical_params,
             scaled_vdisp,
@@ -20922,6 +21321,12 @@ class ClusterJAXEvaluator:
         scaled_vdisp = scaled_vdisp * jnp.exp(jnp.asarray(sigma_log_offset, dtype=jnp.float64))
         scaled_core = scaled_core * jnp.exp(jnp.asarray(core_log_offset, dtype=jnp.float64))
         scaled_cut = scaled_cut * jnp.exp(jnp.asarray(cut_log_offset, dtype=jnp.float64))
+        scaled_vdisp, scaled_core, scaled_cut = self._apply_frozen_scaling_residuals(
+            scaled_vdisp,
+            scaled_core,
+            scaled_cut,
+            spec_jax,
+        )
         v_disp, core_radius_kpc, cut_radius_kpc = self._apply_independent_free_log_displacements(
             physical_params,
             scaled_vdisp,
@@ -24969,6 +25374,32 @@ def _selected_independent_by_potfile_from_artifacts(artifacts_dir: Path) -> list
     return selected_by_potfile
 
 
+def _frozen_residuals_by_potfile_from_state(
+    state: BuildState,
+) -> list[dict[int, tuple[float, float]]]:
+    frozen_by_potfile: list[dict[int, tuple[float, float]]] = [{} for _ in getattr(state, "potfiles", [])]
+    for record in getattr(state, "scaling_component_records", []):
+        try:
+            potfile_order = int(record.get("potfile_order"))
+            catalog_row_index = int(record.get("catalog_row_index"))
+            delta_log_sigma = float(record.get("frozen_delta_log_sigma", 0.0))
+            delta_log_mass = float(record.get("frozen_delta_log_mass", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(delta_log_sigma) or not np.isfinite(delta_log_mass):
+            continue
+        if 0 <= potfile_order < len(frozen_by_potfile) and catalog_row_index >= 0:
+            frozen_by_potfile[potfile_order][catalog_row_index] = (delta_log_sigma, delta_log_mass)
+    return frozen_by_potfile
+
+
+def _frozen_residuals_by_potfile_from_artifacts(
+    artifacts_dir: Path,
+) -> list[dict[int, tuple[float, float]]]:
+    state, _cli_args, _arrays, _init_diagnostics = _load_artifacts(artifacts_dir)
+    return _frozen_residuals_by_potfile_from_state(state)
+
+
 _LIKELIHOOD_STABILIZER_SAVED_ARG_DEFAULTS: dict[str, Any] = {
     "likelihood_stabilizer_max_gain": DEFAULT_LIKELIHOOD_STABILIZER_MAX_GAIN,
     "likelihood_stabilizer_max_residual_arcsec": DEFAULT_LIKELIHOOD_STABILIZER_MAX_RESIDUAL_ARCSEC,
@@ -25486,6 +25917,7 @@ def _build_state_from_inputs(
     frozen_active_scaling_source_run_dir: str | Path | None = None,
     frozen_active_scaling_source_path: str | Path | None = None,
     perturbation_discovery_independent_override_by_potfile: list[set[int]] | None = None,
+    perturbation_discovery_frozen_residuals_by_potfile: list[dict[int, tuple[float, float]]] | None = None,
 ) -> BuildState:
     fit_mode = fit_mode_override or args.fit_mode
     model_fit_mode = FIT_MODE_JOINT if fit_mode == FIT_MODE_EVIDENCE_NS else fit_mode
@@ -25576,6 +26008,20 @@ def _build_state_from_inputs(
         if perturbation_discovery_independent_override_by_potfile is None
         else _normalize_selected_by_potfile(perturbation_discovery_independent_override_by_potfile, len(potfiles))
     )
+    perturbation_discovery_frozen_residuals_by_potfile = (
+        None
+        if perturbation_discovery_frozen_residuals_by_potfile is None
+        else [
+            {
+                int(row_index): (float(values[0]), float(values[1]))
+                for row_index, values in residuals.items()
+            }
+            for residuals in perturbation_discovery_frozen_residuals_by_potfile[: len(potfiles)]
+        ]
+    )
+    if perturbation_discovery_frozen_residuals_by_potfile is not None:
+        while len(perturbation_discovery_frozen_residuals_by_potfile) < len(potfiles):
+            perturbation_discovery_frozen_residuals_by_potfile.append({})
     if model_fit_mode in {"small-only", FIT_MODE_JOINT}:
         active_selected_by_potfile = [set() for _ in potfiles]
         active_rank_info: dict[tuple[int, int], dict[str, Any]] = {}
@@ -25676,6 +26122,7 @@ def _build_state_from_inputs(
             scaling_param_indices,
             scaling_scatter_indices,
             independent_scaling_indices,
+            perturbation_discovery_frozen_residuals_by_potfile,
             active_rank_info,
             start_component_index=len(base_components),
             kpc_per_arcsec=scaling_kpc_per_arcsec,
@@ -27345,6 +27792,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
         _write_truth_validation_outputs(args, run_dir)
         if args.skip_plots:
             _log(args, "[output] plot generation skipped by --skip-plots")
+            _log_stage1_model_summary_table(args, validation_evaluator, run_dir)
             validation_evaluator.release_runtime_caches()
             if validation_evaluator is not evaluator:
                 evaluator.release_runtime_caches()
@@ -27367,6 +27815,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
             )
             plot_elapsed = time.time() - plot_start
             validation_evaluator.timing_totals["plot_runtime"] += plot_elapsed
+            _log_stage1_model_summary_table(args, validation_evaluator, run_dir)
             _log(args, f"[output] complete in {_fmt_seconds(plot_elapsed)} run_dir={run_dir}")
             validation_evaluator.release_runtime_caches()
             if validation_evaluator is not evaluator:
@@ -27491,26 +27940,34 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
         if perturbation_discovery_final_enabled:
                 old_state_for_transfer = state
                 old_specs_for_transfer = list(state.parameter_specs)
-                final_polish_steps = max(0, int(getattr(args, "perturbation_discovery_final_svi_polish_steps", 2000)))
-                polish_engine = SAMPLING_ENGINE_FULL_FLAT
                 stage1_engine = str(
                     getattr(args, "stage1_sampling_engine", SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT)
                 )
-                final_union, final_union_diag = _perturbation_discovery_union_from_evaluator(
+                final_union, final_union_diag, final_union_detail_df = _perturbation_discovery_union_from_evaluator(
                     state,
                     evaluator,
                     best_fit,
                 )
+                if not final_union_detail_df.empty:
+                    discovery_tables_dir = run_dir / "tables"
+                    discovery_tables_dir.mkdir(parents=True, exist_ok=True)
+                    discovery_table_path = discovery_tables_dir / "perturbation_discovery_diagnostics.csv"
+                    final_union_detail_df.to_csv(discovery_table_path, index=False)
+                    _log(
+                        args,
+                        (
+                            "[perturbation-discovery:diagnostics] "
+                            f"rows={len(final_union_detail_df)} path={discovery_table_path}"
+                        ),
+                )
                 final_args = argparse.Namespace(**vars(args))
-                final_args.sampling_engine = polish_engine
+                final_args.sampling_engine = SAMPLING_ENGINE_FULL_FLAT
                 final_args.perturbation_discovery_stage0 = True
                 _log(
                     args,
                     _perturbation_discovery_svi_final_log_message(
                         final_union_diag,
-                        polish_engine=polish_engine,
                         stage1_engine=stage1_engine,
-                        final_polish_steps=int(final_polish_steps),
                     ),
                 )
                 state, evaluator, sample_model, best_fit, final_rebuild_diag = (
@@ -27532,7 +27989,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                 svi_diagnostics.update(
                     {
                         "perturbation_discovery_final_enabled": True,
-                        "perturbation_discovery_polish_engine": str(polish_engine),
+                        "perturbation_discovery_final_rebuild_engine": SAMPLING_ENGINE_FULL_FLAT,
                         "perturbation_discovery_final_stage1_engine": str(stage1_engine),
                         "perturbation_discovery_final_candidates": int(final_rebuild_diag["count"]),
                         "perturbation_discovery_final_added": int(final_rebuild_diag["added"]),
@@ -27545,15 +28002,17 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                         "perturbation_discovery_final_active_equals_independent": bool(
                             final_rebuild_diag.get("active_equals_independent", False)
                         ),
-                        "perturbation_discovery_final_svi_polish_steps": int(final_polish_steps),
-                        "perturbation_discovery_final_svi_polish_enabled": bool(final_polish_steps > 0),
+                        "perturbation_discovery_final_frozen_residual_inactive_members": int(
+                            final_rebuild_diag.get("frozen_residual_inactive_members", 0)
+                        ),
+                        "perturbation_discovery_final_zero_residual_inactive_members": int(
+                            final_rebuild_diag.get("zero_residual_inactive_members", 0)
+                        ),
                         **_perturbation_discovery_svi_final_diagnostics(
                             final_union_diag,
                             final_rebuild_diag,
                             final_model_counts,
-                            polish_engine=polish_engine,
                             stage1_engine=stage1_engine,
-                            final_polish_steps=int(final_polish_steps),
                         ),
                     }
                 )
@@ -27563,6 +28022,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                         final_model_counts,
                         old_parameter_count=len(old_state_for_transfer.parameter_specs),
                         new_parameter_count=len(state.parameter_specs),
+                        rebuild_diag=final_rebuild_diag,
                     ),
                 )
                 _log_active_approximation_table(args, evaluator)
@@ -27576,10 +28036,12 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                         f"retained={final_rebuild_diag['retained']} "
                         f"strict_active={'yes' if bool(final_rebuild_diag.get('strict_active', False)) else 'no'} "
                         f"active_equals_independent={'yes' if bool(final_rebuild_diag.get('active_equals_independent', False)) else 'no'} "
+                        f"frozen_residual_inactive_members={int(final_rebuild_diag.get('frozen_residual_inactive_members', 0))} "
+                        f"zero_residual_inactive_members={int(final_rebuild_diag.get('zero_residual_inactive_members', 0))} "
                         f"exact_unique={int(final_union_diag.get('exact_unique', 0))} "
                         f"pairs={int(final_union_diag.get('pairs', 0))} "
                         f"score_fraction={float(final_union_diag.get('score_fraction', 0.0)):.4g} "
-                        f"polish_engine={polish_engine} "
+                        "stage0_final_rebuild=full_flat "
                         f"stage1_engine={stage1_engine} "
                         f"old_parameters={len(old_state_for_transfer.parameter_specs)} "
                         f"new_parameters={len(state.parameter_specs)}"
@@ -27587,23 +28049,6 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                 )
                 args = final_args
                 pre_nuts_refresh_reason = "pre_nuts_perturbation_discovery_final_rebuilt"
-                if final_polish_steps > 0:
-                    _log(
-                        args,
-                        "[perturbation-discovery] stage0 full_flat cache refresh disabled reason=polish_initial",
-                    )
-                    best_fit, polish_posterior, polish_diag = _run_perturbation_discovery_final_svi_polish(
-                        args,
-                        state,
-                        evaluator,
-                        sample_model,
-                        best_fit,
-                        steps=final_polish_steps,
-                    )
-                    svi_posterior = polish_posterior
-                    posterior = polish_posterior
-                    svi_diagnostics.update(polish_diag)
-                    pre_nuts_refresh_reason = "pre_nuts_perturbation_discovery_final_polished"
         if svi_followed_by_nuts:
             if perturbation_stage0:
                 _log(
@@ -27710,6 +28155,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
     _write_truth_validation_outputs(args, run_dir)
     if args.skip_plots:
         _log(args, "[output] plot generation skipped by --skip-plots")
+        _log_stage1_model_summary_table(args, validation_evaluator, run_dir)
         validation_evaluator.release_runtime_caches()
         if validation_evaluator is not evaluator:
             evaluator.release_runtime_caches()
@@ -27733,6 +28179,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
         _log_stage_fit_quality_table(args, stage_run_summary)
         plot_elapsed = time.time() - plot_start
         validation_evaluator.timing_totals["plot_runtime"] += plot_elapsed
+        _log_stage1_model_summary_table(args, validation_evaluator, run_dir)
         _log(args, f"[output] complete in {_fmt_seconds(plot_elapsed)} run_dir={run_dir}")
         validation_evaluator.release_runtime_caches()
         if validation_evaluator is not evaluator:
@@ -28372,6 +28819,7 @@ def _run_single_stage(
     source_position_prior_values: dict[str, tuple[float, float]] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
     perturbation_discovery_independent_override_by_potfile: list[set[int]] | None = None,
+    perturbation_discovery_frozen_residuals_by_potfile: list[dict[int, tuple[float, float]]] | None = None,
     frozen_active_scaling_source_run_dir: str | Path | None = None,
     require_frozen_active_scaling: bool = False,
 ) -> Path:
@@ -28411,6 +28859,9 @@ def _run_single_stage(
             perturbation_discovery_independent_override_by_potfile=(
                 perturbation_discovery_independent_override_by_potfile
             ),
+            perturbation_discovery_frozen_residuals_by_potfile=(
+                perturbation_discovery_frozen_residuals_by_potfile
+            ),
         ),
         detail=f"fit_mode={fit_mode}",
     )
@@ -28441,6 +28892,7 @@ def _run_single_stage_spawn_worker(
     source_position_prior_values: dict[str, tuple[float, float]] | None,
     previous_stage_best_values: dict[str, float] | None,
     perturbation_discovery_independent_override_by_potfile: list[set[int]] | None,
+    perturbation_discovery_frozen_residuals_by_potfile: list[dict[int, tuple[float, float]]] | None,
     frozen_active_scaling_source_run_dir: str | Path | None,
     require_frozen_active_scaling: bool,
 ) -> None:
@@ -28456,6 +28908,9 @@ def _run_single_stage_spawn_worker(
             previous_stage_best_values=previous_stage_best_values,
             perturbation_discovery_independent_override_by_potfile=(
                 perturbation_discovery_independent_override_by_potfile
+            ),
+            perturbation_discovery_frozen_residuals_by_potfile=(
+                perturbation_discovery_frozen_residuals_by_potfile
             ),
             frozen_active_scaling_source_run_dir=frozen_active_scaling_source_run_dir,
             require_frozen_active_scaling=require_frozen_active_scaling,
@@ -28479,6 +28934,7 @@ def _run_single_stage_in_fresh_process(
     source_position_prior_values: dict[str, tuple[float, float]] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
     perturbation_discovery_independent_override_by_potfile: list[set[int]] | None = None,
+    perturbation_discovery_frozen_residuals_by_potfile: list[dict[int, tuple[float, float]]] | None = None,
     frozen_active_scaling_source_run_dir: str | Path | None = None,
     require_frozen_active_scaling: bool = False,
 ) -> Path:
@@ -28504,6 +28960,7 @@ def _run_single_stage_in_fresh_process(
             source_position_prior_values,
             previous_stage_best_values,
             perturbation_discovery_independent_override_by_potfile,
+            perturbation_discovery_frozen_residuals_by_potfile,
             frozen_active_scaling_source_run_dir,
             require_frozen_active_scaling,
         ),
@@ -28797,6 +29254,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
     stage0_artifacts_dir = stage0_run_dir / "artifacts"
     stage0_init_values = _physical_best_fit_values_from_artifacts(stage0_artifacts_dir)
     stage0_selected_by_potfile = _selected_independent_by_potfile_from_artifacts(stage0_artifacts_dir)
+    stage0_frozen_residuals_by_potfile = _frozen_residuals_by_potfile_from_artifacts(stage0_artifacts_dir)
     stage0_selected_count = int(sum(len(values) for values in stage0_selected_by_potfile))
     _log(
         args,
@@ -28832,6 +29290,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
             svi_init_physical_values=stage0_init_values,
             previous_stage_best_values=stage0_init_values,
             perturbation_discovery_independent_override_by_potfile=stage0_selected_by_potfile,
+            perturbation_discovery_frozen_residuals_by_potfile=stage0_frozen_residuals_by_potfile,
         )
 
     summary_payload: dict[str, Any] = {
@@ -28870,6 +29329,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
         stage2_init_artifacts = stage1_run_dir / "artifacts"
         stage2_init_values = _physical_best_fit_values_from_artifacts(stage2_init_artifacts)
         stage2_selected_by_potfile = _selected_independent_by_potfile_from_artifacts(stage2_init_artifacts)
+        stage2_frozen_residuals_by_potfile = _frozen_residuals_by_potfile_from_artifacts(stage2_init_artifacts)
         source_position_priors = _source_position_prior_values_from_artifacts(stage2_init_artifacts)
         stage2_runs_fresh = bool(getattr(args, "stage2_fresh_process", True)) and not fast_resume
         stage2_run_dir = maybe_run_stage(
@@ -28882,6 +29342,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
             source_position_prior_values=source_position_priors,
             previous_stage_best_values=stage2_init_values,
             perturbation_discovery_independent_override_by_potfile=stage2_selected_by_potfile,
+            perturbation_discovery_frozen_residuals_by_potfile=stage2_frozen_residuals_by_potfile,
         )
         summary_payload["stage2_run_dir"] = str(stage2_run_dir)
         summary_payload["stage2_sample_likelihood_mode"] = str(stage2_likelihood)

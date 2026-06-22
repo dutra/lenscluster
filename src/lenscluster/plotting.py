@@ -2430,6 +2430,11 @@ def _scaling_relation_summary_table(
         "free_component_index",
         "catalog_mag",
         "catalog_color",
+        "frozen_delta_log_sigma",
+        "frozen_delta_log_mass",
+        "frozen_sigma_ratio",
+        "frozen_mass_ratio",
+        "frozen_radius_ratio",
         "luminosity_ratio",
         "anchor_mag",
         "alpha_sigma_median",
@@ -2569,10 +2574,19 @@ def _scaling_relation_summary_table(
         gamma_values = _values(gamma_ml_base, gamma_ml_indices, component_index)
         gamma_map = _map_value(gamma_ml_base, gamma_ml_indices, component_index)
         lum = float(luminosity_ratio[component_index])
+        frozen_delta_log_sigma = float(getattr(row, "frozen_delta_log_sigma", 0.0))
+        frozen_delta_log_mass = float(getattr(row, "frozen_delta_log_mass", 0.0))
+        if not np.isfinite(frozen_delta_log_sigma):
+            frozen_delta_log_sigma = 0.0
+        if not np.isfinite(frozen_delta_log_mass):
+            frozen_delta_log_mass = 0.0
+        frozen_sigma_ratio = float(np.exp(frozen_delta_log_sigma))
+        frozen_mass_ratio = float(np.exp(frozen_delta_log_mass))
+        frozen_radius_ratio = float(np.exp(frozen_delta_log_mass - 2.0 * frozen_delta_log_sigma))
         size_luminosity_scale = np.power(lum, beta_radius)
-        scaling_v_disp = sigma_ref * np.power(lum, alpha_sigma)
-        scaling_core = core_ref * size_luminosity_scale
-        scaling_cut = cut_ref * size_luminosity_scale
+        scaling_v_disp = sigma_ref * np.power(lum, alpha_sigma) * frozen_sigma_ratio
+        scaling_core = core_ref * size_luminosity_scale * frozen_radius_ratio
+        scaling_cut = cut_ref * size_luminosity_scale * frozen_radius_ratio
         scaling_log10_mass = _log10_dpie_mass_msun(scaling_v_disp, scaling_cut)
         sigma_ref_map = _map_value(sigma_ref_base, sigma_ref_indices, component_index)
         cut_ref_map = _map_value(cut_ref_base, cut_ref_indices, component_index)
@@ -2591,6 +2605,11 @@ def _scaling_relation_summary_table(
             "free_component_index": int(getattr(row, "free_component_index", -1)),
             "catalog_mag": catalog_mag,
             "catalog_color": float(getattr(row, "catalog_color", np.nan)),
+            "frozen_delta_log_sigma": frozen_delta_log_sigma,
+            "frozen_delta_log_mass": frozen_delta_log_mass,
+            "frozen_sigma_ratio": frozen_sigma_ratio,
+            "frozen_mass_ratio": frozen_mass_ratio,
+            "frozen_radius_ratio": frozen_radius_ratio,
             "luminosity_ratio": lum,
             "anchor_mag": anchor_mag,
             "selected_active": selected_active,
@@ -2604,15 +2623,20 @@ def _scaling_relation_summary_table(
             row_dict,
             "scaling_v_disp",
             scaling_v_disp,
-            sigma_ref_map * float(np.power(lum, alpha_sigma_map)),
+            sigma_ref_map * float(np.power(lum, alpha_sigma_map)) * frozen_sigma_ratio,
         )
         size_luminosity_scale_map = float(np.power(lum, beta_radius_map))
-        _add_summary(row_dict, "scaling_core_radius_kpc", scaling_core, core_ref_map * size_luminosity_scale_map)
+        _add_summary(
+            row_dict,
+            "scaling_core_radius_kpc",
+            scaling_core,
+            core_ref_map * size_luminosity_scale_map * frozen_radius_ratio,
+        )
         _add_summary(
             row_dict,
             "scaling_cut_radius_kpc",
             scaling_cut,
-            cut_ref_map * size_luminosity_scale_map,
+            cut_ref_map * size_luminosity_scale_map * frozen_radius_ratio,
         )
         _add_summary(
             row_dict,
@@ -2620,8 +2644,8 @@ def _scaling_relation_summary_table(
             scaling_log10_mass,
             float(
                 _log10_dpie_mass_msun(
-                    sigma_ref_map * float(np.power(lum, alpha_sigma_map)),
-                    cut_ref_map * size_luminosity_scale_map,
+                    sigma_ref_map * float(np.power(lum, alpha_sigma_map)) * frozen_sigma_ratio,
+                    cut_ref_map * size_luminosity_scale_map * frozen_radius_ratio,
                 )
             ),
         )
@@ -5393,6 +5417,145 @@ def _plot_scaling_rank_scatter(plot_dir: Path, scaling_rank_df: pd.DataFrame) ->
         _apply_log_importance_axis(ax, pot_df["importance"])
     fig.tight_layout()
     fig.savefig(_plot_path(plot_dir, "scaling_rank_scatter.png"), dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _load_perturbation_discovery_diagnostics_table(tables_dir: Path) -> pd.DataFrame:
+    path = tables_dir / "perturbation_discovery_diagnostics.csv"
+    if not path.is_file():
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+
+def _plot_perturbation_discovery_diagnostics(plot_dir: Path, diagnostics_df: pd.DataFrame) -> None:
+    required = {
+        "component_index",
+        "catalog_id",
+        "image_index",
+        "score",
+        "alpha_norm",
+        "jacobian_norm",
+        "selected_pair",
+        "selected_galaxy",
+        "alpha_tol_arcsec",
+        "jacobian_tol",
+        "jacobian_weight",
+        "threshold_score",
+    }
+    if diagnostics_df.empty or not required.issubset(diagnostics_df.columns):
+        return
+    df = diagnostics_df.copy()
+    for column in (
+        "score",
+        "alpha_norm",
+        "jacobian_norm",
+        "alpha_tol_arcsec",
+        "jacobian_tol",
+        "jacobian_weight",
+        "threshold_score",
+    ):
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df["selected_pair"] = df["selected_pair"].astype(bool)
+    df["selected_galaxy"] = df["selected_galaxy"].astype(bool)
+    df = df[np.isfinite(df["score"].to_numpy(dtype=float))]
+    if df.empty:
+        return
+
+    max_idx = df.groupby("component_index", sort=False)["score"].idxmax()
+    galaxy_df = df.loc[max_idx].copy().sort_values("score", ascending=False).reset_index(drop=True)
+    image_df = (
+        df.groupby(["image_index", "family_id", "image_label"], dropna=False)
+        .agg(selected_pairs=("selected_pair", "sum"), max_score=("score", "max"))
+        .reset_index()
+        .sort_values("image_index")
+    )
+    threshold = float(np.nanmedian(pd.to_numeric(df["threshold_score"], errors="coerce")))
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        threshold = 1.0
+    alpha_tol = float(np.nanmedian(df["alpha_tol_arcsec"]))
+    jacobian_tol = float(np.nanmedian(df["jacobian_tol"]))
+    jacobian_weight = float(np.nanmedian(df["jacobian_weight"]))
+    selected_galaxies = int(galaxy_df["selected_galaxy"].sum())
+    selected_pairs = int(df["selected_pair"].sum())
+    total_candidates = int(galaxy_df["component_index"].nunique())
+
+    fig, axes = plt.subplots(1, 3, figsize=(17.5, 5.2), constrained_layout=True)
+    selected_color = "#d62728"
+    unselected_color = "#6f7782"
+
+    x = np.arange(len(galaxy_df), dtype=int)
+    colors = np.where(galaxy_df["selected_galaxy"].to_numpy(dtype=bool), selected_color, unselected_color)
+    axes[0].scatter(x, galaxy_df["score"], c=colors, s=26, linewidth=0.0)
+    axes[0].axhline(threshold, color="black", linestyle="--", linewidth=1.0, label="threshold score")
+    axes[0].set_yscale("log")
+    axes[0].set_xlabel("galaxies sorted by max score")
+    axes[0].set_ylabel("max image-galaxy score")
+    axes[0].set_title("selection threshold")
+    axes[0].legend(loc="best", fontsize=8)
+
+    selected_mask = galaxy_df["selected_galaxy"].to_numpy(dtype=bool)
+    axes[1].scatter(
+        galaxy_df.loc[~selected_mask, "alpha_norm"],
+        galaxy_df.loc[~selected_mask, "jacobian_norm"],
+        color=unselected_color,
+        s=24,
+        alpha=0.65,
+        label="not selected",
+    )
+    axes[1].scatter(
+        galaxy_df.loc[selected_mask, "alpha_norm"],
+        galaxy_df.loc[selected_mask, "jacobian_norm"],
+        color=selected_color,
+        edgecolor="black",
+        linewidth=0.4,
+        s=34,
+        alpha=0.9,
+        label="selected",
+    )
+    curve_alpha = np.linspace(0.0, threshold, 200)
+    if np.isfinite(jacobian_weight) and jacobian_weight > 0.0:
+        curve_jac = np.sqrt(np.maximum(threshold**2 - curve_alpha**2, 0.0) / jacobian_weight)
+        axes[1].plot(curve_alpha, curve_jac, color="black", linestyle="--", linewidth=1.0, label="score = 1")
+    else:
+        axes[1].axvline(threshold, color="black", linestyle="--", linewidth=1.0, label="score = 1")
+    axes[1].set_xlabel(r"$|\alpha| / \alpha_{\rm tol}$")
+    axes[1].set_ylabel(r"$||\Delta A||_F / J_{\rm tol}$")
+    axes[1].set_title("worst image per galaxy")
+    axes[1].legend(loc="best", fontsize=8)
+
+    image_x = np.arange(len(image_df), dtype=int)
+    axes[2].bar(image_x, image_df["selected_pairs"].to_numpy(dtype=float), color="#4c78a8", alpha=0.85)
+    axes[2].set_xlabel("image")
+    axes[2].set_ylabel("selected galaxy pairs")
+    axes[2].set_title("selected pairs by image")
+    if len(image_df) <= 24:
+        labels = [
+            f"{row.family_id}:{row.image_label}" if str(row.family_id) else str(row.image_index)
+            for row in image_df.itertuples(index=False)
+        ]
+        axes[2].set_xticks(image_x)
+        axes[2].set_xticklabels(labels, rotation=60, ha="right", fontsize=7)
+
+    annotation = (
+        f"alpha_tol = {alpha_tol:.4g} arcsec\n"
+        f"jacobian_tol = {jacobian_tol:.4g}\n"
+        f"jacobian_weight = {jacobian_weight:.4g}\n"
+        f"candidates = {total_candidates}\n"
+        f"selected galaxies = {selected_galaxies}\n"
+        f"selected pairs = {selected_pairs}"
+    )
+    axes[0].text(
+        0.02,
+        0.98,
+        annotation,
+        transform=axes[0].transAxes,
+        va="top",
+        ha="left",
+        fontsize=8,
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "0.6", "alpha": 0.92},
+    )
+    fig.suptitle("Perturbation discovery diagnostics", fontsize=14)
+    fig.savefig(_plot_path(plot_dir, "perturbation_discovery_diagnostics.pdf"), dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -12601,6 +12764,11 @@ def _generate_plots_and_tables(
             getattr(args, "caustic_source_redshift", 9.0),
         ),
     )
+    perturbation_discovery_df = _run_logged_phase(
+        args,
+        "plots.perturbation_discovery_diagnostics_table",
+        lambda: _load_perturbation_discovery_diagnostics_table(tables_dir),
+    )
 
     _run_logged_phase(args, "plots.write_potential_summary_csv", lambda: summary_df.to_csv(tables_dir / "potential_summary.csv", index=False))
     _run_logged_phase(args, "plots.write_family_diagnostics_csv", lambda: family_df.to_csv(tables_dir / "family_diagnostics.csv", index=False))
@@ -12759,6 +12927,17 @@ def _generate_plots_and_tables(
             "scaling_relation_summary",
             "plots.scaling_relation_summary",
             lambda: _plot_scaling_relation_summary(run_dir, scaling_relation_df),
+        ),
+        *(
+            [
+                (
+                    "perturbation_discovery_diagnostics",
+                    "plots.perturbation_discovery_diagnostics",
+                    lambda: _plot_perturbation_discovery_diagnostics(run_dir, perturbation_discovery_df),
+                )
+            ]
+            if not perturbation_discovery_df.empty
+            else []
         ),
         (
             "independent_scaling_galaxy_map",

@@ -6322,8 +6322,6 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(getattr(args, "perturbation_discovery_jacobian_tol", 0.01)),
         "--perturbation-discovery-jacobian-weight",
         str(getattr(args, "perturbation_discovery_jacobian_weight", 1.0)),
-        "--perturbation-discovery-final-svi-polish-steps",
-        str(getattr(args, "perturbation_discovery_final_svi_polish_steps", 2000)),
         "--source-plane-covariance-floor",
         str(args.source_plane_covariance_floor),
         "--source-plane-covariance-mode",
@@ -7519,7 +7517,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--perturbation-discovery-alpha-tol-arcsec", type=float, default=0.01)
     parser.add_argument("--perturbation-discovery-jacobian-tol", type=float, default=0.01)
     parser.add_argument("--perturbation-discovery-jacobian-weight", type=float, default=1.0)
-    parser.add_argument("--perturbation-discovery-final-svi-polish-steps", type=_parse_nonnegative_int, default=2000)
     parser.add_argument("--source-plane-covariance-floor", type=float, default=1.0e-6)
     parser.add_argument(
         "--source-plane-covariance-mode",

@@ -5260,6 +5260,16 @@ def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free
     final_args.sampling_engine = cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT
     final_args.perturbation_discovery_stage0 = False
     old_theta = cluster_solver._default_theta(old_state.parameter_specs)
+    by_name = {str(spec.sample_name): idx for idx, spec in enumerate(old_state.parameter_specs)}
+    old_theta[by_name["potfile_faint_independent_free_log_sigma_delta_unit"]] = 1.5
+    old_theta[by_name["potfile_faint_independent_free_log_mass_delta_unit"]] = -0.5
+    old_theta[by_name["potfile_bright_independent_free_log_sigma_delta_unit"]] = 9.0
+    old_theta[by_name["potfile_bright_independent_free_log_mass_delta_unit"]] = 9.0
+    old_theta[by_name["potfile_mid_independent_free_log_sigma_delta_unit"]] = -2.0
+    old_theta[by_name["potfile_mid_independent_free_log_mass_delta_unit"]] = 0.75
+    physical_old = cluster_solver._convert_theta_to_physical(old_theta, old_state.parameter_specs)
+    sigma_tau = float(physical_old[by_name["potfile_independent_free_log_sigma_tau"]])
+    mass_tau = float(physical_old[by_name["potfile_independent_free_log_mass_tau"]])
 
     state, evaluator, _sample_model, _theta, diagnostics = cluster_solver._rebuild_perturbation_discovery_state_from_union(
         final_args,
@@ -5286,6 +5296,225 @@ def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free
     assert diagnostics["active_equals_independent"] is True
     assert len(evaluator.active_scaling_component_indices) == 1
     assert len(evaluator.cached_scaling_component_indices) == 2
+    assert diagnostics["frozen_residual_inactive_members"] == 2
+    assert diagnostics["zero_residual_inactive_members"] == 0
+    records_by_id = {str(record["catalog_id"]): record for record in state.scaling_component_records}
+    assert records_by_id["bright"]["selected_independent"] is True
+    assert records_by_id["bright"]["frozen_delta_log_sigma"] == pytest.approx(0.0)
+    assert records_by_id["bright"]["frozen_delta_log_mass"] == pytest.approx(0.0)
+    assert records_by_id["faint"]["selected_independent"] is False
+    assert records_by_id["faint"]["frozen_delta_log_sigma"] == pytest.approx(sigma_tau * 1.5)
+    assert records_by_id["faint"]["frozen_delta_log_mass"] == pytest.approx(mass_tau * -0.5)
+    assert records_by_id["mid"]["selected_independent"] is False
+    assert records_by_id["mid"]["frozen_delta_log_sigma"] == pytest.approx(sigma_tau * -2.0)
+    assert records_by_id["mid"]["frozen_delta_log_mass"] == pytest.approx(mass_tau * 0.75)
+    packed = state.packed_lens_spec
+    for catalog_id in ("faint", "mid"):
+        component_index = int(records_by_id[catalog_id]["component_index"])
+        assert float(packed.frozen_log_sigma_delta[component_index]) == pytest.approx(
+            records_by_id[catalog_id]["frozen_delta_log_sigma"]
+        )
+        assert float(packed.frozen_log_mass_delta[component_index]) == pytest.approx(
+            records_by_id[catalog_id]["frozen_delta_log_mass"]
+        )
+
+
+def test_perturbation_discovery_score_table_matches_threshold_rule() -> None:
+    state = SimpleNamespace(
+        scaling_component_records=[
+            {
+                "potfile_id": "members",
+                "potfile_order": 0,
+                "catalog_id": "g1",
+                "catalog_row_index": 0,
+                "component_index": 10,
+            },
+            {
+                "potfile_id": "members",
+                "potfile_order": 0,
+                "catalog_id": "g2",
+                "catalog_row_index": 1,
+                "component_index": 11,
+            },
+        ],
+        family_data=[
+            SimpleNamespace(family_id="1", image_labels=["a", "b"]),
+        ],
+    )
+    flat_data = SimpleNamespace(
+        family_ids=("1",),
+        global_family_index_per_image=np.asarray([0, 0], dtype=np.int32),
+        local_image_index_per_image=np.asarray([0, 1], dtype=np.int32),
+    )
+    table, score, selected_pair, selected_galaxy = cluster_solver._perturbation_discovery_score_table(
+        state,
+        flat_data,
+        np.asarray([10, 11], dtype=np.int32),
+        np.asarray([20, 11], dtype=np.int32),
+        np.asarray([[0.2, 0.0], [0.05, 0.0]], dtype=float),
+        np.asarray([[0.0, 0.0], [0.0, 0.0]], dtype=float),
+        np.asarray([[0.0, 0.0], [0.0, 0.0]], dtype=float),
+        np.asarray([[0.0, 0.0], [0.0, 0.0]], dtype=float),
+        np.asarray([[0.0, 0.0], [0.0, 0.0]], dtype=float),
+        np.asarray([[0.0, 0.6], [0.0, 0.0]], dtype=float),
+        alpha_tol=0.1,
+        jacobian_tol=0.5,
+        jacobian_weight=1.0,
+    )
+
+    np.testing.assert_allclose(score, [[2.0, 1.2], [0.5, 0.0]])
+    np.testing.assert_array_equal(selected_pair, [[True, True], [False, False]])
+    np.testing.assert_array_equal(selected_galaxy, [True, False])
+    assert len(table) == 4
+    assert table.loc[0, "catalog_id"] == "g1"
+    assert table.loc[0, "component_index"] == 10
+    assert table.loc[0, "evaluation_component_index"] == 20
+    assert table.loc[0, "family_id"] == "1"
+    assert table.loc[0, "image_label"] == "a"
+    assert bool(table.loc[0, "selected_pair"]) is True
+    assert bool(table.loc[2, "selected_galaxy"]) is False
+
+
+def test_perturbation_discovery_scores_free_branch_but_selects_scaling_identity() -> None:
+    state = SimpleNamespace(
+        potfiles=[{"id": "members"}],
+        scaling_component_records=[
+            {
+                "potfile_id": "members",
+                "potfile_order": 0,
+                "catalog_id": "g1",
+                "catalog_row_index": 0,
+                "component_index": 10,
+                "free_component_index": 20,
+            },
+            {
+                "potfile_id": "members",
+                "potfile_order": 0,
+                "catalog_id": "g2",
+                "catalog_row_index": 1,
+                "component_index": 11,
+                "free_component_index": -1,
+            },
+        ],
+        family_data=[
+            SimpleNamespace(family_id="1", image_labels=["a", "b"]),
+        ],
+    )
+    flat_data = SimpleNamespace(
+        x_obs=np.asarray([0.0, 1.0], dtype=float),
+        y_obs=np.asarray([0.0, 0.0], dtype=float),
+        family_ids=("1",),
+        global_family_index_per_image=np.asarray([0, 0], dtype=np.int32),
+        local_image_index_per_image=np.asarray([0, 1], dtype=np.int32),
+    )
+
+    class FakeEvaluator:
+        scaling_component_indices = np.asarray([10, 11], dtype=np.int32)
+        flat_critical_arc_data = flat_data
+        perturbation_discovery_alpha_tol_arcsec = 0.1
+        perturbation_discovery_jacobian_tol = 0.5
+        perturbation_discovery_jacobian_weight = 1.0
+
+        def _physical_parameter_vector(self, reference):
+            return reference
+
+        def _build_flat_packed_lens_state_with_validity_from_physical(
+            self,
+            _physical_params,
+            _flat_data,
+            *,
+            stop_gradient,
+        ):
+            del stop_gradient
+            return SimpleNamespace(), {"is_valid": np.asarray(True), "reason_flags": np.asarray([], dtype=bool)}
+
+        def _record_invalid_state_callback(self, _reason_flags):
+            raise AssertionError("state should be valid")
+
+        def _flat_component_alpha_and_jacobian_delta_rows_for_components(
+            self,
+            _x_obs,
+            _y_obs,
+            _packed_state,
+            components,
+        ):
+            np.testing.assert_array_equal(np.asarray(components, dtype=np.int32), np.asarray([20, 11], dtype=np.int32))
+            return (
+                np.asarray([[0.2, 0.0], [0.0, 0.0]], dtype=float),
+                np.zeros((2, 2), dtype=float),
+                np.zeros((2, 2), dtype=float),
+                np.zeros((2, 2), dtype=float),
+                np.zeros((2, 2), dtype=float),
+                np.zeros((2, 2), dtype=float),
+            )
+
+    selected, diagnostics, table = cluster_solver._perturbation_discovery_union_from_evaluator(
+        state,
+        FakeEvaluator(),
+        np.zeros(1, dtype=float),
+    )
+
+    assert selected == [{0}]
+    assert diagnostics["count"] == 1
+    assert diagnostics["evaluated_free_branch_galaxies"] == 1
+    assert table.loc[0, "component_index"] == 10
+    assert table.loc[0, "evaluation_component_index"] == 20
+    assert bool(table.loc[0, "selected_galaxy"]) is True
+
+
+def test_frozen_residuals_by_potfile_from_state_preserves_stage0_offsets() -> None:
+    state = SimpleNamespace(
+        potfiles=[{"id": "members"}],
+        scaling_component_records=[
+            {
+                "potfile_order": 0,
+                "catalog_row_index": 0,
+                "frozen_delta_log_sigma": 0.12,
+                "frozen_delta_log_mass": -0.08,
+            },
+            {
+                "potfile_order": 0,
+                "catalog_row_index": 1,
+                "frozen_delta_log_sigma": 0.0,
+                "frozen_delta_log_mass": 0.0,
+            },
+        ],
+    )
+
+    residuals = cluster_solver._frozen_residuals_by_potfile_from_state(state)
+
+    assert set(residuals[0]) == {0, 1}
+    assert residuals[0][0][0] == pytest.approx(0.12)
+    assert residuals[0][0][1] == pytest.approx(-0.08)
+    assert residuals[0][1] == (0.0, 0.0)
+
+
+def test_frozen_residuals_by_potfile_from_artifacts_loads_saved_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = SimpleNamespace(
+        potfiles=[{"id": "members"}],
+        scaling_component_records=[
+            {
+                "potfile_order": 0,
+                "catalog_row_index": 3,
+                "frozen_delta_log_sigma": -0.03,
+                "frozen_delta_log_mass": 0.07,
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        cluster_solver,
+        "_load_artifacts",
+        lambda artifacts_dir: (state, {}, {}, {}),
+    )
+
+    residuals = cluster_solver._frozen_residuals_by_potfile_from_artifacts(tmp_path / "artifacts")
+
+    assert set(residuals[0]) == {3}
+    assert residuals[0][3][0] == pytest.approx(-0.03)
+    assert residuals[0][3][1] == pytest.approx(0.07)
 
 
 def test_refreshing_surrogate_flat_still_uses_active_scaling_galaxies_normally(
@@ -7376,6 +7605,79 @@ def test_flat_packed_state_applies_log_displacement_delta_units_to_free_branch_o
     )
 
 
+def test_flat_packed_state_applies_frozen_residuals_to_inactive_scaling_branch() -> None:
+    base_state = _stage4_state_with_independent_and_inactive_scaling()
+    n_components = int(np.asarray(base_state.packed_lens_spec.profile_type).size)
+    frozen_sigma = np.zeros(n_components, dtype=float)
+    frozen_mass = np.zeros(n_components, dtype=float)
+    inactive_component = 3
+    frozen_sigma[inactive_component] = 0.2
+    frozen_mass[inactive_component] = 0.5
+    shifted_state = replace(
+        base_state,
+        packed_lens_spec=replace(
+            base_state.packed_lens_spec,
+            frozen_log_sigma_delta=frozen_sigma,
+            frozen_log_mass_delta=frozen_mass,
+        ),
+    )
+    base_state = replace(
+        base_state,
+        packed_lens_spec=replace(
+            base_state.packed_lens_spec,
+            frozen_log_sigma_delta=np.zeros(n_components, dtype=float),
+            frozen_log_mass_delta=np.zeros(n_components, dtype=float),
+        ),
+    )
+    base_evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=base_state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    shifted_evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=shifted_state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine="refreshing_surrogate_flat",
+        active_scaling_galaxies=[0],
+        active_scaling_selection="fixed",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    theta = cluster_solver._default_theta(base_state.parameter_specs)
+    physical_base = base_evaluator._physical_parameter_vector(jnp.asarray(theta, dtype=jnp.float64))
+    physical_shifted = shifted_evaluator._physical_parameter_vector(jnp.asarray(theta, dtype=jnp.float64))
+    flat_data = base_evaluator.flat_critical_arc_data
+    packed_base, validity_base = base_evaluator._build_flat_packed_lens_state_with_validity_from_physical(
+        physical_base,
+        flat_data,
+        stop_gradient=False,
+    )
+    packed_shifted, validity_shifted = shifted_evaluator._build_flat_packed_lens_state_with_validity_from_physical(
+        physical_shifted,
+        shifted_evaluator.flat_critical_arc_data,
+        stop_gradient=False,
+    )
+    assert bool(np.asarray(validity_base["is_valid"], dtype=bool))
+    assert bool(np.asarray(validity_shifted["is_valid"], dtype=bool))
+
+    base_sigma0 = np.asarray(packed_base["sigma0"], dtype=float)
+    shifted_sigma0 = np.asarray(packed_shifted["sigma0"], dtype=float)
+    assert float(np.max(np.abs(shifted_sigma0[inactive_component] - base_sigma0[inactive_component]))) > 1.0e-6
+    np.testing.assert_allclose(
+        np.asarray(packed_shifted["Rs"])[inactive_component] / np.asarray(packed_base["Rs"])[inactive_component],
+        np.exp(0.5 - 2.0 * 0.2),
+        rtol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        shifted_sigma0[[1, 2]],
+        base_sigma0[[1, 2]],
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+
 def test_stage0_full_flat_initial_state_has_no_free_candidates() -> None:
     state = replace(_minimal_stage4_surrogate_state(), perturbation_discovery_stage0=True)
     evaluator = cluster_solver.ClusterJAXEvaluator(
@@ -8809,6 +9111,90 @@ def test_active_approximation_table_logs_pipe_rows(monkeypatch: pytest.MonkeyPat
     assert "| z_bins | 1 |" in table
     assert "| families | 2 |" in table
     assert "| sample_likelihood | linearized-forward-beta-image-plane |" in table
+
+
+def test_stage1_model_summary_rows_include_partition_and_cache_counts() -> None:
+    packed = SimpleNamespace(
+        frozen_log_sigma_delta=np.asarray([0.0, 0.0, 0.0, 0.2, 0.0, 0.0], dtype=float),
+        frozen_log_mass_delta=np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, -0.3], dtype=float),
+    )
+    evaluator = SimpleNamespace(
+        state=SimpleNamespace(packed_lens_spec=packed, perturbation_discovery_stage0=False),
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+        sample_likelihood_mode=cluster_solver.SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
+        large_component_indices=np.asarray([0, 1], dtype=int),
+        scaling_component_indices=np.asarray([2, 3, 4, 5], dtype=int),
+        exact_scaling_component_indices=np.asarray([2], dtype=int),
+        active_scaling_component_indices=np.asarray([2], dtype=int),
+        free_correction_scaling_component_indices=np.asarray([2], dtype=int),
+        cached_scaling_component_indices=np.asarray([3, 4, 5], dtype=int),
+        inactive_scaling_component_indices=np.asarray([3, 4, 5], dtype=int),
+        excluded_scaling_component_indices=np.asarray([], dtype=int),
+        scaling_scatter_param_indices=np.asarray([8], dtype=int),
+        source_metric_cache_by_z={2.0: object()},
+    )
+
+    rows = cluster_solver._stage1_model_summary_rows(evaluator)
+    row_values = {name: value for name, value, *_rest in rows}
+
+    assert row_values["sampling_engine"] == "refreshing_surrogate_flat"
+    assert row_values["sample_likelihood"] == "local-jacobian"
+    assert row_values["large_exact"] == "2"
+    assert row_values["total_scaling"] == "4"
+    assert row_values["selected_exact_scaling"] == "1/4"
+    assert row_values["free_scaling"] == "1"
+    assert row_values["cached_inactive_scaling"] == "3"
+    assert row_values["excluded_scaling"] == "0"
+    assert row_values["frozen_residual_inactive"] == "2"
+    assert row_values["zero_residual_inactive"] == "1"
+    assert row_values["local_jacobian_metric"] == "frozen_refreshed"
+    assert row_values["scaling_scatter_cache"] == "linearized"
+    assert row_values["source_metric_cache"] == "refreshed"
+
+
+def test_stage1_model_summary_logs_and_writes_csv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    logs: list[str] = []
+    renderables: list[Any] = []
+    evaluator = SimpleNamespace(
+        state=SimpleNamespace(
+            packed_lens_spec=SimpleNamespace(
+                frozen_log_sigma_delta=np.asarray([0.0, 0.2], dtype=float),
+                frozen_log_mass_delta=np.asarray([0.0, 0.0], dtype=float),
+            ),
+            perturbation_discovery_stage0=False,
+        ),
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+        sample_likelihood_mode=cluster_solver.SAMPLE_LIKELIHOOD_SOURCE,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
+        large_component_indices=np.asarray([0], dtype=int),
+        scaling_component_indices=np.asarray([1, 2], dtype=int),
+        exact_scaling_component_indices=np.asarray([1], dtype=int),
+        active_scaling_component_indices=np.asarray([1], dtype=int),
+        free_correction_scaling_component_indices=np.asarray([1], dtype=int),
+        cached_scaling_component_indices=np.asarray([2], dtype=int),
+        inactive_scaling_component_indices=np.asarray([2], dtype=int),
+        excluded_scaling_component_indices=np.asarray([], dtype=int),
+        scaling_scatter_param_indices=np.asarray([], dtype=int),
+        source_metric_cache_by_z={},
+    )
+
+    monkeypatch.setattr(
+        cluster_solver,
+        "_log",
+        lambda _args, message, **kwargs: (logs.append(str(message)), renderables.append(kwargs.get("renderable"))),
+    )
+    run_dir = tmp_path / "fit" / cluster_solver.STAGE1_BACKPROJECTED_CENTROID_FIT_DIR
+
+    cluster_solver._log_stage1_model_summary_table(argparse.Namespace(), evaluator, run_dir)
+
+    assert logs and logs[0].startswith("[stage1-model-summary]")
+    assert "| selected_exact_scaling | 1/2 |" in logs[0]
+    assert getattr(renderables[0], "title", None) == "Stage 1 model summary"
+    csv_path = run_dir / "tables" / "stage1_model_summary.csv"
+    assert csv_path.exists()
+    csv_text = csv_path.read_text(encoding="utf-8")
+    assert "cached_inactive_scaling,1,active" in csv_text
 
 
 def test_active_approximation_table_reports_scaling_rank_and_z_bins() -> None:
@@ -13937,51 +14323,57 @@ def test_run_svi_fit_exact_discovery_skips_cache_refreshes(
     assert diagnostics["perturbation_discovery_svi_rebuild_count"] == 0
 
 
-def test_topk_discovery_final_diagnostic_messages_include_counts() -> None:
+def test_perturbation_discovery_final_diagnostic_messages_include_counts() -> None:
     union_diag = {
-        "k": 5,
         "candidate_galaxies": 200,
         "n_images": 42,
         "pairs": 210,
         "exact_unique": 31,
         "count": 29,
         "score_fraction": 0.87,
+        "alpha_tol_arcsec": 0.02,
+        "jacobian_tol": 0.03,
+        "jacobian_weight": 0.5,
+        "max_selected_score": 7.0,
+        "max_unselected_score": 0.9,
     }
-    svi_final_message = cluster_solver._topk_discovery_svi_final_log_message(
+    svi_final_message = cluster_solver._perturbation_discovery_svi_final_log_message(
         union_diag,
-        final_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
-        final_polish_steps=2000,
+        stage1_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
     )
 
-    assert "[topk-discovery:svi-final]" in svi_final_message
-    assert "k=5" in svi_final_message
+    assert "[perturbation-discovery:svi-final]" in svi_final_message
     assert "candidate_galaxies=200" in svi_final_message
     assert "images=42" in svi_final_message
     assert "pairs=210" in svi_final_message
-    assert "unique_topk=31" in svi_final_message
+    assert "unique_selected=31" in svi_final_message
     assert "independent_candidates=29" in svi_final_message
+    assert "alpha_tol_arcsec=0.02" in svi_final_message
+    assert "jacobian_tol=0.03" in svi_final_message
+    assert "jacobian_weight=0.5" in svi_final_message
     assert "score_fraction=0.87" in svi_final_message
-    assert "final_engine=refreshing_surrogate_flat" in svi_final_message
-    assert "final_svi_polish_steps=2000" in svi_final_message
+    assert "stage0_final_rebuild=full_flat" in svi_final_message
+    assert "stage1_engine=refreshing_surrogate_flat" in svi_final_message
+    assert "final_svi_polish_steps" not in svi_final_message
 
-    counts = cluster_solver._topk_discovery_final_model_counts(
+    counts = cluster_solver._perturbation_discovery_final_model_counts(
         SimpleNamespace(
             active_scaling_component_indices=np.arange(29, dtype=np.int32),
             exact_scaling_component_indices=np.arange(29, dtype=np.int32),
-            cached_scaling_component_indices=np.arange(171, dtype=np.int32),
+            cached_scaling_component_indices=np.arange(29, 200, dtype=np.int32),
             independent_scaling_component_indices=np.arange(29, dtype=np.int32),
             free_correction_scaling_component_indices=np.arange(29, dtype=np.int32),
             large_component_indices=np.arange(2, dtype=np.int32),
             scaling_component_indices=np.arange(200, dtype=np.int32),
         )
     )
-    final_model_message = cluster_solver._topk_discovery_final_model_log_message(
+    final_model_message = cluster_solver._perturbation_discovery_final_model_log_message(
         counts,
         old_parameter_count=8,
         new_parameter_count=95,
     )
 
-    assert "[topk-discovery:final-model]" in final_model_message
+    assert "[perturbation-discovery:final-model]" in final_model_message
     assert "active_scaling=29" in final_model_message
     assert "exact_scaling=29" in final_model_message
     assert "cached_scaling=171" in final_model_message
@@ -13991,89 +14383,19 @@ def test_topk_discovery_final_diagnostic_messages_include_counts() -> None:
     assert "total_scaling=200" in final_model_message
     assert "old_parameters=8" in final_model_message
     assert "new_parameters=95" in final_model_message
-    diagnostics = cluster_solver._topk_discovery_svi_final_diagnostics(
-        {**union_diag, "k_valid": 5},
+    diagnostics = cluster_solver._perturbation_discovery_svi_final_diagnostics(
+        union_diag,
         {"count": 29},
         counts,
-        final_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
-        final_polish_steps=2000,
+        stage1_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
     )
-    assert diagnostics["topk_discovery_svi_final_independent_candidates"] == 29
-    assert diagnostics["topk_discovery_svi_final_pairs"] == 210
-    assert diagnostics["topk_discovery_svi_final_candidate_galaxies"] == 200
-    assert diagnostics["topk_discovery_svi_final_images"] == 42
-    assert diagnostics["topk_discovery_svi_final_engine"] == "refreshing_surrogate_flat"
-    assert diagnostics["topk_discovery_final_model_cached_scaling"] == 171
-
-
-def test_topk_discovery_final_svi_polish_updates_center_and_posterior(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    specs = [
-        ParameterSpec("halo.x", "halo_x", "halo", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0),
-        ParameterSpec("halo.y", "halo_y", "halo", 0, "y", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0),
-    ]
-
-    class FakeGuide:
-        def median(self, _params: dict[str, Any]) -> dict[str, float]:
-            return {"halo_x": 0.25, "halo_y": -0.5}
-
-        def sample_posterior(self, _key: Any, _params: dict[str, Any], sample_shape: tuple[int, ...]):
-            return {
-                "halo_x": jnp.asarray(np.full(sample_shape, 0.25, dtype=float)),
-                "halo_y": jnp.asarray(np.full(sample_shape, -0.5, dtype=float)),
-            }
-
-    class FakeSVI:
-        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
-
-        def run(self, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
-            return SimpleNamespace(state=object(), losses=np.asarray([3.0, 1.5], dtype=float))
-
-        def get_params(self, _state: object) -> dict[str, Any]:
-            return {}
-
-    init_values_seen: list[dict[str, float] | None] = []
-
-    def fake_make_guide(
-        _sample_model: object,
-        _parameter_specs: list[ParameterSpec],
-        init_values: dict[str, float] | None = None,
-    ) -> FakeGuide:
-        init_values_seen.append(None if init_values is None else dict(init_values))
-        return FakeGuide()
-
-    monkeypatch.setattr(cluster_solver, "_make_auto_normal_guide", fake_make_guide)
-    monkeypatch.setattr(cluster_solver, "SVI", FakeSVI)
-    monkeypatch.setattr(cluster_solver, "_run_logged_phase", lambda _args, _phase_name, fn, **_kwargs: fn())
-    monkeypatch.setattr(cluster_solver, "_posterior_logprob_matrix", lambda _specs, _evaluator, samples: np.zeros(samples.shape[0]))
-    monkeypatch.setattr(cluster_solver, "_log", lambda *_args, **_kwargs: None)
-    args = argparse.Namespace(
-        nuts_init_boundary_frac=0.0,
-        svi_learning_rate=0.05,
-        seed=7,
-        samples=2,
-        chains=1,
-    )
-    state = SimpleNamespace(parameter_specs=specs)
-
-    theta, posterior, diagnostics = cluster_solver._run_topk_discovery_final_svi_polish(
-        args,
-        state,
-        object(),
-        object(),
-        np.asarray([0.0, 0.0], dtype=float),
-        steps=5,
-    )
-
-    np.testing.assert_allclose(theta, np.asarray([0.25, -0.5], dtype=float))
-    assert posterior.samples.shape == (2, 2)
-    assert posterior.sampler == "svi_polish"
-    assert diagnostics["topk_discovery_final_svi_polish_steps"] == 5
-    assert diagnostics["topk_discovery_final_svi_polish_final_loss"] == pytest.approx(1.5)
-    assert diagnostics["topk_discovery_final_svi_polish_center_shift"] == pytest.approx(math.hypot(0.25, 0.5))
-    assert init_values_seen == [{"halo_x": 0.0, "halo_y": 0.0}]
+    assert diagnostics["perturbation_discovery_svi_final_independent_candidates"] == 29
+    assert diagnostics["perturbation_discovery_svi_final_pairs"] == 210
+    assert diagnostics["perturbation_discovery_svi_final_candidate_galaxies"] == 200
+    assert diagnostics["perturbation_discovery_svi_final_images"] == 42
+    assert diagnostics["perturbation_discovery_svi_final_rebuild_engine"] == "full_flat"
+    assert diagnostics["perturbation_discovery_svi_final_stage1_engine"] == "refreshing_surrogate_flat"
+    assert diagnostics["perturbation_discovery_final_strict_active"] is True
 
 
 def test_run_svi_fit_population_active_scaling_keeps_last_active_inference_cache_for_freeze(
@@ -15174,162 +15496,6 @@ def test_run_inference_direct_nuts_uses_state_init_without_svi(
     ]
     assert "nuts_initial" in evaluator.refresh_reasons
     assert "post_nuts" in evaluator.refresh_reasons
-
-
-def test_run_inference_topk_final_rebuild_logs_active_table_with_current_helper(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    specs = [
-        ParameterSpec("halo.x", "halo_x", "halo", 0, "x", "normal", -np.inf, np.inf, 0.1, mean=0.0, std=1.0)
-    ]
-    state = SimpleNamespace(
-        run_name="stage3_image_plane",
-        par_path="data/clustersim/input.par",
-        parameter_specs=specs,
-        family_data=[],
-        bin_data=[],
-        svi_init_values=None,
-    )
-
-    class FakeEvaluator:
-        def __init__(self, label: str, *, sampling_engine: str) -> None:
-            self.label = label
-            self.state = state
-            self.surrogate_enabled = sampling_engine == cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT
-            self.sampling_engine = sampling_engine
-            self.timing_totals = {"validation_runtime": 0.0}
-            self.refresh_reasons: list[str] = []
-            self.active_inference_enabled = False
-            self.using_frozen_active_scaling = False
-            self.large_component_indices = np.asarray([0], dtype=np.int32)
-            self.scaling_component_indices = np.asarray([1, 2, 3], dtype=np.int32)
-            self.active_scaling_component_indices = np.asarray([1], dtype=np.int32)
-            self.exact_scaling_component_indices = np.asarray([1], dtype=np.int32)
-            self.cached_scaling_component_indices = np.asarray([2, 3], dtype=np.int32)
-            self.inactive_scaling_component_indices = np.asarray([2, 3], dtype=np.int32)
-            self.independent_scaling_component_indices = np.asarray([1], dtype=np.int32)
-            self.free_correction_scaling_component_indices = np.asarray([1], dtype=np.int32)
-            self.excluded_scaling_component_indices = np.asarray([], dtype=np.int32)
-            self.active_scaling_selection = "fixed"
-            self.topk_discovery_scaling_galaxies = 1
-            self.quick_diagnostics = True
-            self.sample_likelihood_mode = cluster_solver.SAMPLE_LIKELIHOOD_SOURCE
-            self.source_plane_covariance_mode = cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION
-            self.source_metric_cache_by_z: dict[float, Any] = {}
-            self.scaling_scatter_param_indices = np.asarray([], dtype=np.int32)
-
-        def refresh_surrogate(self, _theta: np.ndarray, reason: str) -> None:
-            self.refresh_reasons.append(f"surrogate:{reason}")
-
-        def refresh_scaling_scatter_cache(self, _theta: np.ndarray, reason: str) -> None:
-            self.refresh_reasons.append(f"scatter:{reason}")
-
-        def refresh_source_metric_cache(self, _theta: np.ndarray, reason: str) -> None:
-            self.refresh_reasons.append(f"source:{reason}")
-
-        def release_runtime_caches(self) -> None:
-            self.refresh_reasons.append("released")
-
-    initial_evaluator = FakeEvaluator("initial", sampling_engine=cluster_solver.SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT)
-    final_evaluator = FakeEvaluator("final", sampling_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT)
-    logs: list[str] = []
-    active_table_calls: list[str] = []
-
-    svi_posterior = PosteriorResults(
-        samples=np.asarray([[0.1]], dtype=float),
-        log_prob=np.asarray([1.0], dtype=float),
-        accept_prob=np.asarray([], dtype=float),
-        diverging=np.asarray([], dtype=bool),
-        num_steps=np.asarray([], dtype=float),
-        warmup_steps=0,
-        sample_steps=1,
-        num_chains=1,
-        init_diagnostics={},
-        grouped_samples=np.asarray([[[0.1]]], dtype=float),
-        grouped_log_prob=np.asarray([[1.0]], dtype=float),
-        sampler="svi",
-    )
-    nuts_posterior = PosteriorResults(
-        samples=np.asarray([[0.2]], dtype=float),
-        log_prob=np.asarray([2.0], dtype=float),
-        accept_prob=np.asarray([0.9], dtype=float),
-        diverging=np.asarray([False], dtype=bool),
-        num_steps=np.asarray([3.0], dtype=float),
-        warmup_steps=0,
-        sample_steps=1,
-        num_chains=1,
-        init_diagnostics={},
-        grouped_samples=np.asarray([[[0.2]]], dtype=float),
-        grouped_log_prob=np.asarray([[2.0]], dtype=float),
-        sampler="numpyro_nuts",
-    )
-
-    def fake_run_svi_fit(_args, _state, _evaluator, sample_model):
-        return cluster_solver._SviFitResult(
-            best_fit=np.asarray([0.1], dtype=float),
-            posterior=svi_posterior,
-            diagnostics={"svi_final_elbo_loss": 3.0, "svi_block_count": 1},
-            state=state,
-            evaluator=initial_evaluator,
-            sample_model=sample_model,
-        )
-
-    def fake_rebuild_topk(_args, _state, _best_fit, _final_union, *, reason: str):
-        assert reason == "topk_discovery_final"
-        return (
-            state,
-            final_evaluator,
-            object(),
-            np.asarray([0.15], dtype=float),
-            {"count": 1, "added": 1, "removed": 0, "retained": 0},
-        )
-
-    monkeypatch.setattr(cluster_solver, "_configure_debug_log", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(cluster_solver, "_log", lambda _args, message, **_kwargs: logs.append(str(message)))
-    monkeypatch.setattr(cluster_solver, "_prepare_direct_evaluator", lambda _args, _state: (initial_evaluator, np.zeros(1)))
-    monkeypatch.setattr(cluster_solver, "_posterior_model", lambda _specs, _evaluator: object())
-    monkeypatch.setattr(cluster_solver, "_run_svi_fit", fake_run_svi_fit)
-    monkeypatch.setattr(
-        cluster_solver,
-        "_topk_discovery_union_from_evaluator",
-        lambda *_args, **_kwargs: ({0: {0}}, {"k": 1, "k_valid": 1, "candidate_galaxies": 3, "n_images": 2, "pairs": 2, "exact_unique": 1, "count": 1, "score_fraction": 0.9}),
-    )
-    monkeypatch.setattr(cluster_solver, "_rebuild_topk_discovery_state_from_union", fake_rebuild_topk)
-    monkeypatch.setattr(cluster_solver, "_transfer_posterior_samples_by_sample_name", lambda posterior, *_args: posterior)
-    monkeypatch.setattr(cluster_solver, "_svi_refresh_evaluator_snapshot", lambda _evaluator: {})
-    monkeypatch.setattr(cluster_solver, "_svi_refresh_status_log_payload", lambda *_args, **_kwargs: ("[svi] refresh mocked", None))
-    monkeypatch.setattr(cluster_solver, "_prepare_svi_health_for_nuts", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(cluster_solver, "_run_repeated_nuts_sampling", lambda *_args, **_kwargs: (nuts_posterior, np.asarray([0.2], dtype=float)))
-    monkeypatch.setattr(cluster_solver, "_max_likelihood_best_fit_from_posterior", lambda _args, _evaluator, _posterior, fallback: np.asarray(fallback, dtype=float))
-    monkeypatch.setattr(
-        cluster_solver,
-        "_save_inference_checkpoint",
-        lambda _args, _state, _evaluator, run_dir, best_fit, posterior: (Path(run_dir) / "artifacts", np.asarray(best_fit, dtype=float), posterior),
-    )
-    monkeypatch.setattr(cluster_solver, "_output_evaluator_for_validation", lambda _args, _state, evaluator, _best_fit: evaluator)
-    monkeypatch.setattr(cluster_solver, "_approximate_evaluation", lambda *_args, **_kwargs: EvaluationResult(loglike=0.0, family_predictions={}))
-    monkeypatch.setattr(cluster_solver, "_write_truth_validation_outputs", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(cluster_solver, "_log_posterior_summary", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(cluster_solver, "_log_active_approximation_table", lambda _args, evaluator: active_table_calls.append(evaluator.label))
-
-    args = argparse.Namespace(
-        fit_method=cluster_solver.FIT_METHOD_SVI_NUTS,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT,
-        topk_discovery_final_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
-        topk_discovery_final_svi_polish_steps=0,
-        output_dir=str(tmp_path),
-        skip_validation=True,
-        quick_diagnostics=False,
-        skip_plots=True,
-        quiet=True,
-    )
-
-    cluster_solver._run_inference(args, state, tmp_path / state.run_name)
-
-    assert any(message.startswith("[topk-discovery:final-model]") for message in logs)
-    assert "final" in active_table_calls
-    assert "surrogate:pre_nuts_topk_discovery_final_rebuilt" in final_evaluator.refresh_reasons
 
 
 @pytest.mark.parametrize("fit_method", [cluster_solver.FIT_METHOD_MCHMC, cluster_solver.FIT_METHOD_MCLMC])
@@ -16837,8 +17003,6 @@ def test_cluster_solver_accepts_perturbation_discovery_threshold_controls(monkey
             "0.03",
             "--perturbation-discovery-jacobian-weight",
             "0.5",
-            "--perturbation-discovery-final-svi-polish-steps",
-            "500",
         ],
     )
 
@@ -16847,7 +17011,6 @@ def test_cluster_solver_accepts_perturbation_discovery_threshold_controls(monkey
     assert args.perturbation_discovery_alpha_tol_arcsec == pytest.approx(0.02)
     assert args.perturbation_discovery_jacobian_tol == pytest.approx(0.03)
     assert args.perturbation_discovery_jacobian_weight == pytest.approx(0.5)
-    assert args.perturbation_discovery_final_svi_polish_steps == 500
 
 
 def test_cluster_solver_rejects_perturbation_discovery_for_production_stage_engines(
@@ -16920,7 +17083,7 @@ def test_cluster_solver_rejects_removed_local_topk_flags(monkeypatch: pytest.Mon
         _parse_args()
 
 
-def test_cluster_solver_rejects_negative_perturbation_discovery_final_svi_polish_steps(
+def test_cluster_solver_rejects_removed_perturbation_discovery_final_svi_polish_steps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -16931,7 +17094,7 @@ def test_cluster_solver_rejects_negative_perturbation_discovery_final_svi_polish
             "--par-path",
             "data/clustersim/input.par",
             "--perturbation-discovery-final-svi-polish-steps",
-            "-1",
+            "500",
         ],
     )
 
@@ -18766,6 +18929,8 @@ def test_run_xsh_critical_arc_mode_selects_new_image_plane_mode() -> None:
     assert "perturbation_discovery_final_polish_engine" not in text
     assert '"--perturbation-discovery-final-polish-engine"' not in text
     assert '"--perturbation-discovery-final-engine"' not in text
+    assert "perturbation_discovery_final_svi_polish_steps" not in text
+    assert '"--perturbation-discovery-final-svi-polish-steps"' not in text
     assert '"--critical-arc-critical-direction-sigma-arcsec", 10.0' in text
     assert '"--critical-arc-base-prob", 0.10' in text
     assert '"--critical-arc-max-prob", 0.85' in text
@@ -19030,15 +19195,12 @@ def test_validation_parser_accepts_perturbation_discovery_threshold_controls() -
             "0.03",
             "--perturbation-discovery-jacobian-weight",
             "2.0",
-            "--perturbation-discovery-final-svi-polish-steps",
-            "250",
         ]
     )
 
     assert args.perturbation_discovery_alpha_tol_arcsec == pytest.approx(0.02)
     assert args.perturbation_discovery_jacobian_tol == pytest.approx(0.03)
     assert args.perturbation_discovery_jacobian_weight == pytest.approx(2.0)
-    assert args.perturbation_discovery_final_svi_polish_steps == 250
 
 
 def test_validation_parser_rejects_perturbation_discovery_for_production_stage_engines() -> None:
@@ -19057,9 +19219,9 @@ def test_validation_parser_rejects_removed_local_topk_surrogate_flat() -> None:
         validation._build_parser().parse_args(["--sampling-engine", "local_topk_surrogate_flat"])
 
 
-def test_validation_parser_rejects_negative_perturbation_discovery_final_svi_polish_steps() -> None:
+def test_validation_parser_rejects_removed_perturbation_discovery_final_svi_polish_steps() -> None:
     with pytest.raises(SystemExit):
-        validation._build_parser().parse_args(["--perturbation-discovery-final-svi-polish-steps", "-1"])
+        validation._build_parser().parse_args(["--perturbation-discovery-final-svi-polish-steps", "250"])
 
 
 def test_validation_parser_rejects_active_scaling_inference_controls() -> None:
@@ -27386,6 +27548,7 @@ def test_sequential_stage2_linearized_runs_as_free_source_forward_fit(
     monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {"halo_v_disp": 1200.0})
     monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
     monkeypatch.setattr(cluster_solver, "_selected_independent_by_potfile_from_artifacts", lambda _artifacts_dir: [{2, 5}])
+    monkeypatch.setattr(cluster_solver, "_frozen_residuals_by_potfile_from_artifacts", lambda _artifacts_dir: [{0: (0.1, -0.2)}])
     args = argparse.Namespace(
         run_name="fit",
         par_path="data/clustersim/input.par",
@@ -27705,6 +27868,7 @@ def test_sequential_stage2_critical_arc_runs_as_free_source_forward_fit(
     monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {"halo_v_disp": 1200.0})
     monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
     monkeypatch.setattr(cluster_solver, "_selected_independent_by_potfile_from_artifacts", lambda _artifacts_dir: [{2, 5}])
+    monkeypatch.setattr(cluster_solver, "_frozen_residuals_by_potfile_from_artifacts", lambda _artifacts_dir: [{0: (0.1, -0.2)}])
     args = argparse.Namespace(
         run_name="fit",
         par_path="data/clustersim/input.par",

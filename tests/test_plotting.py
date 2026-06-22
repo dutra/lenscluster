@@ -389,6 +389,38 @@ def test_scaling_relation_summary_plot_writes_pdf(tmp_path: Path) -> None:
     assert not (tmp_path / "scaling_relation_summary.png").exists()
 
 
+def test_perturbation_discovery_diagnostics_plot_writes_pdf(tmp_path: Path) -> None:
+    diagnostics_df = pd.DataFrame(
+        {
+            "potfile_id": ["members", "members", "members", "members"],
+            "potfile_order": [0, 0, 0, 0],
+            "catalog_id": ["g1", "g1", "g2", "g2"],
+            "catalog_row_index": [0, 0, 1, 1],
+            "component_index": [10, 10, 11, 11],
+            "image_index": [0, 1, 0, 1],
+            "family_id": ["1", "1", "1", "1"],
+            "image_label": ["a", "b", "a", "b"],
+            "alpha_x_arcsec": [0.2, 0.0, 0.05, 0.0],
+            "alpha_y_arcsec": [0.0, 0.0, 0.0, 0.0],
+            "alpha_arcsec": [0.2, 0.0, 0.05, 0.0],
+            "jacobian_frobenius": [0.0, 0.6, 0.0, 0.0],
+            "alpha_tol_arcsec": [0.1, 0.1, 0.1, 0.1],
+            "jacobian_tol": [0.5, 0.5, 0.5, 0.5],
+            "jacobian_weight": [1.0, 1.0, 1.0, 1.0],
+            "alpha_norm": [2.0, 0.0, 0.5, 0.0],
+            "jacobian_norm": [0.0, 1.2, 0.0, 0.0],
+            "score": [2.0, 1.2, 0.5, 0.0],
+            "threshold_score": [1.0, 1.0, 1.0, 1.0],
+            "selected_pair": [True, True, False, False],
+            "selected_galaxy": [True, True, False, False],
+        }
+    )
+
+    plotting._plot_perturbation_discovery_diagnostics(tmp_path, diagnostics_df)
+
+    assert plotting._plot_path(tmp_path, "perturbation_discovery_diagnostics.pdf").is_file()
+
+
 def test_scaling_relation_summary_plot_layers_and_counts_box(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     relation_df = pd.DataFrame(
         {
@@ -2185,6 +2217,26 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         sample_steps=1,
         num_chains=1,
     )
+    tables_dir = tmp_path / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "component_index": [10],
+            "catalog_id": ["g1"],
+            "image_index": [0],
+            "family_id": ["1"],
+            "image_label": ["a"],
+            "score": [2.0],
+            "alpha_norm": [2.0],
+            "jacobian_norm": [0.0],
+            "selected_pair": [True],
+            "selected_galaxy": [True],
+            "alpha_tol_arcsec": [0.1],
+            "jacobian_tol": [0.5],
+            "jacobian_weight": [1.0],
+            "threshold_score": [1.0],
+        }
+    ).to_csv(tables_dir / "perturbation_discovery_diagnostics.csv", index=False)
 
     run_summary = plotting._generate_plots_and_tables(
         run_dir=tmp_path,
@@ -2214,6 +2266,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert "residual_vs_magnification" in captured_tasks
     assert "residual_geometry_trends" in captured_tasks
     assert "posterior_predictive_coverage" in captured_tasks
+    assert "perturbation_discovery_diagnostics" in captured_tasks
     assert "subhalo_mass_function" in captured_tasks
     assert "subhalo_radial_distribution" in captured_tasks
     assert "critical_arc_support_histogram" not in captured_tasks

@@ -84,6 +84,8 @@ class PackedLensSpec:
     independent_free_log_mass_delta_unit_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     independent_free_log_sigma_tau_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     independent_free_log_mass_tau_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    frozen_log_sigma_delta: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    frozen_log_mass_delta: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
     active_gate_intercept_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     active_gate_mag_slope_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     active_gate_logit_offset_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
