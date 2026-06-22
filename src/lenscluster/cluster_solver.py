@@ -263,22 +263,13 @@ SAMPLING_ENGINE_FULL = "full"
 SAMPLING_ENGINE_FULL_FLAT = "full_flat"
 SAMPLING_ENGINE_REFRESHING_SURROGATE = "refreshing_surrogate"
 SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT = "refreshing_surrogate_flat"
-SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT = "exact_discovery_flat"
 SINGLE_STAGE_SAMPLING_ENGINES = (
     SAMPLING_ENGINE_FULL,
     SAMPLING_ENGINE_FULL_FLAT,
     SAMPLING_ENGINE_REFRESHING_SURROGATE,
     SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
 )
-SAMPLING_ENGINES = (
-    *SINGLE_STAGE_SAMPLING_ENGINES,
-    SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
-)
-PERTURBATION_DISCOVERY_FINAL_POLISH_ENGINES = (
-    SAMPLING_ENGINE_FULL_FLAT,
-    SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
-)
-STAGE0_SAMPLING_ENGINE_CHOICES = (SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,)
+SAMPLING_ENGINES = SINGLE_STAGE_SAMPLING_ENGINES
 STAGE1_SAMPLING_ENGINE_CHOICES = (
     SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
     SAMPLING_ENGINE_FULL_FLAT,
@@ -1332,12 +1323,6 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--stage0-sampling-engine",
-        choices=STAGE0_SAMPLING_ENGINE_CHOICES,
-        default=SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
-        help="Sampling engine used for the sequential stage0_fast_initializer discovery SVI.",
-    )
-    parser.add_argument(
         "--stage1-sampling-engine",
         choices=STAGE1_SAMPLING_ENGINE_CHOICES,
         default=SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
@@ -1391,15 +1376,6 @@ def _parse_args() -> argparse.Namespace:
         type=_nonnegative_float_arg,
         default=DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_WEIGHT,
         help="Relative nonnegative weight of Jacobian perturbations in the stage-0 perturbation score.",
-    )
-    parser.add_argument(
-        "--perturbation-discovery-final-polish-engine",
-        choices=PERTURBATION_DISCOVERY_FINAL_POLISH_ENGINES,
-        default=SAMPLING_ENGINE_FULL_FLAT,
-        help=(
-            "Sampling engine used for the fixed-candidate stage-0 SVI polish after "
-            "perturbation discovery selects exact/free member galaxies."
-        ),
     )
     parser.add_argument(
         "--perturbation-discovery-final-svi-polish-steps",
@@ -2291,7 +2267,7 @@ def _local_jacobian_metric_mode_for_values(
     sample_mode = str(sample_likelihood_mode)
     engine = str(sampling_engine)
     if sample_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
-        if engine in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT}:
+        if engine in {SAMPLING_ENGINE_FULL_FLAT}:
             return LOCAL_JACOBIAN_METRIC_CURRENT_EXACT
         return LOCAL_JACOBIAN_METRIC_FROZEN_REFRESHED
     if sample_mode == SAMPLE_LIKELIHOOD_SOURCE:
@@ -2607,6 +2583,7 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
     items: list[str] = []
     family_count = _count_items(getattr(state, "family_data", []))
     bin_count = _count_items(getattr(state, "bin_data", []))
+    perturbation_stage0 = bool(getattr(state, "perturbation_discovery_stage0", False))
     if bool(getattr(evaluator, "surrogate_enabled", False)):
         items.append(
             "refreshing_surrogate=active "
@@ -2615,7 +2592,13 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
         )
     if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_FULL_FLAT:
         sample_likelihood_mode = str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))
-        if sample_likelihood_mode == SAMPLE_LIKELIHOOD_SOURCE:
+        if perturbation_stage0:
+            items.append(
+                "sampling_engine=full_flat purpose=stage0_perturbation_discovery "
+                f"alpha_tol_arcsec={float(getattr(evaluator, 'perturbation_discovery_alpha_tol_arcsec', DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC)):.4g} "
+                f"jacobian_tol={float(getattr(evaluator, 'perturbation_discovery_jacobian_tol', DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL)):.4g}"
+            )
+        elif sample_likelihood_mode == SAMPLE_LIKELIHOOD_SOURCE:
             items.append("sampling_engine=full_flat exact flattened source-plane likelihood")
         elif sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
             items.append("sampling_engine=full_flat exact flattened local-metric likelihood")
@@ -2625,12 +2608,6 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
         items.append("sampling_engine=refreshing_surrogate legacy per-bin surrogate")
     if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT:
         items.append("sampling_engine=refreshing_surrogate_flat flattened surrogate")
-    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
-        items.append(
-            "sampling_engine=exact_discovery_flat cacheless exact full-population discovery "
-            f"alpha_tol_arcsec={float(getattr(evaluator, 'perturbation_discovery_alpha_tol_arcsec', DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC)):.4g} "
-            f"jacobian_tol={float(getattr(evaluator, 'perturbation_discovery_jacobian_tol', DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL)):.4g}"
-        )
     if family_count > 0 and bin_count < family_count:
         items.append(f"z_bins=active grouped_families={family_count} bins={bin_count}")
     if bool(getattr(evaluator, "quick_diagnostics", False)):
@@ -2724,7 +2701,7 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
     if (
         _count_items(getattr(evaluator, "scaling_scatter_param_indices", [])) > 0
         and _count_items(getattr(evaluator, "scaling_component_indices", [])) > 0
-        and str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) != SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
+        and not perturbation_stage0
     ):
         items.append("scaling_scatter_cache=linearized scaling-scatter covariance")
     source_covariance_mode = str(
@@ -2735,7 +2712,7 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
         and str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)) == SAMPLE_LIKELIHOOD_SOURCE
     ):
         items.append("source_plane_covariance=unit")
-    elif str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
+    elif perturbation_stage0:
         items.append("source_metric=current_exact")
     elif _count_items(getattr(evaluator, "source_metric_cache_by_z", {})) > 0:
         items.append("source_metric_cache=refreshed local lensing metric")
@@ -2826,7 +2803,7 @@ def _active_scaling_realized_fraction_value_style(value: str) -> str:
 
 
 def _active_scaling_rank_summary(evaluator: Any) -> dict[str, str]:
-    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
+    if bool(getattr(getattr(evaluator, "state", None), "perturbation_discovery_stage0", False)):
         return {}
     scaling_rank_df = getattr(evaluator, "scaling_rank_df", None)
     if scaling_rank_df is None or getattr(scaling_rank_df, "empty", True):
@@ -2939,9 +2916,7 @@ def _active_approximation_rows(evaluator: Any) -> list[ApproximationRow]:
     free_scaling = _count_items(getattr(evaluator, "free_correction_scaling_component_indices", []))
     excluded_scaling = _count_items(getattr(evaluator, "excluded_scaling_component_indices", []))
     total_scaling = _count_items(getattr(evaluator, "scaling_component_indices", []))
-    exact_discovery_engine = (
-        str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
-    )
+    perturbation_stage0 = bool(getattr(state, "perturbation_discovery_stage0", False))
     rows: list[ApproximationRow] = [
         ("sampling_engine", _format_approximation_value(getattr(evaluator, "sampling_engine", "unknown")), "engine"),
         (
@@ -2959,7 +2934,8 @@ def _active_approximation_rows(evaluator: Any) -> list[ApproximationRow]:
         ("cached_scaling", _format_approximation_value(cached_scaling), "active"),
         ("excluded_scaling", _format_approximation_value(excluded_scaling), "active"),
     ]
-    if exact_discovery_engine:
+    if perturbation_stage0:
+        rows.append(("purpose", "stage0_perturbation_discovery", "engine"))
         rows.append(("perturbation_discovery_exact_svi_scaling", _format_approximation_value(total_scaling), "selection"))
         rows.append(
             (
@@ -3012,7 +2988,7 @@ def _active_approximation_rows(evaluator: Any) -> list[ApproximationRow]:
                 "source",
             )
         )
-    if exact_discovery_engine:
+    if perturbation_stage0:
         rows.append(("scaling_scatter_cache", "disabled", "cache"))
     elif _count_items(getattr(evaluator, "scaling_scatter_param_indices", [])) > 0:
         rows.append(("scaling_scatter_cache", "linearized", "cache"))
@@ -3021,7 +2997,7 @@ def _active_approximation_rows(evaluator: Any) -> list[ApproximationRow]:
         and str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)) == SAMPLE_LIKELIHOOD_SOURCE
     ):
         rows.append(("source_metric_cache", "unit", "cache"))
-    elif exact_discovery_engine:
+    elif perturbation_stage0:
         rows.append(("source_metric_cache", "current_exact", "cache"))
     elif _count_items(getattr(evaluator, "source_metric_cache_by_z", {})) > 0:
         rows.append(("source_metric_cache", "refreshed", "cache"))
@@ -9667,7 +9643,7 @@ def _perturbation_discovery_union_from_evaluator(
 def _perturbation_discovery_svi_final_log_message(
     final_union_diag: Mapping[str, Any],
     *,
-    final_polish_engine: str,
+    polish_engine: str,
     stage1_engine: str,
     final_polish_steps: int,
 ) -> str:
@@ -9684,7 +9660,7 @@ def _perturbation_discovery_svi_final_log_message(
         f"max_selected_score={float(final_union_diag.get('max_selected_score', 0.0)):.4g} "
         f"max_unselected_score={float(final_union_diag.get('max_unselected_score', 0.0)):.4g} "
         f"score_fraction={float(final_union_diag.get('score_fraction', 0.0)):.4g} "
-        f"final_polish_engine={final_polish_engine} "
+        f"polish_engine={polish_engine} "
         f"stage1_engine={stage1_engine} "
         f"final_svi_polish_steps={int(final_polish_steps)}"
     )
@@ -9745,7 +9721,7 @@ def _perturbation_discovery_svi_final_diagnostics(
     final_rebuild_diag: Mapping[str, Any],
     final_model_counts: Mapping[str, Any],
     *,
-    final_polish_engine: str,
+    polish_engine: str,
     stage1_engine: str,
     final_polish_steps: int,
 ) -> dict[str, Any]:
@@ -9761,7 +9737,7 @@ def _perturbation_discovery_svi_final_diagnostics(
         "perturbation_discovery_svi_final_jacobian_weight": float(final_union_diag.get("jacobian_weight", 0.0)),
         "perturbation_discovery_svi_final_max_selected_score": float(final_union_diag.get("max_selected_score", 0.0)),
         "perturbation_discovery_svi_final_max_unselected_score": float(final_union_diag.get("max_unselected_score", 0.0)),
-        "perturbation_discovery_svi_final_polish_engine": str(final_polish_engine),
+        "perturbation_discovery_svi_polish_engine": str(polish_engine),
         "perturbation_discovery_svi_final_stage1_engine": str(stage1_engine),
         "perturbation_discovery_svi_final_polish_steps": int(final_polish_steps),
         "perturbation_discovery_final_strict_active": bool(
@@ -9928,7 +9904,11 @@ def _rebuild_perturbation_discovery_state_from_union(
     new_state = replace(new_state, svi_init_values=new_init_values)
     evaluator = _build_cluster_evaluator_from_args(args, new_state)
     strict_diag: dict[str, Any] = {}
-    if str(reason) == "perturbation_discovery_final":
+    strict_production_partition = not (
+        bool(getattr(args, "perturbation_discovery_stage0", False))
+        and str(getattr(args, "sampling_engine", "")) == SAMPLING_ENGINE_FULL_FLAT
+    )
+    if str(reason) == "perturbation_discovery_final" and strict_production_partition:
         strict_diag = _validate_perturbation_discovery_strict_final_partition(
             evaluator,
             requested_components,
@@ -10153,14 +10133,12 @@ def _svi_refresh_cache_snapshot(
 
 
 def _svi_refresh_evaluator_snapshot(evaluator: Any) -> dict[str, _SviRefreshCacheSnapshot]:
-    exact_discovery = (
-        str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
-    )
+    perturbation_stage0 = bool(getattr(getattr(evaluator, "state", None), "perturbation_discovery_stage0", False))
     source_metric_enabled = not (
         str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)) == SAMPLE_LIKELIHOOD_SOURCE
         and str(getattr(evaluator, "source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION))
         == SOURCE_PLANE_COVARIANCE_MODE_UNIT
-    ) and not exact_discovery
+    ) and not perturbation_stage0
     return {
         "surrogate": _svi_refresh_cache_snapshot(
             getattr(evaluator, "surrogate_cache_by_z", {}),
@@ -10170,7 +10148,7 @@ def _svi_refresh_evaluator_snapshot(evaluator: Any) -> dict[str, _SviRefreshCach
         "scaling": _svi_refresh_cache_snapshot(
             getattr(evaluator, "scaling_scatter_cache_by_z", {}),
             getattr(evaluator, "scaling_scatter_reference_params", None),
-            enabled=not exact_discovery,
+            enabled=not perturbation_stage0,
         ),
         "source_metric": _svi_refresh_cache_snapshot(
             getattr(evaluator, "source_metric_cache_by_z", {}),
@@ -11047,16 +11025,15 @@ def _run_svi_fit(
     block_steps: list[int] = []
     block_refresh_count = 0
     jax_cache_clear_count = 0
-    exact_discovery_svi = (
-        str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
-    )
-    if exact_discovery_svi:
+    perturbation_stage0_svi = bool(getattr(args, "perturbation_discovery_stage0", False))
+    if perturbation_stage0_svi:
         _log(
             args,
             (
-                "[exact-discovery:svi] cacheless_exact_flat "
+                "[perturbation-discovery:svi] cacheless_full_flat "
                 f"scaling_galaxies={len(getattr(evaluator, 'scaling_component_indices', []))} "
-                "independent_candidates=0 cache_refreshes=0"
+                f"selected_free_scaling={len(_selected_component_set_from_state(state))} "
+                "cache_refreshes=0"
             ),
         )
     init_values = dict(state.svi_init_values or {})
@@ -11098,7 +11075,7 @@ def _run_svi_fit(
         center_theta_previous = np.asarray(center_theta, dtype=float)
         init_values = {spec.sample_name: float(center_theta[idx]) for idx, spec in enumerate(state.parameter_specs)}
         remaining_steps -= int(block_steps_current)
-        if remaining_steps > 0 and exact_discovery_svi:
+        if remaining_steps > 0 and perturbation_stage0_svi:
             guide = None
             svi = None
             svi_result = None
@@ -11144,7 +11121,7 @@ def _run_svi_fit(
         getattr(evaluator, "active_inference_enabled", False)
         and str(getattr(evaluator, "active_scaling_inference_likelihood", "")) == ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION
     )
-    if exact_discovery_svi:
+    if perturbation_stage0_svi:
         active_inference_final_refresh_skipped = False
     elif getattr(evaluator, "active_inference_enabled", False):
         if active_inference_final_refresh_skipped:
@@ -11156,11 +11133,11 @@ def _run_svi_fit(
             evaluator.refresh_active_inference_cache(center_theta_previous, reason="svi_final")
     if evaluator.surrogate_enabled:
         evaluator.refresh_surrogate(center_theta_previous, reason="svi_final")
-    if not exact_discovery_svi:
+    if not perturbation_stage0_svi:
         evaluator.refresh_scaling_scatter_cache(center_theta_previous, reason="svi_final")
         evaluator.refresh_source_metric_cache(center_theta_previous, reason="svi_final")
     after_refresh = _svi_refresh_evaluator_snapshot(evaluator)
-    if not exact_discovery_svi:
+    if not perturbation_stage0_svi:
         refresh_message, refresh_renderable = _svi_refresh_status_log_payload(
             state,
             reason="svi_final",
@@ -11216,9 +11193,7 @@ def _run_svi_fit(
         "svi_jax_cache_clear_count": int(jax_cache_clear_count),
         "svi_active_inference_final_refresh_skipped": bool(active_inference_final_refresh_skipped),
         "svi_block_center_shift": [float(value) for value in block_center_shift],
-        "perturbation_discovery_svi_exact": bool(
-            str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
-        ),
+        "perturbation_discovery_svi_exact": bool(perturbation_stage0_svi),
         "perturbation_discovery_svi_independent_candidates": int(len(_selected_component_set_from_state(state))),
         "perturbation_discovery_svi_rebuild_count": 0,
         "direct_evaluator_startup": True,
@@ -13775,19 +13750,6 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         len(max_tree_depths),
     )
     if fit_mode == FIT_MODE_SEQUENTIAL and hasattr(args, "stage2_forward_mode"):
-        stage0_sampling_engine = str(
-            getattr(args, "stage0_sampling_engine", SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT)
-        )
-        if stage0_sampling_engine not in STAGE0_SAMPLING_ENGINE_CHOICES:
-            _fail("--stage0-sampling-engine must be exact_discovery_flat.")
-        final_polish_engine = str(
-            getattr(args, "perturbation_discovery_final_polish_engine", SAMPLING_ENGINE_FULL_FLAT)
-        )
-        if final_polish_engine not in PERTURBATION_DISCOVERY_FINAL_POLISH_ENGINES:
-            _fail(
-                "--perturbation-discovery-final-polish-engine must be one of "
-                f"{', '.join(PERTURBATION_DISCOVERY_FINAL_POLISH_ENGINES)}."
-            )
         stage1_sampling_engine = str(
             getattr(args, "stage1_sampling_engine", SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT)
         )
@@ -16985,7 +16947,7 @@ class ClusterJAXEvaluator:
             SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
         }:
             raise ValueError(f"Unsupported sample_likelihood_mode={self.sample_likelihood_mode!r}.")
-        if self.sampling_engine in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT} and self.sample_likelihood_mode not in {
+        if self.sampling_engine in {SAMPLING_ENGINE_FULL_FLAT} and self.sample_likelihood_mode not in {
             SAMPLE_LIKELIHOOD_SOURCE,
             SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
@@ -17480,7 +17442,7 @@ class ClusterJAXEvaluator:
         if not self.scaling_rank_df.empty:
             self.scaling_rank_df = self.scaling_rank_df.copy()
             self.scaling_rank_df["selected_active"] = False
-            if self.sampling_engine == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
+            if bool(getattr(self.state, "perturbation_discovery_stage0", False)):
                 self.scaling_rank_df["selection_mode"] = "perturbation_discovery_exact_svi"
             else:
                 self.scaling_rank_df["selection_mode"] = "cached_scaling"
@@ -17515,6 +17477,8 @@ class ClusterJAXEvaluator:
             ),
             dtype=np.int32,
         )
+        if bool(getattr(self.state, "perturbation_discovery_stage0", False)):
+            selected_active_scaling = np.asarray(self.scaling_component_indices, dtype=np.int32)
         self.exact_scaling_component_indices = np.asarray(
             sorted(set(selected_active_scaling.tolist()) | set(self.free_correction_scaling_component_indices.tolist())),
             dtype=np.int32,
@@ -17539,7 +17503,11 @@ class ClusterJAXEvaluator:
         if not self.scaling_rank_df.empty and "component_index" in self.scaling_rank_df:
             active_mask = self.scaling_rank_df["component_index"].astype(int).isin(active_set)
             self.scaling_rank_df.loc[:, "selected_active"] = active_mask.to_numpy(dtype=bool)
-            self.scaling_rank_df.loc[active_mask, "selection_mode"] = "perturbation_discovery_exact_free"
+            self.scaling_rank_df.loc[active_mask, "selection_mode"] = (
+                "perturbation_discovery_exact_svi"
+                if bool(getattr(self.state, "perturbation_discovery_stage0", False))
+                else "perturbation_discovery_exact_free"
+            )
         cached_set = set(self.cached_scaling_component_indices.tolist())
         excluded_set = set(self.excluded_scaling_component_indices.tolist())
         free_correction_scaling_set = set(self.free_correction_scaling_component_indices.tolist())
@@ -18834,12 +18802,6 @@ class ClusterJAXEvaluator:
         return cov00, cov01, cov11, finite
 
     def refresh_scaling_scatter_cache(self, reference_params: np.ndarray, reason: str = "manual") -> None:
-        if self.sampling_engine == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
-            del reference_params, reason
-            self.scaling_scatter_cache_by_z = {}
-            self.scaling_scatter_reference_params = None
-            self._refresh_flat_critical_arc_scatter_arrays()
-            return
         if self.sampling_engine in {
             SAMPLING_ENGINE_FULL_FLAT,
             SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
@@ -19064,12 +19026,6 @@ class ClusterJAXEvaluator:
         self._source_loglike_fn = jax.jit(self._source_loglike_impl)
 
     def refresh_source_metric_cache(self, reference_params: np.ndarray, reason: str = "manual") -> None:
-        if self.sampling_engine == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
-            del reference_params, reason
-            self.source_metric_cache_by_z = {}
-            self.source_metric_reference_params = None
-            self._refresh_flat_source_metric_arrays()
-            return
         if self._source_plane_unit_covariance_enabled():
             del reason
             self._reset_source_metric_cache_to_unit(reference_params)
@@ -22779,19 +22735,19 @@ class ClusterJAXEvaluator:
             return jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64)
         if (
             str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
-            in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT}
+            in {SAMPLING_ENGINE_FULL_FLAT}
             and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_SOURCE
         ):
             return self._flat_source_loglike_impl(params)
         if (
             str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
-            in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT}
+            in {SAMPLING_ENGINE_FULL_FLAT}
             and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
         ):
             return self._flat_local_jacobian_source_loglike_impl(params)
         if (
             str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
-            in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT}
+            in {SAMPLING_ENGINE_FULL_FLAT}
             and self.sample_likelihood_mode
             in {
                 SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
@@ -25639,13 +25595,13 @@ def _build_state_from_inputs(
                     "source=override"
                 ),
             )
-        elif str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
+        elif bool(getattr(args, "perturbation_discovery_stage0", False)):
             active_selected_by_potfile = [set() for _ in potfiles]
             active_rank_info = {}
             active_selected_counts = {}
             _log(
                 args,
-                "[input] perturbation_discovery_independent_candidates={} total=0 source=exact-svi",
+                "[input] perturbation_discovery_independent_candidates={} total=0 source=stage0-full-flat",
             )
         if active_selected_counts:
             _log(
@@ -26097,6 +26053,7 @@ def _build_state_from_inputs(
         active_scaling_frozen_source_path=(
             None if frozen_active_scaling_source_path is None else str(frozen_active_scaling_source_path)
         ),
+        perturbation_discovery_stage0=bool(getattr(args, "perturbation_discovery_stage0", False)),
     )
 
 
@@ -26495,6 +26452,7 @@ def _prepare_direct_evaluator(
     state: BuildState,
 ) -> tuple[ClusterJAXEvaluator, np.ndarray]:
     evaluator = _build_cluster_evaluator_from_args(args, state)
+    perturbation_stage0 = bool(getattr(args, "perturbation_discovery_stage0", False))
     _log_active_approximation_table(args, evaluator)
     _log_evaluator_summary(args, evaluator)
     _log_evaluator_memory_shape_diagnostics(args, evaluator, reason="evaluator_built")
@@ -26519,11 +26477,17 @@ def _prepare_direct_evaluator(
             ),
         )
         evaluator.refresh_surrogate(midpoint, reason="svi_nuts_initial")
-    evaluator.refresh_scaling_scatter_cache(midpoint, reason="svi_nuts_initial")
-    evaluator.refresh_source_metric_cache(midpoint, reason="svi_nuts_initial")
-    _log_solver_active_approximation_warning(args, evaluator)
-    _log_evaluator_memory_shape_diagnostics(args, evaluator, reason="initial_refresh")
-    _maybe_clear_jax_caches(args, "initial_refresh")
+    if perturbation_stage0:
+        _log(
+            args,
+            "[perturbation-discovery] stage0 full_flat cache refresh disabled reason=svi_nuts_initial",
+        )
+    else:
+        evaluator.refresh_scaling_scatter_cache(midpoint, reason="svi_nuts_initial")
+        evaluator.refresh_source_metric_cache(midpoint, reason="svi_nuts_initial")
+        _log_solver_active_approximation_warning(args, evaluator)
+        _log_evaluator_memory_shape_diagnostics(args, evaluator, reason="initial_refresh")
+        _maybe_clear_jax_caches(args, "initial_refresh")
     _log(args, "[compile] tracing first JAX likelihood evaluation")
     compile_start = time.time()
     compile_loglike = evaluator.source_loglike(midpoint)
@@ -27282,6 +27246,7 @@ def _rebuild_evaluator_for_frozen_active_scaling(
 
 def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -> None:
     start = time.time()
+    perturbation_stage0 = bool(getattr(args, "perturbation_discovery_stage0", False))
     _configure_debug_log(args, state.run_name, run_dir)
     _log(args, f"[load] run={state.run_name} par={state.par_path}")
     _log(
@@ -27504,22 +27469,18 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
             evaluator.release_runtime_caches()
             evaluator = _rebuild_evaluator_for_frozen_active_scaling(args, state, best_fit)
             sample_model = _posterior_model(state.parameter_specs, evaluator)
-        else:
+        elif not perturbation_stage0:
             evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_svi")
             evaluator.refresh_source_metric_cache(best_fit, reason="post_svi")
         svi_chain_seeds: list[ChainSeed] | None = None
         svi_followed_by_nuts = str(args.fit_method) in {FIT_METHOD_SVI_NUTS, FIT_METHOD_ACTIVE_BLOCKED_NUTS}
         pre_nuts_refresh_reason = "pre_nuts"
-        perturbation_discovery_final_enabled = bool(
-            str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
-        )
+        perturbation_discovery_final_enabled = bool(perturbation_stage0)
         if perturbation_discovery_final_enabled:
                 old_state_for_transfer = state
                 old_specs_for_transfer = list(state.parameter_specs)
                 final_polish_steps = max(0, int(getattr(args, "perturbation_discovery_final_svi_polish_steps", 2000)))
-                final_polish_engine = str(
-                    getattr(args, "perturbation_discovery_final_polish_engine", SAMPLING_ENGINE_FULL_FLAT)
-                )
+                polish_engine = SAMPLING_ENGINE_FULL_FLAT
                 stage1_engine = str(
                     getattr(args, "stage1_sampling_engine", SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT)
                 )
@@ -27529,12 +27490,13 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                     best_fit,
                 )
                 final_args = argparse.Namespace(**vars(args))
-                final_args.sampling_engine = final_polish_engine
+                final_args.sampling_engine = polish_engine
+                final_args.perturbation_discovery_stage0 = True
                 _log(
                     args,
                     _perturbation_discovery_svi_final_log_message(
                         final_union_diag,
-                        final_polish_engine=final_polish_engine,
+                        polish_engine=polish_engine,
                         stage1_engine=stage1_engine,
                         final_polish_steps=int(final_polish_steps),
                     ),
@@ -27558,7 +27520,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                 svi_diagnostics.update(
                     {
                         "perturbation_discovery_final_enabled": True,
-                        "perturbation_discovery_final_polish_engine": str(final_polish_engine),
+                        "perturbation_discovery_polish_engine": str(polish_engine),
                         "perturbation_discovery_final_stage1_engine": str(stage1_engine),
                         "perturbation_discovery_final_candidates": int(final_rebuild_diag["count"]),
                         "perturbation_discovery_final_added": int(final_rebuild_diag["added"]),
@@ -27577,7 +27539,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                             final_union_diag,
                             final_rebuild_diag,
                             final_model_counts,
-                            final_polish_engine=final_polish_engine,
+                            polish_engine=polish_engine,
                             stage1_engine=stage1_engine,
                             final_polish_steps=int(final_polish_steps),
                         ),
@@ -27605,7 +27567,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                         f"exact_unique={int(final_union_diag.get('exact_unique', 0))} "
                         f"pairs={int(final_union_diag.get('pairs', 0))} "
                         f"score_fraction={float(final_union_diag.get('score_fraction', 0.0)):.4g} "
-                        f"final_polish_engine={final_polish_engine} "
+                        f"polish_engine={polish_engine} "
                         f"stage1_engine={stage1_engine} "
                         f"old_parameters={len(old_state_for_transfer.parameter_specs)} "
                         f"new_parameters={len(state.parameter_specs)}"
@@ -27614,13 +27576,10 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                 args = final_args
                 pre_nuts_refresh_reason = "pre_nuts_perturbation_discovery_final_rebuilt"
                 if final_polish_steps > 0:
-                    polish_initial_reason = "pre_nuts_perturbation_discovery_polish_initial"
-                    if getattr(evaluator, "active_inference_enabled", False):
-                        evaluator.refresh_active_inference_cache(best_fit, reason=polish_initial_reason)
-                    if evaluator.surrogate_enabled:
-                        evaluator.refresh_surrogate(best_fit, reason=polish_initial_reason)
-                    evaluator.refresh_scaling_scatter_cache(best_fit, reason=polish_initial_reason)
-                    evaluator.refresh_source_metric_cache(best_fit, reason=polish_initial_reason)
+                    _log(
+                        args,
+                        "[perturbation-discovery] stage0 full_flat cache refresh disabled reason=polish_initial",
+                    )
                     best_fit, polish_posterior, polish_diag = _run_perturbation_discovery_final_svi_polish(
                         args,
                         state,
@@ -27634,25 +27593,31 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                     svi_diagnostics.update(polish_diag)
                     pre_nuts_refresh_reason = "pre_nuts_perturbation_discovery_final_polished"
         if svi_followed_by_nuts:
-            before_refresh = _svi_refresh_evaluator_snapshot(evaluator)
-            if getattr(evaluator, "active_inference_enabled", False):
-                evaluator.refresh_active_inference_cache(best_fit, reason=pre_nuts_refresh_reason)
-            if evaluator.surrogate_enabled:
-                evaluator.refresh_surrogate(best_fit, reason=pre_nuts_refresh_reason)
-            evaluator.refresh_scaling_scatter_cache(best_fit, reason=pre_nuts_refresh_reason)
-            evaluator.refresh_source_metric_cache(best_fit, reason=pre_nuts_refresh_reason)
-            after_refresh = _svi_refresh_evaluator_snapshot(evaluator)
-            refresh_message, refresh_renderable = _svi_refresh_status_log_payload(
-                state,
-                reason=pre_nuts_refresh_reason,
-                block_index=int(svi_diagnostics.get("svi_block_count", 0)),
-                remaining_steps=0,
-                center_shift=0.0,
-                current_theta=best_fit,
-                before=before_refresh,
-                after=after_refresh,
-            )
-            _log(args, refresh_message, renderable=refresh_renderable)
+            if perturbation_stage0:
+                _log(
+                    args,
+                    "[perturbation-discovery] stage0 full_flat cache refresh disabled reason=pre_nuts",
+                )
+            else:
+                before_refresh = _svi_refresh_evaluator_snapshot(evaluator)
+                if getattr(evaluator, "active_inference_enabled", False):
+                    evaluator.refresh_active_inference_cache(best_fit, reason=pre_nuts_refresh_reason)
+                if evaluator.surrogate_enabled:
+                    evaluator.refresh_surrogate(best_fit, reason=pre_nuts_refresh_reason)
+                evaluator.refresh_scaling_scatter_cache(best_fit, reason=pre_nuts_refresh_reason)
+                evaluator.refresh_source_metric_cache(best_fit, reason=pre_nuts_refresh_reason)
+                after_refresh = _svi_refresh_evaluator_snapshot(evaluator)
+                refresh_message, refresh_renderable = _svi_refresh_status_log_payload(
+                    state,
+                    reason=pre_nuts_refresh_reason,
+                    block_index=int(svi_diagnostics.get("svi_block_count", 0)),
+                    remaining_steps=0,
+                    center_shift=0.0,
+                    current_theta=best_fit,
+                    before=before_refresh,
+                    after=after_refresh,
+                )
+                _log(args, refresh_message, renderable=refresh_renderable)
             svi_chain_seeds = _prepare_svi_health_for_nuts(
                 args,
                 state.parameter_specs,
@@ -27685,10 +27650,16 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                 del svi_posterior
                 gc.collect()
     best_fit = _max_likelihood_best_fit_from_posterior(args, evaluator, posterior, best_fit)
-    if evaluator.surrogate_enabled:
-        evaluator.refresh_surrogate(best_fit, reason="post_max_likelihood")
-    evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_max_likelihood")
-    evaluator.refresh_source_metric_cache(best_fit, reason="post_max_likelihood")
+    if perturbation_stage0:
+        _log(
+            args,
+            "[perturbation-discovery] stage0 full_flat cache refresh disabled reason=post_max_likelihood",
+        )
+    else:
+        if evaluator.surrogate_enabled:
+            evaluator.refresh_surrogate(best_fit, reason="post_max_likelihood")
+        evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_max_likelihood")
+        evaluator.refresh_source_metric_cache(best_fit, reason="post_max_likelihood")
     _append_previous_stage_active_scaling_diagnostics(state, posterior)
     _log_posterior_summary(args, "selected", posterior)
     _artifacts_dir, best_fit_physical, posterior_for_output = _save_inference_checkpoint(
@@ -28784,9 +28755,6 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
 
     stage0_run_name = str(Path(root_run_name) / STAGE0_FAST_INITIALIZER_DIR)
     stage1_run_name = str(Path(root_run_name) / STAGE1_BACKPROJECTED_CENTROID_FIT_DIR)
-    stage0_sampling_engine = str(
-        getattr(args, "stage0_sampling_engine", SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT)
-    )
     stage1_sampling_engine = str(
         getattr(args, "stage1_sampling_engine", SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT)
     )
@@ -28794,7 +28762,8 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
         args,
         stage0_controls,
         fit_method=FIT_METHOD_SVI,
-        sampling_engine=stage0_sampling_engine,
+        sampling_engine=SAMPLING_ENGINE_FULL_FLAT,
+        perturbation_discovery_stage0=True,
     )
     stage0_args = _force_quick_diagnostics_for_nonfinal_stage(
         stage0_args,
@@ -28822,6 +28791,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
         (
             "[stage0] handoff "
             f"selected_free_scaling={stage0_selected_count} "
+            f"stage0_engine={SAMPLING_ENGINE_FULL_FLAT} "
             f"stage1_engine={stage1_sampling_engine}"
         ),
     )
@@ -28854,8 +28824,8 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
 
     summary_payload: dict[str, Any] = {
         "fit_mode": "sequential",
-        "stage0_fast_initializer": stage0_sampling_engine == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
-        "stage0_sampling_engine": stage0_sampling_engine,
+        "stage0_fast_initializer": True,
+        "stage0_engine": SAMPLING_ENGINE_FULL_FLAT,
         "stage0_run_dir": str(stage0_run_dir),
         "stage0_selected_free_scaling": int(stage0_selected_count),
         "stage1_sampling_engine": stage1_sampling_engine,

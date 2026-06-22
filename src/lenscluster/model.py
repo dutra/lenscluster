@@ -303,6 +303,7 @@ class BuildState:
     active_scaling_frozen_from_previous_stage: bool = False
     active_scaling_frozen_source_run_dir: str | None = None
     active_scaling_frozen_source_path: str | None = None
+    perturbation_discovery_stage0: bool = False
 
 
 def positive_lognormal_parameters(mean: float, std: float, *, floor: float = 1.0e-6) -> tuple[float, float]:

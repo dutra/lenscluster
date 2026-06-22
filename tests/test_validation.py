@@ -5212,13 +5212,14 @@ def test_perturbation_discovery_svi_build_creates_no_independent_candidates(
         ],
     )
     args = _parse_args()
-    args.sampling_engine = cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
+    args.sampling_engine = cluster_solver.SAMPLING_ENGINE_FULL_FLAT
+    args.perturbation_discovery_stage0 = True
 
     state = cluster_solver._build_state_from_inputs(args)
     evaluator = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_FULL_FLAT,
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
     )
 
@@ -5227,8 +5228,8 @@ def test_perturbation_discovery_svi_build_creates_no_independent_candidates(
     assert not any(spec.component_family == "independent_scaling" for spec in state.parameter_specs)
     assert evaluator.independent_scaling_component_indices.size == 0
     assert evaluator.free_correction_scaling_component_indices.size == 0
-    np.testing.assert_array_equal(evaluator.cached_scaling_component_indices, evaluator.scaling_component_indices)
-    np.testing.assert_array_equal(evaluator.inactive_scaling_component_indices, evaluator.scaling_component_indices)
+    np.testing.assert_array_equal(evaluator.exact_scaling_component_indices, evaluator.scaling_component_indices)
+    assert evaluator.cached_scaling_component_indices.size == 0
 
 
 def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free(
@@ -5250,10 +5251,12 @@ def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free
         ],
     )
     args = _parse_args()
-    args.sampling_engine = cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
+    args.sampling_engine = cluster_solver.SAMPLING_ENGINE_FULL_FLAT
+    args.perturbation_discovery_stage0 = True
     old_state = cluster_solver._build_state_from_inputs(args)
     final_args = argparse.Namespace(**vars(args))
     final_args.sampling_engine = cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT
+    final_args.perturbation_discovery_stage0 = False
     old_theta = cluster_solver._default_theta(old_state.parameter_specs)
 
     state, evaluator, _sample_model, _theta, diagnostics = cluster_solver._rebuild_perturbation_discovery_state_from_union(
@@ -7371,19 +7374,19 @@ def test_flat_packed_state_applies_log_displacement_delta_units_to_free_branch_o
     )
 
 
-def test_exact_discovery_flat_initial_state_has_no_free_candidates() -> None:
-    state = _minimal_stage4_surrogate_state()
+def test_stage0_full_flat_initial_state_has_no_free_candidates() -> None:
+    state = replace(_minimal_stage4_surrogate_state(), perturbation_discovery_stage0=True)
     evaluator = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_FULL_FLAT,
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
     )
 
-    assert evaluator.active_scaling_component_indices.tolist() == []
-    assert evaluator.exact_scaling_component_indices.tolist() == []
-    assert evaluator.cached_scaling_component_indices.tolist() == evaluator.scaling_component_indices.tolist()
-    assert evaluator.inactive_scaling_component_indices.tolist() == evaluator.scaling_component_indices.tolist()
+    assert evaluator.active_scaling_component_indices.tolist() == evaluator.scaling_component_indices.tolist()
+    assert evaluator.exact_scaling_component_indices.tolist() == evaluator.scaling_component_indices.tolist()
+    assert evaluator.cached_scaling_component_indices.tolist() == []
+    assert evaluator.inactive_scaling_component_indices.tolist() == []
     assert evaluator.free_correction_scaling_component_indices.tolist() == []
     assert evaluator.free_correction_free_component_indices.tolist() == []
     assert evaluator.excluded_scaling_component_indices.tolist() == []
@@ -7429,7 +7432,7 @@ def test_transfer_theta_and_posterior_by_sample_name_initializes_new_parameters(
 
 
 @pytest.mark.parametrize("sample_likelihood_mode", [SAMPLE_LIKELIHOOD_SOURCE, SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN])
-def test_exact_discovery_flat_matches_full_flat_value_and_gradient_for_all_independent(sample_likelihood_mode: str) -> None:
+def test_stage0_full_flat_matches_full_flat_value_and_gradient_for_all_independent(sample_likelihood_mode: str) -> None:
     state = _stage4_state_with_all_scaling_selected_independent()
     full = cluster_solver.ClusterJAXEvaluator(
         state=state,
@@ -7441,7 +7444,7 @@ def test_exact_discovery_flat_matches_full_flat_value_and_gradient_for_all_indep
     discovery = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_FULL_FLAT,
         sample_likelihood_mode=sample_likelihood_mode,
         source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_UNIT,
     )
@@ -7474,7 +7477,7 @@ def test_perturbation_discovery_source_matches_full_flat_value_and_gradient() ->
     discovery = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_FULL_FLAT,
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
         source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_UNIT,
     )
@@ -7496,12 +7499,12 @@ def test_perturbation_discovery_source_matches_full_flat_value_and_gradient() ->
     )
 
 
-def test_exact_discovery_source_magnification_covariance_does_not_require_metric_cache() -> None:
+def test_stage0_full_flat_source_magnification_covariance_does_not_require_metric_cache() -> None:
     state = _minimal_stage4_surrogate_state()
     evaluator = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_FULL_FLAT,
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
         source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
     )
@@ -7529,7 +7532,7 @@ def test_perturbation_discovery_local_jacobian_matches_full_flat_value_and_gradi
     discovery = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_FULL_FLAT,
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
     )
     theta = np.asarray(cluster_solver._default_theta(state.parameter_specs), dtype=float)
@@ -8903,14 +8906,10 @@ def test_active_approximation_table_reports_frozen_refreshed_local_jacobian_metr
     assert cluster_solver._local_jacobian_metric_mode(evaluator) == cluster_solver.LOCAL_JACOBIAN_METRIC_FROZEN_REFRESHED
 
 
-@pytest.mark.parametrize(
-    "sampling_engine",
-    [cluster_solver.SAMPLING_ENGINE_FULL_FLAT, cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT],
-)
-def test_active_approximation_table_reports_current_exact_local_jacobian_metric(sampling_engine: str) -> None:
+def test_active_approximation_table_reports_current_exact_local_jacobian_metric() -> None:
     evaluator = SimpleNamespace(
         state=SimpleNamespace(family_data=[], bin_data=[], parameter_specs=[]),
-        sampling_engine=sampling_engine,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_FULL_FLAT,
         surrogate_enabled=False,
         active_scaling_component_indices=np.asarray([0, 1, 2], dtype=int),
         inactive_scaling_component_indices=np.asarray([], dtype=int),
@@ -13913,11 +13912,13 @@ def test_run_svi_fit_exact_discovery_skips_cache_refreshes(
         nuts_init_boundary_frac=0.0,
         samples=1,
         chains=1,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_FULL_FLAT,
+        perturbation_discovery_stage0=True,
     )
     state = SimpleNamespace(
         parameter_specs=specs,
         svi_init_values=None,
+        perturbation_discovery_stage0=True,
         scaling_component_records=[
             {"component_index": 3, "selected_independent": False},
             {"component_index": 4, "selected_independent": False},
@@ -16784,7 +16785,7 @@ def test_cluster_solver_rejects_exact_discovery_flat_global_sampling_engine(monk
         _parse_args()
 
 
-def test_cluster_solver_accepts_exact_discovery_flat_stage0_sampling_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cluster_solver_rejects_stage0_sampling_engine_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
@@ -16794,30 +16795,16 @@ def test_cluster_solver_accepts_exact_discovery_flat_stage0_sampling_engine(monk
             "data/clustersim/input.par",
             "--stage0-sampling-engine",
             "exact_discovery_flat",
-            "--perturbation-discovery-alpha-tol-arcsec",
-            "0.02",
-            "--perturbation-discovery-jacobian-tol",
-            "0.03",
-            "--perturbation-discovery-jacobian-weight",
-            "0.5",
-            "--perturbation-discovery-final-polish-engine",
-            "full_flat",
-            "--perturbation-discovery-final-svi-polish-steps",
-            "500",
         ],
     )
 
-    args = _parse_args()
-
-    assert args.stage0_sampling_engine == "exact_discovery_flat"
-    assert args.perturbation_discovery_alpha_tol_arcsec == pytest.approx(0.02)
-    assert args.perturbation_discovery_jacobian_tol == pytest.approx(0.03)
-    assert args.perturbation_discovery_jacobian_weight == pytest.approx(0.5)
-    assert args.perturbation_discovery_final_polish_engine == "full_flat"
-    assert args.perturbation_discovery_final_svi_polish_steps == 500
+    with pytest.raises(SystemExit):
+        _parse_args()
 
 
-def test_cluster_solver_rejects_exact_discovery_flat_final_polish_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cluster_solver_rejects_perturbation_discovery_final_polish_engine_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
@@ -16826,12 +16813,39 @@ def test_cluster_solver_rejects_exact_discovery_flat_final_polish_engine(monkeyp
             "--par-path",
             "data/clustersim/input.par",
             "--perturbation-discovery-final-polish-engine",
-            "exact_discovery_flat",
+            "full_flat",
         ],
     )
 
     with pytest.raises(SystemExit):
         _parse_args()
+
+
+def test_cluster_solver_accepts_perturbation_discovery_threshold_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--perturbation-discovery-alpha-tol-arcsec",
+            "0.02",
+            "--perturbation-discovery-jacobian-tol",
+            "0.03",
+            "--perturbation-discovery-jacobian-weight",
+            "0.5",
+            "--perturbation-discovery-final-svi-polish-steps",
+            "500",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.perturbation_discovery_alpha_tol_arcsec == pytest.approx(0.02)
+    assert args.perturbation_discovery_jacobian_tol == pytest.approx(0.03)
+    assert args.perturbation_discovery_jacobian_weight == pytest.approx(0.5)
+    assert args.perturbation_discovery_final_svi_polish_steps == 500
 
 
 def test_cluster_solver_rejects_perturbation_discovery_for_production_stage_engines(
@@ -16914,8 +16928,6 @@ def test_cluster_solver_rejects_negative_perturbation_discovery_final_svi_polish
             "cluster_solver",
             "--par-path",
             "data/clustersim/input.par",
-            "--sampling-engine",
-            "exact_discovery_flat",
             "--perturbation-discovery-final-svi-polish-steps",
             "-1",
         ],
@@ -18741,16 +18753,16 @@ def test_run_xsh_critical_arc_mode_selects_new_image_plane_mode() -> None:
     assert '"critical_arc": "critical-arc"' in text
     assert '"--stage1-likelihood", stage1_likelihood' in text
     assert '"--stage2-forward-mode", stage2_forward_mode' in text
-    assert 'stage0_sampling_engine = "exact_discovery_flat"' in text
     assert 'stage1_sampling_engine = "refreshing_surrogate_flat"' in text
     assert 'stage2_sampling_engine = "refreshing_surrogate_flat"' in text
-    assert '"--stage0-sampling-engine", stage0_sampling_engine' in text
+    assert "stage0_sampling_engine" not in text
+    assert '"--stage0-sampling-engine"' not in text
     assert '"--stage1-sampling-engine", stage1_sampling_engine' in text
     assert '"--sampling-engine", sampling_engine' not in text
     assert '"--perturbation-discovery-alpha-tol-arcsec", perturbation_discovery_alpha_tol_arcsec' in text
     assert '"--perturbation-discovery-jacobian-tol", perturbation_discovery_jacobian_tol' in text
-    assert 'perturbation_discovery_final_polish_engine = "full_flat"' in text
-    assert '"--perturbation-discovery-final-polish-engine", perturbation_discovery_final_polish_engine' in text
+    assert "perturbation_discovery_final_polish_engine" not in text
+    assert '"--perturbation-discovery-final-polish-engine"' not in text
     assert '"--perturbation-discovery-final-engine"' not in text
     assert '"--critical-arc-critical-direction-sigma-arcsec", 10.0' in text
     assert '"--critical-arc-base-prob", 0.10' in text
@@ -18987,37 +18999,44 @@ def test_validation_parser_rejects_exact_discovery_flat_global_sampling_engine()
         validation._build_parser().parse_args(["--sampling-engine", "exact_discovery_flat"])
 
 
-def test_validation_parser_accepts_exact_discovery_flat_stage0_sampling_engine() -> None:
+def test_validation_parser_rejects_stage0_sampling_engine_flag() -> None:
+    with pytest.raises(SystemExit):
+        validation._build_parser().parse_args(
+            [
+                "--stage0-sampling-engine",
+                "exact_discovery_flat",
+            ]
+        )
+
+
+def test_validation_parser_rejects_perturbation_discovery_final_polish_engine_flag() -> None:
+    with pytest.raises(SystemExit):
+        validation._build_parser().parse_args(
+            [
+                "--perturbation-discovery-final-polish-engine",
+                "full_flat",
+            ]
+        )
+
+
+def test_validation_parser_accepts_perturbation_discovery_threshold_controls() -> None:
     args = validation._build_parser().parse_args(
         [
-            "--stage0-sampling-engine",
-            "exact_discovery_flat",
             "--perturbation-discovery-alpha-tol-arcsec",
             "0.02",
             "--perturbation-discovery-jacobian-tol",
             "0.03",
             "--perturbation-discovery-jacobian-weight",
             "2.0",
-            "--perturbation-discovery-final-polish-engine",
-            "full_flat",
             "--perturbation-discovery-final-svi-polish-steps",
             "250",
         ]
     )
 
-    assert args.stage0_sampling_engine == "exact_discovery_flat"
     assert args.perturbation_discovery_alpha_tol_arcsec == pytest.approx(0.02)
     assert args.perturbation_discovery_jacobian_tol == pytest.approx(0.03)
     assert args.perturbation_discovery_jacobian_weight == pytest.approx(2.0)
-    assert args.perturbation_discovery_final_polish_engine == "full_flat"
     assert args.perturbation_discovery_final_svi_polish_steps == 250
-
-
-def test_validation_parser_rejects_exact_discovery_flat_final_polish_engine() -> None:
-    with pytest.raises(SystemExit):
-        validation._build_parser().parse_args(
-            ["--perturbation-discovery-final-polish-engine", "exact_discovery_flat"]
-        )
 
 
 def test_validation_parser_rejects_perturbation_discovery_for_production_stage_engines() -> None:

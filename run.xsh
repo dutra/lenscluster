@@ -180,10 +180,8 @@ image_plane_newton_steps = 0
 linearized_beta_prior_sigma_arcsec = 3.0
 source_position_parameterization = "prior-whitened" #conditional-whitened" #"prior-whitened"
 source_plane_covariance_mode = "magnification"
-stage0_sampling_engine = "exact_discovery_flat"
 stage1_sampling_engine = "refreshing_surrogate_flat"
 stage2_sampling_engine = "refreshing_surrogate_flat"
-perturbation_discovery_final_polish_engine = "full_flat"
 perturbation_discovery_final_svi_polish_steps = 10000
 independent_scaling_free_log_sigma_tau_prior_median = 0.10
 independent_scaling_free_log_mass_tau_prior_median = 0.20
@@ -229,7 +227,6 @@ workflow_args = [
     "--potfile-member-mag-max", 22.0,
     "--sampling-refresh-runs", *sampling_refresh_runs,
     "--fit-mode", fit_mode,
-    "--stage0-sampling-engine", stage0_sampling_engine,
     "--stage1-sampling-engine", stage1_sampling_engine,
     "--stage1-likelihood", stage1_likelihood,
     "--stage2-forward-mode", stage2_forward_mode,
@@ -258,7 +255,6 @@ discovery_args = [
     "--perturbation-discovery-alpha-tol-arcsec", perturbation_discovery_alpha_tol_arcsec,
     "--perturbation-discovery-jacobian-tol", perturbation_discovery_jacobian_tol,
     "--perturbation-discovery-jacobian-weight", perturbation_discovery_jacobian_weight,
-    "--perturbation-discovery-final-polish-engine", perturbation_discovery_final_polish_engine,
     "--perturbation-discovery-final-svi-polish-steps", perturbation_discovery_final_svi_polish_steps,
     "--independent-scaling-free-log-sigma-tau-prior-median", independent_scaling_free_log_sigma_tau_prior_median,
     "--independent-scaling-free-log-mass-tau-prior-median", independent_scaling_free_log_mass_tau_prior_median,

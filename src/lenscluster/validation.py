@@ -6312,8 +6312,6 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(getattr(args, "likelihood_stabilizer_student_t_nu", DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU)),
         "--sampling-engine",
         str(args.sampling_engine),
-        "--stage0-sampling-engine",
-        str(getattr(args, "stage0_sampling_engine", "exact_discovery_flat")),
         "--stage1-sampling-engine",
         str(getattr(args, "stage1_sampling_engine", "refreshing_surrogate_flat")),
         "--stage2-sampling-engine",
@@ -6324,8 +6322,6 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(getattr(args, "perturbation_discovery_jacobian_tol", 0.01)),
         "--perturbation-discovery-jacobian-weight",
         str(getattr(args, "perturbation_discovery_jacobian_weight", 1.0)),
-        "--perturbation-discovery-final-polish-engine",
-        str(getattr(args, "perturbation_discovery_final_polish_engine", "full_flat")),
         "--perturbation-discovery-final-svi-polish-steps",
         str(getattr(args, "perturbation_discovery_final_svi_polish_steps", 2000)),
         "--source-plane-covariance-floor",
@@ -7511,11 +7507,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default="refreshing_surrogate",
     )
     parser.add_argument(
-        "--stage0-sampling-engine",
-        choices=("exact_discovery_flat",),
-        default="exact_discovery_flat",
-    )
-    parser.add_argument(
         "--stage1-sampling-engine",
         choices=("refreshing_surrogate_flat", "full_flat"),
         default="refreshing_surrogate_flat",
@@ -7528,11 +7519,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--perturbation-discovery-alpha-tol-arcsec", type=float, default=0.01)
     parser.add_argument("--perturbation-discovery-jacobian-tol", type=float, default=0.01)
     parser.add_argument("--perturbation-discovery-jacobian-weight", type=float, default=1.0)
-    parser.add_argument(
-        "--perturbation-discovery-final-polish-engine",
-        choices=("full_flat", "refreshing_surrogate_flat"),
-        default="full_flat",
-    )
     parser.add_argument("--perturbation-discovery-final-svi-polish-steps", type=_parse_nonnegative_int, default=2000)
     parser.add_argument("--source-plane-covariance-floor", type=float, default=1.0e-6)
     parser.add_argument(
