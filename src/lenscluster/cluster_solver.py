@@ -263,20 +263,28 @@ SAMPLING_ENGINE_FULL = "full"
 SAMPLING_ENGINE_FULL_FLAT = "full_flat"
 SAMPLING_ENGINE_REFRESHING_SURROGATE = "refreshing_surrogate"
 SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT = "refreshing_surrogate_flat"
-SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT = "perturbation_discovery_flat"
-SAMPLING_ENGINES = (
+SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT = "exact_discovery_flat"
+SINGLE_STAGE_SAMPLING_ENGINES = (
     SAMPLING_ENGINE_FULL,
     SAMPLING_ENGINE_FULL_FLAT,
     SAMPLING_ENGINE_REFRESHING_SURROGATE,
     SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
-    SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT,
 )
-PERTURBATION_DISCOVERY_FINAL_ENGINES = (
+SAMPLING_ENGINES = (
+    *SINGLE_STAGE_SAMPLING_ENGINES,
+    SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
+)
+PERTURBATION_DISCOVERY_FINAL_POLISH_ENGINES = (
+    SAMPLING_ENGINE_FULL_FLAT,
+    SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+)
+STAGE0_SAMPLING_ENGINE_CHOICES = (SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,)
+STAGE1_SAMPLING_ENGINE_CHOICES = (
     SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
     SAMPLING_ENGINE_FULL_FLAT,
 )
 STAGE4_SAMPLING_ENGINE_INHERIT = "inherit"
-STAGE4_SAMPLING_ENGINE_CHOICES = (STAGE4_SAMPLING_ENGINE_INHERIT, *SAMPLING_ENGINES)
+STAGE4_SAMPLING_ENGINE_CHOICES = (STAGE4_SAMPLING_ENGINE_INHERIT, *SINGLE_STAGE_SAMPLING_ENGINES)
 DEFAULT_SAMPLER = "numpyro_nuts"
 DEFAULT_SOURCE_SIGMA_INT_LOWER_ARCSEC = 1.0e-3
 DEFAULT_SOURCE_SIGMA_INT_UPPER_ARCSEC = 2.0
@@ -294,10 +302,9 @@ DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_MEDIAN_ARCSEC = 0.3
 DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_LOG_SIGMA = 0.5
 DEFAULT_SCALING_SCATTER_PRIOR_MEDIAN = 0.02
 DEFAULT_SCALING_SCATTER_PRIOR_LOG_SIGMA = 0.5
-DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN = 0.20
-DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN = 0.30
-DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN = 0.30
-DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA = 0.40
+DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN = 0.10
+DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN = 0.20
+DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA = 0.25
 DEFAULT_SOLVER_POTFILE_SIGMA_REF_MEAN = 100.0
 DEFAULT_SOLVER_POTFILE_SIGMA_REF_STD = 40.0
 DEFAULT_SOLVER_POTFILE_SIGMA_REF_LOWER = 20.0
@@ -317,10 +324,10 @@ DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN = 0.25
 DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD = 0.06
 DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER = 0.05
 DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER = 0.60
-DEFAULT_SOLVER_POTFILE_BETA_RADIUS_MEAN = 0.50
-DEFAULT_SOLVER_POTFILE_BETA_RADIUS_STD = 0.15
-DEFAULT_SOLVER_POTFILE_BETA_RADIUS_LOWER = -0.20
-DEFAULT_SOLVER_POTFILE_BETA_RADIUS_UPPER = 1.30
+DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN = 0.20
+DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD = 0.20
+DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER = -0.50
+DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER = 0.80
 SOLVER_POTFILE_POSITIVE_PRIOR_COORDINATE = "log_positive_latent"
 DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC = 0.01
 DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL = 0.01
@@ -523,7 +530,11 @@ STAGE2_FORWARD_MODES = (
     STAGE2_FORWARD_MODE_CRITICAL_ARC,
 )
 STAGE2_SAMPLING_ENGINE_INHERIT = "inherit"
-STAGE2_SAMPLING_ENGINE_CHOICES = (STAGE2_SAMPLING_ENGINE_INHERIT, *SAMPLING_ENGINES)
+STAGE2_SAMPLING_ENGINE_CHOICES = (
+    STAGE2_SAMPLING_ENGINE_INHERIT,
+    SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+    SAMPLING_ENGINE_FULL_FLAT,
+)
 FIT_METHOD_SVI = "svi"
 FIT_METHOD_SVI_NUTS = "svi+nuts"
 FIT_METHOD_NUTS = "nuts"
@@ -1313,12 +1324,24 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--sampling-engine",
-        choices=SAMPLING_ENGINES,
+        choices=SINGLE_STAGE_SAMPLING_ENGINES,
         default=SAMPLING_ENGINE_REFRESHING_SURROGATE,
         help=(
-            "Use the exact full likelihood, a first-order inactive-scaling surrogate, "
-            "or an exact active-scaling subset that omits inactive scaling galaxies during fitting."
+            "Use the exact full likelihood or a first-order inactive-scaling surrogate "
+            "for single-stage/non-sequential runs."
         ),
+    )
+    parser.add_argument(
+        "--stage0-sampling-engine",
+        choices=STAGE0_SAMPLING_ENGINE_CHOICES,
+        default=SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
+        help="Sampling engine used for the sequential stage0_fast_initializer discovery SVI.",
+    )
+    parser.add_argument(
+        "--stage1-sampling-engine",
+        choices=STAGE1_SAMPLING_ENGINE_CHOICES,
+        default=SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+        help="Sampling engine used after stage-0 discovery for stage1_backprojected_centroid_fit.",
     )
     parser.add_argument(
         "--stage1-likelihood",
@@ -1335,8 +1358,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-sampling-engine",
         choices=STAGE2_SAMPLING_ENGINE_CHOICES,
-        default=STAGE2_SAMPLING_ENGINE_INHERIT,
-        help="Stage-2 sampling-engine override. 'inherit' uses --sampling-engine.",
+        default=SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+        help="Stage-2 sampling engine. 'inherit' uses --stage1-sampling-engine.",
     )
     parser.add_argument(
         "--stage2-fresh-process",
@@ -1370,10 +1393,13 @@ def _parse_args() -> argparse.Namespace:
         help="Relative nonnegative weight of Jacobian perturbations in the stage-0 perturbation score.",
     )
     parser.add_argument(
-        "--perturbation-discovery-final-engine",
-        choices=PERTURBATION_DISCOVERY_FINAL_ENGINES,
-        default=SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
-        help="Sampling engine used after exact perturbation discovery discovery rebuilds the final independent/free candidate set.",
+        "--perturbation-discovery-final-polish-engine",
+        choices=PERTURBATION_DISCOVERY_FINAL_POLISH_ENGINES,
+        default=SAMPLING_ENGINE_FULL_FLAT,
+        help=(
+            "Sampling engine used for the fixed-candidate stage-0 SVI polish after "
+            "perturbation discovery selects exact/free member galaxies."
+        ),
     )
     parser.add_argument(
         "--perturbation-discovery-final-svi-polish-steps",
@@ -1398,34 +1424,28 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--independent-scaling-free-log-vdisp-tau-prior-median",
+        "--independent-scaling-free-log-sigma-tau-prior-median",
         type=float,
-        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
-        help="Lognormal prior median for selected free-galaxy log-vdisp displacement tau.",
+        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
+        help="Lognormal prior median for selected free-galaxy log-sigma displacement tau.",
     )
     parser.add_argument(
-        "--independent-scaling-free-log-core-tau-prior-median",
+        "--independent-scaling-free-log-mass-tau-prior-median",
         type=float,
-        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
-        help="Lognormal prior median for selected free-galaxy log-core displacement tau.",
-    )
-    parser.add_argument(
-        "--independent-scaling-free-log-cut-tau-prior-median",
-        type=float,
-        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
-        help="Lognormal prior median for selected free-galaxy log-cut displacement tau.",
+        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
+        help="Lognormal prior median for selected free-galaxy log-mass displacement tau.",
     )
     parser.add_argument(
         "--independent-scaling-free-log-tau-prior-sigma",
         type=float,
         default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
-        help="Shared lognormal prior log-sigma for selected free-galaxy displacement tau parameters.",
+        help="Shared lognormal prior log-sigma for selected free-galaxy sigma/mass displacement tau parameters.",
     )
     parser.add_argument(
         "--scaling-relation-mode",
         choices=SCALING_RELATION_MODES,
         default=DEFAULT_SCALING_RELATION_MODE,
-        help="Member-galaxy scaling-law parametrization. The live model uses direct alpha_sigma and beta_radius exponents.",
+        help="Member-galaxy scaling-law parametrization. The live model samples alpha_sigma and gamma_ml, deriving beta_radius.",
     )
     parser.add_argument(
         "--scaling-scatter",
@@ -2271,7 +2291,7 @@ def _local_jacobian_metric_mode_for_values(
     sample_mode = str(sample_likelihood_mode)
     engine = str(sampling_engine)
     if sample_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
-        if engine in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT}:
+        if engine in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT}:
             return LOCAL_JACOBIAN_METRIC_CURRENT_EXACT
         return LOCAL_JACOBIAN_METRIC_FROZEN_REFRESHED
     if sample_mode == SAMPLE_LIKELIHOOD_SOURCE:
@@ -2605,9 +2625,9 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
         items.append("sampling_engine=refreshing_surrogate legacy per-bin surrogate")
     if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT:
         items.append("sampling_engine=refreshing_surrogate_flat flattened surrogate")
-    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT:
+    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
         items.append(
-            "sampling_engine=perturbation_discovery_flat exact full-population discovery "
+            "sampling_engine=exact_discovery_flat cacheless exact full-population discovery "
             f"alpha_tol_arcsec={float(getattr(evaluator, 'perturbation_discovery_alpha_tol_arcsec', DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC)):.4g} "
             f"jacobian_tol={float(getattr(evaluator, 'perturbation_discovery_jacobian_tol', DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL)):.4g}"
         )
@@ -2704,6 +2724,7 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
     if (
         _count_items(getattr(evaluator, "scaling_scatter_param_indices", [])) > 0
         and _count_items(getattr(evaluator, "scaling_component_indices", [])) > 0
+        and str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) != SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
     ):
         items.append("scaling_scatter_cache=linearized scaling-scatter covariance")
     source_covariance_mode = str(
@@ -2714,6 +2735,8 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
         and str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)) == SAMPLE_LIKELIHOOD_SOURCE
     ):
         items.append("source_plane_covariance=unit")
+    elif str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
+        items.append("source_metric=current_exact")
     elif _count_items(getattr(evaluator, "source_metric_cache_by_z", {})) > 0:
         items.append("source_metric_cache=refreshed local lensing metric")
     return items
@@ -2803,7 +2826,7 @@ def _active_scaling_realized_fraction_value_style(value: str) -> str:
 
 
 def _active_scaling_rank_summary(evaluator: Any) -> dict[str, str]:
-    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT:
+    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
         return {}
     scaling_rank_df = getattr(evaluator, "scaling_rank_df", None)
     if scaling_rank_df is None or getattr(scaling_rank_df, "empty", True):
@@ -2916,8 +2939,8 @@ def _active_approximation_rows(evaluator: Any) -> list[ApproximationRow]:
     free_scaling = _count_items(getattr(evaluator, "free_correction_scaling_component_indices", []))
     excluded_scaling = _count_items(getattr(evaluator, "excluded_scaling_component_indices", []))
     total_scaling = _count_items(getattr(evaluator, "scaling_component_indices", []))
-    perturbation_discovery_engine = (
-        str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT
+    exact_discovery_engine = (
+        str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
     )
     rows: list[ApproximationRow] = [
         ("sampling_engine", _format_approximation_value(getattr(evaluator, "sampling_engine", "unknown")), "engine"),
@@ -2936,7 +2959,7 @@ def _active_approximation_rows(evaluator: Any) -> list[ApproximationRow]:
         ("cached_scaling", _format_approximation_value(cached_scaling), "active"),
         ("excluded_scaling", _format_approximation_value(excluded_scaling), "active"),
     ]
-    if perturbation_discovery_engine:
+    if exact_discovery_engine:
         rows.append(("perturbation_discovery_exact_svi_scaling", _format_approximation_value(total_scaling), "selection"))
         rows.append(
             (
@@ -2989,13 +3012,17 @@ def _active_approximation_rows(evaluator: Any) -> list[ApproximationRow]:
                 "source",
             )
         )
-    if _count_items(getattr(evaluator, "scaling_scatter_param_indices", [])) > 0:
+    if exact_discovery_engine:
+        rows.append(("scaling_scatter_cache", "disabled", "cache"))
+    elif _count_items(getattr(evaluator, "scaling_scatter_param_indices", [])) > 0:
         rows.append(("scaling_scatter_cache", "linearized", "cache"))
     if (
         source_covariance_mode == SOURCE_PLANE_COVARIANCE_MODE_UNIT
         and str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)) == SAMPLE_LIKELIHOOD_SOURCE
     ):
         rows.append(("source_metric_cache", "unit", "cache"))
+    elif exact_discovery_engine:
+        rows.append(("source_metric_cache", "current_exact", "cache"))
     elif _count_items(getattr(evaluator, "source_metric_cache_by_z", {})) > 0:
         rows.append(("source_metric_cache", "refreshed", "cache"))
     return rows
@@ -9640,7 +9667,8 @@ def _perturbation_discovery_union_from_evaluator(
 def _perturbation_discovery_svi_final_log_message(
     final_union_diag: Mapping[str, Any],
     *,
-    final_engine: str,
+    final_polish_engine: str,
+    stage1_engine: str,
     final_polish_steps: int,
 ) -> str:
     return (
@@ -9656,7 +9684,8 @@ def _perturbation_discovery_svi_final_log_message(
         f"max_selected_score={float(final_union_diag.get('max_selected_score', 0.0)):.4g} "
         f"max_unselected_score={float(final_union_diag.get('max_unselected_score', 0.0)):.4g} "
         f"score_fraction={float(final_union_diag.get('score_fraction', 0.0)):.4g} "
-        f"final_engine={final_engine} "
+        f"final_polish_engine={final_polish_engine} "
+        f"stage1_engine={stage1_engine} "
         f"final_svi_polish_steps={int(final_polish_steps)}"
     )
 
@@ -9716,7 +9745,8 @@ def _perturbation_discovery_svi_final_diagnostics(
     final_rebuild_diag: Mapping[str, Any],
     final_model_counts: Mapping[str, Any],
     *,
-    final_engine: str,
+    final_polish_engine: str,
+    stage1_engine: str,
     final_polish_steps: int,
 ) -> dict[str, Any]:
     return {
@@ -9731,7 +9761,8 @@ def _perturbation_discovery_svi_final_diagnostics(
         "perturbation_discovery_svi_final_jacobian_weight": float(final_union_diag.get("jacobian_weight", 0.0)),
         "perturbation_discovery_svi_final_max_selected_score": float(final_union_diag.get("max_selected_score", 0.0)),
         "perturbation_discovery_svi_final_max_unselected_score": float(final_union_diag.get("max_unselected_score", 0.0)),
-        "perturbation_discovery_svi_final_engine": str(final_engine),
+        "perturbation_discovery_svi_final_polish_engine": str(final_polish_engine),
+        "perturbation_discovery_svi_final_stage1_engine": str(stage1_engine),
         "perturbation_discovery_svi_final_polish_steps": int(final_polish_steps),
         "perturbation_discovery_final_strict_active": bool(
             final_model_counts.get("perturbation_discovery_final_strict_active", False)
@@ -10122,11 +10153,14 @@ def _svi_refresh_cache_snapshot(
 
 
 def _svi_refresh_evaluator_snapshot(evaluator: Any) -> dict[str, _SviRefreshCacheSnapshot]:
+    exact_discovery = (
+        str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
+    )
     source_metric_enabled = not (
         str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)) == SAMPLE_LIKELIHOOD_SOURCE
         and str(getattr(evaluator, "source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION))
         == SOURCE_PLANE_COVARIANCE_MODE_UNIT
-    )
+    ) and not exact_discovery
     return {
         "surrogate": _svi_refresh_cache_snapshot(
             getattr(evaluator, "surrogate_cache_by_z", {}),
@@ -10136,6 +10170,7 @@ def _svi_refresh_evaluator_snapshot(evaluator: Any) -> dict[str, _SviRefreshCach
         "scaling": _svi_refresh_cache_snapshot(
             getattr(evaluator, "scaling_scatter_cache_by_z", {}),
             getattr(evaluator, "scaling_scatter_reference_params", None),
+            enabled=not exact_discovery,
         ),
         "source_metric": _svi_refresh_cache_snapshot(
             getattr(evaluator, "source_metric_cache_by_z", {}),
@@ -11012,13 +11047,16 @@ def _run_svi_fit(
     block_steps: list[int] = []
     block_refresh_count = 0
     jax_cache_clear_count = 0
-    if str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT:
+    exact_discovery_svi = (
+        str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
+    )
+    if exact_discovery_svi:
         _log(
             args,
             (
-                "[perturbation-discovery:svi] exact_flat_discovery "
+                "[exact-discovery:svi] cacheless_exact_flat "
                 f"scaling_galaxies={len(getattr(evaluator, 'scaling_component_indices', []))} "
-                "independent_candidates=0 refresh_rebuilds=0"
+                "independent_candidates=0 cache_refreshes=0"
             ),
         )
     init_values = dict(state.svi_init_values or {})
@@ -11060,7 +11098,13 @@ def _run_svi_fit(
         center_theta_previous = np.asarray(center_theta, dtype=float)
         init_values = {spec.sample_name: float(center_theta[idx]) for idx, spec in enumerate(state.parameter_specs)}
         remaining_steps -= int(block_steps_current)
-        if remaining_steps > 0:
+        if remaining_steps > 0 and exact_discovery_svi:
+            guide = None
+            svi = None
+            svi_result = None
+            params = None
+            gc.collect()
+        elif remaining_steps > 0:
             refresh_reason = f"svi_block_{block_index}"
             before_refresh = _svi_refresh_evaluator_snapshot(evaluator)
             if getattr(evaluator, "active_inference_enabled", False):
@@ -11100,7 +11144,9 @@ def _run_svi_fit(
         getattr(evaluator, "active_inference_enabled", False)
         and str(getattr(evaluator, "active_scaling_inference_likelihood", "")) == ACTIVE_SCALING_INFERENCE_LIKELIHOOD_POPULATION
     )
-    if getattr(evaluator, "active_inference_enabled", False):
+    if exact_discovery_svi:
+        active_inference_final_refresh_skipped = False
+    elif getattr(evaluator, "active_inference_enabled", False):
         if active_inference_final_refresh_skipped:
             _log(
                 args,
@@ -11110,26 +11156,28 @@ def _run_svi_fit(
             evaluator.refresh_active_inference_cache(center_theta_previous, reason="svi_final")
     if evaluator.surrogate_enabled:
         evaluator.refresh_surrogate(center_theta_previous, reason="svi_final")
-    evaluator.refresh_scaling_scatter_cache(center_theta_previous, reason="svi_final")
-    evaluator.refresh_source_metric_cache(center_theta_previous, reason="svi_final")
+    if not exact_discovery_svi:
+        evaluator.refresh_scaling_scatter_cache(center_theta_previous, reason="svi_final")
+        evaluator.refresh_source_metric_cache(center_theta_previous, reason="svi_final")
     after_refresh = _svi_refresh_evaluator_snapshot(evaluator)
-    refresh_message, refresh_renderable = _svi_refresh_status_log_payload(
-        state,
-        reason="svi_final",
-        block_index=block_index,
-        remaining_steps=0,
-        center_shift=block_center_shift[-1] if block_center_shift else float("nan"),
-        current_theta=center_theta_previous,
-        before=before_refresh,
-        after=after_refresh,
-    )
-    _log(
-        args,
-        refresh_message,
-        renderable=refresh_renderable,
-    )
-    if _maybe_clear_jax_caches_after_svi_refresh(args, "svi_final"):
-        jax_cache_clear_count += 1
+    if not exact_discovery_svi:
+        refresh_message, refresh_renderable = _svi_refresh_status_log_payload(
+            state,
+            reason="svi_final",
+            block_index=block_index,
+            remaining_steps=0,
+            center_shift=block_center_shift[-1] if block_center_shift else float("nan"),
+            current_theta=center_theta_previous,
+            before=before_refresh,
+            after=after_refresh,
+        )
+        _log(
+            args,
+            refresh_message,
+            renderable=refresh_renderable,
+        )
+        if _maybe_clear_jax_caches_after_svi_refresh(args, "svi_final"):
+            jax_cache_clear_count += 1
     svi_elapsed = time.time() - svi_start
     evaluator.timing_totals["svi_runtime"] = evaluator.timing_totals.get("svi_runtime", 0.0) + svi_elapsed
     losses = np.concatenate(block_losses) if block_losses else np.empty((0,), dtype=float)
@@ -11169,7 +11217,7 @@ def _run_svi_fit(
         "svi_active_inference_final_refresh_skipped": bool(active_inference_final_refresh_skipped),
         "svi_block_center_shift": [float(value) for value in block_center_shift],
         "perturbation_discovery_svi_exact": bool(
-            str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT
+            str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
         ),
         "perturbation_discovery_svi_independent_candidates": int(len(_selected_component_set_from_state(state))),
         "perturbation_discovery_svi_rebuild_count": 0,
@@ -13727,6 +13775,29 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         len(max_tree_depths),
     )
     if fit_mode == FIT_MODE_SEQUENTIAL and hasattr(args, "stage2_forward_mode"):
+        stage0_sampling_engine = str(
+            getattr(args, "stage0_sampling_engine", SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT)
+        )
+        if stage0_sampling_engine not in STAGE0_SAMPLING_ENGINE_CHOICES:
+            _fail("--stage0-sampling-engine must be exact_discovery_flat.")
+        final_polish_engine = str(
+            getattr(args, "perturbation_discovery_final_polish_engine", SAMPLING_ENGINE_FULL_FLAT)
+        )
+        if final_polish_engine not in PERTURBATION_DISCOVERY_FINAL_POLISH_ENGINES:
+            _fail(
+                "--perturbation-discovery-final-polish-engine must be one of "
+                f"{', '.join(PERTURBATION_DISCOVERY_FINAL_POLISH_ENGINES)}."
+            )
+        stage1_sampling_engine = str(
+            getattr(args, "stage1_sampling_engine", SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT)
+        )
+        if stage1_sampling_engine not in STAGE1_SAMPLING_ENGINE_CHOICES:
+            _fail("--stage1-sampling-engine must be one of " f"{', '.join(STAGE1_SAMPLING_ENGINE_CHOICES)}.")
+        requested_stage2_sampling_engine = str(
+            getattr(args, "stage2_sampling_engine", SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT)
+        )
+        if requested_stage2_sampling_engine not in STAGE2_SAMPLING_ENGINE_CHOICES:
+            _fail("--stage2-sampling-engine must be one of " f"{', '.join(STAGE2_SAMPLING_ENGINE_CHOICES)}.")
         stage2_forward_enabled = _stage2_forward_enabled(args)
         max_allowed_values = 3 if stage2_forward_enabled else 2
         if max_value_count > max_allowed_values:
@@ -15182,12 +15253,12 @@ def _build_scaling_parameter_specs(
                 "step": 0.02,
                 "transform_kind": "identity",
             },
-            "beta_radius": {
+            "gamma_ml": {
                 "prior_kind": "truncated_normal",
-                "lower": DEFAULT_SOLVER_POTFILE_BETA_RADIUS_LOWER,
-                "upper": DEFAULT_SOLVER_POTFILE_BETA_RADIUS_UPPER,
-                "mean": DEFAULT_SOLVER_POTFILE_BETA_RADIUS_MEAN,
-                "std": DEFAULT_SOLVER_POTFILE_BETA_RADIUS_STD,
+                "lower": DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER,
+                "upper": DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER,
+                "mean": DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN,
+                "std": DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD,
                 "step": 0.05,
                 "transform_kind": "identity",
             },
@@ -15197,7 +15268,7 @@ def _build_scaling_parameter_specs(
                 f"Unsupported scaling_relation_mode={scaling_relation_mode!r}; "
                 f"expected {SCALING_RELATION_MODE_DIRECT_EXPONENTS!r}."
             )
-        scaling_fields = ("sigma", "cutkpc", "corekpc", "alpha_sigma", "beta_radius")
+        scaling_fields = ("sigma", "cutkpc", "corekpc", "alpha_sigma", "gamma_ml")
         for field_name in scaling_fields:
             prior = solver_priors[field_name]
             prior_kind = str(prior["prior_kind"])
@@ -15321,15 +15392,13 @@ def _build_independent_scaling_parameter_specs(
     selected_by_potfile: list[set[int]],
     *,
     start_index: int,
-    log_vdisp_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
-    log_core_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
-    log_cut_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+    log_sigma_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
+    log_mass_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
     log_tau_prior_sigma: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
 ) -> tuple[list[ParameterSpec], list[dict[int, dict[str, int]]]]:
     tau_medians = _validate_independent_scaling_log_displacement_hyperparameters(
-        log_vdisp_tau_prior_median=log_vdisp_tau_prior_median,
-        log_core_tau_prior_median=log_core_tau_prior_median,
-        log_cut_tau_prior_median=log_cut_tau_prior_median,
+        log_sigma_tau_prior_median=log_sigma_tau_prior_median,
+        log_mass_tau_prior_median=log_mass_tau_prior_median,
         log_tau_prior_sigma=log_tau_prior_sigma,
     )
     tau_prior_sigma = float(log_tau_prior_sigma)
@@ -15394,15 +15463,13 @@ def _build_independent_scaling_parameter_specs(
         catalog_df = potfile["catalog_df"]
         catalog_ids = catalog_df["id"].astype(str).tolist()
         site_names = {
-            "independent_free_log_v_disp_delta_unit": _sample_name(potfile_id, "independent_free_log_v_disp_delta_unit"),
-            "independent_free_log_core_radius_delta_unit": _sample_name(potfile_id, "independent_free_log_core_radius_delta_unit"),
-            "independent_free_log_cut_radius_delta_unit": _sample_name(potfile_id, "independent_free_log_cut_radius_delta_unit"),
+            "independent_free_log_sigma_delta_unit": _sample_name(potfile_id, "independent_free_log_sigma_delta_unit"),
+            "independent_free_log_mass_delta_unit": _sample_name(potfile_id, "independent_free_log_mass_delta_unit"),
         }
         tau_indices: dict[str, int] = {}
         for field_name, median in (
-            ("independent_free_log_v_disp_tau", tau_medians[0]),
-            ("independent_free_log_core_radius_tau", tau_medians[1]),
-            ("independent_free_log_cut_radius_tau", tau_medians[2]),
+            ("independent_free_log_sigma_tau", tau_medians[0]),
+            ("independent_free_log_mass_tau", tau_medians[1]),
         ):
             tau_indices[field_name] = start_index + len(specs)
             specs.append(_tau_spec(potfile_id=potfile_id, field_name=field_name, median=float(median)))
@@ -15410,9 +15477,8 @@ def _build_independent_scaling_parameter_specs(
             catalog_id = str(catalog_ids[int(row_index)])
             row_lookup = dict(tau_indices)
             for field_name in (
-                "independent_free_log_v_disp_delta_unit",
-                "independent_free_log_core_radius_delta_unit",
-                "independent_free_log_cut_radius_delta_unit",
+                "independent_free_log_sigma_delta_unit",
+                "independent_free_log_mass_delta_unit",
             ):
                 index = start_index + len(specs)
                 specs.append(
@@ -16027,23 +16093,21 @@ def _build_packed_lens_spec(
     cut_ref_base = np.zeros(n_components, dtype=float)
     core_ref_base = np.zeros(n_components, dtype=float)
     alpha_sigma_base = np.full(n_components, DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN, dtype=float)
-    beta_radius_base = np.full(n_components, DEFAULT_SOLVER_POTFILE_BETA_RADIUS_MEAN, dtype=float)
+    gamma_ml_base = np.full(n_components, DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN, dtype=float)
     sigma_ref_param_index = np.full(n_components, -1, dtype=np.int32)
     cut_ref_param_index = np.full(n_components, -1, dtype=np.int32)
     core_ref_param_index = np.full(n_components, -1, dtype=np.int32)
     alpha_sigma_param_index = np.full(n_components, -1, dtype=np.int32)
-    beta_radius_param_index = np.full(n_components, -1, dtype=np.int32)
+    gamma_ml_param_index = np.full(n_components, -1, dtype=np.int32)
     sigma_log_scatter_param_index = np.full(n_components, -1, dtype=np.int32)
     core_log_scatter_param_index = np.full(n_components, -1, dtype=np.int32)
     cut_log_scatter_param_index = np.full(n_components, -1, dtype=np.int32)
     independent_branch_role = np.full(n_components, INDEPENDENT_BRANCH_NONE, dtype=np.int32)
     independent_magnitude_feature = np.zeros(n_components, dtype=float)
-    independent_free_log_v_disp_delta_unit_param_index = np.full(n_components, -1, dtype=np.int32)
-    independent_free_log_core_radius_delta_unit_param_index = np.full(n_components, -1, dtype=np.int32)
-    independent_free_log_cut_radius_delta_unit_param_index = np.full(n_components, -1, dtype=np.int32)
-    independent_free_log_v_disp_tau_param_index = np.full(n_components, -1, dtype=np.int32)
-    independent_free_log_core_radius_tau_param_index = np.full(n_components, -1, dtype=np.int32)
-    independent_free_log_cut_radius_tau_param_index = np.full(n_components, -1, dtype=np.int32)
+    independent_free_log_sigma_delta_unit_param_index = np.full(n_components, -1, dtype=np.int32)
+    independent_free_log_mass_delta_unit_param_index = np.full(n_components, -1, dtype=np.int32)
+    independent_free_log_sigma_tau_param_index = np.full(n_components, -1, dtype=np.int32)
+    independent_free_log_mass_tau_param_index = np.full(n_components, -1, dtype=np.int32)
 
     for idx, (component, assignments) in enumerate(zip(base_components, component_param_assignments)):
         profile_type[idx] = int(component["profil"])
@@ -16081,23 +16145,21 @@ def _build_packed_lens_spec(
         cut_ref_base[idx] = float(item["cut_ref_base"])
         core_ref_base[idx] = float(item["core_ref_base"])
         alpha_sigma_base[idx] = float(item.get("alpha_sigma_base", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN))
-        beta_radius_base[idx] = float(item.get("beta_radius_base", DEFAULT_SOLVER_POTFILE_BETA_RADIUS_MEAN))
+        gamma_ml_base[idx] = float(item.get("gamma_ml_base", DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN))
         sigma_ref_param_index[idx] = int(item.get("sigma_ref_param_index", -1))
         cut_ref_param_index[idx] = int(item.get("cut_ref_param_index", -1))
         core_ref_param_index[idx] = int(item.get("core_ref_param_index", -1))
         alpha_sigma_param_index[idx] = int(item.get("alpha_sigma_param_index", -1))
-        beta_radius_param_index[idx] = int(item.get("beta_radius_param_index", -1))
+        gamma_ml_param_index[idx] = int(item.get("gamma_ml_param_index", -1))
         sigma_log_scatter_param_index[idx] = int(item.get("sigma_log_scatter_param_index", -1))
         core_log_scatter_param_index[idx] = int(item.get("core_log_scatter_param_index", -1))
         cut_log_scatter_param_index[idx] = int(item.get("cut_log_scatter_param_index", -1))
         independent_branch_role[idx] = int(item.get("independent_branch_role", INDEPENDENT_BRANCH_NONE))
         independent_magnitude_feature[idx] = float(item.get("independent_magnitude_feature", 0.0))
-        independent_free_log_v_disp_delta_unit_param_index[idx] = int(item.get("independent_free_log_v_disp_delta_unit_param_index", -1))
-        independent_free_log_core_radius_delta_unit_param_index[idx] = int(item.get("independent_free_log_core_radius_delta_unit_param_index", -1))
-        independent_free_log_cut_radius_delta_unit_param_index[idx] = int(item.get("independent_free_log_cut_radius_delta_unit_param_index", -1))
-        independent_free_log_v_disp_tau_param_index[idx] = int(item.get("independent_free_log_v_disp_tau_param_index", -1))
-        independent_free_log_core_radius_tau_param_index[idx] = int(item.get("independent_free_log_core_radius_tau_param_index", -1))
-        independent_free_log_cut_radius_tau_param_index[idx] = int(item.get("independent_free_log_cut_radius_tau_param_index", -1))
+        independent_free_log_sigma_delta_unit_param_index[idx] = int(item.get("independent_free_log_sigma_delta_unit_param_index", -1))
+        independent_free_log_mass_delta_unit_param_index[idx] = int(item.get("independent_free_log_mass_delta_unit_param_index", -1))
+        independent_free_log_sigma_tau_param_index[idx] = int(item.get("independent_free_log_sigma_tau_param_index", -1))
+        independent_free_log_mass_tau_param_index[idx] = int(item.get("independent_free_log_mass_tau_param_index", -1))
 
     for idx, component in enumerate(base_components):
         if int(component.get("component_family_code", COMPONENT_FAMILY_LARGE)) != COMPONENT_FAMILY_INDEPENDENT_FREE:
@@ -16109,18 +16171,16 @@ def _build_packed_lens_spec(
         cut_ref_base[idx] = float(component.get("cut_ref_base", 0.0))
         core_ref_base[idx] = float(component.get("core_ref_base", 0.0))
         alpha_sigma_base[idx] = float(component.get("alpha_sigma_base", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN))
-        beta_radius_base[idx] = float(component.get("beta_radius_base", DEFAULT_SOLVER_POTFILE_BETA_RADIUS_MEAN))
+        gamma_ml_base[idx] = float(component.get("gamma_ml_base", DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN))
         sigma_ref_param_index[idx] = int(component.get("sigma_ref_param_index", -1))
         cut_ref_param_index[idx] = int(component.get("cut_ref_param_index", -1))
         core_ref_param_index[idx] = int(component.get("core_ref_param_index", -1))
         alpha_sigma_param_index[idx] = int(component.get("alpha_sigma_param_index", -1))
-        beta_radius_param_index[idx] = int(component.get("beta_radius_param_index", -1))
-        independent_free_log_v_disp_delta_unit_param_index[idx] = int(component.get("independent_free_log_v_disp_delta_unit_param_index", -1))
-        independent_free_log_core_radius_delta_unit_param_index[idx] = int(component.get("independent_free_log_core_radius_delta_unit_param_index", -1))
-        independent_free_log_cut_radius_delta_unit_param_index[idx] = int(component.get("independent_free_log_cut_radius_delta_unit_param_index", -1))
-        independent_free_log_v_disp_tau_param_index[idx] = int(component.get("independent_free_log_v_disp_tau_param_index", -1))
-        independent_free_log_core_radius_tau_param_index[idx] = int(component.get("independent_free_log_core_radius_tau_param_index", -1))
-        independent_free_log_cut_radius_tau_param_index[idx] = int(component.get("independent_free_log_cut_radius_tau_param_index", -1))
+        gamma_ml_param_index[idx] = int(component.get("gamma_ml_param_index", -1))
+        independent_free_log_sigma_delta_unit_param_index[idx] = int(component.get("independent_free_log_sigma_delta_unit_param_index", -1))
+        independent_free_log_mass_delta_unit_param_index[idx] = int(component.get("independent_free_log_mass_delta_unit_param_index", -1))
+        independent_free_log_sigma_tau_param_index[idx] = int(component.get("independent_free_log_sigma_tau_param_index", -1))
+        independent_free_log_mass_tau_param_index[idx] = int(component.get("independent_free_log_mass_tau_param_index", -1))
 
     return PackedLensSpec(
         profile_type=profile_type,
@@ -16148,23 +16208,21 @@ def _build_packed_lens_spec(
         cut_ref_base=cut_ref_base,
         core_ref_base=core_ref_base,
         alpha_sigma_base=alpha_sigma_base,
-        beta_radius_base=beta_radius_base,
+        gamma_ml_base=gamma_ml_base,
         sigma_ref_param_index=sigma_ref_param_index,
         cut_ref_param_index=cut_ref_param_index,
         core_ref_param_index=core_ref_param_index,
         alpha_sigma_param_index=alpha_sigma_param_index,
-        beta_radius_param_index=beta_radius_param_index,
+        gamma_ml_param_index=gamma_ml_param_index,
         sigma_log_scatter_param_index=sigma_log_scatter_param_index,
         core_log_scatter_param_index=core_log_scatter_param_index,
         cut_log_scatter_param_index=cut_log_scatter_param_index,
         independent_branch_role=independent_branch_role,
         independent_magnitude_feature=independent_magnitude_feature,
-        independent_free_log_v_disp_delta_unit_param_index=independent_free_log_v_disp_delta_unit_param_index,
-        independent_free_log_core_radius_delta_unit_param_index=independent_free_log_core_radius_delta_unit_param_index,
-        independent_free_log_cut_radius_delta_unit_param_index=independent_free_log_cut_radius_delta_unit_param_index,
-        independent_free_log_v_disp_tau_param_index=independent_free_log_v_disp_tau_param_index,
-        independent_free_log_core_radius_tau_param_index=independent_free_log_core_radius_tau_param_index,
-        independent_free_log_cut_radius_tau_param_index=independent_free_log_cut_radius_tau_param_index,
+        independent_free_log_sigma_delta_unit_param_index=independent_free_log_sigma_delta_unit_param_index,
+        independent_free_log_mass_delta_unit_param_index=independent_free_log_mass_delta_unit_param_index,
+        independent_free_log_sigma_tau_param_index=independent_free_log_sigma_tau_param_index,
+        independent_free_log_mass_tau_param_index=independent_free_log_mass_tau_param_index,
     )
 
 
@@ -16232,7 +16290,7 @@ def _build_scaling_components(
             magnitude_feature = np.nan_to_num(magnitude_feature, nan=0.0, posinf=0.0, neginf=0.0)
         luminosity_ratio = np.power(10.0, -0.4 * (magnitudes - float(potfile["mag0"])))
         alpha_sigma_base_value = DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN
-        beta_radius_base_value = DEFAULT_SOLVER_POTFILE_BETA_RADIUS_MEAN
+        gamma_ml_base_value = DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN
         for row_index, row in enumerate(catalog_df.itertuples(index=False)):
             ellipticite, angle_pos = _catalog_shape_to_ellipticity(row.catalog_a, row.catalog_b, row.catalog_theta)
             component_index = start_component_index + len(components)
@@ -16263,12 +16321,12 @@ def _build_scaling_components(
                     "cut_ref_base": cut_radius_kpc,
                     "core_ref_base": core_radius_kpc,
                     "alpha_sigma_base": alpha_sigma_base_value,
-                    "beta_radius_base": beta_radius_base_value,
+                    "gamma_ml_base": gamma_ml_base_value,
                     "sigma_ref_param_index": int(param_index_lookup.get("sigma", -1)),
                     "cut_ref_param_index": int(param_index_lookup.get("cutkpc", -1)),
                     "core_ref_param_index": int(param_index_lookup.get("corekpc", -1)),
                     "alpha_sigma_param_index": int(param_index_lookup.get("alpha_sigma", -1)),
-                    "beta_radius_param_index": int(param_index_lookup.get("beta_radius", -1)),
+                    "gamma_ml_param_index": int(param_index_lookup.get("gamma_ml", -1)),
                     "sigma_log_scatter_param_index": int(scatter_index_lookup.get("sigma", -1)),
                     "core_log_scatter_param_index": int(scatter_index_lookup.get("core", -1)),
                     "cut_log_scatter_param_index": int(scatter_index_lookup.get("cut", -1)),
@@ -16298,18 +16356,16 @@ def _build_scaling_components(
                         "cut_ref_base": cut_radius_kpc,
                         "core_ref_base": core_radius_kpc,
                         "alpha_sigma_base": alpha_sigma_base_value,
-                        "beta_radius_base": beta_radius_base_value,
+                        "gamma_ml_base": gamma_ml_base_value,
                         "sigma_ref_param_index": int(param_index_lookup.get("sigma", -1)),
                         "cut_ref_param_index": int(param_index_lookup.get("cutkpc", -1)),
                         "core_ref_param_index": int(param_index_lookup.get("corekpc", -1)),
                         "alpha_sigma_param_index": int(param_index_lookup.get("alpha_sigma", -1)),
-                        "beta_radius_param_index": int(param_index_lookup.get("beta_radius", -1)),
-                        "independent_free_log_v_disp_delta_unit_param_index": int(independent_lookup.get("independent_free_log_v_disp_delta_unit", -1)),
-                        "independent_free_log_core_radius_delta_unit_param_index": int(independent_lookup.get("independent_free_log_core_radius_delta_unit", -1)),
-                        "independent_free_log_cut_radius_delta_unit_param_index": int(independent_lookup.get("independent_free_log_cut_radius_delta_unit", -1)),
-                        "independent_free_log_v_disp_tau_param_index": int(independent_lookup.get("independent_free_log_v_disp_tau", -1)),
-                        "independent_free_log_core_radius_tau_param_index": int(independent_lookup.get("independent_free_log_core_radius_tau", -1)),
-                        "independent_free_log_cut_radius_tau_param_index": int(independent_lookup.get("independent_free_log_cut_radius_tau", -1)),
+                        "gamma_ml_param_index": int(param_index_lookup.get("gamma_ml", -1)),
+                        "independent_free_log_sigma_delta_unit_param_index": int(independent_lookup.get("independent_free_log_sigma_delta_unit", -1)),
+                        "independent_free_log_mass_delta_unit_param_index": int(independent_lookup.get("independent_free_log_mass_delta_unit", -1)),
+                        "independent_free_log_sigma_tau_param_index": int(independent_lookup.get("independent_free_log_sigma_tau", -1)),
+                        "independent_free_log_mass_tau_param_index": int(independent_lookup.get("independent_free_log_mass_tau", -1)),
                     }
                 )
                 assignments.append([])
@@ -16421,24 +16477,20 @@ def _logit_probability(probability: float, *, context: str) -> float:
 
 def _validate_independent_scaling_log_displacement_hyperparameters(
     *,
-    log_vdisp_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
-    log_core_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
-    log_cut_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+    log_sigma_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
+    log_mass_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
     log_tau_prior_sigma: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
-) -> tuple[float, float, float]:
-    tau_v = float(log_vdisp_tau_prior_median)
-    tau_core = float(log_core_tau_prior_median)
-    tau_cut = float(log_cut_tau_prior_median)
+) -> tuple[float, float]:
+    tau_sigma_value = float(log_sigma_tau_prior_median)
+    tau_mass_value = float(log_mass_tau_prior_median)
     tau_sigma = float(log_tau_prior_sigma)
-    if not np.isfinite(tau_v) or tau_v <= 0.0:
-        raise ValueError("--independent-scaling-free-log-vdisp-tau-prior-median must be finite and positive.")
-    if not np.isfinite(tau_core) or tau_core <= 0.0:
-        raise ValueError("--independent-scaling-free-log-core-tau-prior-median must be finite and positive.")
-    if not np.isfinite(tau_cut) or tau_cut <= 0.0:
-        raise ValueError("--independent-scaling-free-log-cut-tau-prior-median must be finite and positive.")
+    if not np.isfinite(tau_sigma_value) or tau_sigma_value <= 0.0:
+        raise ValueError("--independent-scaling-free-log-sigma-tau-prior-median must be finite and positive.")
+    if not np.isfinite(tau_mass_value) or tau_mass_value <= 0.0:
+        raise ValueError("--independent-scaling-free-log-mass-tau-prior-median must be finite and positive.")
     if not np.isfinite(tau_sigma) or tau_sigma <= 0.0:
         raise ValueError("--independent-scaling-free-log-tau-prior-sigma must be finite and positive.")
-    return tau_v, tau_core, tau_cut
+    return tau_sigma_value, tau_mass_value
 
 
 def _rank_potfile_scaling_rows(
@@ -16933,7 +16985,7 @@ class ClusterJAXEvaluator:
             SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
         }:
             raise ValueError(f"Unsupported sample_likelihood_mode={self.sample_likelihood_mode!r}.")
-        if self.sampling_engine in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT} and self.sample_likelihood_mode not in {
+        if self.sampling_engine in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT} and self.sample_likelihood_mode not in {
             SAMPLE_LIKELIHOOD_SOURCE,
             SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
@@ -17428,7 +17480,7 @@ class ClusterJAXEvaluator:
         if not self.scaling_rank_df.empty:
             self.scaling_rank_df = self.scaling_rank_df.copy()
             self.scaling_rank_df["selected_active"] = False
-            if self.sampling_engine == SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT:
+            if self.sampling_engine == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
                 self.scaling_rank_df["selection_mode"] = "perturbation_discovery_exact_svi"
             else:
                 self.scaling_rank_df["selection_mode"] = "cached_scaling"
@@ -18025,19 +18077,17 @@ class ClusterJAXEvaluator:
             "core_ref_param_index": jnp.asarray(spec.core_ref_param_index, dtype=jnp.int32),
             "alpha_sigma_base": float_component_array("alpha_sigma_base", fill_value=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN),
             "alpha_sigma_param_index": int_component_array("alpha_sigma_param_index"),
-            "beta_radius_base": float_component_array("beta_radius_base", fill_value=DEFAULT_SOLVER_POTFILE_BETA_RADIUS_MEAN),
-            "beta_radius_param_index": int_component_array("beta_radius_param_index"),
+            "gamma_ml_base": float_component_array("gamma_ml_base", fill_value=DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN),
+            "gamma_ml_param_index": int_component_array("gamma_ml_param_index"),
             "sigma_log_scatter_param_index": jnp.asarray(spec.sigma_log_scatter_param_index, dtype=jnp.int32),
             "core_log_scatter_param_index": jnp.asarray(spec.core_log_scatter_param_index, dtype=jnp.int32),
             "cut_log_scatter_param_index": jnp.asarray(spec.cut_log_scatter_param_index, dtype=jnp.int32),
             "independent_branch_role": int_component_array("independent_branch_role", fill_value=INDEPENDENT_BRANCH_NONE),
             "independent_magnitude_feature": float_component_array("independent_magnitude_feature"),
-            "independent_free_log_v_disp_delta_unit_param_index": int_component_array("independent_free_log_v_disp_delta_unit_param_index"),
-            "independent_free_log_core_radius_delta_unit_param_index": int_component_array("independent_free_log_core_radius_delta_unit_param_index"),
-            "independent_free_log_cut_radius_delta_unit_param_index": int_component_array("independent_free_log_cut_radius_delta_unit_param_index"),
-            "independent_free_log_v_disp_tau_param_index": int_component_array("independent_free_log_v_disp_tau_param_index"),
-            "independent_free_log_core_radius_tau_param_index": int_component_array("independent_free_log_core_radius_tau_param_index"),
-            "independent_free_log_cut_radius_tau_param_index": int_component_array("independent_free_log_cut_radius_tau_param_index"),
+            "independent_free_log_sigma_delta_unit_param_index": int_component_array("independent_free_log_sigma_delta_unit_param_index"),
+            "independent_free_log_mass_delta_unit_param_index": int_component_array("independent_free_log_mass_delta_unit_param_index"),
+            "independent_free_log_sigma_tau_param_index": int_component_array("independent_free_log_sigma_tau_param_index"),
+            "independent_free_log_mass_tau_param_index": int_component_array("independent_free_log_mass_tau_param_index"),
             "active_gate_intercept_param_index": int_component_array("active_gate_intercept_param_index"),
             "active_gate_mag_slope_param_index": int_component_array("active_gate_mag_slope_param_index"),
             "active_gate_logit_offset_param_index": int_component_array("active_gate_logit_offset_param_index"),
@@ -18784,10 +18834,15 @@ class ClusterJAXEvaluator:
         return cov00, cov01, cov11, finite
 
     def refresh_scaling_scatter_cache(self, reference_params: np.ndarray, reason: str = "manual") -> None:
+        if self.sampling_engine == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
+            del reference_params, reason
+            self.scaling_scatter_cache_by_z = {}
+            self.scaling_scatter_reference_params = None
+            self._refresh_flat_critical_arc_scatter_arrays()
+            return
         if self.sampling_engine in {
             SAMPLING_ENGINE_FULL_FLAT,
             SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
-            SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT,
         }:
             self._refresh_flat_scaling_scatter_cache_from_reference(reference_params, reason=reason)
             return
@@ -19009,6 +19064,12 @@ class ClusterJAXEvaluator:
         self._source_loglike_fn = jax.jit(self._source_loglike_impl)
 
     def refresh_source_metric_cache(self, reference_params: np.ndarray, reason: str = "manual") -> None:
+        if self.sampling_engine == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
+            del reference_params, reason
+            self.source_metric_cache_by_z = {}
+            self.source_metric_reference_params = None
+            self._refresh_flat_source_metric_arrays()
+            return
         if self._source_plane_unit_covariance_enabled():
             del reason
             self._reset_source_metric_cache_to_unit(reference_params)
@@ -19016,7 +19077,6 @@ class ClusterJAXEvaluator:
         if self.sampling_engine in {
             SAMPLING_ENGINE_FULL_FLAT,
             SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
-            SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT,
         }:
             self._refresh_flat_source_metric_cache_from_reference(reference_params, reason=reason)
             return
@@ -19762,10 +19822,17 @@ class ClusterJAXEvaluator:
         )
         self._maybe_record_invalid_state(validity)
         invalid = ~validity["is_valid"]
-        beta_x, beta_y = jax.lax.cond(
+        beta_x, beta_y, jac_a00, jac_a01, jac_a10, jac_a11 = jax.lax.cond(
             invalid,
-            lambda _: (flat_data.x_obs, flat_data.y_obs),
-            lambda current_state: self._flat_ray_shooting_for_components(
+            lambda _: (
+                flat_data.x_obs,
+                flat_data.y_obs,
+                jnp.ones_like(flat_data.x_obs),
+                jnp.zeros_like(flat_data.x_obs),
+                jnp.zeros_like(flat_data.y_obs),
+                jnp.ones_like(flat_data.y_obs),
+            ),
+            lambda current_state: self._flat_ray_shooting_and_lensing_jacobian_for_components(
                 flat_data.x_obs,
                 flat_data.y_obs,
                 current_state,
@@ -19776,7 +19843,10 @@ class ClusterJAXEvaluator:
             physical_params,
             flat_data,
         )
-        source_metric = self.flat_source_metric_cache
+        if self._source_plane_unit_covariance_enabled():
+            inv_abs_mu = jnp.ones_like(flat_data.x_obs, dtype=jnp.float64)
+        else:
+            inv_abs_mu = jnp.clip(jnp.abs(jac_a00 * jac_a11 - jac_a01 * jac_a10), 1.0e-6, 1.0e6)
         flat_loglike = _source_plane_bin_loglike(
             beta_x=beta_x,
             beta_y=beta_y,
@@ -19788,7 +19858,7 @@ class ClusterJAXEvaluator:
             source_sigma_int=source_sigma_int,
             scatter_var_x=scatter_var_x,
             scatter_var_y=scatter_var_y,
-            inv_abs_mu=source_metric.inv_abs_mu,
+            inv_abs_mu=inv_abs_mu,
             covariance_floor=self.source_plane_covariance_floor,
             outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
             max_gain=self.likelihood_stabilizer_max_gain,
@@ -19800,6 +19870,7 @@ class ClusterJAXEvaluator:
             invalid
             | (~jnp.all(jnp.isfinite(beta_x)))
             | (~jnp.all(jnp.isfinite(beta_y)))
+            | (~jnp.all(jnp.isfinite(inv_abs_mu)))
             | (~jnp.all(jnp.isfinite(scatter_var_x)))
             | (~jnp.all(jnp.isfinite(scatter_var_y)))
             | (~jnp.isfinite(flat_loglike))
@@ -20333,10 +20404,10 @@ class ClusterJAXEvaluator:
         alpha_sigma = self._apply_param_updates(
             spec_jax["alpha_sigma_base"], spec_jax["alpha_sigma_param_index"], physical_params
         )
-        beta_radius = self._apply_param_updates(
-            spec_jax["beta_radius_base"], spec_jax["beta_radius_param_index"], physical_params
+        gamma_ml = self._apply_param_updates(
+            spec_jax["gamma_ml_base"], spec_jax["gamma_ml_param_index"], physical_params
         )
-        gamma_ml = 2.0 * alpha_sigma + beta_radius - 1.0
+        beta_radius = 1.0 + gamma_ml - 2.0 * alpha_sigma
         return alpha_sigma, beta_radius, gamma_ml
 
     def _dpie_sigma0_factor_for_z_source(self, z_source: float) -> float:
@@ -20493,50 +20564,43 @@ class ClusterJAXEvaluator:
         scaled_core = core_ref * size_luminosity_scale
         scaled_cut = cut_ref * size_luminosity_scale
         free_role = spec_jax["independent_branch_role"] == INDEPENDENT_BRANCH_FREE
-        log_displacement_free = free_role & (spec_jax["independent_free_log_v_disp_delta_unit_param_index"] >= 0)
-        free_v_delta = self._apply_param_updates(
+        log_displacement_free = free_role & (spec_jax["independent_free_log_sigma_delta_unit_param_index"] >= 0)
+        free_sigma_delta_unit = self._apply_param_updates(
             jnp.zeros_like(spec_jax["luminosity_ratio"]),
-            spec_jax["independent_free_log_v_disp_delta_unit_param_index"],
+            spec_jax["independent_free_log_sigma_delta_unit_param_index"],
             physical_params,
         )
-        free_core_delta = self._apply_param_updates(
+        free_mass_delta_unit = self._apply_param_updates(
             jnp.zeros_like(spec_jax["luminosity_ratio"]),
-            spec_jax["independent_free_log_core_radius_delta_unit_param_index"],
+            spec_jax["independent_free_log_mass_delta_unit_param_index"],
             physical_params,
         )
-        free_cut_delta = self._apply_param_updates(
+        free_sigma_tau = self._apply_param_updates(
             jnp.zeros_like(spec_jax["luminosity_ratio"]),
-            spec_jax["independent_free_log_cut_radius_delta_unit_param_index"],
+            spec_jax["independent_free_log_sigma_tau_param_index"],
             physical_params,
         )
-        free_v_tau = self._apply_param_updates(
+        free_mass_tau = self._apply_param_updates(
             jnp.zeros_like(spec_jax["luminosity_ratio"]),
-            spec_jax["independent_free_log_v_disp_tau_param_index"],
+            spec_jax["independent_free_log_mass_tau_param_index"],
             physical_params,
         )
-        free_core_tau = self._apply_param_updates(
-            jnp.zeros_like(spec_jax["luminosity_ratio"]),
-            spec_jax["independent_free_log_core_radius_tau_param_index"],
-            physical_params,
-        )
-        free_cut_tau = self._apply_param_updates(
-            jnp.zeros_like(spec_jax["luminosity_ratio"]),
-            spec_jax["independent_free_log_cut_radius_tau_param_index"],
-            physical_params,
-        )
+        free_log_sigma_delta = free_sigma_tau * free_sigma_delta_unit
+        free_log_mass_delta = free_mass_tau * free_mass_delta_unit
+        free_log_radius_delta = free_log_mass_delta - 2.0 * free_log_sigma_delta
         v_disp = jnp.where(
             log_displacement_free,
-            scaled_vdisp * jnp.exp(free_v_tau * free_v_delta),
+            scaled_vdisp * jnp.exp(free_log_sigma_delta),
             v_disp,
         )
         core_radius_kpc = jnp.where(
             log_displacement_free,
-            scaled_core * jnp.exp(free_core_tau * free_core_delta),
+            scaled_core * jnp.exp(free_log_radius_delta),
             core_radius_kpc,
         )
         cut_radius_kpc = jnp.where(
             log_displacement_free,
-            scaled_cut * jnp.exp(free_cut_tau * free_cut_delta),
+            scaled_cut * jnp.exp(free_log_radius_delta),
             cut_radius_kpc,
         )
         v_disp = jnp.where(is_scaling, scaled_vdisp, v_disp)
@@ -20660,51 +20724,44 @@ class ClusterJAXEvaluator:
         spec_arrays: dict[str, jnp.ndarray],
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         free_role = spec_arrays["independent_branch_role"] == INDEPENDENT_BRANCH_FREE
-        log_displacement_free = free_role & (spec_arrays["independent_free_log_v_disp_delta_unit_param_index"] >= 0)
+        log_displacement_free = free_role & (spec_arrays["independent_free_log_sigma_delta_unit_param_index"] >= 0)
         zeros = jnp.zeros_like(spec_arrays["luminosity_ratio"])
-        free_v_delta = self._apply_param_updates(
+        free_sigma_delta_unit = self._apply_param_updates(
             zeros,
-            spec_arrays["independent_free_log_v_disp_delta_unit_param_index"],
+            spec_arrays["independent_free_log_sigma_delta_unit_param_index"],
             physical_params,
         )
-        free_core_delta = self._apply_param_updates(
+        free_mass_delta_unit = self._apply_param_updates(
             zeros,
-            spec_arrays["independent_free_log_core_radius_delta_unit_param_index"],
+            spec_arrays["independent_free_log_mass_delta_unit_param_index"],
             physical_params,
         )
-        free_cut_delta = self._apply_param_updates(
+        free_sigma_tau = self._apply_param_updates(
             zeros,
-            spec_arrays["independent_free_log_cut_radius_delta_unit_param_index"],
+            spec_arrays["independent_free_log_sigma_tau_param_index"],
             physical_params,
         )
-        free_v_tau = self._apply_param_updates(
+        free_mass_tau = self._apply_param_updates(
             zeros,
-            spec_arrays["independent_free_log_v_disp_tau_param_index"],
+            spec_arrays["independent_free_log_mass_tau_param_index"],
             physical_params,
         )
-        free_core_tau = self._apply_param_updates(
-            zeros,
-            spec_arrays["independent_free_log_core_radius_tau_param_index"],
-            physical_params,
-        )
-        free_cut_tau = self._apply_param_updates(
-            zeros,
-            spec_arrays["independent_free_log_cut_radius_tau_param_index"],
-            physical_params,
-        )
+        free_log_sigma_delta = free_sigma_tau * free_sigma_delta_unit
+        free_log_mass_delta = free_mass_tau * free_mass_delta_unit
+        free_log_radius_delta = free_log_mass_delta - 2.0 * free_log_sigma_delta
         v_disp = jnp.where(
             log_displacement_free,
-            scaled_vdisp * jnp.exp(free_v_tau * free_v_delta),
+            scaled_vdisp * jnp.exp(free_log_sigma_delta),
             v_disp,
         )
         core_radius_kpc = jnp.where(
             log_displacement_free,
-            scaled_core * jnp.exp(free_core_tau * free_core_delta),
+            scaled_core * jnp.exp(free_log_radius_delta),
             core_radius_kpc,
         )
         cut_radius_kpc = jnp.where(
             log_displacement_free,
-            scaled_cut * jnp.exp(free_cut_tau * free_cut_delta),
+            scaled_cut * jnp.exp(free_log_radius_delta),
             cut_radius_kpc,
         )
         return v_disp, core_radius_kpc, cut_radius_kpc
@@ -22722,19 +22779,19 @@ class ClusterJAXEvaluator:
             return jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64)
         if (
             str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
-            in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT}
+            in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT}
             and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_SOURCE
         ):
             return self._flat_source_loglike_impl(params)
         if (
             str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
-            in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT}
+            in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT}
             and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
         ):
             return self._flat_local_jacobian_source_loglike_impl(params)
         if (
             str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
-            in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT}
+            in {SAMPLING_ENGINE_FULL_FLAT, SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT}
             and self.sample_likelihood_mode
             in {
                 SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
@@ -24607,25 +24664,18 @@ def _save_plot_bundle_h5(
                     "sigma, cutkpc, and corekpc use log-positive latent priors "
                     "matched to solver-defined physical scales, not literal physical-space densities"
                 ),
-                "independent_scaling_free_log_vdisp_tau_prior_median": float(
+                "independent_scaling_free_log_sigma_tau_prior_median": float(
                     getattr(
                         state,
-                        "independent_scaling_free_log_vdisp_tau_prior_median",
-                        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+                        "independent_scaling_free_log_sigma_tau_prior_median",
+                        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
                     )
                 ),
-                "independent_scaling_free_log_core_tau_prior_median": float(
+                "independent_scaling_free_log_mass_tau_prior_median": float(
                     getattr(
                         state,
-                        "independent_scaling_free_log_core_tau_prior_median",
-                        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
-                    )
-                ),
-                "independent_scaling_free_log_cut_tau_prior_median": float(
-                    getattr(
-                        state,
-                        "independent_scaling_free_log_cut_tau_prior_median",
-                        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+                        "independent_scaling_free_log_mass_tau_prior_median",
+                        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
                     )
                 ),
                 "independent_scaling_free_log_tau_prior_sigma": float(
@@ -24833,22 +24883,16 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
             ),
             independent_scaling_model=str(meta.get("independent_scaling_model", "log_displacement")),
             scaling_relation_mode=str(meta.get("scaling_relation_mode", DEFAULT_SCALING_RELATION_MODE)),
-            independent_scaling_free_log_vdisp_tau_prior_median=float(
+            independent_scaling_free_log_sigma_tau_prior_median=float(
                 meta.get(
-                    "independent_scaling_free_log_vdisp_tau_prior_median",
-                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+                    "independent_scaling_free_log_sigma_tau_prior_median",
+                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
                 )
             ),
-            independent_scaling_free_log_core_tau_prior_median=float(
+            independent_scaling_free_log_mass_tau_prior_median=float(
                 meta.get(
-                    "independent_scaling_free_log_core_tau_prior_median",
-                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
-                )
-            ),
-            independent_scaling_free_log_cut_tau_prior_median=float(
-                meta.get(
-                    "independent_scaling_free_log_cut_tau_prior_median",
-                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+                    "independent_scaling_free_log_mass_tau_prior_median",
+                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
                 )
             ),
             independent_scaling_free_log_tau_prior_sigma=float(
@@ -24951,6 +24995,22 @@ def _physical_best_fit_values_from_artifacts(artifacts_dir: Path) -> dict[str, f
             f"does not match {len(state.parameter_specs)} parameters."
         )
     return {spec.sample_name: float(best_fit[idx]) for idx, spec in enumerate(state.parameter_specs)}
+
+
+def _selected_independent_by_potfile_from_artifacts(artifacts_dir: Path) -> list[set[int]]:
+    state, _cli_args, _arrays, _init_diagnostics = _load_artifacts(artifacts_dir)
+    selected_by_potfile = [set() for _ in getattr(state, "potfiles", [])]
+    for record in getattr(state, "scaling_component_records", []):
+        if not bool(record.get("selected_independent", False)):
+            continue
+        try:
+            potfile_order = int(record.get("potfile_order"))
+            catalog_row_index = int(record.get("catalog_row_index"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= potfile_order < len(selected_by_potfile):
+            selected_by_potfile[potfile_order].add(catalog_row_index)
+    return selected_by_potfile
 
 
 _LIKELIHOOD_STABILIZER_SAVED_ARG_DEFAULTS: dict[str, Any] = {
@@ -25579,7 +25639,7 @@ def _build_state_from_inputs(
                     "source=override"
                 ),
             )
-        elif str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT:
+        elif str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT:
             active_selected_by_potfile = [set() for _ in potfiles]
             active_rank_info = {}
             active_selected_counts = {}
@@ -25619,25 +25679,18 @@ def _build_state_from_inputs(
             potfiles,
             active_selected_by_potfile,
             start_index=len(parameter_specs),
-            log_vdisp_tau_prior_median=float(
+            log_sigma_tau_prior_median=float(
                 getattr(
                     args,
-                    "independent_scaling_free_log_vdisp_tau_prior_median",
-                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+                    "independent_scaling_free_log_sigma_tau_prior_median",
+                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
                 )
             ),
-            log_core_tau_prior_median=float(
+            log_mass_tau_prior_median=float(
                 getattr(
                     args,
-                    "independent_scaling_free_log_core_tau_prior_median",
-                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
-                )
-            ),
-            log_cut_tau_prior_median=float(
-                getattr(
-                    args,
-                    "independent_scaling_free_log_cut_tau_prior_median",
-                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+                    "independent_scaling_free_log_mass_tau_prior_median",
+                    DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
                 )
             ),
             log_tau_prior_sigma=float(
@@ -26015,25 +26068,18 @@ def _build_state_from_inputs(
         ),
         independent_scaling_model="log_displacement",
         scaling_relation_mode=str(getattr(args, "scaling_relation_mode", DEFAULT_SCALING_RELATION_MODE)),
-        independent_scaling_free_log_vdisp_tau_prior_median=float(
+        independent_scaling_free_log_sigma_tau_prior_median=float(
             getattr(
                 args,
-                "independent_scaling_free_log_vdisp_tau_prior_median",
-                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+                "independent_scaling_free_log_sigma_tau_prior_median",
+                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
             )
         ),
-        independent_scaling_free_log_core_tau_prior_median=float(
+        independent_scaling_free_log_mass_tau_prior_median=float(
             getattr(
                 args,
-                "independent_scaling_free_log_core_tau_prior_median",
-                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
-            )
-        ),
-        independent_scaling_free_log_cut_tau_prior_median=float(
-            getattr(
-                args,
-                "independent_scaling_free_log_cut_tau_prior_median",
-                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+                "independent_scaling_free_log_mass_tau_prior_median",
+                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
             )
         ),
         independent_scaling_free_log_tau_prior_sigma=float(
@@ -27462,29 +27508,34 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
             evaluator.refresh_scaling_scatter_cache(best_fit, reason="post_svi")
             evaluator.refresh_source_metric_cache(best_fit, reason="post_svi")
         svi_chain_seeds: list[ChainSeed] | None = None
-        if str(args.fit_method) in {FIT_METHOD_SVI_NUTS, FIT_METHOD_ACTIVE_BLOCKED_NUTS}:
-            pre_nuts_refresh_reason = "pre_nuts"
-            perturbation_discovery_final_enabled = bool(
-                str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT
-            )
-            if perturbation_discovery_final_enabled:
+        svi_followed_by_nuts = str(args.fit_method) in {FIT_METHOD_SVI_NUTS, FIT_METHOD_ACTIVE_BLOCKED_NUTS}
+        pre_nuts_refresh_reason = "pre_nuts"
+        perturbation_discovery_final_enabled = bool(
+            str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
+        )
+        if perturbation_discovery_final_enabled:
                 old_state_for_transfer = state
                 old_specs_for_transfer = list(state.parameter_specs)
                 final_polish_steps = max(0, int(getattr(args, "perturbation_discovery_final_svi_polish_steps", 2000)))
+                final_polish_engine = str(
+                    getattr(args, "perturbation_discovery_final_polish_engine", SAMPLING_ENGINE_FULL_FLAT)
+                )
+                stage1_engine = str(
+                    getattr(args, "stage1_sampling_engine", SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT)
+                )
                 final_union, final_union_diag = _perturbation_discovery_union_from_evaluator(
                     state,
                     evaluator,
                     best_fit,
                 )
                 final_args = argparse.Namespace(**vars(args))
-                final_args.sampling_engine = str(
-                    getattr(args, "perturbation_discovery_final_engine", SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT)
-                )
+                final_args.sampling_engine = final_polish_engine
                 _log(
                     args,
                     _perturbation_discovery_svi_final_log_message(
                         final_union_diag,
-                        final_engine=str(final_args.sampling_engine),
+                        final_polish_engine=final_polish_engine,
+                        stage1_engine=stage1_engine,
                         final_polish_steps=int(final_polish_steps),
                     ),
                 )
@@ -27507,7 +27558,8 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                 svi_diagnostics.update(
                     {
                         "perturbation_discovery_final_enabled": True,
-                        "perturbation_discovery_final_engine": str(final_args.sampling_engine),
+                        "perturbation_discovery_final_polish_engine": str(final_polish_engine),
+                        "perturbation_discovery_final_stage1_engine": str(stage1_engine),
                         "perturbation_discovery_final_candidates": int(final_rebuild_diag["count"]),
                         "perturbation_discovery_final_added": int(final_rebuild_diag["added"]),
                         "perturbation_discovery_final_removed": int(final_rebuild_diag["removed"]),
@@ -27525,7 +27577,8 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                             final_union_diag,
                             final_rebuild_diag,
                             final_model_counts,
-                            final_engine=str(final_args.sampling_engine),
+                            final_polish_engine=final_polish_engine,
+                            stage1_engine=stage1_engine,
                             final_polish_steps=int(final_polish_steps),
                         ),
                     }
@@ -27552,7 +27605,8 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                         f"exact_unique={int(final_union_diag.get('exact_unique', 0))} "
                         f"pairs={int(final_union_diag.get('pairs', 0))} "
                         f"score_fraction={float(final_union_diag.get('score_fraction', 0.0)):.4g} "
-                        f"final_engine={final_args.sampling_engine} "
+                        f"final_polish_engine={final_polish_engine} "
+                        f"stage1_engine={stage1_engine} "
                         f"old_parameters={len(old_state_for_transfer.parameter_specs)} "
                         f"new_parameters={len(state.parameter_specs)}"
                     ),
@@ -27579,6 +27633,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                     posterior = polish_posterior
                     svi_diagnostics.update(polish_diag)
                     pre_nuts_refresh_reason = "pre_nuts_perturbation_discovery_final_polished"
+        if svi_followed_by_nuts:
             before_refresh = _svi_refresh_evaluator_snapshot(evaluator)
             if getattr(evaluator, "active_inference_enabled", False):
                 evaluator.refresh_active_inference_cache(best_fit, reason=pre_nuts_refresh_reason)
@@ -28307,6 +28362,9 @@ def _archive_run_inputs(args: argparse.Namespace, state: BuildState, run_dir: Pa
 def _stage_banner_title_from_run_name(run_name: str) -> str:
     stage_name = Path(str(run_name)).name
     labels = {
+        STAGE0_FAST_INITIALIZER_DIR: "STAGE 0: stage0_fast_initializer",
+        STAGE1_BACKPROJECTED_CENTROID_FIT_DIR: "STAGE 1: stage1_backprojected_centroid_fit",
+        STAGE2_FREE_SOURCE_FORWARD_FIT_DIR: "STAGE 2: stage2_free_source_forward_fit",
         "stage1_large_only": "STAGE 1: stage1_large_only",
         "stage2_joint": "STAGE 2: stage2_joint",
         "stage3_image_plane": "STAGE 3: stage3_image_plane",
@@ -28330,6 +28388,7 @@ def _run_single_stage(
     svi_init_physical_values: dict[str, float] | None = None,
     source_position_prior_values: dict[str, tuple[float, float]] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
+    perturbation_discovery_independent_override_by_potfile: list[set[int]] | None = None,
     frozen_active_scaling_source_run_dir: str | Path | None = None,
     require_frozen_active_scaling: bool = False,
 ) -> Path:
@@ -28366,6 +28425,9 @@ def _run_single_stage(
             svi_init_physical_values=svi_init_physical_values,
             source_position_prior_values=source_position_prior_values,
             previous_stage_best_values=previous_stage_best_values,
+            perturbation_discovery_independent_override_by_potfile=(
+                perturbation_discovery_independent_override_by_potfile
+            ),
         ),
         detail=f"fit_mode={fit_mode}",
     )
@@ -28395,6 +28457,7 @@ def _run_single_stage_spawn_worker(
     svi_init_physical_values: dict[str, float] | None,
     source_position_prior_values: dict[str, tuple[float, float]] | None,
     previous_stage_best_values: dict[str, float] | None,
+    perturbation_discovery_independent_override_by_potfile: list[set[int]] | None,
     frozen_active_scaling_source_run_dir: str | Path | None,
     require_frozen_active_scaling: bool,
 ) -> None:
@@ -28408,6 +28471,9 @@ def _run_single_stage_spawn_worker(
             svi_init_physical_values=svi_init_physical_values,
             source_position_prior_values=source_position_prior_values,
             previous_stage_best_values=previous_stage_best_values,
+            perturbation_discovery_independent_override_by_potfile=(
+                perturbation_discovery_independent_override_by_potfile
+            ),
             frozen_active_scaling_source_run_dir=frozen_active_scaling_source_run_dir,
             require_frozen_active_scaling=require_frozen_active_scaling,
         )
@@ -28429,6 +28495,7 @@ def _run_single_stage_in_fresh_process(
     svi_init_physical_values: dict[str, float] | None = None,
     source_position_prior_values: dict[str, tuple[float, float]] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
+    perturbation_discovery_independent_override_by_potfile: list[set[int]] | None = None,
     frozen_active_scaling_source_run_dir: str | Path | None = None,
     require_frozen_active_scaling: bool = False,
 ) -> Path:
@@ -28453,6 +28520,7 @@ def _run_single_stage_in_fresh_process(
             svi_init_physical_values,
             source_position_prior_values,
             previous_stage_best_values,
+            perturbation_discovery_independent_override_by_potfile,
             frozen_active_scaling_source_run_dir,
             require_frozen_active_scaling,
         ),
@@ -28662,6 +28730,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
         DEFAULT_SAMPLING_REFRESH_RUNS,
         DEFAULT_MAX_TREE_DEPTH,
     )
+    stage0_controls = stage_fit_controls.get("stage0", default_controls)
     stage1_controls = stage_fit_controls.get("stage1", default_controls)
     stage2_controls = stage_fit_controls.get("stage2", stage1_controls)
     root_run_name = args.run_name or _make_run_name(args.par_path)
@@ -28713,8 +28782,54 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
             return _run_single_stage_in_fresh_process(stage_args, fit_mode, run_name, **kwargs)
         return _run_single_stage(stage_args, fit_mode, run_name, **kwargs)
 
+    stage0_run_name = str(Path(root_run_name) / STAGE0_FAST_INITIALIZER_DIR)
     stage1_run_name = str(Path(root_run_name) / STAGE1_BACKPROJECTED_CENTROID_FIT_DIR)
-    stage1_args = _args_with_fit_controls(args, stage1_controls)
+    stage0_sampling_engine = str(
+        getattr(args, "stage0_sampling_engine", SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT)
+    )
+    stage1_sampling_engine = str(
+        getattr(args, "stage1_sampling_engine", SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT)
+    )
+    stage0_args = _args_with_fit_controls(
+        args,
+        stage0_controls,
+        fit_method=FIT_METHOD_SVI,
+        sampling_engine=stage0_sampling_engine,
+    )
+    stage0_args = _force_quick_diagnostics_for_nonfinal_stage(
+        stage0_args,
+        stage0_run_name,
+        STAGE1_BACKPROJECTED_CENTROID_FIT_DIR,
+    )
+    if fast_resume:
+        stage0_run_dir = Path(args.output_dir) / stage0_run_name
+        _require_fast_resume_plot_artifacts(stage0_run_dir, STAGE0_FAST_INITIALIZER_DIR)
+        _require_fast_resume_cosmology_compatibility(stage0_args, stage0_run_dir, STAGE0_FAST_INITIALIZER_DIR)
+        _log(args, f"[resume fast] skipping stage0 run_name={stage0_run_name} run_dir={stage0_run_dir}")
+    else:
+        stage0_run_dir = maybe_run_stage(
+            stage0_args,
+            FIT_MODE_JOINT,
+            stage0_run_name,
+            sample_likelihood_mode=stage1_likelihood,
+        )
+    stage0_artifacts_dir = stage0_run_dir / "artifacts"
+    stage0_init_values = _physical_best_fit_values_from_artifacts(stage0_artifacts_dir)
+    stage0_selected_by_potfile = _selected_independent_by_potfile_from_artifacts(stage0_artifacts_dir)
+    stage0_selected_count = int(sum(len(values) for values in stage0_selected_by_potfile))
+    _log(
+        args,
+        (
+            "[stage0] handoff "
+            f"selected_free_scaling={stage0_selected_count} "
+            f"stage1_engine={stage1_sampling_engine}"
+        ),
+    )
+    stage1_args = _args_with_fit_controls(
+        args,
+        stage1_controls,
+        sampling_engine=stage1_sampling_engine,
+    )
     if stage2_enabled:
         stage1_args = _force_quick_diagnostics_for_nonfinal_stage(
             stage1_args,
@@ -28732,32 +28847,47 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
             FIT_MODE_JOINT,
             stage1_run_name,
             sample_likelihood_mode=stage1_likelihood,
+            svi_init_physical_values=stage0_init_values,
+            previous_stage_best_values=stage0_init_values,
+            perturbation_discovery_independent_override_by_potfile=stage0_selected_by_potfile,
         )
 
     summary_payload: dict[str, Any] = {
         "fit_mode": "sequential",
-        "stage0_fast_initializer": str(getattr(args, "sampling_engine", "")) == SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT,
+        "stage0_fast_initializer": stage0_sampling_engine == SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
+        "stage0_sampling_engine": stage0_sampling_engine,
+        "stage0_run_dir": str(stage0_run_dir),
+        "stage0_selected_free_scaling": int(stage0_selected_count),
+        "stage1_sampling_engine": stage1_sampling_engine,
         "stage1_run_dir": str(stage1_run_dir),
         "stage1_likelihood": str(getattr(args, "stage1_likelihood", STAGE1_LIKELIHOOD_LOCAL_JACOBIAN)),
         "stage1_sample_likelihood_mode": str(stage1_likelihood),
         "stage2_forward_mode": str(getattr(args, "stage2_forward_mode", STAGE2_FORWARD_MODE_NONE)),
         "stage_fit_controls": {
+            "stage0": stage0_controls.to_json(),
             "stage1": stage1_controls.to_json(),
             "stage2": stage2_controls.to_json(),
         },
         "resume_mode": str(resume_mode or "none"),
     }
-    aggregate_stage_dirs: list[Path | None] = [stage1_run_dir]
+    aggregate_stage_dirs: list[Path | None] = [stage0_run_dir, stage1_run_dir]
 
     if stage2_enabled:
         stage2_run_name = str(Path(root_run_name) / STAGE2_FREE_SOURCE_FORWARD_FIT_DIR)
         stage2_updates: dict[str, Any] = {}
-        requested_stage2_engine = str(getattr(args, "stage2_sampling_engine", STAGE2_SAMPLING_ENGINE_INHERIT))
-        if requested_stage2_engine != STAGE2_SAMPLING_ENGINE_INHERIT:
-            stage2_updates["sampling_engine"] = requested_stage2_engine
+        requested_stage2_engine = str(
+            getattr(args, "stage2_sampling_engine", SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT)
+        )
+        effective_stage2_engine = (
+            stage1_sampling_engine
+            if requested_stage2_engine == STAGE2_SAMPLING_ENGINE_INHERIT
+            else requested_stage2_engine
+        )
+        stage2_updates["sampling_engine"] = effective_stage2_engine
         stage2_args = _args_with_fit_controls(args, stage2_controls, **stage2_updates)
         stage2_init_artifacts = stage1_run_dir / "artifacts"
         stage2_init_values = _physical_best_fit_values_from_artifacts(stage2_init_artifacts)
+        stage2_selected_by_potfile = _selected_independent_by_potfile_from_artifacts(stage2_init_artifacts)
         source_position_priors = _source_position_prior_values_from_artifacts(stage2_init_artifacts)
         stage2_runs_fresh = bool(getattr(args, "stage2_fresh_process", True)) and not fast_resume
         stage2_run_dir = maybe_run_stage(
@@ -28769,13 +28899,12 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
             svi_init_physical_values=stage2_init_values,
             source_position_prior_values=source_position_priors,
             previous_stage_best_values=stage2_init_values,
+            perturbation_discovery_independent_override_by_potfile=stage2_selected_by_potfile,
         )
         summary_payload["stage2_run_dir"] = str(stage2_run_dir)
         summary_payload["stage2_sample_likelihood_mode"] = str(stage2_likelihood)
         summary_payload["stage2_sampling_engine_requested"] = requested_stage2_engine
-        summary_payload["stage2_sampling_engine_effective"] = str(
-            getattr(stage2_args, "sampling_engine", getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL))
-        )
+        summary_payload["stage2_sampling_engine_effective"] = str(effective_stage2_engine)
         summary_payload["stage2_fresh_process"] = bool(stage2_runs_fresh)
         aggregate_stage_dirs.append(stage2_run_dir)
 

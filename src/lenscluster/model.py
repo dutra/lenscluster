@@ -75,17 +75,15 @@ class PackedLensSpec:
     core_log_scatter_param_index: np.ndarray
     cut_log_scatter_param_index: np.ndarray
     alpha_sigma_base: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
-    beta_radius_base: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    gamma_ml_base: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
     alpha_sigma_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
-    beta_radius_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    gamma_ml_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     independent_branch_role: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     independent_magnitude_feature: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
-    independent_free_log_v_disp_delta_unit_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
-    independent_free_log_core_radius_delta_unit_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
-    independent_free_log_cut_radius_delta_unit_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
-    independent_free_log_v_disp_tau_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
-    independent_free_log_core_radius_tau_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
-    independent_free_log_cut_radius_tau_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    independent_free_log_sigma_delta_unit_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    independent_free_log_mass_delta_unit_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    independent_free_log_sigma_tau_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
+    independent_free_log_mass_tau_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     active_gate_intercept_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     active_gate_mag_slope_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     active_gate_logit_offset_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
@@ -298,10 +296,9 @@ class BuildState:
     active_scaling_freeze_threshold: float = 0.5
     independent_scaling_model: str = "log_displacement"
     scaling_relation_mode: str = "direct-exponents"
-    independent_scaling_free_log_vdisp_tau_prior_median: float = 0.20
-    independent_scaling_free_log_core_tau_prior_median: float = 0.30
-    independent_scaling_free_log_cut_tau_prior_median: float = 0.30
-    independent_scaling_free_log_tau_prior_sigma: float = 0.40
+    independent_scaling_free_log_sigma_tau_prior_median: float = 0.10
+    independent_scaling_free_log_mass_tau_prior_median: float = 0.20
+    independent_scaling_free_log_tau_prior_sigma: float = 0.25
     frozen_active_scaling_component_indices: np.ndarray | None = None
     active_scaling_frozen_from_previous_stage: bool = False
     active_scaling_frozen_source_run_dir: str | None = None

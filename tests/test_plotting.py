@@ -70,35 +70,40 @@ def test_active_scaling_summary_plot_writes_pdf_only(tmp_path: Path) -> None:
     assert not (tmp_path / "active_scaling_summary.png").exists()
 
 
-def test_scaling_results_summary_table_lenstool_mode_reports_reference_values_and_mass() -> None:
+def test_scaling_results_summary_table_reports_bergamini_reference_values_and_mass() -> None:
     specs = [
         _potfile_parameter_spec("members", "sigma"),
         _potfile_parameter_spec("members", "cutkpc"),
         _potfile_parameter_spec("members", "corekpc"),
-        _potfile_parameter_spec("members", "vdslope"),
-        _potfile_parameter_spec("members", "slope"),
+        _potfile_parameter_spec("members", "alpha_sigma"),
+        _potfile_parameter_spec("members", "gamma_ml"),
         _potfile_parameter_spec("members", "sigma_log_scatter", component_family="scaling_scatter"),
         _potfile_parameter_spec(
             "members",
-            "independent_free_log_v_disp_tau",
+            "independent_free_log_sigma_tau",
+            component_family="independent_scaling",
+        ),
+        _potfile_parameter_spec(
+            "members",
+            "independent_free_log_mass_tau",
             component_family="independent_scaling",
         ),
     ]
     samples = np.asarray(
         [
-            [100.0, 30.0, 1.0, 4.0, 4.0, 0.10, 0.20],
-            [120.0, 40.0, 2.0, 4.0, 4.0, 0.20, 0.30],
-            [140.0, 50.0, 3.0, 4.0, 4.0, 0.30, 0.40],
+            [100.0, 30.0, 1.0, 0.20, -0.10, 0.10, 0.08, 0.16],
+            [120.0, 40.0, 2.0, 0.25, 0.00, 0.20, 0.10, 0.20],
+            [140.0, 50.0, 3.0, 0.30, 0.20, 0.30, 0.12, 0.24],
         ],
         dtype=float,
     )
-    best_fit = np.asarray([120.0, 40.0, 2.0, 4.0, 4.0, 0.2, 0.3], dtype=float)
+    best_fit = np.asarray([120.0, 40.0, 2.0, 0.25, 0.0, 0.2, 0.1, 0.2], dtype=float)
 
     table = plotting._scaling_results_summary_table(
         specs,
         samples,
         best_fit,
-        "lenstool-denominator",
+        "direct-exponents",
     )
 
     row = table.iloc[0]
@@ -111,26 +116,28 @@ def test_scaling_results_summary_table_lenstool_mode_reports_reference_values_an
     mass = (
         math.pi
         * np.square(samples[:, 0])
-        * np.maximum(samples[:, 1] - samples[:, 2], 0.0)
+        * np.maximum(samples[:, 1], 0.0)
         / plotting.DPiE_MASS_GRAVITATIONAL_CONSTANT_KPC_KMS2_PER_MSUN
     )
     _mass_p16, expected_mass_median, _mass_p84 = plotting._weighted_quantile(np.log10(mass), weights, [0.16, 0.5, 0.84])
 
     assert row["potfile_id"] == "members"
-    assert row["scaling_relation_mode"] == "lenstool-denominator"
+    assert row["scaling_relation_mode"] == "direct-exponents"
     assert row["vdisp_star_median"] == pytest.approx(expected_sigma_median)
     assert row["vdisp_star_p16"] == pytest.approx(expected_sigma_p16)
     assert row["vdisp_star_p84"] == pytest.approx(expected_sigma_p84)
-    assert row["alpha_sigma_eff_median"] == pytest.approx(0.25)
-    assert row["beta_radius_eff_median"] == pytest.approx(0.5)
-    assert row["vdslope_median"] == pytest.approx(4.0)
-    assert row["slope_median"] == pytest.approx(4.0)
+    assert row["alpha_sigma_median"] == pytest.approx(0.25)
+    assert row["gamma_ml_median"] == pytest.approx(0.0)
+    assert row["beta_radius_median"] == pytest.approx(0.5)
     assert row["log10_m_star_msun_median"] == pytest.approx(expected_mass_median)
     assert row["sigma_log_scatter_median"] == pytest.approx(
         plotting._weighted_quantile(samples[:, 5], weights, [0.5])[0]
     )
-    assert row["free_log_v_disp_tau_median"] == pytest.approx(
+    assert row["free_log_sigma_tau_median"] == pytest.approx(
         plotting._weighted_quantile(samples[:, 6], weights, [0.5])[0]
+    )
+    assert row["free_log_mass_tau_median"] == pytest.approx(
+        plotting._weighted_quantile(samples[:, 7], weights, [0.5])[0]
     )
     assert plotting.SCALING_RESULTS_MASS_NOTE in row["m_star_definition"]
 
@@ -170,10 +177,7 @@ def test_scaling_results_summary_table_bergamini_mode_reports_effective_beta() -
     assert row["scaling_relation_mode"] == "bergamini-ml"
     assert row["alpha_sigma_median"] == pytest.approx(alpha_median)
     assert row["gamma_ml_median"] == pytest.approx(gamma_median)
-    assert row["alpha_sigma_eff_median"] == pytest.approx(row["alpha_sigma_median"])
-    assert row["beta_radius_eff_median"] == pytest.approx(beta_median)
-    assert np.isnan(row["vdslope_median"])
-    assert np.isnan(row["slope_median"])
+    assert row["beta_radius_median"] == pytest.approx(beta_median)
 
 
 def test_scaling_results_summary_rich_table_smoke() -> None:
@@ -193,12 +197,15 @@ def test_scaling_results_summary_rich_table_smoke() -> None:
             "log10_m_star_msun_median": [11.0],
             "log10_m_star_msun_p16": [10.8],
             "log10_m_star_msun_p84": [11.2],
-            "alpha_sigma_eff_median": [0.25],
-            "alpha_sigma_eff_p16": [0.2],
-            "alpha_sigma_eff_p84": [0.3],
-            "beta_radius_eff_median": [0.5],
-            "beta_radius_eff_p16": [0.4],
-            "beta_radius_eff_p84": [0.6],
+            "alpha_sigma_median": [0.25],
+            "alpha_sigma_p16": [0.2],
+            "alpha_sigma_p84": [0.3],
+            "beta_radius_median": [0.5],
+            "beta_radius_p16": [0.4],
+            "beta_radius_p84": [0.6],
+            "gamma_ml_median": [0.0],
+            "gamma_ml_p16": [-0.1],
+            "gamma_ml_p84": [0.1],
         }
     )
 
@@ -273,19 +280,19 @@ def test_scaling_relation_summary_table_preserves_classes_and_free_branch() -> N
         sigma_ref_base=np.full(3, 300.0, dtype=float),
         cut_ref_base=np.full(3, 50.0, dtype=float),
         core_ref_base=np.full(3, 2.0, dtype=float),
-        vdslope_base=np.full(3, 4.0, dtype=float),
-        slope_base=np.full(3, 4.0, dtype=float),
+        alpha_sigma_base=np.full(3, 0.25, dtype=float),
+        gamma_ml_base=np.full(3, 0.0, dtype=float),
         sigma_ref_param_index=np.zeros(3, dtype=np.int32),
         cut_ref_param_index=np.full(3, 1, dtype=np.int32),
         core_ref_param_index=np.full(3, 2, dtype=np.int32),
-        vdslope_param_index=np.full(3, 3, dtype=np.int32),
-        slope_param_index=np.full(3, 4, dtype=np.int32),
+        alpha_sigma_param_index=np.full(3, 3, dtype=np.int32),
+        gamma_ml_param_index=np.full(3, 4, dtype=np.int32),
     )
     samples = np.asarray(
         [
-            [280.0, 45.0, 1.8, 4.0, 4.0],
-            [300.0, 50.0, 2.0, 4.0, 4.0],
-            [320.0, 55.0, 2.2, 4.0, 4.0],
+            [280.0, 45.0, 1.8, 0.25, 0.0],
+            [300.0, 50.0, 2.0, 0.25, 0.0],
+            [320.0, 55.0, 2.2, 0.25, 0.0],
         ],
         dtype=float,
     )
@@ -294,7 +301,7 @@ def test_scaling_relation_summary_table_preserves_classes_and_free_branch() -> N
         scaling_rank_df,
         [SimpleNamespace()],
         samples,
-        np.asarray([300.0, 50.0, 2.0, 4.0, 4.0], dtype=float),
+        np.asarray([300.0, 50.0, 2.0, 0.25, 0.0], dtype=float),
         packed,
         independent_scaling_df=independent_df,
     )

@@ -113,7 +113,7 @@ CRITICAL_ARC_LOG_S_MIN_FLOOR = 1.0e-12
 SUBHALO_TOTAL_MASS_RADIUS_FACTOR = 1.0e6
 DPiE_MASS_GRAVITATIONAL_CONSTANT_KPC_KMS2_PER_MSUN = 4.30091e-6
 SCALING_RESULTS_MASS_NOTE = (
-    "M* = pi * vdisp*^2 * max(rcut* - rcore*, 0) / G, "
+    "M* = pi * vdisp*^2 * rcut* / G, "
     "with G = 4.30091e-6 kpc (km/s)^2 Msun^-1"
 )
 NUMPYRO_MODEL_PLOT_FILENAME = "numpyro_model.pdf"
@@ -717,15 +717,12 @@ def _scaling_results_summary_table(
         "cut_log_scatter_median",
         "cut_log_scatter_p16",
         "cut_log_scatter_p84",
-        "free_log_v_disp_tau_median",
-        "free_log_v_disp_tau_p16",
-        "free_log_v_disp_tau_p84",
-        "free_log_core_radius_tau_median",
-        "free_log_core_radius_tau_p16",
-        "free_log_core_radius_tau_p84",
-        "free_log_cut_radius_tau_median",
-        "free_log_cut_radius_tau_p16",
-        "free_log_cut_radius_tau_p84",
+        "free_log_sigma_tau_median",
+        "free_log_sigma_tau_p16",
+        "free_log_sigma_tau_p84",
+        "free_log_mass_tau_median",
+        "free_log_mass_tau_p16",
+        "free_log_mass_tau_p84",
         "m_star_definition",
     ]
     sample_array = np.asarray(samples, dtype=float)
@@ -789,11 +786,11 @@ def _scaling_results_summary_table(
         _add_summary(row, "vdisp_star", sigma, _map(field_index.get("sigma")))
         _add_summary(row, "rcut_star_kpc", cut, _map(field_index.get("cutkpc")))
         _add_summary(row, "rcore_star_kpc", core, _map(field_index.get("corekpc")))
-        if sigma is not None and cut is not None and core is not None:
+        if sigma is not None and cut is not None:
             mass = (
                 math.pi
                 * np.square(sigma)
-                * np.maximum(cut - core, 0.0)
+                * np.maximum(cut, 0.0)
                 / DPiE_MASS_GRAVITATIONAL_CONSTANT_KPC_KMS2_PER_MSUN
             )
             with np.errstate(divide="ignore", invalid="ignore"):
@@ -804,7 +801,7 @@ def _scaling_results_summary_table(
             mass_map = (
                 math.pi
                 * sigma_map * sigma_map
-                * max(cut_map - core_map, 0.0)
+                * max(cut_map, 0.0)
                 / DPiE_MASS_GRAVITATIONAL_CONSTANT_KPC_KMS2_PER_MSUN
             )
             log_mass_map = math.log10(mass_map) if mass_map > 0.0 and np.isfinite(mass_map) else float("nan")
@@ -813,12 +810,12 @@ def _scaling_results_summary_table(
             _add_summary(row, "log10_m_star_msun", None, float("nan"))
 
         alpha_sigma = _values(field_index.get("alpha_sigma"))
-        beta_radius = _values(field_index.get("beta_radius"))
-        if alpha_sigma is not None and beta_radius is not None:
+        gamma_ml = _values(field_index.get("gamma_ml"))
+        if alpha_sigma is not None and gamma_ml is not None:
             alpha_map = _map(field_index.get("alpha_sigma"))
-            beta_map = _map(field_index.get("beta_radius"))
-            gamma_ml = 2.0 * alpha_sigma + beta_radius - 1.0
-            gamma_map = 2.0 * alpha_map + beta_map - 1.0
+            gamma_map = _map(field_index.get("gamma_ml"))
+            beta_radius = 1.0 + gamma_ml - 2.0 * alpha_sigma
+            beta_map = 1.0 + gamma_map - 2.0 * alpha_map
             _add_summary(row, "alpha_sigma", alpha_sigma, alpha_map)
             _add_summary(row, "beta_radius", beta_radius, beta_map)
             _add_summary(row, "gamma_ml", gamma_ml, gamma_map)
@@ -830,9 +827,8 @@ def _scaling_results_summary_table(
             ("sigma_log_scatter", "sigma_log_scatter"),
             ("core_log_scatter", "core_log_scatter"),
             ("cut_log_scatter", "cut_log_scatter"),
-            ("free_log_v_disp_tau", "independent_free_log_v_disp_tau"),
-            ("free_log_core_radius_tau", "independent_free_log_core_radius_tau"),
-            ("free_log_cut_radius_tau", "independent_free_log_cut_radius_tau"),
+            ("free_log_sigma_tau", "independent_free_log_sigma_tau"),
+            ("free_log_mass_tau", "independent_free_log_mass_tau"),
         ):
             _add_summary(row, prefix, _values(field_index.get(field)))
         rows.append(row)
@@ -868,9 +864,8 @@ def _build_scaling_results_rich_table(summary_df: pd.DataFrame) -> Any:
         ("sigma scatter", "sigma_log_scatter"),
         ("core scatter", "core_log_scatter"),
         ("cut scatter", "cut_log_scatter"),
-        ("tau_v", "free_log_v_disp_tau"),
-        ("tau_core", "free_log_core_radius_tau"),
-        ("tau_cut", "free_log_cut_radius_tau"),
+        ("tau_sigma", "free_log_sigma_tau"),
+        ("tau_mass", "free_log_mass_tau"),
     ]
     for header, _prefix in columns:
         table.add_column(header)
@@ -892,9 +887,8 @@ def _build_scaling_results_rich_table(summary_df: pd.DataFrame) -> Any:
             _interval_text(row_series, "sigma_log_scatter"),
             _interval_text(row_series, "core_log_scatter"),
             _interval_text(row_series, "cut_log_scatter"),
-            _interval_text(row_series, "free_log_v_disp_tau"),
-            _interval_text(row_series, "free_log_core_radius_tau"),
-            _interval_text(row_series, "free_log_cut_radius_tau"),
+            _interval_text(row_series, "free_log_sigma_tau"),
+            _interval_text(row_series, "free_log_mass_tau"),
         )
     return table
 
@@ -2065,42 +2059,42 @@ def _independent_scaling_diagnostics_table(
         "free_cut_radius_kpc_p16",
         "free_cut_radius_kpc_p84",
         "free_cut_radius_kpc_map",
-        "free_log_v_disp_delta_median",
-        "free_log_v_disp_delta_p16",
-        "free_log_v_disp_delta_p84",
-        "free_log_v_disp_delta_map",
-        "free_log_core_radius_delta_median",
-        "free_log_core_radius_delta_p16",
-        "free_log_core_radius_delta_p84",
-        "free_log_core_radius_delta_map",
-        "free_log_cut_radius_delta_median",
-        "free_log_cut_radius_delta_p16",
-        "free_log_cut_radius_delta_p84",
-        "free_log_cut_radius_delta_map",
-        "free_log_v_disp_tau_median",
-        "free_log_v_disp_tau_p16",
-        "free_log_v_disp_tau_p84",
-        "free_log_v_disp_tau_map",
-        "free_log_core_radius_tau_median",
-        "free_log_core_radius_tau_p16",
-        "free_log_core_radius_tau_p84",
-        "free_log_core_radius_tau_map",
-        "free_log_cut_radius_tau_median",
-        "free_log_cut_radius_tau_p16",
-        "free_log_cut_radius_tau_p84",
-        "free_log_cut_radius_tau_map",
-        "v_disp_ratio_median",
-        "v_disp_ratio_p16",
-        "v_disp_ratio_p84",
-        "v_disp_ratio_map",
-        "core_radius_ratio_median",
-        "core_radius_ratio_p16",
-        "core_radius_ratio_p84",
-        "core_radius_ratio_map",
-        "cut_radius_ratio_median",
-        "cut_radius_ratio_p16",
-        "cut_radius_ratio_p84",
-        "cut_radius_ratio_map",
+        "delta_log_sigma_median",
+        "delta_log_sigma_p16",
+        "delta_log_sigma_p84",
+        "delta_log_sigma_map",
+        "delta_log_mass_median",
+        "delta_log_mass_p16",
+        "delta_log_mass_p84",
+        "delta_log_mass_map",
+        "tau_sigma_median",
+        "tau_sigma_p16",
+        "tau_sigma_p84",
+        "tau_sigma_map",
+        "tau_mass_median",
+        "tau_mass_p16",
+        "tau_mass_p84",
+        "tau_mass_map",
+        "sigma_ratio_median",
+        "sigma_ratio_p16",
+        "sigma_ratio_p84",
+        "sigma_ratio_map",
+        "mass_ratio_median",
+        "mass_ratio_p16",
+        "mass_ratio_p84",
+        "mass_ratio_map",
+        "radius_ratio_median",
+        "radius_ratio_p16",
+        "radius_ratio_p84",
+        "radius_ratio_map",
+        "core_ratio_median",
+        "core_ratio_p16",
+        "core_ratio_p84",
+        "core_ratio_map",
+        "cut_ratio_median",
+        "cut_ratio_p16",
+        "cut_ratio_p84",
+        "cut_ratio_map",
     ]
     sample_array = np.asarray(samples, dtype=float)
     best_fit_array = np.asarray(best_fit, dtype=float).reshape(-1)
@@ -2142,8 +2136,8 @@ def _independent_scaling_diagnostics_table(
     alpha_sigma_base = _component_array_from_packed(
         packed_lens_spec, "alpha_sigma_base", n_components, dtype=float, fill_value=0.25
     )
-    beta_radius_base = _component_array_from_packed(
-        packed_lens_spec, "beta_radius_base", n_components, dtype=float, fill_value=0.5
+    gamma_ml_base = _component_array_from_packed(
+        packed_lens_spec, "gamma_ml_base", n_components, dtype=float, fill_value=0.2
     )
     sigma_ref_indices = _component_array_from_packed(
         packed_lens_spec, "sigma_ref_param_index", n_components, dtype=np.int32, fill_value=-1
@@ -2157,8 +2151,8 @@ def _independent_scaling_diagnostics_table(
     alpha_sigma_indices = _component_array_from_packed(
         packed_lens_spec, "alpha_sigma_param_index", n_components, dtype=np.int32, fill_value=-1
     )
-    beta_radius_indices = _component_array_from_packed(
-        packed_lens_spec, "beta_radius_param_index", n_components, dtype=np.int32, fill_value=-1
+    gamma_ml_indices = _component_array_from_packed(
+        packed_lens_spec, "gamma_ml_param_index", n_components, dtype=np.int32, fill_value=-1
     )
     v_disp_base = _component_array_from_packed(packed_lens_spec, "v_disp_base", n_components, dtype=float, fill_value=0.0)
     core_base = _component_array_from_packed(packed_lens_spec, "core_radius_kpc_base", n_components, dtype=float, fill_value=0.0)
@@ -2172,23 +2166,17 @@ def _independent_scaling_diagnostics_table(
     cut_radius_indices = _component_array_from_packed(
         packed_lens_spec, "cut_radius_param_index", n_components, dtype=np.int32, fill_value=-1
     )
-    free_v_delta_indices = _component_array_from_packed(
-        packed_lens_spec, "independent_free_log_v_disp_delta_unit_param_index", n_components, dtype=np.int32, fill_value=-1
+    free_sigma_delta_indices = _component_array_from_packed(
+        packed_lens_spec, "independent_free_log_sigma_delta_unit_param_index", n_components, dtype=np.int32, fill_value=-1
     )
-    free_core_delta_indices = _component_array_from_packed(
-        packed_lens_spec, "independent_free_log_core_radius_delta_unit_param_index", n_components, dtype=np.int32, fill_value=-1
+    free_mass_delta_indices = _component_array_from_packed(
+        packed_lens_spec, "independent_free_log_mass_delta_unit_param_index", n_components, dtype=np.int32, fill_value=-1
     )
-    free_cut_delta_indices = _component_array_from_packed(
-        packed_lens_spec, "independent_free_log_cut_radius_delta_unit_param_index", n_components, dtype=np.int32, fill_value=-1
+    free_sigma_tau_indices = _component_array_from_packed(
+        packed_lens_spec, "independent_free_log_sigma_tau_param_index", n_components, dtype=np.int32, fill_value=-1
     )
-    free_v_tau_indices = _component_array_from_packed(
-        packed_lens_spec, "independent_free_log_v_disp_tau_param_index", n_components, dtype=np.int32, fill_value=-1
-    )
-    free_core_tau_indices = _component_array_from_packed(
-        packed_lens_spec, "independent_free_log_core_radius_tau_param_index", n_components, dtype=np.int32, fill_value=-1
-    )
-    free_cut_tau_indices = _component_array_from_packed(
-        packed_lens_spec, "independent_free_log_cut_radius_tau_param_index", n_components, dtype=np.int32, fill_value=-1
+    free_mass_tau_indices = _component_array_from_packed(
+        packed_lens_spec, "independent_free_log_mass_tau_param_index", n_components, dtype=np.int32, fill_value=-1
     )
     weights = _normalized_weights(sample_weights, sample_array.shape[0])
 
@@ -2213,9 +2201,11 @@ def _independent_scaling_diagnostics_table(
 
     def _effective_exponents(component_index: int) -> tuple[np.ndarray, np.ndarray, float, float]:
         alpha_values = _values(alpha_sigma_base, alpha_sigma_indices, component_index)
-        beta_values = _values(beta_radius_base, beta_radius_indices, component_index)
+        gamma_values = _values(gamma_ml_base, gamma_ml_indices, component_index)
         alpha_map = _map_value(alpha_sigma_base, alpha_sigma_indices, component_index)
-        beta_map = _map_value(beta_radius_base, beta_radius_indices, component_index)
+        gamma_map = _map_value(gamma_ml_base, gamma_ml_indices, component_index)
+        beta_values = 1.0 + gamma_values - 2.0 * alpha_values
+        beta_map = 1.0 + gamma_map - 2.0 * alpha_map
         return alpha_values, beta_values, alpha_map, beta_map
 
     rows: list[dict[str, Any]] = []
@@ -2246,32 +2236,28 @@ def _independent_scaling_diagnostics_table(
         scaling_core_map = core_ref_map * size_luminosity_scale_map
         scaling_cut_map = cut_ref_map * size_luminosity_scale_map
 
-        log_displacement_free = int(free_v_delta_indices[free_component_index]) >= 0
+        log_displacement_free = int(free_sigma_delta_indices[free_component_index]) >= 0
         if log_displacement_free:
-            free_v_delta_unit = _values(np.zeros(n_components, dtype=float), free_v_delta_indices, free_component_index)
-            free_core_delta_unit = _values(np.zeros(n_components, dtype=float), free_core_delta_indices, free_component_index)
-            free_cut_delta_unit = _values(np.zeros(n_components, dtype=float), free_cut_delta_indices, free_component_index)
-            free_v_tau = _values(np.zeros(n_components, dtype=float), free_v_tau_indices, free_component_index)
-            free_core_tau = _values(np.zeros(n_components, dtype=float), free_core_tau_indices, free_component_index)
-            free_cut_tau = _values(np.zeros(n_components, dtype=float), free_cut_tau_indices, free_component_index)
-            free_v_delta = free_v_tau * free_v_delta_unit
-            free_core_delta = free_core_tau * free_core_delta_unit
-            free_cut_delta = free_cut_tau * free_cut_delta_unit
-            free_v_disp = scaling_v_disp * np.exp(free_v_delta)
-            free_core = scaling_core * np.exp(free_core_delta)
-            free_cut = scaling_cut * np.exp(free_cut_delta)
-            free_v_delta_unit_map = _map_value(np.zeros(n_components, dtype=float), free_v_delta_indices, free_component_index)
-            free_core_delta_unit_map = _map_value(np.zeros(n_components, dtype=float), free_core_delta_indices, free_component_index)
-            free_cut_delta_unit_map = _map_value(np.zeros(n_components, dtype=float), free_cut_delta_indices, free_component_index)
-            free_v_tau_map = _map_value(np.zeros(n_components, dtype=float), free_v_tau_indices, free_component_index)
-            free_core_tau_map = _map_value(np.zeros(n_components, dtype=float), free_core_tau_indices, free_component_index)
-            free_cut_tau_map = _map_value(np.zeros(n_components, dtype=float), free_cut_tau_indices, free_component_index)
-            free_v_delta_map = free_v_tau_map * free_v_delta_unit_map
-            free_core_delta_map = free_core_tau_map * free_core_delta_unit_map
-            free_cut_delta_map = free_cut_tau_map * free_cut_delta_unit_map
-            free_v_disp_map = scaling_v_disp_map * float(np.exp(free_v_delta_map))
-            free_core_map = scaling_core_map * float(np.exp(free_core_delta_map))
-            free_cut_map = scaling_cut_map * float(np.exp(free_cut_delta_map))
+            free_sigma_delta_unit = _values(np.zeros(n_components, dtype=float), free_sigma_delta_indices, free_component_index)
+            free_mass_delta_unit = _values(np.zeros(n_components, dtype=float), free_mass_delta_indices, free_component_index)
+            free_sigma_tau = _values(np.zeros(n_components, dtype=float), free_sigma_tau_indices, free_component_index)
+            free_mass_tau = _values(np.zeros(n_components, dtype=float), free_mass_tau_indices, free_component_index)
+            delta_log_sigma = free_sigma_tau * free_sigma_delta_unit
+            delta_log_mass = free_mass_tau * free_mass_delta_unit
+            delta_log_radius = delta_log_mass - 2.0 * delta_log_sigma
+            free_v_disp = scaling_v_disp * np.exp(delta_log_sigma)
+            free_core = scaling_core * np.exp(delta_log_radius)
+            free_cut = scaling_cut * np.exp(delta_log_radius)
+            free_sigma_delta_unit_map = _map_value(np.zeros(n_components, dtype=float), free_sigma_delta_indices, free_component_index)
+            free_mass_delta_unit_map = _map_value(np.zeros(n_components, dtype=float), free_mass_delta_indices, free_component_index)
+            free_sigma_tau_map = _map_value(np.zeros(n_components, dtype=float), free_sigma_tau_indices, free_component_index)
+            free_mass_tau_map = _map_value(np.zeros(n_components, dtype=float), free_mass_tau_indices, free_component_index)
+            delta_log_sigma_map = free_sigma_tau_map * free_sigma_delta_unit_map
+            delta_log_mass_map = free_mass_tau_map * free_mass_delta_unit_map
+            delta_log_radius_map = delta_log_mass_map - 2.0 * delta_log_sigma_map
+            free_v_disp_map = scaling_v_disp_map * float(np.exp(delta_log_sigma_map))
+            free_core_map = scaling_core_map * float(np.exp(delta_log_radius_map))
+            free_cut_map = scaling_cut_map * float(np.exp(delta_log_radius_map))
         else:
             free_v_disp = _values(v_disp_base, v_disp_indices, free_component_index)
             free_core = _values(core_base, core_indices, free_component_index)
@@ -2279,14 +2265,13 @@ def _independent_scaling_diagnostics_table(
             free_v_disp_map = _map_value(v_disp_base, v_disp_indices, free_component_index)
             free_core_map = _map_value(core_base, core_indices, free_component_index)
             free_cut_map = _map_value(cut_base, cut_radius_indices, free_component_index)
-            free_v_delta = np.full(sample_array.shape[0], np.nan, dtype=float)
-            free_core_delta = np.full(sample_array.shape[0], np.nan, dtype=float)
-            free_cut_delta = np.full(sample_array.shape[0], np.nan, dtype=float)
-            free_v_tau = np.full(sample_array.shape[0], np.nan, dtype=float)
-            free_core_tau = np.full(sample_array.shape[0], np.nan, dtype=float)
-            free_cut_tau = np.full(sample_array.shape[0], np.nan, dtype=float)
-            free_v_delta_map = free_core_delta_map = free_cut_delta_map = float("nan")
-            free_v_tau_map = free_core_tau_map = free_cut_tau_map = float("nan")
+            delta_log_sigma = np.full(sample_array.shape[0], np.nan, dtype=float)
+            delta_log_mass = np.full(sample_array.shape[0], np.nan, dtype=float)
+            delta_log_radius = np.full(sample_array.shape[0], np.nan, dtype=float)
+            free_sigma_tau = np.full(sample_array.shape[0], np.nan, dtype=float)
+            free_mass_tau = np.full(sample_array.shape[0], np.nan, dtype=float)
+            delta_log_sigma_map = delta_log_mass_map = delta_log_radius_map = float("nan")
+            free_sigma_tau_map = free_mass_tau_map = float("nan")
 
         row_dict: dict[str, Any] = {
             "potfile_id": str(getattr(row, "potfile_id")),
@@ -2306,15 +2291,15 @@ def _independent_scaling_diagnostics_table(
         _add_summary(row_dict, "free_v_disp", free_v_disp, free_v_disp_map)
         _add_summary(row_dict, "free_core_radius_kpc", free_core, free_core_map)
         _add_summary(row_dict, "free_cut_radius_kpc", free_cut, free_cut_map)
-        _add_summary(row_dict, "free_log_v_disp_delta", free_v_delta, free_v_delta_map)
-        _add_summary(row_dict, "free_log_core_radius_delta", free_core_delta, free_core_delta_map)
-        _add_summary(row_dict, "free_log_cut_radius_delta", free_cut_delta, free_cut_delta_map)
-        _add_summary(row_dict, "free_log_v_disp_tau", free_v_tau, free_v_tau_map)
-        _add_summary(row_dict, "free_log_core_radius_tau", free_core_tau, free_core_tau_map)
-        _add_summary(row_dict, "free_log_cut_radius_tau", free_cut_tau, free_cut_tau_map)
-        _add_summary(row_dict, "v_disp_ratio", free_v_disp / scaling_v_disp, free_v_disp_map / scaling_v_disp_map)
-        _add_summary(row_dict, "core_radius_ratio", free_core / scaling_core, free_core_map / scaling_core_map)
-        _add_summary(row_dict, "cut_radius_ratio", free_cut / scaling_cut, free_cut_map / scaling_cut_map)
+        _add_summary(row_dict, "delta_log_sigma", delta_log_sigma, delta_log_sigma_map)
+        _add_summary(row_dict, "delta_log_mass", delta_log_mass, delta_log_mass_map)
+        _add_summary(row_dict, "tau_sigma", free_sigma_tau, free_sigma_tau_map)
+        _add_summary(row_dict, "tau_mass", free_mass_tau, free_mass_tau_map)
+        _add_summary(row_dict, "sigma_ratio", free_v_disp / scaling_v_disp, free_v_disp_map / scaling_v_disp_map)
+        _add_summary(row_dict, "mass_ratio", np.exp(delta_log_mass), float(np.exp(delta_log_mass_map)))
+        _add_summary(row_dict, "radius_ratio", np.exp(delta_log_radius), float(np.exp(delta_log_radius_map)))
+        _add_summary(row_dict, "core_ratio", free_core / scaling_core, free_core_map / scaling_core_map)
+        _add_summary(row_dict, "cut_ratio", free_cut / scaling_cut, free_cut_map / scaling_cut_map)
         rows.append(row_dict)
     if not rows:
         return pd.DataFrame(columns=columns)
@@ -2349,15 +2334,21 @@ def _independent_scaling_plot_table(
         "free_v_disp_median",
         "free_core_radius_kpc_median",
         "free_cut_radius_kpc_median",
-        "v_disp_ratio_median",
-        "v_disp_ratio_p16",
-        "v_disp_ratio_p84",
-        "core_radius_ratio_median",
-        "core_radius_ratio_p16",
-        "core_radius_ratio_p84",
-        "cut_radius_ratio_median",
-        "cut_radius_ratio_p16",
-        "cut_radius_ratio_p84",
+        "sigma_ratio_median",
+        "sigma_ratio_p16",
+        "sigma_ratio_p84",
+        "mass_ratio_median",
+        "mass_ratio_p16",
+        "mass_ratio_p84",
+        "radius_ratio_median",
+        "radius_ratio_p16",
+        "radius_ratio_p84",
+        "core_ratio_median",
+        "core_ratio_p16",
+        "core_ratio_p84",
+        "cut_ratio_median",
+        "cut_ratio_p16",
+        "cut_ratio_p84",
     ]
     if scaling_rank_df.empty:
         return pd.DataFrame(columns=base_columns + posterior_columns)
@@ -2481,8 +2472,8 @@ def _scaling_relation_summary_table(
     alpha_sigma_base = _component_array_from_packed(
         packed_lens_spec, "alpha_sigma_base", n_components, dtype=float, fill_value=0.25
     )
-    beta_radius_base = _component_array_from_packed(
-        packed_lens_spec, "beta_radius_base", n_components, dtype=float, fill_value=0.5
+    gamma_ml_base = _component_array_from_packed(
+        packed_lens_spec, "gamma_ml_base", n_components, dtype=float, fill_value=0.2
     )
     sigma_ref_indices = _component_array_from_packed(
         packed_lens_spec, "sigma_ref_param_index", n_components, dtype=np.int32, fill_value=-1
@@ -2496,8 +2487,8 @@ def _scaling_relation_summary_table(
     alpha_sigma_indices = _component_array_from_packed(
         packed_lens_spec, "alpha_sigma_param_index", n_components, dtype=np.int32, fill_value=-1
     )
-    beta_radius_indices = _component_array_from_packed(
-        packed_lens_spec, "beta_radius_param_index", n_components, dtype=np.int32, fill_value=-1
+    gamma_ml_indices = _component_array_from_packed(
+        packed_lens_spec, "gamma_ml_param_index", n_components, dtype=np.int32, fill_value=-1
     )
     weights = _normalized_weights(sample_weights, sample_array.shape[0])
 
@@ -2522,9 +2513,11 @@ def _scaling_relation_summary_table(
 
     def _effective_exponents(component_index: int) -> tuple[np.ndarray, np.ndarray, float, float]:
         alpha_values = _values(alpha_sigma_base, alpha_sigma_indices, component_index)
-        beta_values = _values(beta_radius_base, beta_radius_indices, component_index)
+        gamma_values = _values(gamma_ml_base, gamma_ml_indices, component_index)
         alpha_map = _map_value(alpha_sigma_base, alpha_sigma_indices, component_index)
-        beta_map = _map_value(beta_radius_base, beta_radius_indices, component_index)
+        gamma_map = _map_value(gamma_ml_base, gamma_ml_indices, component_index)
+        beta_values = 1.0 + gamma_values - 2.0 * alpha_values
+        beta_map = 1.0 + gamma_map - 2.0 * alpha_map
         return alpha_values, beta_values, alpha_map, beta_map
 
     rows: list[dict[str, Any]] = []
@@ -3820,26 +3813,19 @@ def _run_summary(
         "total_scaling_by_potfile": evaluator.total_scaling_by_potfile,
         "independent_scaling_settings": {
             "candidate_source": "active_scaling_galaxies",
-            "free_branch": "log_displacement",
-            "free_log_vdisp_tau_prior_median": float(
+            "free_branch": "bergamini_sigma_mass_log_displacement",
+            "free_log_sigma_tau_prior_median": float(
                 getattr(
                     state,
-                    "independent_scaling_free_log_vdisp_tau_prior_median",
-                    getattr(args, "independent_scaling_free_log_vdisp_tau_prior_median", 0.20),
+                    "independent_scaling_free_log_sigma_tau_prior_median",
+                    getattr(args, "independent_scaling_free_log_sigma_tau_prior_median", 0.10),
                 )
             ),
-            "free_log_core_tau_prior_median": float(
+            "free_log_mass_tau_prior_median": float(
                 getattr(
                     state,
-                    "independent_scaling_free_log_core_tau_prior_median",
-                    getattr(args, "independent_scaling_free_log_core_tau_prior_median", 0.30),
-                )
-            ),
-            "free_log_cut_tau_prior_median": float(
-                getattr(
-                    state,
-                    "independent_scaling_free_log_cut_tau_prior_median",
-                    getattr(args, "independent_scaling_free_log_cut_tau_prior_median", 0.30),
+                    "independent_scaling_free_log_mass_tau_prior_median",
+                    getattr(args, "independent_scaling_free_log_mass_tau_prior_median", 0.20),
                 )
             ),
             "free_log_tau_prior_sigma": float(
@@ -5465,9 +5451,9 @@ def _observed_image_points_from_fit_quality(image_fit_quality_df: pd.DataFrame |
 def _draw_independent_scaling_ratios(ax: Any, pot_df: pd.DataFrame, *, potfile_id: str) -> None:
     any_plotted = False
     for label, color, prefix, x_offset in (
-        ("v_disp free/scaling", "tab:purple", "v_disp_ratio", -0.16),
-        ("core free/scaling", "tab:blue", "core_radius_ratio", 0.0),
-        ("cut free/scaling", "tab:green", "cut_radius_ratio", 0.16),
+        ("sigma free/scaling", "tab:purple", "sigma_ratio", -0.18),
+        ("mass free/scaling", "tab:red", "mass_ratio", 0.0),
+        ("radius free/scaling", "tab:blue", "radius_ratio", 0.18),
     ):
         median_col = f"{prefix}_median"
         p16_col = f"{prefix}_p16"

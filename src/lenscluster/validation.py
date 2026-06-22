@@ -4351,11 +4351,12 @@ def _recovered_subhalo_mass_table(state: Any, best_fit: np.ndarray, truth: dict[
         getattr(packed, "alpha_sigma_param_index", np.full(component_family.size, -1, dtype=int)),
         best_fit_values,
     )
-    beta_radius = _updated_component_values(
-        getattr(packed, "beta_radius_base", np.full(component_family.size, 0.5, dtype=float)),
-        getattr(packed, "beta_radius_param_index", np.full(component_family.size, -1, dtype=int)),
+    gamma_ml = _updated_component_values(
+        getattr(packed, "gamma_ml_base", np.full(component_family.size, 0.2, dtype=float)),
+        getattr(packed, "gamma_ml_param_index", np.full(component_family.size, -1, dtype=int)),
         best_fit_values,
     )
+    beta_radius = 1.0 + gamma_ml - 2.0 * alpha_sigma
     mass_ref = _truth_subhalo_mass_ref(truth)
     rows: list[dict[str, Any]] = []
     for component_index in scaling_indices:
@@ -5169,12 +5170,11 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
     ):
         raise SystemExit("--fix-image-sigma-int-arcsec must be finite and nonnegative.")
     for attr, option in (
-        ("independent_scaling_free_log_vdisp_tau_prior_median", "--independent-scaling-free-log-vdisp-tau-prior-median"),
-        ("independent_scaling_free_log_core_tau_prior_median", "--independent-scaling-free-log-core-tau-prior-median"),
-        ("independent_scaling_free_log_cut_tau_prior_median", "--independent-scaling-free-log-cut-tau-prior-median"),
+        ("independent_scaling_free_log_sigma_tau_prior_median", "--independent-scaling-free-log-sigma-tau-prior-median"),
+        ("independent_scaling_free_log_mass_tau_prior_median", "--independent-scaling-free-log-mass-tau-prior-median"),
         ("independent_scaling_free_log_tau_prior_sigma", "--independent-scaling-free-log-tau-prior-sigma"),
     ):
-        value = float(getattr(args, attr, 0.4 if attr.endswith("sigma") else 0.3))
+        value = float(getattr(args, attr, 0.25 if attr.endswith("sigma") else 0.2))
         if not np.isfinite(value) or value <= 0.0:
             raise SystemExit(f"{option} must be finite and positive.")
     image_presence_penalty_weight = getattr(args, "image_presence_penalty_weight", None)
@@ -6246,22 +6246,20 @@ def _validate_validation_args(args: argparse.Namespace) -> None:
     ):
         raise SystemExit("--fix-image-sigma-int-arcsec must be finite and nonnegative.")
     for attr, option in (
-        ("independent_scaling_free_log_vdisp_tau_prior_median", "--independent-scaling-free-log-vdisp-tau-prior-median"),
-        ("independent_scaling_free_log_core_tau_prior_median", "--independent-scaling-free-log-core-tau-prior-median"),
-        ("independent_scaling_free_log_cut_tau_prior_median", "--independent-scaling-free-log-cut-tau-prior-median"),
+        ("independent_scaling_free_log_sigma_tau_prior_median", "--independent-scaling-free-log-sigma-tau-prior-median"),
+        ("independent_scaling_free_log_mass_tau_prior_median", "--independent-scaling-free-log-mass-tau-prior-median"),
         ("independent_scaling_free_log_tau_prior_sigma", "--independent-scaling-free-log-tau-prior-sigma"),
     ):
-        value = float(getattr(args, attr, 0.4 if attr.endswith("sigma") else 0.3))
+        value = float(getattr(args, attr, 0.25 if attr.endswith("sigma") else 0.2))
         if not np.isfinite(value) or value <= 0.0:
             raise SystemExit(f"{option} must be finite and positive.")
 
 
 def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: argparse.Namespace) -> Path:
     from .cluster_solver import (
-        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
-        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
+        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
-        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
     )
 
     controls = _normalize_validation_stage_fit_controls(args)
@@ -6314,14 +6312,20 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(getattr(args, "likelihood_stabilizer_student_t_nu", DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU)),
         "--sampling-engine",
         str(args.sampling_engine),
+        "--stage0-sampling-engine",
+        str(getattr(args, "stage0_sampling_engine", "exact_discovery_flat")),
+        "--stage1-sampling-engine",
+        str(getattr(args, "stage1_sampling_engine", "refreshing_surrogate_flat")),
+        "--stage2-sampling-engine",
+        str(getattr(args, "stage2_sampling_engine", "refreshing_surrogate_flat")),
         "--perturbation-discovery-alpha-tol-arcsec",
         str(getattr(args, "perturbation_discovery_alpha_tol_arcsec", 0.01)),
         "--perturbation-discovery-jacobian-tol",
         str(getattr(args, "perturbation_discovery_jacobian_tol", 0.01)),
         "--perturbation-discovery-jacobian-weight",
         str(getattr(args, "perturbation_discovery_jacobian_weight", 1.0)),
-        "--perturbation-discovery-final-engine",
-        str(getattr(args, "perturbation_discovery_final_engine", "refreshing_surrogate_flat")),
+        "--perturbation-discovery-final-polish-engine",
+        str(getattr(args, "perturbation_discovery_final_polish_engine", "full_flat")),
         "--perturbation-discovery-final-svi-polish-steps",
         str(getattr(args, "perturbation_discovery_final_svi_polish_steps", 2000)),
         "--source-plane-covariance-floor",
@@ -6336,28 +6340,20 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(getattr(args, "exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)),
         "--exact-image-num-iter-max",
         str(getattr(args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)),
-        "--independent-scaling-free-log-vdisp-tau-prior-median",
+        "--independent-scaling-free-log-sigma-tau-prior-median",
         str(
             getattr(
                 args,
-                "independent_scaling_free_log_vdisp_tau_prior_median",
-                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+                "independent_scaling_free_log_sigma_tau_prior_median",
+                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
             )
         ),
-        "--independent-scaling-free-log-core-tau-prior-median",
+        "--independent-scaling-free-log-mass-tau-prior-median",
         str(
             getattr(
                 args,
-                "independent_scaling_free_log_core_tau_prior_median",
-                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
-            )
-        ),
-        "--independent-scaling-free-log-cut-tau-prior-median",
-        str(
-            getattr(
-                args,
-                "independent_scaling_free_log_cut_tau_prior_median",
-                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+                "independent_scaling_free_log_mass_tau_prior_median",
+                DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
             )
         ),
         "--independent-scaling-free-log-tau-prior-sigma",
@@ -6983,10 +6979,9 @@ def _build_parser() -> argparse.ArgumentParser:
         DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA,
         DEFAULT_ACTIVE_SCALING_LOGIT_PRIOR_SIGMA,
         DEFAULT_ACTIVE_SCALING_MAG_SLOPE_PRIOR_SIGMA,
-        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
-        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
+        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
-        DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
     )
 
     parser = argparse.ArgumentParser(description="Mock-recovery validation suite for lenscluster.")
@@ -7512,17 +7507,31 @@ def _build_parser() -> argparse.ArgumentParser:
             "full_flat",
             "refreshing_surrogate",
             "refreshing_surrogate_flat",
-            "perturbation_discovery_flat",
         ),
         default="refreshing_surrogate",
+    )
+    parser.add_argument(
+        "--stage0-sampling-engine",
+        choices=("exact_discovery_flat",),
+        default="exact_discovery_flat",
+    )
+    parser.add_argument(
+        "--stage1-sampling-engine",
+        choices=("refreshing_surrogate_flat", "full_flat"),
+        default="refreshing_surrogate_flat",
+    )
+    parser.add_argument(
+        "--stage2-sampling-engine",
+        choices=("inherit", "refreshing_surrogate_flat", "full_flat"),
+        default="refreshing_surrogate_flat",
     )
     parser.add_argument("--perturbation-discovery-alpha-tol-arcsec", type=float, default=0.01)
     parser.add_argument("--perturbation-discovery-jacobian-tol", type=float, default=0.01)
     parser.add_argument("--perturbation-discovery-jacobian-weight", type=float, default=1.0)
     parser.add_argument(
-        "--perturbation-discovery-final-engine",
-        choices=("refreshing_surrogate_flat", "full_flat"),
-        default="refreshing_surrogate_flat",
+        "--perturbation-discovery-final-polish-engine",
+        choices=("full_flat", "refreshing_surrogate_flat"),
+        default="full_flat",
     )
     parser.add_argument("--perturbation-discovery-final-svi-polish-steps", type=_parse_nonnegative_int, default=2000)
     parser.add_argument("--source-plane-covariance-floor", type=float, default=1.0e-6)
@@ -7538,19 +7547,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Forward solver sampling of flat wCDM Omega_m,w0 in every executed sequential fitting stage.",
     )
     parser.add_argument(
-        "--independent-scaling-free-log-vdisp-tau-prior-median",
+        "--independent-scaling-free-log-sigma-tau-prior-median",
         type=float,
-        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN,
+        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
     )
     parser.add_argument(
-        "--independent-scaling-free-log-core-tau-prior-median",
+        "--independent-scaling-free-log-mass-tau-prior-median",
         type=float,
-        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN,
-    )
-    parser.add_argument(
-        "--independent-scaling-free-log-cut-tau-prior-median",
-        type=float,
-        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN,
+        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
     )
     parser.add_argument(
         "--independent-scaling-free-log-tau-prior-sigma",

@@ -10,7 +10,7 @@ $JAX_NUM_CPU_DEVICES = cores
 
 PYTHON = "/home/dutra/.conda/envs/lenstronomy/bin/python"
 
-output_dir = f"jun2b_perturbation_discovery_direct_exponents"
+output_dir = f"jun2d_perturbation_discovery_direct_exponents_bergamini"
 
 HFF_RGB_BANDS = ["F435W", "F606W", "F814W", "F105W", "F125W", "F140W", "F160W"]
 HFF_RGB_DISPLAY = {"q": 6.4, "stretch": 0.0145, "minimum": -5.5e-4, "red_gain": 0.47, "green_gain": 0.91, "blue_gain": 3.95}
@@ -126,9 +126,9 @@ stage2_forward_modes = {
 stage2_forward_mode = stage2_forward_modes[mode]
 stage1_likelihood = "local-jacobian"
 
-fit_method = ["svi+nuts"]
-refresh_every = 1000
-svi_steps = [6000]
+fit_method = ["nuts"]
+refresh_every = 2000000
+svi_steps = [10000]
 warmup = [1000]
 samples = [250]
 sampling_refresh_runs = [1]
@@ -141,7 +141,7 @@ z_bin_efficiency_tol = 0.0
 
 
 perturbation_discovery_alpha_tol_arcsec = 0.1
-perturbation_discovery_jacobian_tol = 0.2
+perturbation_discovery_jacobian_tol = 0.5
 perturbation_discovery_jacobian_weight = 1.0
 
 OUTPUT_DIR = f"{OUTPUT_DIR}_PD{perturbation_discovery_alpha_tol_arcsec:g}_{perturbation_discovery_jacobian_tol:g}_T{max_tree_depth[-1]}W{warmup[-1]}S{samples[-1]}"
@@ -180,14 +180,14 @@ image_plane_newton_steps = 0
 linearized_beta_prior_sigma_arcsec = 3.0
 source_position_parameterization = "prior-whitened" #conditional-whitened" #"prior-whitened"
 source_plane_covariance_mode = "magnification"
-sampling_engine = "perturbation_discovery_flat"
-stage2_sampling_engine = "perturbation_discovery_flat"
-perturbation_discovery_final_engine = "refreshing_surrogate_flat"
-perturbation_discovery_final_svi_polish_steps = 2000
-independent_scaling_free_log_vdisp_tau_prior_median = 0.20
-independent_scaling_free_log_core_tau_prior_median = 0.30
-independent_scaling_free_log_cut_tau_prior_median = 0.30
-independent_scaling_free_log_tau_prior_sigma = 0.40
+stage0_sampling_engine = "exact_discovery_flat"
+stage1_sampling_engine = "refreshing_surrogate_flat"
+stage2_sampling_engine = "refreshing_surrogate_flat"
+perturbation_discovery_final_polish_engine = "full_flat"
+perturbation_discovery_final_svi_polish_steps = 10000
+independent_scaling_free_log_sigma_tau_prior_median = 0.10
+independent_scaling_free_log_mass_tau_prior_median = 0.20
+independent_scaling_free_log_tau_prior_sigma = 0.25
 pos_sigma_arcsec = 0.1
 critical_arc_args = [
     "--critical-arc-critical-direction-sigma-arcsec", 10.0,
@@ -229,6 +229,8 @@ workflow_args = [
     "--potfile-member-mag-max", 22.0,
     "--sampling-refresh-runs", *sampling_refresh_runs,
     "--fit-mode", fit_mode,
+    "--stage0-sampling-engine", stage0_sampling_engine,
+    "--stage1-sampling-engine", stage1_sampling_engine,
     "--stage1-likelihood", stage1_likelihood,
     "--stage2-forward-mode", stage2_forward_mode,
     *(["--exact-image-diagnostics-stage2"] if exact_image_diagnostics_stage2 else []),
@@ -253,15 +255,13 @@ workflow_args = [
 ]
 
 discovery_args = [
-    "--sampling-engine", sampling_engine,
     "--perturbation-discovery-alpha-tol-arcsec", perturbation_discovery_alpha_tol_arcsec,
     "--perturbation-discovery-jacobian-tol", perturbation_discovery_jacobian_tol,
     "--perturbation-discovery-jacobian-weight", perturbation_discovery_jacobian_weight,
-    "--perturbation-discovery-final-engine", perturbation_discovery_final_engine,
+    "--perturbation-discovery-final-polish-engine", perturbation_discovery_final_polish_engine,
     "--perturbation-discovery-final-svi-polish-steps", perturbation_discovery_final_svi_polish_steps,
-    "--independent-scaling-free-log-vdisp-tau-prior-median", independent_scaling_free_log_vdisp_tau_prior_median,
-    "--independent-scaling-free-log-core-tau-prior-median", independent_scaling_free_log_core_tau_prior_median,
-    "--independent-scaling-free-log-cut-tau-prior-median", independent_scaling_free_log_cut_tau_prior_median,
+    "--independent-scaling-free-log-sigma-tau-prior-median", independent_scaling_free_log_sigma_tau_prior_median,
+    "--independent-scaling-free-log-mass-tau-prior-median", independent_scaling_free_log_mass_tau_prior_median,
     "--independent-scaling-free-log-tau-prior-sigma", independent_scaling_free_log_tau_prior_sigma,
 ]
 

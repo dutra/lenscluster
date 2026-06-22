@@ -3166,11 +3166,11 @@ def test_recovered_subhalo_mass_table_uses_recovered_scaling_parameters() -> Non
         sigma_ref_base=np.asarray([0.0, 245.0, 245.0], dtype=float),
         cut_ref_base=np.asarray([0.0, 40.0, 40.0], dtype=float),
         alpha_sigma_base=np.asarray([0.0, 0.25, 0.25], dtype=float),
-        beta_radius_base=np.asarray([0.0, 0.50, 0.50], dtype=float),
+        gamma_ml_base=np.asarray([0.0, 0.0, 0.0], dtype=float),
         sigma_ref_param_index=np.asarray([-1, 0, 0], dtype=int),
         cut_ref_param_index=np.asarray([-1, 1, 1], dtype=int),
         alpha_sigma_param_index=np.asarray([-1, 2, 2], dtype=int),
-        beta_radius_param_index=np.asarray([-1, 3, 3], dtype=int),
+        gamma_ml_param_index=np.asarray([-1, 3, 3], dtype=int),
     )
     state = SimpleNamespace(
         packed_lens_spec=packed,
@@ -5207,19 +5207,18 @@ def test_perturbation_discovery_svi_build_creates_no_independent_candidates(
             "joint",
             "--fit-method",
             "svi+nuts",
-            "--sampling-engine",
-            "perturbation_discovery_flat",
             "--perturbation-discovery-alpha-tol-arcsec",
             "0.01",
         ],
     )
     args = _parse_args()
+    args.sampling_engine = cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
 
     state = cluster_solver._build_state_from_inputs(args)
     evaluator = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
     )
 
@@ -5248,11 +5247,10 @@ def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free
             "joint",
             "--fit-method",
             "svi+nuts",
-            "--sampling-engine",
-            "perturbation_discovery_flat",
         ],
     )
     args = _parse_args()
+    args.sampling_engine = cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT
     old_state = cluster_solver._build_state_from_inputs(args)
     final_args = argparse.Namespace(**vars(args))
     final_args.sampling_engine = cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT
@@ -6038,6 +6036,7 @@ def test_independent_scaling_candidates_are_active_and_not_inactive_surrogate() 
                 "component_index": 1,
                 "catalog_id": "galaxy-a",
                 "catalog_mag": 20.0,
+                "catalog_color": 1.0,
                 "x_centre": 1.0,
                 "y_centre": 1.0,
                 "selected_independent": True,
@@ -6125,12 +6124,12 @@ def _single_independent_branch_evaluator() -> cluster_solver.ClusterJAXEvaluator
         cut_ref_base=np.asarray([20.0, 0.0], dtype=float),
         core_ref_base=np.asarray([1.0, 0.0], dtype=float),
         alpha_sigma_base=np.asarray([0.25, 0.0], dtype=float),
-        beta_radius_base=np.asarray([0.5, 0.0], dtype=float),
+        gamma_ml_base=np.asarray([0.0, 0.0], dtype=float),
         sigma_ref_param_index=int_missing.copy(),
         cut_ref_param_index=int_missing.copy(),
         core_ref_param_index=int_missing.copy(),
         alpha_sigma_param_index=int_missing.copy(),
-        beta_radius_param_index=int_missing.copy(),
+        gamma_ml_param_index=int_missing.copy(),
         sigma_log_scatter_param_index=int_missing.copy(),
         core_log_scatter_param_index=int_missing.copy(),
         cut_log_scatter_param_index=int_missing.copy(),
@@ -6198,17 +6197,17 @@ def test_packed_lens_state_scales_core_radius_with_beta_radius() -> None:
     np.testing.assert_allclose(np.asarray(packed_state["Rs"])[0], 40.0, rtol=1.0e-12)
 
 
-def test_packed_lens_state_direct_beta_radius_controls_size_exponent() -> None:
+def test_packed_lens_state_gamma_ml_controls_size_exponent() -> None:
     evaluator = _single_independent_branch_evaluator()
     packed_spec = evaluator.state.packed_lens_spec
     packed_spec.luminosity_ratio[0] = 4.0
     packed_spec.alpha_sigma_base = np.full(2, 0.25, dtype=float)
-    packed_spec.beta_radius_base = np.full(2, 0.5, dtype=float)
+    packed_spec.gamma_ml_base = np.full(2, 0.0, dtype=float)
     packed_spec.alpha_sigma_param_index = np.asarray([0, -1], dtype=np.int32)
-    packed_spec.beta_radius_param_index = np.asarray([1, -1], dtype=np.int32)
+    packed_spec.gamma_ml_param_index = np.asarray([1, -1], dtype=np.int32)
     evaluator.packed_spec_jax = cluster_solver.ClusterJAXEvaluator._prepare_packed_spec_arrays(evaluator)
 
-    physical_params = jnp.asarray([0.25, 0.7, 200.0, 2.0, 50.0, 1.0e-8], dtype=jnp.float64)
+    physical_params = jnp.asarray([0.25, 0.2, 200.0, 2.0, 50.0, 1.0e-8], dtype=jnp.float64)
     packed_state, details = evaluator._build_packed_lens_state_details_from_physical(
         physical_params,
         2.0,
@@ -6238,9 +6237,8 @@ def test_independent_scaling_parameter_specs_log_displacement_replaces_direct_fr
         potfiles,
         [{0, 1}],
         start_index=20,
-        log_vdisp_tau_prior_median=0.22,
-        log_core_tau_prior_median=0.33,
-        log_cut_tau_prior_median=0.44,
+        log_sigma_tau_prior_median=0.22,
+        log_mass_tau_prior_median=0.33,
         log_tau_prior_sigma=0.55,
     )
 
@@ -6249,9 +6247,8 @@ def test_independent_scaling_parameter_specs_log_displacement_replaces_direct_fr
     assert "independent_free_core_radius_kpc" not in fields
     assert "independent_free_cut_radius_kpc" not in fields
     for field_name in (
-        "independent_free_log_v_disp_delta_unit",
-        "independent_free_log_core_radius_delta_unit",
-        "independent_free_log_cut_radius_delta_unit",
+        "independent_free_log_sigma_delta_unit",
+        "independent_free_log_mass_delta_unit",
     ):
         field_specs = [spec for spec in specs if spec.field == field_name]
         assert len(field_specs) == 2
@@ -6259,9 +6256,8 @@ def test_independent_scaling_parameter_specs_log_displacement_replaces_direct_fr
         assert all(spec.prior_kind == "normal" for spec in field_specs)
         assert all(spec.transform_kind == "identity" for spec in field_specs)
     for field_name, median in (
-        ("independent_free_log_v_disp_tau", 0.22),
-        ("independent_free_log_core_radius_tau", 0.33),
-        ("independent_free_log_cut_radius_tau", 0.44),
+        ("independent_free_log_sigma_tau", 0.22),
+        ("independent_free_log_mass_tau", 0.33),
     ):
         field_specs = [spec for spec in specs if spec.field == field_name]
         assert len(field_specs) == 1
@@ -6271,10 +6267,10 @@ def test_independent_scaling_parameter_specs_log_displacement_replaces_direct_fr
     assert not any("offset" in field for field in fields)
     assert not any("scatter" in field for field in fields)
     assert not any("residual" in field for field in fields)
-    assert indices[0][0]["independent_free_log_v_disp_delta_unit"] >= 0
-    assert indices[0][1]["independent_free_log_v_disp_delta_unit"] >= 0
-    assert indices[0][0]["independent_free_log_v_disp_tau"] == indices[0][1][
-        "independent_free_log_v_disp_tau"
+    assert indices[0][0]["independent_free_log_sigma_delta_unit"] >= 0
+    assert indices[0][1]["independent_free_log_sigma_delta_unit"] >= 0
+    assert indices[0][0]["independent_free_log_sigma_tau"] == indices[0][1][
+        "independent_free_log_sigma_tau"
     ]
 
 
@@ -6307,15 +6303,21 @@ def _independent_scaling_plot_fixture() -> tuple[pd.DataFrame, pd.DataFrame]:
             "free_v_disp_median": [120.0],
             "free_core_radius_kpc_median": [0.1425],
             "free_cut_radius_kpc_median": [255.0],
-            "v_disp_ratio_median": [1.20],
-            "v_disp_ratio_p16": [1.10],
-            "v_disp_ratio_p84": [1.30],
-            "core_radius_ratio_median": [0.95],
-            "core_radius_ratio_p16": [0.90],
-            "core_radius_ratio_p84": [1.00],
-            "cut_radius_ratio_median": [0.85],
-            "cut_radius_ratio_p16": [0.80],
-            "cut_radius_ratio_p84": [0.90],
+            "sigma_ratio_median": [1.20],
+            "sigma_ratio_p16": [1.10],
+            "sigma_ratio_p84": [1.30],
+            "mass_ratio_median": [1.10],
+            "mass_ratio_p16": [1.00],
+            "mass_ratio_p84": [1.20],
+            "radius_ratio_median": [0.85],
+            "radius_ratio_p16": [0.80],
+            "radius_ratio_p84": [0.90],
+            "core_ratio_median": [0.95],
+            "core_ratio_p16": [0.90],
+            "core_ratio_p84": [1.00],
+            "cut_ratio_median": [0.85],
+            "cut_ratio_p16": [0.80],
+            "cut_ratio_p84": [0.90],
         }
     )
     return scaling_rank_df, independent_df
@@ -6324,11 +6326,11 @@ def _independent_scaling_plot_fixture() -> tuple[pd.DataFrame, pd.DataFrame]:
 def _independent_scaling_gate_specs() -> list[ParameterSpec]:
     return [
         ParameterSpec(
-            name="members.galaxy-a.independent_free_log_v_disp_delta_unit",
-            sample_name="members_galaxy_a_independent_free_log_v_disp_delta_unit",
+            name="members.galaxy-a.independent_free_log_sigma_delta_unit",
+            sample_name="members_galaxy_a_independent_free_log_sigma_delta_unit",
             potential_id="members",
             profile_type=cluster_solver.DP_IE_PROFILE,
-            field="independent_free_log_v_disp_delta_unit",
+            field="independent_free_log_sigma_delta_unit",
             prior_kind="normal",
             lower=float("-inf"),
             upper=float("inf"),
@@ -6336,11 +6338,11 @@ def _independent_scaling_gate_specs() -> list[ParameterSpec]:
             component_family="independent_scaling",
         ),
         ParameterSpec(
-            name="members.galaxy-a.independent_free_log_cut_radius_delta_unit",
-            sample_name="members_galaxy_a_independent_free_log_cut_radius_delta_unit",
+            name="members.galaxy-a.independent_free_log_mass_delta_unit",
+            sample_name="members_galaxy_a_independent_free_log_mass_delta_unit",
             potential_id="members",
             profile_type=cluster_solver.DP_IE_PROFILE,
-            field="independent_free_log_cut_radius_delta_unit",
+            field="independent_free_log_mass_delta_unit",
             prior_kind="normal",
             lower=float("-inf"),
             upper=float("inf"),
@@ -6363,15 +6365,15 @@ def test_independent_scaling_plot_table_preserves_all_modeled_galaxies() -> None
     assert int(independent_row["component_index"]) == 1
     assert int(independent_row["rank"]) == 1
     assert int(independent_row["free_component_index"]) == 4
-    assert float(independent_row["v_disp_ratio_median"]) == pytest.approx(1.20)
-    assert float(independent_row["core_radius_ratio_median"]) == pytest.approx(0.95)
-    assert float(independent_row["cut_radius_ratio_median"]) == pytest.approx(0.85)
+    assert float(independent_row["sigma_ratio_median"]) == pytest.approx(1.20)
+    assert float(independent_row["mass_ratio_median"]) == pytest.approx(1.10)
+    assert float(independent_row["radius_ratio_median"]) == pytest.approx(0.85)
     active_row = plot_df[plot_df["catalog_id"] == "galaxy-b"].iloc[0]
     inactive_row = plot_df[plot_df["catalog_id"] == "galaxy-c"].iloc[0]
     assert active_row["independent_plot_class"] == "active_not_independent"
     assert inactive_row["independent_plot_class"] == "not_sampled"
-    assert np.isnan(float(active_row["v_disp_ratio_median"]))
-    assert np.isnan(float(inactive_row["v_disp_ratio_median"]))
+    assert np.isnan(float(active_row["sigma_ratio_median"]))
+    assert np.isnan(float(inactive_row["sigma_ratio_median"]))
 
 
 def test_independent_scaling_plot_helpers_write_candidate_outputs(tmp_path: Path) -> None:
@@ -6607,11 +6609,11 @@ def test_default_corner_excludes_independent_scaling_internals() -> None:
             component_family="scaling",
         ),
         ParameterSpec(
-            name="members.galaxy-a.independent_free_log_v_disp_delta_unit",
-            sample_name="members_galaxy_a_independent_free_log_v_disp_delta_unit",
+            name="members.galaxy-a.independent_free_log_sigma_delta_unit",
+            sample_name="members_galaxy_a_independent_free_log_sigma_delta_unit",
             potential_id="members",
             profile_type=cluster_solver.DP_IE_PROFILE,
-            field="independent_free_log_v_disp_delta_unit",
+            field="independent_free_log_sigma_delta_unit",
             prior_kind="normal",
             lower=-np.inf,
             upper=np.inf,
@@ -6993,22 +6995,20 @@ def _stage4_state_with_independent_and_inactive_scaling() -> BuildState:
                 ],
                 dtype=np.int32,
             ),
-            "independent_free_log_v_disp_delta_unit_param_index": np.asarray([-1, -1, 1, -1], dtype=np.int32),
-            "independent_free_log_core_radius_delta_unit_param_index": np.asarray([-1, -1, 2, -1], dtype=np.int32),
-            "independent_free_log_cut_radius_delta_unit_param_index": np.asarray([-1, -1, 3, -1], dtype=np.int32),
-            "independent_free_log_v_disp_tau_param_index": np.asarray([-1, -1, 4, -1], dtype=np.int32),
-            "independent_free_log_core_radius_tau_param_index": np.asarray([-1, -1, 5, -1], dtype=np.int32),
-            "independent_free_log_cut_radius_tau_param_index": np.asarray([-1, -1, 6, -1], dtype=np.int32),
+            "independent_free_log_sigma_delta_unit_param_index": np.asarray([-1, -1, 1, -1], dtype=np.int32),
+            "independent_free_log_mass_delta_unit_param_index": np.asarray([-1, -1, 2, -1], dtype=np.int32),
+            "independent_free_log_sigma_tau_param_index": np.asarray([-1, -1, 3, -1], dtype=np.int32),
+            "independent_free_log_mass_tau_param_index": np.asarray([-1, -1, 4, -1], dtype=np.int32),
             "independent_magnitude_feature": np.asarray([0.0, 0.5, 0.5, 0.0], dtype=float),
         }
     )
     independent_specs = [
         ParameterSpec(
-            name="members.galaxy-a.independent_free_log_v_disp_delta_unit",
-            sample_name="members_galaxy_a_independent_free_log_v_disp_delta_unit",
+            name="members.galaxy-a.independent_free_log_sigma_delta_unit",
+            sample_name="members_galaxy_a_independent_free_log_sigma_delta_unit",
             potential_id="members",
             profile_type=cluster_solver.DP_IE_PROFILE,
-            field="independent_free_log_v_disp_delta_unit",
+            field="independent_free_log_sigma_delta_unit",
             prior_kind="normal",
             lower=-np.inf,
             upper=np.inf,
@@ -7018,11 +7018,11 @@ def _stage4_state_with_independent_and_inactive_scaling() -> BuildState:
             component_family="independent_scaling",
         ),
         ParameterSpec(
-            name="members.galaxy-a.independent_free_log_core_radius_delta_unit",
-            sample_name="members_galaxy_a_independent_free_log_core_radius_delta_unit",
+            name="members.galaxy-a.independent_free_log_mass_delta_unit",
+            sample_name="members_galaxy_a_independent_free_log_mass_delta_unit",
             potential_id="members",
             profile_type=cluster_solver.DP_IE_PROFILE,
-            field="independent_free_log_core_radius_delta_unit",
+            field="independent_free_log_mass_delta_unit",
             prior_kind="normal",
             lower=-np.inf,
             upper=np.inf,
@@ -7032,25 +7032,11 @@ def _stage4_state_with_independent_and_inactive_scaling() -> BuildState:
             component_family="independent_scaling",
         ),
         ParameterSpec(
-            name="members.galaxy-a.independent_free_log_cut_radius_delta_unit",
-            sample_name="members_galaxy_a_independent_free_log_cut_radius_delta_unit",
+            name="members.independent_free_log_sigma_tau",
+            sample_name="members_independent_free_log_sigma_tau",
             potential_id="members",
             profile_type=cluster_solver.DP_IE_PROFILE,
-            field="independent_free_log_cut_radius_delta_unit",
-            prior_kind="normal",
-            lower=-np.inf,
-            upper=np.inf,
-            step=0.1,
-            mean=0.0,
-            std=1.0,
-            component_family="independent_scaling",
-        ),
-        ParameterSpec(
-            name="members.independent_free_log_v_disp_tau",
-            sample_name="members_independent_free_log_v_disp_tau",
-            potential_id="members",
-            profile_type=cluster_solver.DP_IE_PROFILE,
-            field="independent_free_log_v_disp_tau",
+            field="independent_free_log_sigma_tau",
             prior_kind="normal",
             lower=-np.inf,
             upper=np.inf,
@@ -7063,28 +7049,11 @@ def _stage4_state_with_independent_and_inactive_scaling() -> BuildState:
             physical_mean=0.25,
         ),
         ParameterSpec(
-            name="members.independent_free_log_core_radius_tau",
-            sample_name="members_independent_free_log_core_radius_tau",
+            name="members.independent_free_log_mass_tau",
+            sample_name="members_independent_free_log_mass_tau",
             potential_id="members",
             profile_type=cluster_solver.DP_IE_PROFILE,
-            field="independent_free_log_core_radius_tau",
-            prior_kind="normal",
-            lower=-np.inf,
-            upper=np.inf,
-            step=0.1,
-            mean=np.log(0.25),
-            std=0.5,
-            transform_kind="log_positive",
-            component_family="independent_scaling",
-            physical_lower=0.0,
-            physical_mean=0.25,
-        ),
-        ParameterSpec(
-            name="members.independent_free_log_cut_radius_tau",
-            sample_name="members_independent_free_log_cut_radius_tau",
-            potential_id="members",
-            profile_type=cluster_solver.DP_IE_PROFILE,
-            field="independent_free_log_cut_radius_tau",
+            field="independent_free_log_mass_tau",
             prior_kind="normal",
             lower=-np.inf,
             upper=np.inf,
@@ -7110,6 +7079,7 @@ def _stage4_state_with_independent_and_inactive_scaling() -> BuildState:
                 "component_index": 1,
                 "catalog_id": "galaxy-a",
                 "catalog_mag": 19.0,
+                "catalog_color": 1.1,
                 "independent_magnitude_feature": 0.5,
                 "x_centre": 1.0,
                 "y_centre": 1.0,
@@ -7122,6 +7092,7 @@ def _stage4_state_with_independent_and_inactive_scaling() -> BuildState:
                 "component_index": 3,
                 "catalog_id": "galaxy-b",
                 "catalog_mag": 20.0,
+                "catalog_color": 0.9,
                 "independent_magnitude_feature": 0.0,
                 "x_centre": -1.5,
                 "y_centre": 0.5,
@@ -7337,12 +7308,8 @@ def test_flat_packed_state_applies_log_displacement_delta_units_to_free_branch_o
     scaling_component = 1
     inactive_component = 3
     shifted = np.asarray(theta, dtype=float).copy()
-    for index_array in (
-        packed_spec.independent_free_log_v_disp_delta_unit_param_index,
-        packed_spec.independent_free_log_core_radius_delta_unit_param_index,
-        packed_spec.independent_free_log_cut_radius_delta_unit_param_index,
-    ):
-        shifted[int(index_array[free_component])] = 2.0
+    shifted[int(packed_spec.independent_free_log_sigma_delta_unit_param_index[free_component])] = 2.0
+    shifted[int(packed_spec.independent_free_log_mass_delta_unit_param_index[free_component])] = 1.0
 
     flat_data = evaluator.flat_critical_arc_data
     physical_base = evaluator._physical_parameter_vector(jnp.asarray(theta, dtype=jnp.float64))
@@ -7404,12 +7371,12 @@ def test_flat_packed_state_applies_log_displacement_delta_units_to_free_branch_o
     )
 
 
-def test_perturbation_discovery_flat_initial_state_has_no_free_candidates() -> None:
+def test_exact_discovery_flat_initial_state_has_no_free_candidates() -> None:
     state = _minimal_stage4_surrogate_state()
     evaluator = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
     )
 
@@ -7462,7 +7429,7 @@ def test_transfer_theta_and_posterior_by_sample_name_initializes_new_parameters(
 
 
 @pytest.mark.parametrize("sample_likelihood_mode", [SAMPLE_LIKELIHOOD_SOURCE, SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN])
-def test_perturbation_discovery_flat_matches_full_flat_value_and_gradient_for_all_independent(sample_likelihood_mode: str) -> None:
+def test_exact_discovery_flat_matches_full_flat_value_and_gradient_for_all_independent(sample_likelihood_mode: str) -> None:
     state = _stage4_state_with_all_scaling_selected_independent()
     full = cluster_solver.ClusterJAXEvaluator(
         state=state,
@@ -7474,7 +7441,7 @@ def test_perturbation_discovery_flat_matches_full_flat_value_and_gradient_for_al
     discovery = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
         sample_likelihood_mode=sample_likelihood_mode,
         source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_UNIT,
     )
@@ -7507,7 +7474,7 @@ def test_perturbation_discovery_source_matches_full_flat_value_and_gradient() ->
     discovery = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
         source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_UNIT,
     )
@@ -7529,6 +7496,28 @@ def test_perturbation_discovery_source_matches_full_flat_value_and_gradient() ->
     )
 
 
+def test_exact_discovery_source_magnification_covariance_does_not_require_metric_cache() -> None:
+    state = _minimal_stage4_surrogate_state()
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
+    )
+    evaluator.source_metric_cache_by_z = {}
+    evaluator.source_metric_reference_params = None
+    evaluator.flat_source_metric_cache = None
+    theta = np.asarray(cluster_solver._default_theta(state.parameter_specs), dtype=float)
+    theta_jax = jnp.asarray(theta, dtype=jnp.float64)
+
+    value = evaluator._source_loglike_fn(theta_jax)
+    gradient = jax.grad(evaluator._source_loglike_fn)(theta_jax)
+
+    assert np.isfinite(float(value))
+    assert np.isfinite(np.asarray(gradient)).all()
+
+
 def test_perturbation_discovery_local_jacobian_matches_full_flat_value_and_gradient() -> None:
     state = _minimal_stage4_surrogate_state()
     full = cluster_solver.ClusterJAXEvaluator(
@@ -7540,7 +7529,7 @@ def test_perturbation_discovery_local_jacobian_matches_full_flat_value_and_gradi
     discovery = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
     )
     theta = np.asarray(cluster_solver._default_theta(state.parameter_specs), dtype=float)
@@ -8916,7 +8905,7 @@ def test_active_approximation_table_reports_frozen_refreshed_local_jacobian_metr
 
 @pytest.mark.parametrize(
     "sampling_engine",
-    [cluster_solver.SAMPLING_ENGINE_FULL_FLAT, cluster_solver.SAMPLING_ENGINE_PERTURBATION_DISCOVERY_FLAT],
+    [cluster_solver.SAMPLING_ENGINE_FULL_FLAT, cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT],
 )
 def test_active_approximation_table_reports_current_exact_local_jacobian_metric(sampling_engine: str) -> None:
     evaluator = SimpleNamespace(
@@ -12576,19 +12565,19 @@ def test_scaling_parameter_specs_use_direct_exponent_mode_only() -> None:
     ]
     specs, param_indices, _ = cluster_solver._build_scaling_parameter_specs(potfiles, kpc_per_arcsec=10.0)
 
-    assert {"alpha_sigma", "beta_radius"} <= {spec.field for spec in specs}
-    assert {"vdslope", "slope", "gamma_ml"}.isdisjoint({spec.field for spec in specs})
+    assert {"alpha_sigma", "gamma_ml"} <= {spec.field for spec in specs}
+    assert {"vdslope", "slope", "beta_radius"}.isdisjoint({spec.field for spec in specs})
 
     alpha_spec = specs[param_indices[0]["alpha_sigma"]]
-    beta_spec = specs[param_indices[0]["beta_radius"]]
+    gamma_spec = specs[param_indices[0]["gamma_ml"]]
     assert alpha_spec.mean == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN)
     assert alpha_spec.std == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD)
     assert alpha_spec.lower == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER)
     assert alpha_spec.upper == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER)
-    assert beta_spec.mean == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_BETA_RADIUS_MEAN)
-    assert beta_spec.std == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_BETA_RADIUS_STD)
-    assert beta_spec.lower == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_BETA_RADIUS_LOWER)
-    assert beta_spec.upper == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_BETA_RADIUS_UPPER)
+    assert gamma_spec.mean == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN)
+    assert gamma_spec.std == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD)
+    assert gamma_spec.lower == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER)
+    assert gamma_spec.upper == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER)
 
 
 def _log_uniform_image_plane_scatter_spec(floor_arcsec: float = 0.1, upper_arcsec: float = 0.5) -> ParameterSpec:
@@ -13854,7 +13843,7 @@ def test_run_svi_fit_logs_bounded_refresh_deltas(monkeypatch: pytest.MonkeyPatch
     assert all("probes=" not in message and "arrays=" not in message and "mb=" not in message for message in refresh_logs)
 
 
-def test_run_svi_fit_topk_discovery_does_not_rebuild_candidates(
+def test_run_svi_fit_exact_discovery_skips_cache_refreshes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     specs = [
@@ -13888,6 +13877,7 @@ def test_run_svi_fit_topk_discovery_does_not_rebuild_candidates(
 
         def __init__(self) -> None:
             self.timing_totals: dict[str, float] = {}
+            self.refresh_calls: list[str] = []
             self.surrogate_cache_by_z: dict[float, Any] = {}
             self.scaling_scatter_cache_by_z: dict[float, Any] = {}
             self.source_metric_cache_by_z: dict[float, Any] = {}
@@ -13896,11 +13886,11 @@ def test_run_svi_fit_topk_discovery_does_not_rebuild_candidates(
             self.source_metric_reference_params = np.asarray([0.0], dtype=float)
 
         def refresh_scaling_scatter_cache(self, params: np.ndarray, reason: str = "manual") -> None:
-            del reason
+            self.refresh_calls.append(f"scaling:{reason}")
             self.scaling_scatter_reference_params = np.asarray(params, dtype=float).copy()
 
         def refresh_source_metric_cache(self, params: np.ndarray, reason: str = "manual") -> None:
-            del reason
+            self.refresh_calls.append(f"source_metric:{reason}")
             self.source_metric_reference_params = np.asarray(params, dtype=float).copy()
 
     def fake_make_guide(_sample_model: object, _parameter_specs: list[ParameterSpec], _init_values=None) -> FakeGuide:
@@ -13913,16 +13903,7 @@ def test_run_svi_fit_topk_discovery_does_not_rebuild_candidates(
     monkeypatch.setattr(cluster_solver, "_log_posterior_summary", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cluster_solver, "_log", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cluster_solver, "_maybe_clear_jax_caches_after_svi_refresh", lambda _args, _reason: False)
-    monkeypatch.setattr(
-        cluster_solver,
-        "_topk_discovery_union_from_evaluator",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Top-K discovery should not run during SVI")),
-    )
-    monkeypatch.setattr(
-        cluster_solver,
-        "_rebuild_topk_discovery_state_from_union",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("SVI should not rebuild candidates")),
-    )
+    evaluator = FakeEvaluator()
 
     args = argparse.Namespace(
         svi_steps=2,
@@ -13932,7 +13913,7 @@ def test_run_svi_fit_topk_discovery_does_not_rebuild_candidates(
         nuts_init_boundary_frac=0.0,
         samples=1,
         chains=1,
-        sampling_engine=cluster_solver.SAMPLING_ENGINE_TOPK_DISCOVERY_FLAT,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_EXACT_DISCOVERY_FLAT,
     )
     state = SimpleNamespace(
         parameter_specs=specs,
@@ -13943,12 +13924,14 @@ def test_run_svi_fit_topk_discovery_does_not_rebuild_candidates(
         ],
     )
 
-    best_fit, _posterior, diagnostics = cluster_solver._run_svi_fit(args, state, FakeEvaluator(), object())
+    best_fit, _posterior, diagnostics = cluster_solver._run_svi_fit(args, state, evaluator, object())
 
     assert best_fit.tolist() == pytest.approx([0.4])
-    assert diagnostics["topk_discovery_svi_exact"] is True
-    assert diagnostics["topk_discovery_svi_independent_candidates"] == 0
-    assert diagnostics["topk_discovery_svi_rebuild_count"] == 0
+    assert evaluator.refresh_calls == []
+    assert diagnostics["svi_cache_refresh_count"] == 0
+    assert diagnostics["perturbation_discovery_svi_exact"] is True
+    assert diagnostics["perturbation_discovery_svi_independent_candidates"] == 0
+    assert diagnostics["perturbation_discovery_svi_rebuild_count"] == 0
 
 
 def test_topk_discovery_final_diagnostic_messages_include_counts() -> None:
@@ -16752,6 +16735,8 @@ def test_cluster_solver_accepts_full_flat_sampling_engine(monkeypatch: pytest.Mo
             "data/clustersim/input.par",
             "--sampling-engine",
             "full_flat",
+            "--stage1-sampling-engine",
+            "full_flat",
             "--stage2-sampling-engine",
             "full_flat",
         ],
@@ -16760,6 +16745,7 @@ def test_cluster_solver_accepts_full_flat_sampling_engine(monkeypatch: pytest.Mo
     args = _parse_args()
 
     assert args.sampling_engine == "full_flat"
+    assert args.stage1_sampling_engine == "full_flat"
     assert args.stage2_sampling_engine == "full_flat"
 
 
@@ -16781,7 +16767,7 @@ def test_cluster_solver_accepts_refreshing_surrogate_flat_sampling_engine(monkey
     assert args.sampling_engine == "refreshing_surrogate_flat"
 
 
-def test_cluster_solver_accepts_perturbation_discovery_flat_sampling_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cluster_solver_rejects_exact_discovery_flat_global_sampling_engine(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
@@ -16790,15 +16776,32 @@ def test_cluster_solver_accepts_perturbation_discovery_flat_sampling_engine(monk
             "--par-path",
             "data/clustersim/input.par",
             "--sampling-engine",
-            "perturbation_discovery_flat",
+            "exact_discovery_flat",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+
+def test_cluster_solver_accepts_exact_discovery_flat_stage0_sampling_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--stage0-sampling-engine",
+            "exact_discovery_flat",
             "--perturbation-discovery-alpha-tol-arcsec",
             "0.02",
             "--perturbation-discovery-jacobian-tol",
             "0.03",
             "--perturbation-discovery-jacobian-weight",
             "0.5",
-            "--perturbation-discovery-final-engine",
-            "refreshing_surrogate_flat",
+            "--perturbation-discovery-final-polish-engine",
+            "full_flat",
             "--perturbation-discovery-final-svi-polish-steps",
             "500",
         ],
@@ -16806,12 +16809,48 @@ def test_cluster_solver_accepts_perturbation_discovery_flat_sampling_engine(monk
 
     args = _parse_args()
 
-    assert args.sampling_engine == "perturbation_discovery_flat"
+    assert args.stage0_sampling_engine == "exact_discovery_flat"
     assert args.perturbation_discovery_alpha_tol_arcsec == pytest.approx(0.02)
     assert args.perturbation_discovery_jacobian_tol == pytest.approx(0.03)
     assert args.perturbation_discovery_jacobian_weight == pytest.approx(0.5)
-    assert args.perturbation_discovery_final_engine == "refreshing_surrogate_flat"
+    assert args.perturbation_discovery_final_polish_engine == "full_flat"
     assert args.perturbation_discovery_final_svi_polish_steps == 500
+
+
+def test_cluster_solver_rejects_exact_discovery_flat_final_polish_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--perturbation-discovery-final-polish-engine",
+            "exact_discovery_flat",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+
+def test_cluster_solver_rejects_perturbation_discovery_for_production_stage_engines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for option in ("--stage1-sampling-engine", "--stage2-sampling-engine"):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cluster_solver",
+                "--par-path",
+                "data/clustersim/input.par",
+                option,
+                "exact_discovery_flat",
+            ],
+        )
+        with pytest.raises(SystemExit):
+            _parse_args()
 
 
 def test_cluster_solver_rejects_topk_discovery_flat_sampling_engine(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -16876,7 +16915,7 @@ def test_cluster_solver_rejects_negative_perturbation_discovery_final_svi_polish
             "--par-path",
             "data/clustersim/input.par",
             "--sampling-engine",
-            "perturbation_discovery_flat",
+            "exact_discovery_flat",
             "--perturbation-discovery-final-svi-polish-steps",
             "-1",
         ],
@@ -18702,11 +18741,17 @@ def test_run_xsh_critical_arc_mode_selects_new_image_plane_mode() -> None:
     assert '"critical_arc": "critical-arc"' in text
     assert '"--stage1-likelihood", stage1_likelihood' in text
     assert '"--stage2-forward-mode", stage2_forward_mode' in text
-    assert 'sampling_engine = "perturbation_discovery_flat"' in text
-    assert 'stage2_sampling_engine = "perturbation_discovery_flat"' in text
+    assert 'stage0_sampling_engine = "exact_discovery_flat"' in text
+    assert 'stage1_sampling_engine = "refreshing_surrogate_flat"' in text
+    assert 'stage2_sampling_engine = "refreshing_surrogate_flat"' in text
+    assert '"--stage0-sampling-engine", stage0_sampling_engine' in text
+    assert '"--stage1-sampling-engine", stage1_sampling_engine' in text
+    assert '"--sampling-engine", sampling_engine' not in text
     assert '"--perturbation-discovery-alpha-tol-arcsec", perturbation_discovery_alpha_tol_arcsec' in text
     assert '"--perturbation-discovery-jacobian-tol", perturbation_discovery_jacobian_tol' in text
-    assert '"--perturbation-discovery-final-engine", perturbation_discovery_final_engine' in text
+    assert 'perturbation_discovery_final_polish_engine = "full_flat"' in text
+    assert '"--perturbation-discovery-final-polish-engine", perturbation_discovery_final_polish_engine' in text
+    assert '"--perturbation-discovery-final-engine"' not in text
     assert '"--critical-arc-critical-direction-sigma-arcsec", 10.0' in text
     assert '"--critical-arc-base-prob", 0.10' in text
     assert '"--critical-arc-max-prob", 0.85' in text
@@ -18723,7 +18768,7 @@ def test_run_xsh_critical_arc_mode_selects_new_image_plane_mode() -> None:
     assert '"--critical-arc-singular-softness-lower", 0.005' in text
     assert '"--critical-arc-singular-softness-upper", 0.20' in text
     assert '"--scaling-scatter"' in text
-    assert '"--scaling-scatter-fields", "sigma"' in text
+    assert '"--scaling-scatter-fields", "sigma,cut"' in text
     assert '"--critical-arc-lm-trust-radius-arcsec", 10.0' in text
     assert "--critical-arc-speed-mode" not in text
     assert '"--arc-recovery-p-arc-threshold", 0.5' in text
@@ -18733,9 +18778,9 @@ def test_run_xsh_critical_arc_mode_selects_new_image_plane_mode() -> None:
     assert "validation_args = [" in text
     assert '"--exact-image-min-distance-arcsec", 0.5' in text
     assert '"--exact-image-precision-limit", 1.0e-2' in text
-    assert '"--exact-image-num-iter-max", 20' in text
+    assert '"--exact-image-num-iter-max", 50' in text
     assert '"--match-tolerance-arcsec", 2.0' in text
-    assert 'source_plane_covariance_mode = "unit"' in text
+    assert 'source_plane_covariance_mode = "magnification"' in text
     assert '"--source-plane-covariance-mode", source_plane_covariance_mode' in text
     assert '"kappa_true_fits": "data/ff_sims/ares/kappa_z9_0.fits"' in text
     assert '"kappa_true_fits": "data/ff_sims/hera/kappa_z9_0.fits"' in text
@@ -18922,9 +18967,13 @@ def test_validation_parser_rejects_active_subset_sampling_engine() -> None:
 
 
 def test_validation_parser_accepts_full_flat_sampling_engine() -> None:
-    args = validation._build_parser().parse_args(["--sampling-engine", "full_flat"])
+    args = validation._build_parser().parse_args(
+        ["--sampling-engine", "full_flat", "--stage1-sampling-engine", "full_flat", "--stage2-sampling-engine", "full_flat"]
+    )
 
     assert args.sampling_engine == "full_flat"
+    assert args.stage1_sampling_engine == "full_flat"
+    assert args.stage2_sampling_engine == "full_flat"
 
 
 def test_validation_parser_accepts_refreshing_surrogate_flat_sampling_engine() -> None:
@@ -18933,30 +18982,48 @@ def test_validation_parser_accepts_refreshing_surrogate_flat_sampling_engine() -
     assert args.sampling_engine == "refreshing_surrogate_flat"
 
 
-def test_validation_parser_accepts_perturbation_discovery_flat_sampling_engine() -> None:
+def test_validation_parser_rejects_exact_discovery_flat_global_sampling_engine() -> None:
+    with pytest.raises(SystemExit):
+        validation._build_parser().parse_args(["--sampling-engine", "exact_discovery_flat"])
+
+
+def test_validation_parser_accepts_exact_discovery_flat_stage0_sampling_engine() -> None:
     args = validation._build_parser().parse_args(
         [
-            "--sampling-engine",
-            "perturbation_discovery_flat",
+            "--stage0-sampling-engine",
+            "exact_discovery_flat",
             "--perturbation-discovery-alpha-tol-arcsec",
             "0.02",
             "--perturbation-discovery-jacobian-tol",
             "0.03",
             "--perturbation-discovery-jacobian-weight",
             "2.0",
-            "--perturbation-discovery-final-engine",
+            "--perturbation-discovery-final-polish-engine",
             "full_flat",
             "--perturbation-discovery-final-svi-polish-steps",
             "250",
         ]
     )
 
-    assert args.sampling_engine == "perturbation_discovery_flat"
+    assert args.stage0_sampling_engine == "exact_discovery_flat"
     assert args.perturbation_discovery_alpha_tol_arcsec == pytest.approx(0.02)
     assert args.perturbation_discovery_jacobian_tol == pytest.approx(0.03)
     assert args.perturbation_discovery_jacobian_weight == pytest.approx(2.0)
-    assert args.perturbation_discovery_final_engine == "full_flat"
+    assert args.perturbation_discovery_final_polish_engine == "full_flat"
     assert args.perturbation_discovery_final_svi_polish_steps == 250
+
+
+def test_validation_parser_rejects_exact_discovery_flat_final_polish_engine() -> None:
+    with pytest.raises(SystemExit):
+        validation._build_parser().parse_args(
+            ["--perturbation-discovery-final-polish-engine", "exact_discovery_flat"]
+        )
+
+
+def test_validation_parser_rejects_perturbation_discovery_for_production_stage_engines() -> None:
+    for option in ("--stage1-sampling-engine", "--stage2-sampling-engine"):
+        with pytest.raises(SystemExit):
+            validation._build_parser().parse_args([option, "exact_discovery_flat"])
 
 
 def test_validation_parser_rejects_topk_discovery_flat_sampling_engine() -> None:
@@ -19221,12 +19288,10 @@ def test_cluster_solver_parser_accepts_independent_scaling_log_displacement_hype
                 "cluster_solver",
                 "--par-path",
                 "data/clustersim/input.par",
-                "--independent-scaling-free-log-vdisp-tau-prior-median",
+                "--independent-scaling-free-log-sigma-tau-prior-median",
                 "0.22",
-                "--independent-scaling-free-log-core-tau-prior-median",
+                "--independent-scaling-free-log-mass-tau-prior-median",
                 "0.33",
-                "--independent-scaling-free-log-cut-tau-prior-median",
-                "0.44",
                 "--independent-scaling-free-log-tau-prior-sigma",
                 "0.55",
         ],
@@ -19234,9 +19299,8 @@ def test_cluster_solver_parser_accepts_independent_scaling_log_displacement_hype
 
     args = _parse_args()
 
-    assert args.independent_scaling_free_log_vdisp_tau_prior_median == pytest.approx(0.22)
-    assert args.independent_scaling_free_log_core_tau_prior_median == pytest.approx(0.33)
-    assert args.independent_scaling_free_log_cut_tau_prior_median == pytest.approx(0.44)
+    assert args.independent_scaling_free_log_sigma_tau_prior_median == pytest.approx(0.22)
+    assert args.independent_scaling_free_log_mass_tau_prior_median == pytest.approx(0.33)
     assert args.independent_scaling_free_log_tau_prior_sigma == pytest.approx(0.55)
 
 
@@ -19276,29 +19340,25 @@ def test_validation_parser_rejects_independent_scaling_galaxy_count() -> None:
 def test_validation_parser_accepts_independent_scaling_log_displacement_hyperparameters() -> None:
     args = validation._build_parser().parse_args(
         [
-            "--independent-scaling-free-log-vdisp-tau-prior-median",
+            "--independent-scaling-free-log-sigma-tau-prior-median",
             "0.22",
-            "--independent-scaling-free-log-core-tau-prior-median",
+            "--independent-scaling-free-log-mass-tau-prior-median",
             "0.33",
-            "--independent-scaling-free-log-cut-tau-prior-median",
-            "0.44",
             "--independent-scaling-free-log-tau-prior-sigma",
             "0.55",
         ]
     )
 
-    assert args.independent_scaling_free_log_vdisp_tau_prior_median == pytest.approx(0.22)
-    assert args.independent_scaling_free_log_core_tau_prior_median == pytest.approx(0.33)
-    assert args.independent_scaling_free_log_cut_tau_prior_median == pytest.approx(0.44)
+    assert args.independent_scaling_free_log_sigma_tau_prior_median == pytest.approx(0.22)
+    assert args.independent_scaling_free_log_mass_tau_prior_median == pytest.approx(0.33)
     assert args.independent_scaling_free_log_tau_prior_sigma == pytest.approx(0.55)
 
 
 @pytest.mark.parametrize(
     "option",
     [
-        "--independent-scaling-free-log-vdisp-tau-prior-median",
-        "--independent-scaling-free-log-core-tau-prior-median",
-        "--independent-scaling-free-log-cut-tau-prior-median",
+        "--independent-scaling-free-log-sigma-tau-prior-median",
+        "--independent-scaling-free-log-mass-tau-prior-median",
         "--independent-scaling-free-log-tau-prior-sigma",
     ],
 )
@@ -19585,14 +19645,11 @@ def _validation_solver_args(**updates) -> argparse.Namespace:
         active_scaling_mag_slope_prior_sigma=cluster_solver.DEFAULT_ACTIVE_SCALING_MAG_SLOPE_PRIOR_SIGMA,
         active_scaling_local_logit_prior_sigma=cluster_solver.DEFAULT_ACTIVE_SCALING_LOCAL_LOGIT_PRIOR_SIGMA,
         active_scaling_freeze_threshold=cluster_solver.DEFAULT_ACTIVE_SCALING_FREEZE_THRESHOLD,
-        independent_scaling_free_log_vdisp_tau_prior_median=(
-            cluster_solver.DEFAULT_INDEPENDENT_SCALING_FREE_LOG_VDISP_TAU_PRIOR_MEDIAN
+        independent_scaling_free_log_sigma_tau_prior_median=(
+            cluster_solver.DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN
         ),
-        independent_scaling_free_log_core_tau_prior_median=(
-            cluster_solver.DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CORE_TAU_PRIOR_MEDIAN
-        ),
-        independent_scaling_free_log_cut_tau_prior_median=(
-            cluster_solver.DEFAULT_INDEPENDENT_SCALING_FREE_LOG_CUT_TAU_PRIOR_MEDIAN
+        independent_scaling_free_log_mass_tau_prior_median=(
+            cluster_solver.DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN
         ),
         independent_scaling_free_log_tau_prior_sigma=(
             cluster_solver.DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA
@@ -19908,10 +19965,9 @@ def test_validation_run_cluster_solver_forwards_scalar_stage_controls(monkeypatc
         "--independent-scaling-free-hyper-offset-prior-sigma",
     ):
         assert removed_option not in cmd
-    assert _option_values(cmd, "--independent-scaling-free-log-vdisp-tau-prior-median") == ["0.2"]
-    assert _option_values(cmd, "--independent-scaling-free-log-core-tau-prior-median") == ["0.3"]
-    assert _option_values(cmd, "--independent-scaling-free-log-cut-tau-prior-median") == ["0.3"]
-    assert _option_values(cmd, "--independent-scaling-free-log-tau-prior-sigma") == ["0.4"]
+    assert _option_values(cmd, "--independent-scaling-free-log-sigma-tau-prior-median") == ["0.1"]
+    assert _option_values(cmd, "--independent-scaling-free-log-mass-tau-prior-median") == ["0.2"]
+    assert _option_values(cmd, "--independent-scaling-free-log-tau-prior-sigma") == ["0.25"]
     assert "--microcanonical-diagonal-preconditioning" in cmd
     assert _option_values(cmd, "--microcanonical-tune-frac1") == ["0.1"]
     assert _option_values(cmd, "--microcanonical-tune-frac2") == ["0.1"]
@@ -19953,9 +20009,8 @@ def test_validation_run_cluster_solver_forwards_independent_scaling_hyperparamet
         active_scaling_mag_slope_prior_sigma=1.4,
         active_scaling_local_logit_prior_sigma=0.9,
         active_scaling_freeze_threshold=0.6,
-        independent_scaling_free_log_vdisp_tau_prior_median=0.22,
-        independent_scaling_free_log_core_tau_prior_median=0.33,
-        independent_scaling_free_log_cut_tau_prior_median=0.44,
+        independent_scaling_free_log_sigma_tau_prior_median=0.22,
+        independent_scaling_free_log_mass_tau_prior_median=0.33,
         independent_scaling_free_log_tau_prior_sigma=0.55,
     )
 
@@ -19988,9 +20043,8 @@ def test_validation_run_cluster_solver_forwards_independent_scaling_hyperparamet
         "--independent-scaling-free-hyper-offset-prior-sigma",
     ):
         assert removed_option not in cmd
-    assert _option_values(cmd, "--independent-scaling-free-log-vdisp-tau-prior-median") == ["0.22"]
-    assert _option_values(cmd, "--independent-scaling-free-log-core-tau-prior-median") == ["0.33"]
-    assert _option_values(cmd, "--independent-scaling-free-log-cut-tau-prior-median") == ["0.44"]
+    assert _option_values(cmd, "--independent-scaling-free-log-sigma-tau-prior-median") == ["0.22"]
+    assert _option_values(cmd, "--independent-scaling-free-log-mass-tau-prior-median") == ["0.33"]
     assert _option_values(cmd, "--independent-scaling-free-log-tau-prior-sigma") == ["0.55"]
 
 
@@ -27310,6 +27364,7 @@ def test_sequential_stage2_linearized_runs_as_free_source_forward_fit(
     monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {"halo_v_disp": 1200.0})
     monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
+    monkeypatch.setattr(cluster_solver, "_selected_independent_by_potfile_from_artifacts", lambda _artifacts_dir: [{2, 5}])
     args = argparse.Namespace(
         run_name="fit",
         par_path="data/clustersim/input.par",
@@ -27328,16 +27383,21 @@ def test_sequential_stage2_linearized_runs_as_free_source_forward_fit(
     cluster_solver._run_sequential_v2(args)
 
     assert [item[1] for item in calls] == [
+        "fit/stage0_fast_initializer",
         "fit/stage1_backprojected_centroid_fit",
         "fit/stage2_free_source_forward_fit",
     ]
     assert calls[0][2] == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
-    assert calls[1][2] == SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
+    assert calls[1][2] == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
     assert calls[1][3] == {"halo_v_disp": 1200.0}
-    assert calls[1][4] == {"1": (0.1, -0.2)}
+    assert calls[2][2] == SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
+    assert calls[2][3] == {"halo_v_disp": 1200.0}
+    assert calls[2][4] == {"1": (0.1, -0.2)}
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["stage0_run_dir"].endswith("stage0_fast_initializer")
     assert summary["stage1_run_dir"].endswith("stage1_backprojected_centroid_fit")
     assert summary["stage2_run_dir"].endswith("stage2_free_source_forward_fit")
+    assert summary["stage0_selected_free_scaling"] == 2
     assert summary["stage2_forward_mode"] == cluster_solver.STAGE2_FORWARD_MODE_LINEARIZED
 
 
@@ -27623,6 +27683,7 @@ def test_sequential_stage2_critical_arc_runs_as_free_source_forward_fit(
     monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {"halo_v_disp": 1200.0})
     monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
+    monkeypatch.setattr(cluster_solver, "_selected_independent_by_potfile_from_artifacts", lambda _artifacts_dir: [{2, 5}])
     args = argparse.Namespace(
         run_name="fit",
         par_path="data/clustersim/input.par",
@@ -27653,15 +27714,18 @@ def test_sequential_stage2_critical_arc_runs_as_free_source_forward_fit(
     cluster_solver._run_sequential_v2(args)
 
     assert [item[1] for item in calls] == [
+        "fit/stage0_fast_initializer",
         "fit/stage1_backprojected_centroid_fit",
         "fit/stage2_free_source_forward_fit",
     ]
-    assert calls[1][2] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
-    assert calls[1][3] == "smc"
-    assert calls[1][4] == {"halo_v_disp": 1200.0}
-    assert calls[1][5] == {"1": (0.1, -0.2)}
+    assert calls[2][2] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+    assert calls[2][3] == "smc"
+    assert calls[2][4] == {"halo_v_disp": 1200.0}
+    assert calls[2][5] == {"1": (0.1, -0.2)}
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
+    assert summary["stage0_run_dir"].endswith("stage0_fast_initializer")
     assert summary["stage2_run_dir"].endswith("stage2_free_source_forward_fit")
+    assert summary["stage0_selected_free_scaling"] == 2
     assert summary["stage2_forward_mode"] == cluster_solver.STAGE2_FORWARD_MODE_CRITICAL_ARC
     assert summary["stage2_sample_likelihood_mode"] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
 
