@@ -15070,6 +15070,7 @@ def _source_position_dense_mass_blocks(parameter_specs: list[ParameterSpec]) -> 
         "source_y": 1,
     }
     blocks: list[tuple[str, ...]] = []
+    emitted_sites: set[str] = set()
     for group_name in group_order:
         ordered_specs = [
             spec
@@ -15079,8 +15080,10 @@ def _source_position_dense_mass_blocks(parameter_specs: list[ParameterSpec]) -> 
             )
         ]
         site_names = _unique_sample_site_names(ordered_specs)
+        site_names = tuple(name for name in site_names if name not in emitted_sites)
         if site_names:
             blocks.append(site_names)
+            emitted_sites.update(site_names)
     return tuple(blocks)
 
 
@@ -16586,6 +16589,9 @@ def _source_position_sample_name(family_id: str, axis: str) -> str:
     return f"source_{safe_family_id}_beta_{axis}"
 
 
+SOURCE_POSITION_VECTOR_SAMPLE_SITE_NAME = "source_position_beta"
+
+
 def _shared_source_position_prior_values(
     family_data: list[FamilyData],
     mean_x: float,
@@ -16614,6 +16620,7 @@ def _build_source_position_parameter_specs(
             f"expected one of {', '.join(SOURCE_POSITION_PARAMETERIZATIONS)}."
         )
     specs: list[ParameterSpec] = []
+    site_index = 0
     for family in family_data:
         if family.family_id not in source_position_prior_values:
             raise ValueError(
@@ -16641,8 +16648,11 @@ def _build_source_position_parameter_specs(
                     physical_std=sigma,
                     transform_offset=float(center) if mode == SOURCE_POSITION_PARAMETERIZATION_PRIOR_WHITENED else 0.0,
                     transform_scale=sigma if mode == SOURCE_POSITION_PARAMETERIZATION_PRIOR_WHITENED else 1.0,
+                    sample_site_name=SOURCE_POSITION_VECTOR_SAMPLE_SITE_NAME,
+                    sample_site_index=site_index,
                 )
             )
+            site_index += 1
     return specs
 
 

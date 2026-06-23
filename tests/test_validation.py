@@ -4632,6 +4632,59 @@ def test_direct_source_position_specs_keep_physical_beta_sampling() -> None:
     assert [spec.transform_kind for spec in specs] == ["identity", "identity"]
 
 
+def test_source_position_specs_share_one_vector_sample_site() -> None:
+    families = [
+        FamilyData(
+            family_id="1",
+            z_source=2.0,
+            effective_z_source=2.0,
+            sigma_arcsec=0.15,
+            image_labels=["1.1", "1.2"],
+            x_obs=np.asarray([0.0, 1.0]),
+            y_obs=np.asarray([0.0, 1.0]),
+            reliability=np.ones(2),
+        ),
+        FamilyData(
+            family_id="2",
+            z_source=3.0,
+            effective_z_source=3.0,
+            sigma_arcsec=0.15,
+            image_labels=["2.1", "2.2"],
+            x_obs=np.asarray([2.0, 3.0]),
+            y_obs=np.asarray([2.0, 3.0]),
+            reliability=np.ones(2),
+        ),
+    ]
+
+    specs = cluster_solver._build_source_position_parameter_specs(
+        families,
+        {"1": (0.25, -0.5), "2": (1.25, -1.5)},
+        start_index=0,
+        beta_prior_sigma_arcsec=0.3,
+        parameterization="prior-whitened",
+    )
+
+    assert [spec.sample_name for spec in specs] == [
+        "source_1_beta_x",
+        "source_1_beta_y",
+        "source_2_beta_x",
+        "source_2_beta_y",
+    ]
+    assert {spec.sample_site_name for spec in specs} == {cluster_solver.SOURCE_POSITION_VECTOR_SAMPLE_SITE_NAME}
+    assert [spec.sample_site_index for spec in specs] == [0, 1, 2, 3]
+    assert [spec.potential_id for spec in specs] == ["1", "1", "2", "2"]
+    assert [spec.field for spec in specs] == ["beta_x", "beta_y", "beta_x", "beta_y"]
+    assert [spec.transform_offset for spec in specs] == pytest.approx([0.25, -0.5, 1.25, -1.5])
+
+    sites = cluster_solver._parameter_sample_sites(specs)
+    distribution = cluster_solver._distribution_for_sample_site(sites[0], specs)
+
+    assert len(sites) == 1
+    assert sites[0].name == cluster_solver.SOURCE_POSITION_VECTOR_SAMPLE_SITE_NAME
+    assert sites[0].indices == (0, 1, 2, 3)
+    assert tuple(distribution.event_shape) == (4,)
+
+
 def test_explicit_source_position_parameterization_uses_state_metadata_not_spec_shape() -> None:
     family = FamilyData(
         family_id="1",
@@ -15776,6 +15829,73 @@ def test_structured_dense_mass_blocks_group_non_source_and_source_families() -> 
         ("O1_x", "O1_y", "image_sigma_int"),
         ("source_1_beta_x", "source_1_beta_y"),
         ("source_2_beta_x", "source_2_beta_y"),
+    )
+
+
+def test_structured_dense_mass_blocks_emit_shared_source_position_vector_once() -> None:
+    specs = [
+        ParameterSpec("O1.x", "O1_x", "O1", 0, "x", "normal", -np.inf, np.inf, 0.1, component_family="halo"),
+        ParameterSpec(
+            "source.1.beta_x",
+            "source_1_beta_x",
+            "1",
+            0,
+            "beta_x",
+            "normal",
+            -np.inf,
+            np.inf,
+            0.1,
+            component_family="source_position",
+            sample_site_name=cluster_solver.SOURCE_POSITION_VECTOR_SAMPLE_SITE_NAME,
+            sample_site_index=0,
+        ),
+        ParameterSpec(
+            "source.1.beta_y",
+            "source_1_beta_y",
+            "1",
+            0,
+            "beta_y",
+            "normal",
+            -np.inf,
+            np.inf,
+            0.1,
+            component_family="source_position",
+            sample_site_name=cluster_solver.SOURCE_POSITION_VECTOR_SAMPLE_SITE_NAME,
+            sample_site_index=1,
+        ),
+        ParameterSpec(
+            "source.2.beta_x",
+            "source_2_beta_x",
+            "2",
+            0,
+            "beta_x",
+            "normal",
+            -np.inf,
+            np.inf,
+            0.1,
+            component_family="source_position",
+            sample_site_name=cluster_solver.SOURCE_POSITION_VECTOR_SAMPLE_SITE_NAME,
+            sample_site_index=2,
+        ),
+        ParameterSpec(
+            "source.2.beta_y",
+            "source_2_beta_y",
+            "2",
+            0,
+            "beta_y",
+            "normal",
+            -np.inf,
+            np.inf,
+            0.1,
+            component_family="source_position",
+            sample_site_name=cluster_solver.SOURCE_POSITION_VECTOR_SAMPLE_SITE_NAME,
+            sample_site_index=3,
+        ),
+    ]
+
+    assert cluster_solver._structured_nuts_dense_mass_blocks(specs) == (
+        ("O1_x",),
+        (cluster_solver.SOURCE_POSITION_VECTOR_SAMPLE_SITE_NAME,),
     )
 
 
