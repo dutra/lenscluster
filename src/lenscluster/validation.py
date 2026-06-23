@@ -5197,6 +5197,12 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         value = float(getattr(args, attr, 0.25 if attr.endswith("sigma") else 0.2))
         if not np.isfinite(value) or value <= 0.0:
             raise SystemExit(f"{option} must be finite and positive.")
+    softening_length_kpc = float(getattr(args, "softening_length_kpc", 0.0))
+    if not np.isfinite(softening_length_kpc) or softening_length_kpc < 0.0:
+        raise SystemExit("--softening-length-kpc must be finite and nonnegative.")
+    softening_length_prior_log_sigma = float(getattr(args, "softening_length_prior_log_sigma", 0.15))
+    if not np.isfinite(softening_length_prior_log_sigma) or softening_length_prior_log_sigma <= 0.0:
+        raise SystemExit("--softening-length-prior-log-sigma must be finite and positive.")
     image_presence_penalty_weight = getattr(args, "image_presence_penalty_weight", None)
     if image_presence_penalty_weight is not None and (
         not np.isfinite(float(image_presence_penalty_weight)) or float(image_presence_penalty_weight) < 0.0
@@ -6293,6 +6299,12 @@ def _validate_validation_args(args: argparse.Namespace) -> None:
         value = float(getattr(args, attr, 0.25 if attr.endswith("sigma") else 0.2))
         if not np.isfinite(value) or value <= 0.0:
             raise SystemExit(f"{option} must be finite and positive.")
+    softening_length_kpc = float(getattr(args, "softening_length_kpc", 0.0))
+    if not np.isfinite(softening_length_kpc) or softening_length_kpc < 0.0:
+        raise SystemExit("--softening-length-kpc must be finite and nonnegative.")
+    softening_length_prior_log_sigma = float(getattr(args, "softening_length_prior_log_sigma", 0.15))
+    if not np.isfinite(softening_length_prior_log_sigma) or softening_length_prior_log_sigma <= 0.0:
+        raise SystemExit("--softening-length-prior-log-sigma must be finite and positive.")
 
 
 def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: argparse.Namespace) -> Path:
@@ -6301,6 +6313,8 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
         DEFAULT_REFRESH_EVERY,
+        DEFAULT_SOFTENING_LENGTH_KPC,
+        DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA,
     )
 
     controls = _normalize_validation_stage_fit_controls(args)
@@ -6399,6 +6413,10 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
                 DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
             )
         ),
+        "--softening-length-kpc",
+        str(getattr(args, "softening_length_kpc", DEFAULT_SOFTENING_LENGTH_KPC)),
+        "--softening-length-prior-log-sigma",
+        str(getattr(args, "softening_length_prior_log_sigma", DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA)),
         "--pos-sigma-arcsec",
         str(args.pos_sigma_arcsec),
         "--seed",
@@ -7004,6 +7022,8 @@ def _build_parser() -> argparse.ArgumentParser:
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
         DEFAULT_REFRESH_EVERY,
+        DEFAULT_SOFTENING_LENGTH_KPC,
+        DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA,
     )
 
     parser = argparse.ArgumentParser(description="Mock-recovery validation suite for lenscluster.")
@@ -7578,6 +7598,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--independent-scaling-free-log-tau-prior-sigma",
         type=float,
         default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+    )
+    parser.add_argument("--softening-length-kpc", type=float, default=DEFAULT_SOFTENING_LENGTH_KPC)
+    parser.add_argument(
+        "--softening-length-prior-log-sigma",
+        type=float,
+        default=DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA,
     )
     parser.add_argument(
         "--fit-scaling-scatter",

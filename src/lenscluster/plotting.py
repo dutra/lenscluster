@@ -2444,6 +2444,14 @@ def _scaling_relation_summary_table(
         "gamma_ml_p16",
         "gamma_ml_p84",
         "gamma_ml_best",
+        "log_softening_length_kpc_median",
+        "log_softening_length_kpc_p16",
+        "log_softening_length_kpc_p84",
+        "log_softening_length_kpc_best",
+        "softening_length_kpc_median",
+        "softening_length_kpc_p16",
+        "softening_length_kpc_p84",
+        "softening_length_kpc_best",
         "selected_active",
         "selected_independent",
         "scaling_relation_class",
@@ -2455,6 +2463,10 @@ def _scaling_relation_summary_table(
         "scaling_core_radius_kpc_p16",
         "scaling_core_radius_kpc_p84",
         "scaling_core_radius_kpc_best",
+        "scaling_core_radius_effective_kpc_median",
+        "scaling_core_radius_effective_kpc_p16",
+        "scaling_core_radius_effective_kpc_p84",
+        "scaling_core_radius_effective_kpc_best",
         "scaling_cut_radius_kpc_median",
         "scaling_cut_radius_kpc_p16",
         "scaling_cut_radius_kpc_p84",
@@ -2471,6 +2483,10 @@ def _scaling_relation_summary_table(
         "free_core_radius_kpc_p16",
         "free_core_radius_kpc_p84",
         "free_core_radius_kpc_best",
+        "free_core_radius_effective_kpc_median",
+        "free_core_radius_effective_kpc_p16",
+        "free_core_radius_effective_kpc_p84",
+        "free_core_radius_effective_kpc_best",
         "free_cut_radius_kpc_median",
         "free_cut_radius_kpc_p16",
         "free_cut_radius_kpc_p84",
@@ -2525,6 +2541,28 @@ def _scaling_relation_summary_table(
         packed_lens_spec, "gamma_ml_param_index", n_components, dtype=np.int32, fill_value=-1
     )
     weights = _normalized_weights(sample_weights, sample_array.shape[0])
+    log_softening_index = next(
+        (
+            idx
+            for idx, spec in enumerate(parameter_specs)
+            if getattr(spec, "sample_name", "") == "log_softening_length_kpc"
+        ),
+        -1,
+    )
+    if 0 <= log_softening_index < sample_array.shape[1]:
+        log_softening_values = sample_array[:, log_softening_index]
+        log_softening_best = (
+            float(best_fit_array[log_softening_index])
+            if log_softening_index < best_fit_array.size
+            else float("nan")
+        )
+        softening_values = np.exp(log_softening_values)
+        softening_best = float(np.exp(log_softening_best)) if np.isfinite(log_softening_best) else float("nan")
+    else:
+        log_softening_values = np.full(sample_array.shape[0], np.nan, dtype=float)
+        log_softening_best = float("nan")
+        softening_values = np.zeros(sample_array.shape[0], dtype=float)
+        softening_best = 0.0
 
     def _values(base_array: np.ndarray, index_array: np.ndarray, component_index: int) -> np.ndarray:
         idx = int(index_array[component_index])
@@ -2604,6 +2642,8 @@ def _scaling_relation_summary_table(
         _add_summary(row_dict, "alpha_sigma", alpha_sigma, alpha_sigma_best)
         _add_summary(row_dict, "beta_radius", beta_radius, beta_radius_best)
         _add_summary(row_dict, "gamma_ml", gamma_values, gamma_best)
+        _add_summary(row_dict, "log_softening_length_kpc", log_softening_values, log_softening_best)
+        _add_summary(row_dict, "softening_length_kpc", softening_values, softening_best)
         _add_summary(
             row_dict,
             "scaling_v_disp",
@@ -2616,6 +2656,13 @@ def _scaling_relation_summary_table(
             "scaling_core_radius_kpc",
             scaling_core,
             core_ref_best * size_luminosity_scale_best,
+        )
+        scaling_core_best = core_ref_best * size_luminosity_scale_best
+        _add_summary(
+            row_dict,
+            "scaling_core_radius_effective_kpc",
+            np.sqrt(np.square(scaling_core) + np.square(softening_values)),
+            float(np.sqrt(scaling_core_best * scaling_core_best + softening_best * softening_best)),
         )
         _add_summary(
             row_dict,
@@ -2647,6 +2694,10 @@ def _scaling_relation_summary_table(
         "free_core_radius_kpc_p16",
         "free_core_radius_kpc_p84",
         "free_core_radius_kpc_best",
+        "free_core_radius_effective_kpc_median",
+        "free_core_radius_effective_kpc_p16",
+        "free_core_radius_effective_kpc_p84",
+        "free_core_radius_effective_kpc_best",
         "free_cut_radius_kpc_median",
         "free_cut_radius_kpc_p16",
         "free_cut_radius_kpc_p84",
@@ -2679,6 +2730,16 @@ def _scaling_relation_summary_table(
             for column in free_columns:
                 if column not in result:
                     result[column] = np.nan
+    for suffix in ("median", "p16", "p84", "best"):
+        effective_column = f"free_core_radius_effective_kpc_{suffix}"
+        if effective_column in result and np.isfinite(pd.to_numeric(result[effective_column], errors="coerce")).any():
+            continue
+        core_column = f"free_core_radius_kpc_{suffix}"
+        softening_column = f"softening_length_kpc_{suffix}"
+        if core_column in result and softening_column in result:
+            free_core = pd.to_numeric(result[core_column], errors="coerce").to_numpy(dtype=float)
+            softening = pd.to_numeric(result[softening_column], errors="coerce").to_numpy(dtype=float)
+            result[effective_column] = np.sqrt(np.square(free_core) + np.square(softening))
     for suffix in ("median", "p16", "p84", "best"):
         mass_column = f"free_log10_mass_msun_{suffix}"
         if mass_column in result and np.isfinite(pd.to_numeric(result[mass_column], errors="coerce")).any():

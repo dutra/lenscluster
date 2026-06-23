@@ -2537,6 +2537,40 @@ def test_cluster_solver_parses_scaling_relation_mode(monkeypatch: pytest.MonkeyP
             _parse_args()
 
 
+def test_cluster_solver_parses_softening_length_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par"])
+    default_args = _parse_args()
+    assert default_args.softening_length_kpc == pytest.approx(cluster_solver.DEFAULT_SOFTENING_LENGTH_KPC)
+    assert default_args.softening_length_prior_log_sigma == pytest.approx(
+        cluster_solver.DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "input.par",
+            "--softening-length-kpc",
+            "4.0",
+            "--softening-length-prior-log-sigma",
+            "0.2",
+        ],
+    )
+    args = _parse_args()
+    assert args.softening_length_kpc == pytest.approx(4.0)
+    assert args.softening_length_prior_log_sigma == pytest.approx(0.2)
+
+    for invalid_args in (
+        ["--softening-length-kpc", "-1.0"],
+        ["--softening-length-prior-log-sigma", "0.0"],
+    ):
+        monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par", *invalid_args])
+        with pytest.raises(SystemExit):
+            _parse_args()
+
+
 def test_multi_cluster_solver_parses_fov_limit_args() -> None:
     args = multi_cluster_solver._parse_args(
         [
@@ -6467,6 +6501,25 @@ def test_packed_lens_state_scales_core_radius_with_beta_radius() -> None:
     np.testing.assert_allclose(np.asarray(details["rs_raw"])[0], 40.0, rtol=1.0e-12)
     np.testing.assert_allclose(np.asarray(packed_state["Ra"])[0], 2.0, rtol=1.0e-12)
     np.testing.assert_allclose(np.asarray(packed_state["Rs"])[0], 40.0, rtol=1.0e-12)
+
+
+def test_packed_lens_state_applies_sampled_log_softening_length_in_quadrature() -> None:
+    evaluator = _single_independent_branch_evaluator()
+    evaluator.log_softening_length_param_index = 0
+
+    physical_params = jnp.asarray([np.log(4.0), 0.0, 200.0, 3.0, 50.0], dtype=jnp.float64)
+    packed_state, details = evaluator._build_packed_lens_state_details_from_physical(
+        physical_params,
+        2.0,
+        kpc_per_arcsec=jnp.asarray(1.0),
+        dpie_sigma0_factor=jnp.asarray(1.0),
+    )
+
+    np.testing.assert_allclose(np.asarray(details["core_radius_kpc"])[1], 3.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details["softening_length_kpc"]), 4.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details["log_softening_length_kpc"]), np.log(4.0), rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details["core_radius_effective_kpc"])[1], 5.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(packed_state["Ra"])[1], 5.0, rtol=1.0e-12)
 
 
 def test_packed_lens_state_gamma_ml_controls_size_exponent() -> None:
@@ -12764,6 +12817,35 @@ def test_potfile_mode9_scaling_priors_transform_bounds_to_latent_log_space() -> 
     assert core_spec.physical_upper == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_CORE_REF_UPPER_KPC)
     assert core_spec.physical_mean == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_CORE_REF_MEDIAN_KPC)
     assert core_spec.physical_std is None
+
+
+def test_log_softening_length_parameter_spec_is_disabled_at_zero() -> None:
+    spec = cluster_solver._build_log_softening_length_parameter_spec(
+        start_index=0,
+        softening_length_kpc=0.0,
+        prior_log_sigma=0.15,
+    )
+
+    assert spec is None
+
+
+def test_log_softening_length_parameter_spec_samples_log_coordinate() -> None:
+    spec = cluster_solver._build_log_softening_length_parameter_spec(
+        start_index=0,
+        softening_length_kpc=4.0,
+        prior_log_sigma=0.2,
+    )
+
+    assert spec is not None
+    assert spec.sample_name == cluster_solver.LOG_SOFTENING_LENGTH_SAMPLE_NAME
+    assert spec.field == cluster_solver.LOG_SOFTENING_LENGTH_SAMPLE_NAME
+    assert spec.component_family == cluster_solver.SOFTENING_LENGTH_COMPONENT_FAMILY
+    assert spec.prior_kind == "normal"
+    assert spec.transform_kind == "identity"
+    assert spec.mean == pytest.approx(np.log(4.0))
+    assert spec.std == pytest.approx(0.2)
+    assert spec.physical_mean == pytest.approx(np.log(4.0))
+    assert spec.physical_std == pytest.approx(0.2)
 
 
 def test_scaling_parameter_specs_use_direct_exponent_mode_only() -> None:

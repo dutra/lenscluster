@@ -84,6 +84,9 @@ BERGAMINI_CLUSTERS = {
         "kappa_true_fits": "data/ff_sims/published/hera/kappa_z9_0.fits",
         "gammax_true_fits": "data/ff_sims/published/hera/gammax_z9_0.fits",
         "gammay_true_fits": "data/ff_sims/published/hera/gammay_z9_0.fits",
+        # HERA uses H0=72 km/s/Mpc, so h=0.72 and 2.3 h^-1 kpc = 3.19 kpc physical.
+        "softening_length_kpc": 2.3 / 0.72,
+        "softening_length_prior_log_sigma": 0.15,
     },
 }
 CLUSTER_ALIASES = {}
@@ -152,6 +155,12 @@ if mode != "none":
 perturbation_discovery_alpha_tol_arcsec = 0.2
 perturbation_discovery_jacobian_tol = 0.5
 perturbation_discovery_jacobian_weight = 1.0
+softening_length_kpc = cluster_config.get("softening_length_kpc", 0.0)
+softening_length_prior_log_sigma = cluster_config.get("softening_length_prior_log_sigma", 0.15)
+softening_length_args = [
+    "--softening-length-kpc", softening_length_kpc,
+    "--softening-length-prior-log-sigma", softening_length_prior_log_sigma,
+] if softening_length_kpc > 0.0 else []
 
 exact_image_diagnostics_stage2 = True
 image_catalog_family_cutout_image_dir = cluster_config.get("image_catalog_family_cutout_image_dir", "data/BUFFALO_Images")
@@ -278,6 +287,7 @@ discovery_args = [
     "--independent-scaling-free-log-sigma-tau-prior-median", independent_scaling_free_log_sigma_tau_prior_median,
     "--independent-scaling-free-log-mass-tau-prior-median", independent_scaling_free_log_mass_tau_prior_median,
     "--independent-scaling-free-log-tau-prior-sigma", independent_scaling_free_log_tau_prior_sigma,
+    *(softening_length_args),
 ]
 
 scatter_and_stabilizer_args = [

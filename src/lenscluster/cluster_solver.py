@@ -317,6 +317,10 @@ DEFAULT_SOLVER_POTFILE_CORE_REF_MEDIAN_KPC = 0.15
 DEFAULT_SOLVER_POTFILE_CORE_REF_LOG_SIGMA = 0.7
 DEFAULT_SOLVER_POTFILE_CORE_REF_LOWER_KPC = 0.01
 DEFAULT_SOLVER_POTFILE_CORE_REF_UPPER_KPC = 10.0
+DEFAULT_SOFTENING_LENGTH_KPC = 0.0
+DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA = 0.15
+LOG_SOFTENING_LENGTH_SAMPLE_NAME = "log_softening_length_kpc"
+SOFTENING_LENGTH_COMPONENT_FAMILY = "softening_length"
 SCALING_RELATION_MODE_DIRECT_EXPONENTS = "direct-exponents"
 SCALING_RELATION_MODES = (SCALING_RELATION_MODE_DIRECT_EXPONENTS,)
 DEFAULT_SCALING_RELATION_MODE = SCALING_RELATION_MODE_DIRECT_EXPONENTS
@@ -1489,6 +1493,22 @@ def _parse_args() -> argparse.Namespace:
         "--scaling-scatter",
         action="store_true",
         help="Add Bergamini sigma/mass intrinsic log-scatter to member-galaxy scaling relations.",
+    )
+    parser.add_argument(
+        "--softening-length-kpc",
+        type=_nonnegative_float_arg,
+        default=DEFAULT_SOFTENING_LENGTH_KPC,
+        help=(
+            "Reference simulation softening length in kpc. When positive, sample "
+            "log_softening_length_kpc and use sqrt(core_radius_kpc^2 + softening_length_kpc^2) "
+            "as the dPIE core radius passed to lensing."
+        ),
+    )
+    parser.add_argument(
+        "--softening-length-prior-log-sigma",
+        type=_positive_float_arg,
+        default=DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA,
+        help="Normal-prior sigma for log_softening_length_kpc when --softening-length-kpc is positive.",
     )
     parser.add_argument(
         "--refresh-every",
@@ -16541,6 +16561,40 @@ def _build_critical_arc_singular_softness_parameter_spec(
     )
 
 
+def _build_log_softening_length_parameter_spec(
+    start_index: int,
+    *,
+    softening_length_kpc: float,
+    prior_log_sigma: float,
+) -> ParameterSpec | None:
+    del start_index
+    softening = float(softening_length_kpc)
+    log_sigma = float(prior_log_sigma)
+    if not np.isfinite(softening) or softening < 0.0:
+        raise ValueError("softening_length_kpc must be finite and nonnegative.")
+    if not np.isfinite(log_sigma) or log_sigma <= 0.0:
+        raise ValueError("softening_length_prior_log_sigma must be finite and positive.")
+    if softening == 0.0:
+        return None
+    return ParameterSpec(
+        name="softening_length.log_softening_length_kpc",
+        sample_name=LOG_SOFTENING_LENGTH_SAMPLE_NAME,
+        potential_id="softening_length",
+        profile_type=0,
+        field=LOG_SOFTENING_LENGTH_SAMPLE_NAME,
+        prior_kind="normal",
+        lower=float("-inf"),
+        upper=float("inf"),
+        step=0.05,
+        mean=float(np.log(softening)),
+        std=log_sigma,
+        component_family=SOFTENING_LENGTH_COMPONENT_FAMILY,
+        transform_kind="identity",
+        physical_mean=float(np.log(softening)),
+        physical_std=log_sigma,
+    )
+
+
 def _build_cosmology_parameter_specs(start_index: int, cosmo: Any) -> list[ParameterSpec]:
     del start_index
     om0_value = _om0_from_config(cosmo) if isinstance(cosmo, dict) else float(getattr(cosmo, "Om0", 0.3))
@@ -17978,6 +18032,15 @@ class ClusterJAXEvaluator:
         ]
         self.image_sigma_int_param_index = int(image_scatter_indices[0]) if image_scatter_indices else -1
         self.image_sigma_int_sampled = self.fixed_image_sigma_int_arcsec is None and self.image_sigma_int_param_index >= 0
+        self.log_softening_length_param_index = next(
+            (
+                idx
+                for idx, spec in enumerate(self.state.parameter_specs)
+                if spec.sample_name == LOG_SOFTENING_LENGTH_SAMPLE_NAME
+            ),
+            int(getattr(self.state, "log_softening_length_param_index", -1)),
+        )
+        self.softening_length_sampled = self.log_softening_length_param_index >= 0
         critical_arc_threshold_indices = [
             idx
             for idx, spec in enumerate(self.state.parameter_specs)
@@ -18093,6 +18156,8 @@ class ClusterJAXEvaluator:
         self._conditional_source_inverse_basis_cache: dict[tuple[tuple[int, ...], str, bytes], tuple[dict[str, Any], ...]] = {}
         self.scaling_param_indices_jax = jnp.asarray(self.scaling_param_indices, dtype=jnp.int32)
         surrogate_param_indices = self.scaling_param_indices.tolist()
+        if self.softening_length_sampled:
+            surrogate_param_indices.append(self.log_softening_length_param_index)
         if bool(getattr(self, "fit_cosmology_flat_wcdm", False)):
             surrogate_param_indices.extend([self.cosmology_om0_param_index, self.cosmology_w0_param_index])
         self.surrogate_param_indices = np.asarray(
@@ -21096,6 +21161,28 @@ class ClusterJAXEvaluator:
             w0,
         )
 
+    def _softening_length_kpc_from_physical(self, physical_params: jnp.ndarray) -> jnp.ndarray:
+        index = int(getattr(self, "log_softening_length_param_index", -1))
+        if index < 0:
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        log_softening = jnp.take(jnp.asarray(physical_params, dtype=jnp.float64), jnp.asarray(index, dtype=jnp.int32))
+        return jnp.exp(log_softening)
+
+    def _effective_core_radius_kpc_from_physical(
+        self,
+        core_radius_kpc: jnp.ndarray,
+        physical_params: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        if int(getattr(self, "log_softening_length_param_index", -1)) < 0:
+            return (
+                core_radius_kpc,
+                jnp.asarray(0.0, dtype=jnp.float64),
+                jnp.asarray(jnp.nan, dtype=jnp.float64),
+            )
+        softening_length_kpc = self._softening_length_kpc_from_physical(physical_params)
+        core_radius_effective_kpc = jnp.sqrt(jnp.square(core_radius_kpc) + jnp.square(softening_length_kpc))
+        return core_radius_effective_kpc, softening_length_kpc, jnp.log(softening_length_kpc)
+
     def _sampled_cosmology_geometry_for_physical(
         self,
         physical_params: jnp.ndarray,
@@ -21257,7 +21344,10 @@ class ClusterJAXEvaluator:
         if kpc_per_arcsec is None:
             kpc_per_arcsec = self._kpc_per_arcsec_for_physical(physical_params)
         kpc_per_arcsec = jnp.asarray(kpc_per_arcsec, dtype=jnp.float64)
-        ra_raw = core_radius_kpc / kpc_per_arcsec
+        core_radius_effective_kpc, softening_length_kpc, log_softening_length_kpc = (
+            self._effective_core_radius_kpc_from_physical(core_radius_kpc, physical_params)
+        )
+        ra_raw = core_radius_effective_kpc / kpc_per_arcsec
         rs_raw = cut_radius_kpc / kpc_per_arcsec
         ra = jnp.maximum(ra_raw, SAFE_RADIUS_MARGIN_ARCSEC)
         rs = jnp.maximum(rs_raw, ra + SAFE_RADIUS_MARGIN_ARCSEC)
@@ -21291,6 +21381,10 @@ class ClusterJAXEvaluator:
             "sigma0": sigma0,
             "ra_raw": ra_raw,
             "rs_raw": rs_raw,
+            "core_radius_kpc": core_radius_kpc,
+            "core_radius_effective_kpc": core_radius_effective_kpc,
+            "softening_length_kpc": softening_length_kpc,
+            "log_softening_length_kpc": log_softening_length_kpc,
             "v_disp": v_disp,
             "alpha_sigma": alpha_sigma,
             "beta_radius": beta_radius,
@@ -21537,7 +21631,10 @@ class ClusterJAXEvaluator:
         cut_radius_kpc = jnp.where(is_scaling, scaled_cut, cut_radius_kpc)
 
         kpc_per_arcsec = self._kpc_per_arcsec_for_physical(physical_params)
-        ra_raw = core_radius_kpc / kpc_per_arcsec
+        core_radius_effective_kpc, _softening_length_kpc, _log_softening_length_kpc = (
+            self._effective_core_radius_kpc_from_physical(core_radius_kpc, physical_params)
+        )
+        ra_raw = core_radius_effective_kpc / kpc_per_arcsec
         rs_raw = cut_radius_kpc / kpc_per_arcsec
         ra = jnp.maximum(ra_raw, SAFE_RADIUS_MARGIN_ARCSEC)
         rs = jnp.maximum(rs_raw, ra + SAFE_RADIUS_MARGIN_ARCSEC)
@@ -21630,7 +21727,10 @@ class ClusterJAXEvaluator:
         if kpc_per_arcsec is None:
             kpc_per_arcsec = self._kpc_per_arcsec_for_physical(physical_params)
         kpc_per_arcsec = jnp.asarray(kpc_per_arcsec, dtype=jnp.float64)
-        ra_raw = core_radius_kpc / kpc_per_arcsec
+        core_radius_effective_kpc, _softening_length_kpc, _log_softening_length_kpc = (
+            self._effective_core_radius_kpc_from_physical(core_radius_kpc, physical_params)
+        )
+        ra_raw = core_radius_effective_kpc / kpc_per_arcsec
         rs_raw = cut_radius_kpc / kpc_per_arcsec
         ra = jnp.maximum(ra_raw, SAFE_RADIUS_MARGIN_ARCSEC)
         rs = jnp.maximum(rs_raw, ra + SAFE_RADIUS_MARGIN_ARCSEC)
@@ -25363,6 +25463,15 @@ def _save_plot_bundle_h5(
                         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
                     )
                 ),
+                "softening_length_kpc": float(getattr(state, "softening_length_kpc", DEFAULT_SOFTENING_LENGTH_KPC)),
+                "softening_length_prior_log_sigma": float(
+                    getattr(
+                        state,
+                        "softening_length_prior_log_sigma",
+                        DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA,
+                    )
+                ),
+                "log_softening_length_param_index": int(getattr(state, "log_softening_length_param_index", -1)),
                 "frozen_active_scaling_component_indices": (
                     None
                     if getattr(state, "frozen_active_scaling_component_indices", None) is None
@@ -25579,6 +25688,11 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
                     DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
                 )
             ),
+            softening_length_kpc=float(meta.get("softening_length_kpc", DEFAULT_SOFTENING_LENGTH_KPC)),
+            softening_length_prior_log_sigma=float(
+                meta.get("softening_length_prior_log_sigma", DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA)
+            ),
+            log_softening_length_param_index=int(meta.get("log_softening_length_param_index", -1)),
             frozen_active_scaling_component_indices=(
                 None
                 if meta.get("frozen_active_scaling_component_indices") is None
@@ -26610,6 +26724,17 @@ def _build_state_from_inputs(
                 ),
             )
         )
+    log_softening_length_param_index = -1
+    softening_spec = _build_log_softening_length_parameter_spec(
+        start_index=len(parameter_specs),
+        softening_length_kpc=float(getattr(args, "softening_length_kpc", DEFAULT_SOFTENING_LENGTH_KPC)),
+        prior_log_sigma=float(
+            getattr(args, "softening_length_prior_log_sigma", DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA)
+        ),
+    )
+    if softening_spec is not None:
+        log_softening_length_param_index = len(parameter_specs)
+        parameter_specs.append(softening_spec)
     if fit_cosmology_flat_wcdm:
         parameter_specs.extend(_build_cosmology_parameter_specs(len(parameter_specs), cosmo_config))
         if svi_init_values is None:
@@ -26789,6 +26914,11 @@ def _build_state_from_inputs(
                 DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
             )
         ),
+        softening_length_kpc=float(getattr(args, "softening_length_kpc", DEFAULT_SOFTENING_LENGTH_KPC)),
+        softening_length_prior_log_sigma=float(
+            getattr(args, "softening_length_prior_log_sigma", DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA)
+        ),
+        log_softening_length_param_index=int(log_softening_length_param_index),
         frozen_active_scaling_component_indices=frozen_active_indices,
         active_scaling_frozen_from_previous_stage=frozen_active_indices is not None,
         active_scaling_frozen_source_run_dir=(

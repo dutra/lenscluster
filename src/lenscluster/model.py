@@ -301,6 +301,9 @@ class BuildState:
     independent_scaling_free_log_sigma_tau_prior_median: float = 0.10
     independent_scaling_free_log_mass_tau_prior_median: float = 0.20
     independent_scaling_free_log_tau_prior_sigma: float = 0.25
+    softening_length_kpc: float = 0.0
+    softening_length_prior_log_sigma: float = 0.15
+    log_softening_length_param_index: int = -1
     frozen_active_scaling_component_indices: np.ndarray | None = None
     active_scaling_frozen_from_previous_stage: bool = False
     active_scaling_frozen_source_run_dir: str | None = None
