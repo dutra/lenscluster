@@ -173,6 +173,20 @@ DEFAULT_MATCH_TOLERANCE = 2.0
 DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC = 0.1
 DEFAULT_EXACT_IMAGE_PRECISION_LIMIT = 1.0e-8
 DEFAULT_EXACT_IMAGE_NUM_ITER_MAX = 200
+EXACT_IMAGE_FINDER_LENSTRONOMY = "lenstronomy"
+EXACT_IMAGE_FINDER_LOCAL_LM = "local-lm"
+EXACT_IMAGE_FINDER_LOCAL_LM_ADAPTIVE = "local-lm-adaptive"
+EXACT_IMAGE_FINDER_CHOICES = (
+    EXACT_IMAGE_FINDER_LENSTRONOMY,
+    EXACT_IMAGE_FINDER_LOCAL_LM,
+    EXACT_IMAGE_FINDER_LOCAL_LM_ADAPTIVE,
+)
+DEFAULT_EXACT_IMAGE_FINDER = EXACT_IMAGE_FINDER_LENSTRONOMY
+DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC = 1.0e-4
+DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC = 1.0e-3
+DEFAULT_EXACT_IMAGE_LM_MAX_ITER = 30
+DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC = 1.0
+DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS = 8
 DEFAULT_SEARCH_PADDING = 8.0
 DEFAULT_Z_BIN_EFFICIENCY_TOL = 0.01
 DEFAULT_WARMUP = 300
@@ -1048,6 +1062,38 @@ def _positive_int_arg(value: str) -> int:
     return parsed
 
 
+def _truth_grid_draws_arg(value: str) -> int | None:
+    text = str(value).strip().lower()
+    if text == "all":
+        return None
+    try:
+        parsed = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be 'all' or a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be 'all' or a positive integer")
+    return parsed
+
+
+def _truth_grid_size_arg(value: str) -> int:
+    text = str(value).strip().lower()
+    if text == "native":
+        return 0
+    try:
+        parsed = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be 'native', 0, or a positive integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be 'native', 0, or a positive integer")
+    return parsed
+
+
+TRUTH_GRID_MODE_MEDIAN = "median"
+TRUTH_GRID_MODE_POSTERIOR = "posterior"
+TRUTH_GRID_MODE_CHOICES = (TRUTH_GRID_MODE_MEDIAN, TRUTH_GRID_MODE_POSTERIOR)
+DEFAULT_TRUTH_GRID_SIZE = 256
+
+
 def _nonnegative_int_arg(value: str) -> int:
     try:
         parsed = int(value)
@@ -1335,6 +1381,33 @@ def _parse_args() -> argparse.Namespace:
         help="Optional true gamma2/shear-y FITS image paired with --gammax-true-fits for mu truth recovery.",
     )
     parser.add_argument(
+        "--truth-grid-mode",
+        choices=TRUTH_GRID_MODE_CHOICES,
+        default=TRUTH_GRID_MODE_MEDIAN,
+        help=(
+            "Truth-map recovery grid convention. 'median' evaluates one elementwise posterior-median "
+            "realization; 'posterior' evaluates posterior draws and writes q16/median/q84 grids."
+        ),
+    )
+    parser.add_argument(
+        "--truth-grid-draws",
+        type=_truth_grid_draws_arg,
+        default=64,
+        help=(
+            "Posterior draw cap for --truth-grid-mode posterior. Use 'all' to evaluate every retained "
+            "posterior sample; a positive integer selects deterministic evenly spaced draws."
+        ),
+    )
+    parser.add_argument(
+        "--truth-grid-size",
+        type=_truth_grid_size_arg,
+        default=DEFAULT_TRUTH_GRID_SIZE,
+        help=(
+            "Truth-recovery diagnostic grid side length. The default 256 follows Meneghetti et al. "
+            "Use 0 or 'native' to evaluate on the native truth FITS grid."
+        ),
+    )
+    parser.add_argument(
         "--corner-overlay-bayes-dat",
         default=None,
         help=(
@@ -1379,6 +1452,45 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_EXACT_IMAGE_NUM_ITER_MAX,
         help="Maximum Lenstronomy exact image solver iterations for post-fit diagnostics.",
+    )
+    parser.add_argument(
+        "--exact-image-finder",
+        choices=EXACT_IMAGE_FINDER_CHOICES,
+        default=DEFAULT_EXACT_IMAGE_FINDER,
+        help=(
+            "Exact image-finding backend for post-fit diagnostics. lenstronomy keeps the global reference "
+            "solver; local-lm refines known image anchors; local-lm-adaptive adds local fallback near failures."
+        ),
+    )
+    parser.add_argument(
+        "--exact-image-displacement-tol-arcsec",
+        type=_positive_float_arg,
+        default=DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC,
+        help="Internal local-LM image displacement convergence tolerance in arcsec.",
+    )
+    parser.add_argument(
+        "--exact-image-identification-tol-arcsec",
+        type=_positive_float_arg,
+        default=DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC,
+        help="Required local image-root identification accuracy in arcsec for local exact image solvers.",
+    )
+    parser.add_argument(
+        "--exact-image-lm-max-iter",
+        type=int,
+        default=DEFAULT_EXACT_IMAGE_LM_MAX_ITER,
+        help="Maximum local Levenberg-Marquardt iterations per observed image.",
+    )
+    parser.add_argument(
+        "--exact-image-lm-trust-radius-arcsec",
+        type=_positive_float_arg,
+        default=DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC,
+        help="Maximum local Levenberg-Marquardt step size in arcsec.",
+    )
+    parser.add_argument(
+        "--exact-image-adaptive-max-levels",
+        type=int,
+        default=DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
+        help="Maximum local adaptive search refinement levels for local-lm-adaptive.",
     )
     parser.add_argument(
         "--quiet",
@@ -2465,6 +2577,12 @@ def _log_runtime_summary(args: argparse.Namespace) -> None:
             f"exact_image_min_distance_arcsec={getattr(args, 'exact_image_min_distance_arcsec', DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)} "
             f"exact_image_precision_limit={getattr(args, 'exact_image_precision_limit', DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)} "
             f"exact_image_num_iter_max={getattr(args, 'exact_image_num_iter_max', DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)} "
+            f"exact_image_finder={getattr(args, 'exact_image_finder', DEFAULT_EXACT_IMAGE_FINDER)} "
+            f"exact_image_displacement_tol_arcsec={getattr(args, 'exact_image_displacement_tol_arcsec', DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC)} "
+            f"exact_image_identification_tol_arcsec={getattr(args, 'exact_image_identification_tol_arcsec', DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC)} "
+            f"exact_image_lm_max_iter={getattr(args, 'exact_image_lm_max_iter', DEFAULT_EXACT_IMAGE_LM_MAX_ITER)} "
+            f"exact_image_lm_trust_radius_arcsec={getattr(args, 'exact_image_lm_trust_radius_arcsec', DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC)} "
+            f"exact_image_adaptive_max_levels={getattr(args, 'exact_image_adaptive_max_levels', DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS)} "
             f"fit_cosmology_flat_wcdm={bool(getattr(args, 'fit_cosmology_flat_wcdm', False))} "
             f"chains={args.chains} thin={args.thin} skip_validation={args.skip_validation} "
             f"ns_num_live_points={getattr(args, 'ns_num_live_points', None)} "
@@ -3345,7 +3463,7 @@ def _source_metric_cache_status(evaluator: Any) -> str:
     return "disabled"
 
 
-def _stage1_model_summary_rows(evaluator: Any) -> list[ApproximationRow]:
+def _stage_model_summary_rows(evaluator: Any) -> list[ApproximationRow]:
     exact_scaling = _count_items(
         getattr(
             evaluator,
@@ -3399,9 +3517,22 @@ def _stage1_model_summary_rows(evaluator: Any) -> list[ApproximationRow]:
     return rows
 
 
-def _build_stage1_model_summary_rich_table(rows: list[ApproximationRow]) -> Any:
+def _stage_summary_label(run_dir: Path) -> str | None:
+    stage_name = _sequential_stage_name(run_dir)
+    if stage_name == STAGE1_BACKPROJECTED_CENTROID_FIT_DIR:
+        return "Stage 1"
+    if stage_name == STAGE2_FREE_SOURCE_FORWARD_FIT_DIR:
+        return "Stage 2"
+    return None
+
+
+def _stage1_model_summary_rows(evaluator: Any) -> list[ApproximationRow]:
+    return _stage_model_summary_rows(evaluator)
+
+
+def _build_stage_model_summary_rich_table(rows: list[ApproximationRow], stage_label: str) -> Any:
     table = _RichTable(
-        title="Stage 1 model summary",
+        title=f"{stage_label} model summary",
         title_style="bold cyan",
         header_style="bold white",
         border_style="cyan",
@@ -3418,16 +3549,25 @@ def _build_stage1_model_summary_rich_table(rows: list[ApproximationRow]) -> Any:
     return table
 
 
-def _format_stage1_model_summary_table_from_rows(rows: list[ApproximationRow]) -> str:
-    row_lines = ["[stage1-model-summary]", "| name | value |"]
+def _build_stage1_model_summary_rich_table(rows: list[ApproximationRow]) -> Any:
+    return _build_stage_model_summary_rich_table(rows, "Stage 1")
+
+
+def _format_stage_model_summary_table_from_rows(rows: list[ApproximationRow], stage_label: str) -> str:
+    log_key = stage_label.lower().replace(" ", "")
+    row_lines = [f"[{log_key}-model-summary]", "| name | value |"]
     row_lines.extend(f"| {row[0]} | {row[1]} |" for row in rows)
     return "\n".join(row_lines)
 
 
-def _write_stage1_model_summary_csv(run_dir: Path, rows: list[ApproximationRow]) -> Path:
+def _format_stage1_model_summary_table_from_rows(rows: list[ApproximationRow]) -> str:
+    return _format_stage_model_summary_table_from_rows(rows, "Stage 1")
+
+
+def _write_stage_model_summary_csv(run_dir: Path, rows: list[ApproximationRow]) -> Path:
     tables_dir = run_dir / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
-    path = tables_dir / "stage1_model_summary.csv"
+    path = tables_dir / "stage_model_summary.csv"
     pd.DataFrame(
         [
             {"name": str(row[0]), "value": str(row[1]), "category": str(row[2])}
@@ -3437,19 +3577,141 @@ def _write_stage1_model_summary_csv(run_dir: Path, rows: list[ApproximationRow])
     return path
 
 
+def _write_stage1_model_summary_csv(run_dir: Path, rows: list[ApproximationRow]) -> Path:
+    return _write_stage_model_summary_csv(run_dir, rows)
+
+
+def _log_stage_model_summary_table(
+    args: argparse.Namespace | None,
+    evaluator: Any,
+    run_dir: Path,
+) -> None:
+    stage_label = _stage_summary_label(run_dir)
+    if stage_label is None:
+        return
+    rows = _stage_model_summary_rows(evaluator)
+    path = _write_stage_model_summary_csv(run_dir, rows)
+    _log(
+        args,
+        _format_stage_model_summary_table_from_rows(rows, stage_label) + f"\npath={path}",
+        renderable=_build_stage_model_summary_rich_table(rows, stage_label),
+    )
+
+
 def _log_stage1_model_summary_table(
     args: argparse.Namespace | None,
     evaluator: Any,
     run_dir: Path,
 ) -> None:
-    if _sequential_stage_name(run_dir) != STAGE1_BACKPROJECTED_CENTROID_FIT_DIR:
+    if _sequential_stage_name(run_dir) == STAGE1_BACKPROJECTED_CENTROID_FIT_DIR:
+        _log_stage_model_summary_table(args, evaluator, run_dir)
+
+
+def _truth_recovery_stage_summary_rows(run_dir: Path) -> list[dict[str, Any]]:
+    tables_dir = run_dir / "tables"
+    summary_paths = [
+        tables_dir / "truth_recovery_kappa_recovery_summary.csv",
+        tables_dir / "truth_recovery_mu_recovery_summary.csv",
+    ]
+    rows: list[dict[str, Any]] = []
+    for path in summary_paths:
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+        if df.empty or "quantity" not in df:
+            continue
+        for _, row in df.iterrows():
+            quantity = str(row.get("quantity", "")).strip()
+            if not quantity:
+                continue
+            rows.append(
+                {
+                    "quantity": quantity,
+                    "finite_pixels": int(row.get("finite_pixel_count", 0)),
+                    "bias_median": float(row.get(f"{quantity}_bias_median", float("nan"))),
+                    "spread_nmad": float(row.get(f"{quantity}_spread_nmad", float("nan"))),
+                    "rmse": float(row.get(f"{quantity}_rmse", float("nan"))),
+                }
+            )
+    return rows
+
+
+def _format_truth_recovery_value(value: Any) -> str:
+    try:
+        float_value = float(value)
+    except Exception:
+        return "nan"
+    if not np.isfinite(float_value):
+        return "nan"
+    return f"{float_value:.4g}"
+
+
+def _build_truth_recovery_stage_summary_rich_table(rows: list[dict[str, Any]], stage_label: str) -> Any:
+    table = _RichTable(
+        title=f"{stage_label} truth recovery summary",
+        title_style="bold magenta",
+        header_style="bold white",
+        border_style="magenta",
+        show_lines=False,
+        expand=False,
+    )
+    table.add_column("quantity", style="dim", no_wrap=True)
+    table.add_column("finite pixels", justify="right")
+    table.add_column("bias median", justify="right")
+    table.add_column("NMAD spread", justify="right")
+    table.add_column("RMSE", justify="right")
+    for row in rows:
+        table.add_row(
+            str(row["quantity"]),
+            str(row["finite_pixels"]),
+            _format_truth_recovery_value(row["bias_median"]),
+            _format_truth_recovery_value(row["spread_nmad"]),
+            _format_truth_recovery_value(row["rmse"]),
+        )
+    return table
+
+
+def _format_truth_recovery_stage_summary_table(rows: list[dict[str, Any]], stage_label: str) -> str:
+    log_key = stage_label.lower().replace(" ", "")
+    row_lines = [
+        f"[{log_key}-truth-recovery-summary]",
+        "| quantity | finite pixels | bias median | NMAD spread | RMSE |",
+    ]
+    for row in rows:
+        row_lines.append(
+            "| "
+            f"{row['quantity']} | "
+            f"{row['finite_pixels']} | "
+            f"{_format_truth_recovery_value(row['bias_median'])} | "
+            f"{_format_truth_recovery_value(row['spread_nmad'])} | "
+            f"{_format_truth_recovery_value(row['rmse'])} |"
+        )
+    return "\n".join(row_lines)
+
+
+def _write_truth_recovery_stage_summary_csv(run_dir: Path, rows: list[dict[str, Any]]) -> Path:
+    tables_dir = run_dir / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    path = tables_dir / "truth_recovery_stage_summary.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
+def _log_truth_recovery_stage_summary_table(args: argparse.Namespace | None, run_dir: Path) -> None:
+    stage_label = _stage_summary_label(run_dir)
+    if stage_label is None:
         return
-    rows = _stage1_model_summary_rows(evaluator)
-    path = _write_stage1_model_summary_csv(run_dir, rows)
+    rows = _truth_recovery_stage_summary_rows(run_dir)
+    if not rows:
+        return
+    path = _write_truth_recovery_stage_summary_csv(run_dir, rows)
     _log(
         args,
-        _format_stage1_model_summary_table_from_rows(rows) + f"\npath={path}",
-        renderable=_build_stage1_model_summary_rich_table(rows),
+        _format_truth_recovery_stage_summary_table(rows, stage_label) + f"\npath={path}",
+        renderable=_build_truth_recovery_stage_summary_rich_table(rows, stage_label),
     )
 
 
@@ -14171,6 +14433,27 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         _fail("--exact-image-precision-limit must be finite and positive.")
     if int(getattr(args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)) <= 0:
         _fail("--exact-image-num-iter-max must be positive.")
+    if str(getattr(args, "exact_image_finder", DEFAULT_EXACT_IMAGE_FINDER)) not in EXACT_IMAGE_FINDER_CHOICES:
+        _fail("--exact-image-finder must be one of " + ", ".join(EXACT_IMAGE_FINDER_CHOICES) + ".")
+    exact_image_displacement_tol_arcsec = float(
+        getattr(args, "exact_image_displacement_tol_arcsec", DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC)
+    )
+    if not np.isfinite(exact_image_displacement_tol_arcsec) or exact_image_displacement_tol_arcsec <= 0.0:
+        _fail("--exact-image-displacement-tol-arcsec must be finite and positive.")
+    exact_image_identification_tol_arcsec = float(
+        getattr(args, "exact_image_identification_tol_arcsec", DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC)
+    )
+    if not np.isfinite(exact_image_identification_tol_arcsec) or exact_image_identification_tol_arcsec <= 0.0:
+        _fail("--exact-image-identification-tol-arcsec must be finite and positive.")
+    if int(getattr(args, "exact_image_lm_max_iter", DEFAULT_EXACT_IMAGE_LM_MAX_ITER)) <= 0:
+        _fail("--exact-image-lm-max-iter must be positive.")
+    exact_image_lm_trust_radius_arcsec = float(
+        getattr(args, "exact_image_lm_trust_radius_arcsec", DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC)
+    )
+    if not np.isfinite(exact_image_lm_trust_radius_arcsec) or exact_image_lm_trust_radius_arcsec <= 0.0:
+        _fail("--exact-image-lm-trust-radius-arcsec must be finite and positive.")
+    if int(getattr(args, "exact_image_adaptive_max_levels", DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS)) <= 0:
+        _fail("--exact-image-adaptive-max-levels must be positive.")
     try:
         _cosmology_init_overrides_from_args(args)
     except ValueError as exc:
@@ -17655,6 +17938,12 @@ class ClusterJAXEvaluator:
         exact_image_min_distance_arcsec: float = DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC,
         exact_image_precision_limit: float = DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
         exact_image_num_iter_max: int = DEFAULT_EXACT_IMAGE_NUM_ITER_MAX,
+        exact_image_finder: str = DEFAULT_EXACT_IMAGE_FINDER,
+        exact_image_displacement_tol_arcsec: float = DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC,
+        exact_image_identification_tol_arcsec: float = DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC,
+        exact_image_lm_max_iter: int = DEFAULT_EXACT_IMAGE_LM_MAX_ITER,
+        exact_image_lm_trust_radius_arcsec: float = DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC,
+        exact_image_adaptive_max_levels: int = DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
         sampling_engine: str = "full",
         active_scaling_galaxies: list[int] | int | None = None,
         active_scaling_selection: str = "adaptive",
@@ -17718,12 +18007,42 @@ class ClusterJAXEvaluator:
         self.exact_image_min_distance_arcsec = float(exact_image_min_distance_arcsec)
         self.exact_image_precision_limit = float(exact_image_precision_limit)
         self.exact_image_num_iter_max = int(exact_image_num_iter_max)
+        self.exact_image_finder = str(exact_image_finder)
+        self.exact_image_displacement_tol_arcsec = float(exact_image_displacement_tol_arcsec)
+        self.exact_image_identification_tol_arcsec = float(exact_image_identification_tol_arcsec)
+        self.exact_image_lm_max_iter = int(exact_image_lm_max_iter)
+        self.exact_image_lm_trust_radius_arcsec = float(exact_image_lm_trust_radius_arcsec)
+        self.exact_image_adaptive_max_levels = int(exact_image_adaptive_max_levels)
         if not np.isfinite(self.exact_image_min_distance_arcsec) or self.exact_image_min_distance_arcsec <= 0.0:
             raise ValueError("exact_image_min_distance_arcsec must be finite and positive.")
         if not np.isfinite(self.exact_image_precision_limit) or self.exact_image_precision_limit <= 0.0:
             raise ValueError("exact_image_precision_limit must be finite and positive.")
         if self.exact_image_num_iter_max <= 0:
             raise ValueError("exact_image_num_iter_max must be positive.")
+        if self.exact_image_finder not in EXACT_IMAGE_FINDER_CHOICES:
+            raise ValueError(
+                f"Unsupported exact_image_finder={self.exact_image_finder!r}; "
+                f"expected one of {', '.join(EXACT_IMAGE_FINDER_CHOICES)}."
+            )
+        if (
+            not np.isfinite(self.exact_image_displacement_tol_arcsec)
+            or self.exact_image_displacement_tol_arcsec <= 0.0
+        ):
+            raise ValueError("exact_image_displacement_tol_arcsec must be finite and positive.")
+        if (
+            not np.isfinite(self.exact_image_identification_tol_arcsec)
+            or self.exact_image_identification_tol_arcsec <= 0.0
+        ):
+            raise ValueError("exact_image_identification_tol_arcsec must be finite and positive.")
+        if self.exact_image_lm_max_iter <= 0:
+            raise ValueError("exact_image_lm_max_iter must be positive.")
+        if (
+            not np.isfinite(self.exact_image_lm_trust_radius_arcsec)
+            or self.exact_image_lm_trust_radius_arcsec <= 0.0
+        ):
+            raise ValueError("exact_image_lm_trust_radius_arcsec must be finite and positive.")
+        if self.exact_image_adaptive_max_levels <= 0:
+            raise ValueError("exact_image_adaptive_max_levels must be positive.")
         self.sampling_engine = str(sampling_engine)
         if self.sampling_engine not in SAMPLING_ENGINES:
             raise ValueError(
@@ -21631,6 +21950,14 @@ class ClusterJAXEvaluator:
         validity = self._stopped_packed_lens_validity(details) if stop_gradient else self._packed_lens_validity(details)
         return packed_state, validity
 
+    def _build_truth_grid_packed_lens_state(
+        self,
+        params: jnp.ndarray,
+        z_source: float,
+    ) -> dict[str, Any]:
+        packed_state, _details = self._build_packed_lens_state_details(params, z_source)
+        return packed_state
+
     def _build_packed_lens_state(
         self,
         params: jnp.ndarray,
@@ -24588,6 +24915,251 @@ class ClusterJAXEvaluator:
             self.timing_totals["exact_solver"] = self.timing_totals.get("exact_solver", 0.0) + elapsed
             self.timing_totals["exact_solver_lenstronomy"] = self.timing_totals.get("exact_solver_lenstronomy", 0.0) + elapsed
 
+    def _exact_ray_shooting_and_jacobian_numpy(
+        self,
+        family: FamilyData,
+        packed_state: dict[str, Any],
+        x: np.ndarray,
+        y: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        x_jax = jnp.asarray(x, dtype=jnp.float64)
+        y_jax = jnp.asarray(y, dtype=jnp.float64)
+        try:
+            beta_x, beta_y = self._ray_shooting_for_components(family.z_source, x_jax, y_jax, packed_state)
+            jac_a00, jac_a01, jac_a10, jac_a11 = self._lensing_jacobian_for_components(
+                family.z_source,
+                x_jax,
+                y_jax,
+                packed_state,
+            )
+        except Exception:
+            model, _solver = self._get_exact_model_solver(family.z_source)
+            kwargs_lens = self._packed_to_kwargs_lens(packed_state)
+            beta_x, beta_y = model.ray_shooting(x_jax, y_jax, kwargs_lens)
+            f_xx, f_xy, f_yx, f_yy = model.hessian(x_jax, y_jax, kwargs_lens)
+            jac_a00 = 1.0 - f_xx
+            jac_a01 = -f_xy
+            jac_a10 = -f_yx
+            jac_a11 = 1.0 - f_yy
+        return (
+            np.asarray(beta_x, dtype=float),
+            np.asarray(beta_y, dtype=float),
+            np.asarray(jac_a00, dtype=float),
+            np.asarray(jac_a01, dtype=float),
+            np.asarray(jac_a10, dtype=float),
+            np.asarray(jac_a11, dtype=float),
+        )
+
+    def _refine_exact_images_local_lm(
+        self,
+        family: FamilyData,
+        packed_state: dict[str, Any],
+        source_x: float,
+        source_y: float,
+        start_x: np.ndarray,
+        start_y: np.ndarray,
+    ) -> dict[str, Any]:
+        current_x = np.asarray(start_x, dtype=float).reshape(-1).copy()
+        current_y = np.asarray(start_y, dtype=float).reshape(-1).copy()
+        n_images = int(current_x.size)
+        converged = np.zeros(n_images, dtype=bool)
+        finite = np.isfinite(current_x) & np.isfinite(current_y)
+        iterations = np.zeros(n_images, dtype=int)
+        final_step = np.full(n_images, np.inf, dtype=float)
+        final_source_residual = np.full(n_images, np.inf, dtype=float)
+        for step_index in range(int(self.exact_image_lm_max_iter)):
+            beta_x, beta_y, jac_a00, jac_a01, jac_a10, jac_a11 = self._exact_ray_shooting_and_jacobian_numpy(
+                family,
+                packed_state,
+                current_x,
+                current_y,
+            )
+            residual_x = beta_x - float(source_x)
+            residual_y = beta_y - float(source_y)
+            delta_x, delta_y, step_finite = _anchored_solved_image_plane_step_from_jacobian(
+                jnp.asarray(residual_x, dtype=jnp.float64),
+                jnp.asarray(residual_y, dtype=jnp.float64),
+                jnp.asarray(jac_a00, dtype=jnp.float64),
+                jnp.asarray(jac_a01, dtype=jnp.float64),
+                jnp.asarray(jac_a10, dtype=jnp.float64),
+                jnp.asarray(jac_a11, dtype=jnp.float64),
+                trust_radius_arcsec=float(self.exact_image_lm_trust_radius_arcsec),
+                lm_damping_relative=float(self.anchored_image_plane_lm_damping_relative),
+                lm_damping_absolute=float(self.anchored_image_plane_lm_damping_absolute),
+            )
+            delta_x_np = np.asarray(delta_x, dtype=float)
+            delta_y_np = np.asarray(delta_y, dtype=float)
+            step_norm = np.sqrt(np.square(delta_x_np) + np.square(delta_y_np))
+            source_norm = np.sqrt(np.square(residual_x) + np.square(residual_y))
+            step_finite_np = np.asarray(step_finite, dtype=bool)
+            active = finite & step_finite_np & ~converged
+            current_x = np.where(active, current_x + delta_x_np, current_x)
+            current_y = np.where(active, current_y + delta_y_np, current_y)
+            final_step = np.where(active | converged, step_norm, final_step)
+            final_source_residual = np.where(active | converged, source_norm, final_source_residual)
+            iterations = np.where(active, step_index + 1, iterations)
+            newly_converged = (
+                active
+                & np.isfinite(step_norm)
+                & np.isfinite(source_norm)
+                & (step_norm <= float(self.exact_image_displacement_tol_arcsec))
+                & (source_norm <= max(float(self.exact_image_identification_tol_arcsec), float(self.exact_image_precision_limit)))
+            )
+            converged = converged | newly_converged
+            finite = finite & step_finite_np & np.isfinite(current_x) & np.isfinite(current_y)
+            if bool(np.all(converged | ~finite)):
+                break
+        beta_x, beta_y, jac_a00, jac_a01, jac_a10, jac_a11 = self._exact_ray_shooting_and_jacobian_numpy(
+            family,
+            packed_state,
+            current_x,
+            current_y,
+        )
+        residual_x = beta_x - float(source_x)
+        residual_y = beta_y - float(source_y)
+        check_dx, check_dy, check_finite = _anchored_solved_image_plane_step_from_jacobian(
+            jnp.asarray(residual_x, dtype=jnp.float64),
+            jnp.asarray(residual_y, dtype=jnp.float64),
+            jnp.asarray(jac_a00, dtype=jnp.float64),
+            jnp.asarray(jac_a01, dtype=jnp.float64),
+            jnp.asarray(jac_a10, dtype=jnp.float64),
+            jnp.asarray(jac_a11, dtype=jnp.float64),
+            trust_radius_arcsec=float(self.exact_image_lm_trust_radius_arcsec),
+            lm_damping_relative=float(self.anchored_image_plane_lm_damping_relative),
+            lm_damping_absolute=float(self.anchored_image_plane_lm_damping_absolute),
+        )
+        root_error = np.sqrt(np.square(np.asarray(check_dx, dtype=float)) + np.square(np.asarray(check_dy, dtype=float)))
+        source_norm = np.sqrt(np.square(residual_x) + np.square(residual_y))
+        finite_final = (
+            finite
+            & np.asarray(check_finite, dtype=bool)
+            & np.isfinite(root_error)
+            & np.isfinite(source_norm)
+            & np.isfinite(current_x)
+            & np.isfinite(current_y)
+        )
+        identification_pass = finite_final & (root_error <= float(self.exact_image_identification_tol_arcsec))
+        converged = converged | (identification_pass & (root_error <= float(self.exact_image_displacement_tol_arcsec)))
+        return {
+            "x": current_x,
+            "y": current_y,
+            "converged": converged,
+            "finite": finite_final,
+            "identification_pass": identification_pass,
+            "iterations": iterations,
+            "final_step_arcsec": root_error,
+            "final_source_residual_arcsec": source_norm,
+        }
+
+    def _solve_exact_images_local_lm(
+        self,
+        family: FamilyData,
+        packed_state: dict[str, Any],
+        source_x: float,
+        source_y: float,
+        *,
+        adaptive: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        exact_start = time.perf_counter()
+        try:
+            start_x = np.asarray(family.x_obs, dtype=float)
+            start_y = np.asarray(family.y_obs, dtype=float)
+            result = self._refine_exact_images_local_lm(family, packed_state, source_x, source_y, start_x, start_y)
+            adaptive_used = np.zeros(int(start_x.size), dtype=bool)
+            ok = np.asarray(result["identification_pass"], dtype=bool)
+            if adaptive and not bool(np.all(ok)):
+                failed = np.flatnonzero(~ok)
+                radius = min(float(self.exact_image_lm_trust_radius_arcsec), max(float(self.exact_image_min_distance_arcsec), 1.0e-3))
+                for idx in failed:
+                    best_result: dict[str, Any] | None = None
+                    best_score = np.inf
+                    for level in range(int(self.exact_image_adaptive_max_levels)):
+                        offsets = np.asarray([-radius, 0.0, radius], dtype=float)
+                        grid_x, grid_y = np.meshgrid(offsets, offsets)
+                        candidate_x = float(start_x[idx]) + grid_x.reshape(-1)
+                        candidate_y = float(start_y[idx]) + grid_y.reshape(-1)
+                        refined = self._refine_exact_images_local_lm(
+                            family,
+                            packed_state,
+                            source_x,
+                            source_y,
+                            candidate_x,
+                            candidate_y,
+                        )
+                        scores = np.asarray(refined["final_step_arcsec"], dtype=float)
+                        source_scores = np.asarray(refined["final_source_residual_arcsec"], dtype=float)
+                        combined = np.where(
+                            np.asarray(refined["finite"], dtype=bool),
+                            scores + 0.01 * source_scores,
+                            np.inf,
+                        )
+                        best_idx = int(np.argmin(combined))
+                        if np.isfinite(combined[best_idx]) and combined[best_idx] < best_score:
+                            best_score = float(combined[best_idx])
+                            best_result = {key: np.asarray(value)[best_idx] for key, value in refined.items()}
+                        if best_result is not None and bool(best_result["identification_pass"]):
+                            break
+                        radius *= 0.5
+                    if best_result is not None and bool(best_result["identification_pass"]):
+                        for key in ("x", "y", "converged", "finite", "identification_pass", "iterations", "final_step_arcsec", "final_source_residual_arcsec"):
+                            result[key][idx] = best_result[key]
+                        adaptive_used[idx] = True
+                ok = np.asarray(result["identification_pass"], dtype=bool)
+            diagnostics = {
+                "exact_image_finder": EXACT_IMAGE_FINDER_LOCAL_LM_ADAPTIVE if adaptive else EXACT_IMAGE_FINDER_LOCAL_LM,
+                "exact_image_lm_converged": np.asarray(result["converged"], dtype=bool),
+                "exact_image_lm_iterations": np.asarray(result["iterations"], dtype=int),
+                "exact_image_adaptive_used": adaptive_used,
+                "exact_image_final_step_arcsec": np.asarray(result["final_step_arcsec"], dtype=float),
+                "exact_image_final_source_residual_arcsec": np.asarray(result["final_source_residual_arcsec"], dtype=float),
+                "exact_image_identification_pass": np.asarray(result["identification_pass"], dtype=bool),
+                "exact_image_displacement_from_observed_arcsec": np.sqrt(
+                    np.square(np.asarray(result["x"], dtype=float) - start_x)
+                    + np.square(np.asarray(result["y"], dtype=float) - start_y)
+                ),
+            }
+            self._last_exact_image_solver_diagnostics = diagnostics
+            if not bool(np.all(ok)):
+                raise RuntimeError("local exact image solver failed identification tolerance")
+            return np.asarray(result["x"], dtype=float), np.asarray(result["y"], dtype=float)
+        finally:
+            elapsed = time.perf_counter() - exact_start
+            self.timing_totals["exact_solver"] = self.timing_totals.get("exact_solver", 0.0) + elapsed
+            key = "exact_solver_local_lm_adaptive" if adaptive else "exact_solver_local_lm"
+            self.timing_totals[key] = self.timing_totals.get(key, 0.0) + elapsed
+
+    def _solve_exact_images(
+        self,
+        family: FamilyData,
+        packed_state: dict[str, Any],
+        source_x: float,
+        source_y: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        finder = str(getattr(self, "exact_image_finder", DEFAULT_EXACT_IMAGE_FINDER))
+        self._last_exact_image_solver_diagnostics = {
+            "exact_image_finder": finder,
+            "exact_image_lm_converged": np.full(int(getattr(family, "n_images", 0)), np.nan),
+            "exact_image_lm_iterations": np.full(int(getattr(family, "n_images", 0)), np.nan),
+            "exact_image_adaptive_used": np.zeros(int(getattr(family, "n_images", 0)), dtype=bool),
+            "exact_image_final_step_arcsec": np.full(int(getattr(family, "n_images", 0)), np.nan),
+            "exact_image_final_source_residual_arcsec": np.full(int(getattr(family, "n_images", 0)), np.nan),
+            "exact_image_identification_pass": np.full(int(getattr(family, "n_images", 0)), False, dtype=bool),
+            "exact_image_displacement_from_observed_arcsec": np.full(int(getattr(family, "n_images", 0)), np.nan),
+        }
+        if finder == EXACT_IMAGE_FINDER_LENSTRONOMY:
+            x_pred, y_pred = self._solve_exact_images_lenstronomy(family, packed_state, source_x, source_y)
+            self._last_exact_image_solver_diagnostics.update(
+                {
+                    "exact_image_identification_pass": np.ones(min(len(x_pred), int(getattr(family, "n_images", 0))), dtype=bool),
+                }
+            )
+            return x_pred, y_pred
+        if finder == EXACT_IMAGE_FINDER_LOCAL_LM:
+            return self._solve_exact_images_local_lm(family, packed_state, source_x, source_y, adaptive=False)
+        if finder == EXACT_IMAGE_FINDER_LOCAL_LM_ADAPTIVE:
+            return self._solve_exact_images_local_lm(family, packed_state, source_x, source_y, adaptive=True)
+        raise RuntimeError(f"Unsupported exact image finder: {finder}")
+
     def _match_images(self, x_pred: np.ndarray, y_pred: np.ndarray, family: FamilyData) -> tuple[np.ndarray, np.ndarray] | None:
         match_details = self._image_match_diagnostics(x_pred, y_pred, family)
         if (
@@ -25143,13 +25715,15 @@ class ClusterJAXEvaluator:
         x_pred: np.ndarray
         y_pred: np.ndarray
         try:
-            x_pred, y_pred = self._solve_exact_images_lenstronomy(family, packed_state, source_x, source_y)
+            x_pred, y_pred = self._solve_exact_images(family, packed_state, source_x, source_y)
         except Exception:
             arc_details = self._arc_aware_image_support_details(params, family, source_x, source_y)
             cache.multiplicity_mismatch_count += 1
+            solver_details = dict(getattr(self, "_last_exact_image_solver_diagnostics", {}))
             details = {
                 **base_details,
                 **arc_details,
+                **solver_details,
                 "multiplicity_failure_reason": "exact_image_prediction_failed",
             }
             self._record_exact_prediction_details(family.family_id, details)
@@ -25157,6 +25731,7 @@ class ClusterJAXEvaluator:
 
         match_details = self._image_match_diagnostics(np.asarray(x_pred), np.asarray(y_pred), family)
         arc_details = self._arc_aware_image_support_details(params, family, source_x, source_y, match_details)
+        solver_details = dict(getattr(self, "_last_exact_image_solver_diagnostics", {}))
         matched = self._match_images(np.asarray(x_pred), np.asarray(y_pred), family)
         if matched is None:
             if len(x_pred) != family.n_images:
@@ -25167,6 +25742,7 @@ class ClusterJAXEvaluator:
                 **base_details,
                 **{key: value for key, value in match_details.items() if not str(key).startswith("_")},
                 **arc_details,
+                **solver_details,
                 "failed": True,
             }
             self._record_exact_prediction_details(family.family_id, details)
@@ -25178,6 +25754,7 @@ class ClusterJAXEvaluator:
             **base_details,
             **{key: value for key, value in match_details.items() if not str(key).startswith("_")},
             **arc_details,
+            **solver_details,
             "failed": False,
             "x_pred": matched[0],
             "y_pred": matched[1],
@@ -26015,6 +26592,20 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
         ),
         exact_image_num_iter_max=int(
             saved_args.get("exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)
+        ),
+        exact_image_finder=str(saved_args.get("exact_image_finder", DEFAULT_EXACT_IMAGE_FINDER)),
+        exact_image_displacement_tol_arcsec=float(
+            saved_args.get("exact_image_displacement_tol_arcsec", DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC)
+        ),
+        exact_image_identification_tol_arcsec=float(
+            saved_args.get("exact_image_identification_tol_arcsec", DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC)
+        ),
+        exact_image_lm_max_iter=int(saved_args.get("exact_image_lm_max_iter", DEFAULT_EXACT_IMAGE_LM_MAX_ITER)),
+        exact_image_lm_trust_radius_arcsec=float(
+            saved_args.get("exact_image_lm_trust_radius_arcsec", DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC)
+        ),
+        exact_image_adaptive_max_levels=int(
+            saved_args.get("exact_image_adaptive_max_levels", DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS)
         ),
         sampling_engine="full",
         active_scaling_galaxies=saved_args.get("active_scaling_galaxies"),
@@ -27356,6 +27947,20 @@ def _build_cluster_evaluator_from_args(
         exact_image_num_iter_max=int(
             getattr(args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)
         ),
+        exact_image_finder=str(getattr(args, "exact_image_finder", DEFAULT_EXACT_IMAGE_FINDER)),
+        exact_image_displacement_tol_arcsec=float(
+            getattr(args, "exact_image_displacement_tol_arcsec", DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC)
+        ),
+        exact_image_identification_tol_arcsec=float(
+            getattr(args, "exact_image_identification_tol_arcsec", DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC)
+        ),
+        exact_image_lm_max_iter=int(getattr(args, "exact_image_lm_max_iter", DEFAULT_EXACT_IMAGE_LM_MAX_ITER)),
+        exact_image_lm_trust_radius_arcsec=float(
+            getattr(args, "exact_image_lm_trust_radius_arcsec", DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC)
+        ),
+        exact_image_adaptive_max_levels=int(
+            getattr(args, "exact_image_adaptive_max_levels", DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS)
+        ),
         sampling_engine=str(sampling_engine if sampling_engine is not None else getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)),
         active_scaling_galaxies=None,
         active_scaling_selection="fixed",
@@ -28396,7 +29001,8 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
             _write_truth_validation_outputs(args, run_dir)
         if args.skip_plots:
             _log(args, "[output] plot generation skipped by --skip-plots")
-            _log_stage1_model_summary_table(args, validation_evaluator, run_dir)
+            _log_stage_model_summary_table(args, validation_evaluator, run_dir)
+            _log_truth_recovery_stage_summary_table(args, run_dir)
             validation_evaluator.release_runtime_caches()
             if validation_evaluator is not evaluator:
                 evaluator.release_runtime_caches()
@@ -28419,7 +29025,8 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
             )
             plot_elapsed = time.time() - plot_start
             validation_evaluator.timing_totals["plot_runtime"] += plot_elapsed
-            _log_stage1_model_summary_table(args, validation_evaluator, run_dir)
+            _log_stage_model_summary_table(args, validation_evaluator, run_dir)
+            _log_truth_recovery_stage_summary_table(args, run_dir)
             _log(args, f"[output] complete in {_fmt_seconds(plot_elapsed)} run_dir={run_dir}")
             validation_evaluator.release_runtime_caches()
             if validation_evaluator is not evaluator:
@@ -28746,7 +29353,8 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
         _write_truth_validation_outputs(args, run_dir)
     if args.skip_plots:
         _log(args, "[output] plot generation skipped by --skip-plots")
-        _log_stage1_model_summary_table(args, validation_evaluator, run_dir)
+        _log_stage_model_summary_table(args, validation_evaluator, run_dir)
+        _log_truth_recovery_stage_summary_table(args, run_dir)
         validation_evaluator.release_runtime_caches()
         if validation_evaluator is not evaluator:
             evaluator.release_runtime_caches()
@@ -28770,7 +29378,8 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
         _log_stage_fit_quality_table(args, stage_run_summary)
         plot_elapsed = time.time() - plot_start
         validation_evaluator.timing_totals["plot_runtime"] += plot_elapsed
-        _log_stage1_model_summary_table(args, validation_evaluator, run_dir)
+        _log_stage_model_summary_table(args, validation_evaluator, run_dir)
+        _log_truth_recovery_stage_summary_table(args, run_dir)
         _log(args, f"[output] complete in {_fmt_seconds(plot_elapsed)} run_dir={run_dir}")
         validation_evaluator.release_runtime_caches()
         if validation_evaluator is not evaluator:
@@ -28908,8 +29517,14 @@ def _rerender_plots(
         ("exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC, float),
         ("exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT, float),
         ("exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX, int),
+        ("exact_image_finder", DEFAULT_EXACT_IMAGE_FINDER, str),
+        ("exact_image_displacement_tol_arcsec", DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC, float),
+        ("exact_image_identification_tol_arcsec", DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC, float),
+        ("exact_image_lm_max_iter", DEFAULT_EXACT_IMAGE_LM_MAX_ITER, int),
+        ("exact_image_lm_trust_radius_arcsec", DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC, float),
+        ("exact_image_adaptive_max_levels", DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS, int),
     )
-    effective_exact_image_controls: dict[str, float | int] = {}
+    effective_exact_image_controls: dict[str, float | int | str] = {}
     for exact_key, exact_default, exact_cast in exact_image_override_specs:
         current_exact_value = exact_cast(getattr(args, exact_key, exact_default))
         plot_saved_args[exact_key] = current_exact_value
@@ -28920,7 +29535,10 @@ def _rerender_plots(
             "[plots-only] exact image controls "
             f"min_distance_arcsec={effective_exact_image_controls['exact_image_min_distance_arcsec']} "
             f"precision_limit={effective_exact_image_controls['exact_image_precision_limit']} "
-            f"num_iter_max={effective_exact_image_controls['exact_image_num_iter_max']}"
+            f"num_iter_max={effective_exact_image_controls['exact_image_num_iter_max']} "
+            f"finder={effective_exact_image_controls['exact_image_finder']} "
+            f"displacement_tol_arcsec={effective_exact_image_controls['exact_image_displacement_tol_arcsec']} "
+            f"identification_tol_arcsec={effective_exact_image_controls['exact_image_identification_tol_arcsec']}"
         ),
     )
     current_kappa_true_fits = getattr(args, "kappa_true_fits", None)
@@ -28932,6 +29550,9 @@ def _rerender_plots(
     current_gammay_true_fits = getattr(args, "gammay_true_fits", None)
     if current_gammay_true_fits is not None and str(current_gammay_true_fits).strip():
         plot_saved_args["gammay_true_fits"] = str(current_gammay_true_fits)
+    plot_saved_args["truth_grid_mode"] = str(getattr(args, "truth_grid_mode", TRUTH_GRID_MODE_MEDIAN))
+    plot_saved_args["truth_grid_draws"] = getattr(args, "truth_grid_draws", None)
+    plot_saved_args["truth_grid_size"] = int(getattr(args, "truth_grid_size", DEFAULT_TRUTH_GRID_SIZE))
     current_cutout_dir = getattr(args, "image_catalog_family_cutout_image_dir", None)
     if current_cutout_dir is not None and str(current_cutout_dir).strip():
         plot_saved_args["image_catalog_family_cutout_image_dir"] = current_cutout_dir
@@ -28996,6 +29617,20 @@ def _rerender_plots(
         ),
         exact_image_num_iter_max=int(
             plot_saved_args.get("exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)
+        ),
+        exact_image_finder=str(plot_saved_args.get("exact_image_finder", DEFAULT_EXACT_IMAGE_FINDER)),
+        exact_image_displacement_tol_arcsec=float(
+            plot_saved_args.get("exact_image_displacement_tol_arcsec", DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC)
+        ),
+        exact_image_identification_tol_arcsec=float(
+            plot_saved_args.get("exact_image_identification_tol_arcsec", DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC)
+        ),
+        exact_image_lm_max_iter=int(plot_saved_args.get("exact_image_lm_max_iter", DEFAULT_EXACT_IMAGE_LM_MAX_ITER)),
+        exact_image_lm_trust_radius_arcsec=float(
+            plot_saved_args.get("exact_image_lm_trust_radius_arcsec", DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC)
+        ),
+        exact_image_adaptive_max_levels=int(
+            plot_saved_args.get("exact_image_adaptive_max_levels", DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS)
         ),
         sampling_engine=plot_sampling_engine,
         active_scaling_galaxies=plot_saved_args.get("active_scaling_galaxies"),
@@ -30162,6 +30797,20 @@ def _run_sequential(args: argparse.Namespace) -> None:
         ),
         "exact_image_num_iter_max": int(
             getattr(args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)
+        ),
+        "exact_image_finder": str(getattr(args, "exact_image_finder", DEFAULT_EXACT_IMAGE_FINDER)),
+        "exact_image_displacement_tol_arcsec": float(
+            getattr(args, "exact_image_displacement_tol_arcsec", DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC)
+        ),
+        "exact_image_identification_tol_arcsec": float(
+            getattr(args, "exact_image_identification_tol_arcsec", DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC)
+        ),
+        "exact_image_lm_max_iter": int(getattr(args, "exact_image_lm_max_iter", DEFAULT_EXACT_IMAGE_LM_MAX_ITER)),
+        "exact_image_lm_trust_radius_arcsec": float(
+            getattr(args, "exact_image_lm_trust_radius_arcsec", DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC)
+        ),
+        "exact_image_adaptive_max_levels": int(
+            getattr(args, "exact_image_adaptive_max_levels", DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS)
         ),
         "anchored_image_plane_solve_steps": int(
             getattr(args, "anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)

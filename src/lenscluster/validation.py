@@ -139,6 +139,20 @@ DEFAULT_MATCH_TOLERANCE = 1.5
 DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC = 0.2
 DEFAULT_EXACT_IMAGE_PRECISION_LIMIT = 1.0e-8
 DEFAULT_EXACT_IMAGE_NUM_ITER_MAX = 200
+EXACT_IMAGE_FINDER_LENSTRONOMY = "lenstronomy"
+EXACT_IMAGE_FINDER_LOCAL_LM = "local-lm"
+EXACT_IMAGE_FINDER_LOCAL_LM_ADAPTIVE = "local-lm-adaptive"
+EXACT_IMAGE_FINDER_CHOICES = (
+    EXACT_IMAGE_FINDER_LENSTRONOMY,
+    EXACT_IMAGE_FINDER_LOCAL_LM,
+    EXACT_IMAGE_FINDER_LOCAL_LM_ADAPTIVE,
+)
+DEFAULT_EXACT_IMAGE_FINDER = EXACT_IMAGE_FINDER_LENSTRONOMY
+DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC = 1.0e-4
+DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC = 1.0e-3
+DEFAULT_EXACT_IMAGE_LM_MAX_ITER = 30
+DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC = 1.0
+DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS = 8
 DEFAULT_REFRESH_EVERY = 250
 JAX_DEVICE_AUTO = "auto"
 JAX_DEVICE_CPU = "cpu"
@@ -773,6 +787,12 @@ def _recovered_model_tables(
         DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
         DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
         DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+        DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
+        DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC,
+        DEFAULT_EXACT_IMAGE_FINDER,
+        DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC,
+        DEFAULT_EXACT_IMAGE_LM_MAX_ITER,
+        DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC,
         DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC,
         DEFAULT_EXACT_IMAGE_NUM_ITER_MAX,
         DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
@@ -799,6 +819,36 @@ def _recovered_model_tables(
         ),
         exact_image_num_iter_max=int(
             _artifact_arg(artifact_args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)
+        ),
+        exact_image_finder=str(_artifact_arg(artifact_args, "exact_image_finder", DEFAULT_EXACT_IMAGE_FINDER)),
+        exact_image_displacement_tol_arcsec=float(
+            _artifact_arg(
+                artifact_args,
+                "exact_image_displacement_tol_arcsec",
+                DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC,
+            )
+        ),
+        exact_image_identification_tol_arcsec=float(
+            _artifact_arg(
+                artifact_args,
+                "exact_image_identification_tol_arcsec",
+                DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC,
+            )
+        ),
+        exact_image_lm_max_iter=int(_artifact_arg(artifact_args, "exact_image_lm_max_iter", DEFAULT_EXACT_IMAGE_LM_MAX_ITER)),
+        exact_image_lm_trust_radius_arcsec=float(
+            _artifact_arg(
+                artifact_args,
+                "exact_image_lm_trust_radius_arcsec",
+                DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC,
+            )
+        ),
+        exact_image_adaptive_max_levels=int(
+            _artifact_arg(
+                artifact_args,
+                "exact_image_adaptive_max_levels",
+                DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
+            )
         ),
         sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full")),
         active_scaling_galaxies=_artifact_arg(artifact_args, "active_scaling_galaxies", DEFAULT_ACTIVE_SCALING_GALAXIES),
@@ -1396,6 +1446,12 @@ def _posterior_prediction_uncertainty_tables(
         DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
         DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
         DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+        DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
+        DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC,
+        DEFAULT_EXACT_IMAGE_FINDER,
+        DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC,
+        DEFAULT_EXACT_IMAGE_LM_MAX_ITER,
+        DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC,
         DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC,
         DEFAULT_EXACT_IMAGE_NUM_ITER_MAX,
         DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
@@ -1439,6 +1495,38 @@ def _posterior_prediction_uncertainty_tables(
             ),
             exact_image_num_iter_max=int(
                 _artifact_arg(artifact_args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)
+            ),
+            exact_image_finder=str(_artifact_arg(artifact_args, "exact_image_finder", DEFAULT_EXACT_IMAGE_FINDER)),
+            exact_image_displacement_tol_arcsec=float(
+                _artifact_arg(
+                    artifact_args,
+                    "exact_image_displacement_tol_arcsec",
+                    DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC,
+                )
+            ),
+            exact_image_identification_tol_arcsec=float(
+                _artifact_arg(
+                    artifact_args,
+                    "exact_image_identification_tol_arcsec",
+                    DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC,
+                )
+            ),
+            exact_image_lm_max_iter=int(
+                _artifact_arg(artifact_args, "exact_image_lm_max_iter", DEFAULT_EXACT_IMAGE_LM_MAX_ITER)
+            ),
+            exact_image_lm_trust_radius_arcsec=float(
+                _artifact_arg(
+                    artifact_args,
+                    "exact_image_lm_trust_radius_arcsec",
+                    DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC,
+                )
+            ),
+            exact_image_adaptive_max_levels=int(
+                _artifact_arg(
+                    artifact_args,
+                    "exact_image_adaptive_max_levels",
+                    DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
+                )
             ),
             sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full")),
             active_scaling_galaxies=_artifact_arg(artifact_args, "active_scaling_galaxies", DEFAULT_ACTIVE_SCALING_GALAXIES),
@@ -6286,6 +6374,27 @@ def _validate_validation_args(args: argparse.Namespace) -> None:
         raise SystemExit("--exact-image-precision-limit must be finite and positive.")
     if int(getattr(args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)) <= 0:
         raise SystemExit("--exact-image-num-iter-max must be positive.")
+    if str(getattr(args, "exact_image_finder", DEFAULT_EXACT_IMAGE_FINDER)) not in EXACT_IMAGE_FINDER_CHOICES:
+        raise SystemExit("--exact-image-finder has an unsupported value.")
+    exact_image_displacement_tol_arcsec = float(
+        getattr(args, "exact_image_displacement_tol_arcsec", DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC)
+    )
+    if not np.isfinite(exact_image_displacement_tol_arcsec) or exact_image_displacement_tol_arcsec <= 0.0:
+        raise SystemExit("--exact-image-displacement-tol-arcsec must be finite and positive.")
+    exact_image_identification_tol_arcsec = float(
+        getattr(args, "exact_image_identification_tol_arcsec", DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC)
+    )
+    if not np.isfinite(exact_image_identification_tol_arcsec) or exact_image_identification_tol_arcsec <= 0.0:
+        raise SystemExit("--exact-image-identification-tol-arcsec must be finite and positive.")
+    if int(getattr(args, "exact_image_lm_max_iter", DEFAULT_EXACT_IMAGE_LM_MAX_ITER)) <= 0:
+        raise SystemExit("--exact-image-lm-max-iter must be positive.")
+    exact_image_lm_trust_radius_arcsec = float(
+        getattr(args, "exact_image_lm_trust_radius_arcsec", DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC)
+    )
+    if not np.isfinite(exact_image_lm_trust_radius_arcsec) or exact_image_lm_trust_radius_arcsec <= 0.0:
+        raise SystemExit("--exact-image-lm-trust-radius-arcsec must be finite and positive.")
+    if int(getattr(args, "exact_image_adaptive_max_levels", DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS)) <= 0:
+        raise SystemExit("--exact-image-adaptive-max-levels must be positive.")
     fixed_image_sigma_int = getattr(args, "fix_image_sigma_int_arcsec", None)
     if fixed_image_sigma_int is not None and (
         not np.isfinite(float(fixed_image_sigma_int)) or float(fixed_image_sigma_int) < 0.0
@@ -6397,6 +6506,18 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(getattr(args, "exact_image_precision_limit", DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)),
         "--exact-image-num-iter-max",
         str(getattr(args, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX)),
+        "--exact-image-finder",
+        str(getattr(args, "exact_image_finder", DEFAULT_EXACT_IMAGE_FINDER)),
+        "--exact-image-displacement-tol-arcsec",
+        str(getattr(args, "exact_image_displacement_tol_arcsec", DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC)),
+        "--exact-image-identification-tol-arcsec",
+        str(getattr(args, "exact_image_identification_tol_arcsec", DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC)),
+        "--exact-image-lm-max-iter",
+        str(getattr(args, "exact_image_lm_max_iter", DEFAULT_EXACT_IMAGE_LM_MAX_ITER)),
+        "--exact-image-lm-trust-radius-arcsec",
+        str(getattr(args, "exact_image_lm_trust_radius_arcsec", DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC)),
+        "--exact-image-adaptive-max-levels",
+        str(getattr(args, "exact_image_adaptive_max_levels", DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS)),
         "--independent-scaling-free-log-sigma-tau-prior-median",
         str(
             getattr(
@@ -7046,6 +7167,14 @@ def _build_parser() -> argparse.ArgumentParser:
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
         DEFAULT_REFRESH_EVERY,
+        DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER,
+        DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN,
+        DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD,
+        DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER,
+        DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER,
+        DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN,
+        DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD,
+        DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER,
         DEFAULT_SOFTENING_LENGTH_KPC,
         DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA,
     )
@@ -7714,6 +7843,42 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_EXACT_IMAGE_NUM_ITER_MAX,
         help="Pass-through Lenstronomy exact image solver iteration cap.",
+    )
+    parser.add_argument(
+        "--exact-image-finder",
+        choices=EXACT_IMAGE_FINDER_CHOICES,
+        default=DEFAULT_EXACT_IMAGE_FINDER,
+        help="Pass-through exact image-finding backend for solver diagnostics.",
+    )
+    parser.add_argument(
+        "--exact-image-displacement-tol-arcsec",
+        type=float,
+        default=DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC,
+        help="Pass-through local exact image solver displacement convergence tolerance.",
+    )
+    parser.add_argument(
+        "--exact-image-identification-tol-arcsec",
+        type=float,
+        default=DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC,
+        help="Pass-through local exact image solver root identification tolerance.",
+    )
+    parser.add_argument(
+        "--exact-image-lm-max-iter",
+        type=int,
+        default=DEFAULT_EXACT_IMAGE_LM_MAX_ITER,
+        help="Pass-through local exact image solver Levenberg-Marquardt iteration cap.",
+    )
+    parser.add_argument(
+        "--exact-image-lm-trust-radius-arcsec",
+        type=float,
+        default=DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC,
+        help="Pass-through local exact image solver trust radius.",
+    )
+    parser.add_argument(
+        "--exact-image-adaptive-max-levels",
+        type=int,
+        default=DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
+        help="Pass-through local adaptive exact image search refinement cap.",
     )
     parser.add_argument("--target-accept", type=float, default=0.85)
     parser.add_argument(

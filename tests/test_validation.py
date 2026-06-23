@@ -23,6 +23,7 @@ import lenscluster.cluster_solver as cluster_solver
 import lenscluster.image_diagnostics as image_diagnostics
 import lenscluster.mock_cluster as mock_cluster
 import lenscluster.multi_cluster_solver as multi_cluster_solver
+import lenscluster.plotting as plotting
 import lenscluster.validation as validation
 from lenscluster.jax_cosmology import (
     ARCSEC_TO_RAD,
@@ -2121,6 +2122,70 @@ def test_cluster_solver_parses_best_value(monkeypatch: pytest.MonkeyPatch) -> No
     )
     args = _parse_args()
     assert args.best_value == cluster_solver.BEST_VALUE_MEDIAN
+
+
+def test_cluster_solver_parses_truth_grid_mode_and_draws(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par"])
+    default_args = _parse_args()
+    assert default_args.truth_grid_mode == cluster_solver.TRUTH_GRID_MODE_MEDIAN
+    assert default_args.truth_grid_draws == 64
+    assert default_args.truth_grid_size == cluster_solver.DEFAULT_TRUTH_GRID_SIZE
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "input.par",
+            "--truth-grid-mode",
+            "posterior",
+            "--truth-grid-draws",
+            "all",
+            "--truth-grid-size",
+            "native",
+        ],
+    )
+    posterior_args = _parse_args()
+    assert posterior_args.truth_grid_mode == cluster_solver.TRUTH_GRID_MODE_POSTERIOR
+    assert posterior_args.truth_grid_draws is None
+    assert posterior_args.truth_grid_size == 0
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cluster_solver", "--par-path", "input.par", "--truth-grid-draws", "17"],
+    )
+    capped_args = _parse_args()
+    assert capped_args.truth_grid_draws == 17
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cluster_solver", "--par-path", "input.par", "--truth-grid-size", "128"],
+    )
+    sized_args = _parse_args()
+    assert sized_args.truth_grid_size == 128
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par", "--truth-grid-mode", "mean"])
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par", "--truth-grid-draws", "0"])
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cluster_solver", "--par-path", "input.par", "--truth-grid-target-chunk-gb", "1.0"],
+    )
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par", "--truth-grid-size", "-1"])
+    with pytest.raises(SystemExit):
+        _parse_args()
 
 
 def test_cluster_solver_parses_potfile_scaling_prior_controls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -7553,6 +7618,52 @@ def test_flat_packed_state_applies_log_displacement_delta_units_to_free_branch_o
     )
 
 
+def test_truth_grid_jax_bulk_uses_trace_safe_real_evaluator_packed_state(tmp_path: Path) -> None:
+    from astropy.wcs import WCS
+
+    state = _stage4_state_with_independent_and_inactive_scaling()
+    evaluator = cluster_solver.ClusterJAXEvaluator(
+        state=state,
+        match_tolerance_arcsec=0.1,
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_FULL_FLAT,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
+    )
+    theta = cluster_solver._default_theta(state.parameter_specs)
+    posterior = PosteriorResults(
+        samples=np.vstack([theta, theta]),
+        log_prob=np.zeros(2, dtype=float),
+        accept_prob=np.zeros(2, dtype=float),
+        diverging=np.zeros(2, dtype=bool),
+        num_steps=np.zeros(2, dtype=int),
+        warmup_steps=0,
+        sample_steps=2,
+        num_chains=1,
+    )
+    wcs = WCS(naxis=2)
+    wcs.wcs.crpix = [1.0, 1.0]
+    wcs.wcs.crval = [0.0, 0.0]
+    wcs.wcs.cdelt = [1.0 / 3600.0, 1.0 / 3600.0]
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+
+    quantiles, _x_arcsec, _y_arcsec = plotting._posterior_truth_grid_quantiles(
+        tmp_path,
+        evaluator,
+        posterior,
+        wcs,
+        (2, 2),
+        float(evaluator.traced_bin_data[0].effective_z_source),
+        source_truth_fits={"kappa": "kappa.fits"},
+        quantities=("kappa", "detA", "mu"),
+        truth_grid_mode=plotting.TRUTH_GRID_MODE_POSTERIOR,
+    )
+
+    assert np.isfinite(quantiles["kappa"]["median"]).all()
+    assert np.isfinite(quantiles["detA"]["median"]).all()
+    assert np.isfinite(quantiles["mu"]["median"]).all()
+    summary = pd.read_csv(tmp_path / "tables" / "truth_recovery_summary.csv")
+    assert set(summary["truth_grid_backend"]) == {"jax_bulk_hessian"}
+
+
 def test_stage0_full_flat_initial_state_has_no_free_candidates() -> None:
     state = replace(_minimal_stage4_surrogate_state(), perturbation_discovery_stage0=True)
     evaluator = cluster_solver.ClusterJAXEvaluator(
@@ -9112,10 +9223,111 @@ def test_stage1_model_summary_logs_and_writes_csv(monkeypatch: pytest.MonkeyPatc
     assert logs and logs[0].startswith("[stage1-model-summary]")
     assert "| selected_exact_scaling | 1/2 |" in logs[0]
     assert getattr(renderables[0], "title", None) == "Stage 1 model summary"
-    csv_path = run_dir / "tables" / "stage1_model_summary.csv"
+    csv_path = run_dir / "tables" / "stage_model_summary.csv"
     assert csv_path.exists()
     csv_text = csv_path.read_text(encoding="utf-8")
     assert "cached_inactive_scaling,1,active" in csv_text
+
+
+def test_stage_model_summary_logs_stage2_and_writes_csv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    logs: list[str] = []
+    renderables: list[Any] = []
+    evaluator = SimpleNamespace(
+        state=SimpleNamespace(perturbation_discovery_stage0=False),
+        sampling_engine=cluster_solver.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
+        sample_likelihood_mode=cluster_solver.SAMPLE_LIKELIHOOD_SOURCE,
+        source_plane_covariance_mode=cluster_solver.SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
+        large_component_indices=np.asarray([0], dtype=int),
+        scaling_component_indices=np.asarray([1, 2, 3], dtype=int),
+        exact_scaling_component_indices=np.asarray([1, 2], dtype=int),
+        active_scaling_component_indices=np.asarray([1, 2], dtype=int),
+        free_correction_scaling_component_indices=np.asarray([1, 2], dtype=int),
+        cached_scaling_component_indices=np.asarray([3], dtype=int),
+        inactive_scaling_component_indices=np.asarray([3], dtype=int),
+        excluded_scaling_component_indices=np.asarray([], dtype=int),
+        scaling_scatter_param_indices=np.asarray([], dtype=int),
+        source_metric_cache_by_z={},
+    )
+    monkeypatch.setattr(
+        cluster_solver,
+        "_log",
+        lambda _args, message, **kwargs: (logs.append(str(message)), renderables.append(kwargs.get("renderable"))),
+    )
+    run_dir = tmp_path / "fit" / cluster_solver.STAGE2_FREE_SOURCE_FORWARD_FIT_DIR
+
+    cluster_solver._log_stage_model_summary_table(argparse.Namespace(), evaluator, run_dir)
+
+    assert logs and logs[0].startswith("[stage2-model-summary]")
+    assert "| selected_exact_scaling | 2/3 |" in logs[0]
+    assert getattr(renderables[0], "title", None) == "Stage 2 model summary"
+    csv_path = run_dir / "tables" / "stage_model_summary.csv"
+    assert csv_path.exists()
+    assert "cached_inactive_scaling,1,active" in csv_path.read_text(encoding="utf-8")
+
+
+def test_truth_recovery_stage_summary_logs_stage1_and_stage2(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    logs: list[str] = []
+    renderables: list[Any] = []
+    monkeypatch.setattr(
+        cluster_solver,
+        "_log",
+        lambda _args, message, **kwargs: (logs.append(str(message)), renderables.append(kwargs.get("renderable"))),
+    )
+
+    for stage_name, expected_prefix, expected_title in [
+        (cluster_solver.STAGE1_BACKPROJECTED_CENTROID_FIT_DIR, "[stage1-truth-recovery-summary]", "Stage 1 truth recovery summary"),
+        (cluster_solver.STAGE2_FREE_SOURCE_FORWARD_FIT_DIR, "[stage2-truth-recovery-summary]", "Stage 2 truth recovery summary"),
+    ]:
+        run_dir = tmp_path / "fit" / stage_name
+        tables_dir = run_dir / "tables"
+        tables_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [
+                {
+                    "quantity": "kappa",
+                    "finite_pixel_count": 10,
+                    "kappa_bias_median": 0.1,
+                    "kappa_spread_nmad": 0.2,
+                    "kappa_rmse": 0.3,
+                }
+            ]
+        ).to_csv(tables_dir / "truth_recovery_kappa_recovery_summary.csv", index=False)
+        pd.DataFrame(
+            [
+                {
+                    "quantity": "abs_mu",
+                    "finite_pixel_count": 8,
+                    "abs_mu_bias_median": -0.4,
+                    "abs_mu_spread_nmad": 0.5,
+                    "abs_mu_rmse": 0.6,
+                }
+            ]
+        ).to_csv(tables_dir / "truth_recovery_mu_recovery_summary.csv", index=False)
+
+        before = len(logs)
+        cluster_solver._log_truth_recovery_stage_summary_table(argparse.Namespace(), run_dir)
+
+        assert logs[before].startswith(expected_prefix)
+        assert "| kappa | 10 | 0.1 | 0.2 | 0.3 |" in logs[before]
+        assert "| abs_mu | 8 | -0.4 | 0.5 | 0.6 |" in logs[before]
+        assert getattr(renderables[before], "title", None) == expected_title
+        csv_path = tables_dir / "truth_recovery_stage_summary.csv"
+        assert csv_path.exists()
+        summary = pd.read_csv(csv_path)
+        assert summary["quantity"].tolist() == ["kappa", "abs_mu"]
+
+
+def test_truth_recovery_stage_summary_skips_when_no_recovery_csvs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    logs: list[str] = []
+    monkeypatch.setattr(cluster_solver, "_log", lambda _args, message, **_kwargs: logs.append(str(message)))
+
+    cluster_solver._log_truth_recovery_stage_summary_table(
+        argparse.Namespace(),
+        tmp_path / "fit" / cluster_solver.STAGE1_BACKPROJECTED_CENTROID_FIT_DIR,
+    )
+
+    assert logs == []
+    assert not (tmp_path / "fit" / cluster_solver.STAGE1_BACKPROJECTED_CENTROID_FIT_DIR / "tables" / "truth_recovery_stage_summary.csv").exists()
 
 
 def test_active_approximation_table_reports_scaling_rank_and_z_bins() -> None:
@@ -12448,6 +12660,18 @@ def test_cluster_solver_fit_quality_draws_default_and_zero(monkeypatch: pytest.M
     )
     assert args.exact_image_precision_limit == pytest.approx(cluster_solver.DEFAULT_EXACT_IMAGE_PRECISION_LIMIT)
     assert args.exact_image_num_iter_max == cluster_solver.DEFAULT_EXACT_IMAGE_NUM_ITER_MAX
+    assert args.exact_image_finder == cluster_solver.DEFAULT_EXACT_IMAGE_FINDER
+    assert args.exact_image_displacement_tol_arcsec == pytest.approx(
+        cluster_solver.DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC
+    )
+    assert args.exact_image_identification_tol_arcsec == pytest.approx(
+        cluster_solver.DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC
+    )
+    assert args.exact_image_lm_max_iter == cluster_solver.DEFAULT_EXACT_IMAGE_LM_MAX_ITER
+    assert args.exact_image_lm_trust_radius_arcsec == pytest.approx(
+        cluster_solver.DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC
+    )
+    assert args.exact_image_adaptive_max_levels == cluster_solver.DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS
 
     monkeypatch.setattr(
         sys,
@@ -12464,6 +12688,18 @@ def test_cluster_solver_fit_quality_draws_default_and_zero(monkeypatch: pytest.M
             "1e-5",
             "--exact-image-num-iter-max",
             "80",
+            "--exact-image-finder",
+            "local-lm-adaptive",
+            "--exact-image-displacement-tol-arcsec",
+            "1e-4",
+            "--exact-image-identification-tol-arcsec",
+            "1e-3",
+            "--exact-image-lm-max-iter",
+            "40",
+            "--exact-image-lm-trust-radius-arcsec",
+            "0.8",
+            "--exact-image-adaptive-max-levels",
+            "6",
         ],
     )
     args = _parse_args()
@@ -12471,6 +12707,12 @@ def test_cluster_solver_fit_quality_draws_default_and_zero(monkeypatch: pytest.M
     assert args.exact_image_min_distance_arcsec == pytest.approx(0.5)
     assert args.exact_image_precision_limit == pytest.approx(1.0e-5)
     assert args.exact_image_num_iter_max == 80
+    assert args.exact_image_finder == "local-lm-adaptive"
+    assert args.exact_image_displacement_tol_arcsec == pytest.approx(1.0e-4)
+    assert args.exact_image_identification_tol_arcsec == pytest.approx(1.0e-3)
+    assert args.exact_image_lm_max_iter == 40
+    assert args.exact_image_lm_trust_radius_arcsec == pytest.approx(0.8)
+    assert args.exact_image_adaptive_max_levels == 6
     cluster_solver._normalize_stage_fit_controls(args)
 
     args.fit_quality_draws = -1
@@ -12484,6 +12726,11 @@ def test_cluster_solver_fit_quality_draws_default_and_zero(monkeypatch: pytest.M
         ("--exact-image-min-distance-arcsec", "0", "exact-image-min-distance-arcsec"),
         ("--exact-image-precision-limit", "0", "exact-image-precision-limit"),
         ("--exact-image-num-iter-max", "0", "exact-image-num-iter-max"),
+        ("--exact-image-displacement-tol-arcsec", "0", "exact-image-displacement-tol-arcsec"),
+        ("--exact-image-identification-tol-arcsec", "0", "exact-image-identification-tol-arcsec"),
+        ("--exact-image-lm-max-iter", "0", "exact-image-lm-max-iter"),
+        ("--exact-image-lm-trust-radius-arcsec", "0", "exact-image-lm-trust-radius-arcsec"),
+        ("--exact-image-adaptive-max-levels", "0", "exact-image-adaptive-max-levels"),
     ],
 )
 def test_cluster_solver_rejects_invalid_exact_image_controls(
@@ -12498,7 +12745,13 @@ def test_cluster_solver_rejects_invalid_exact_image_controls(
         ["cluster_solver", "--par-path", "data/clustersim/input.par", flag, value],
     )
 
-    if flag in {"--exact-image-min-distance-arcsec", "--exact-image-precision-limit"}:
+    if flag in {
+        "--exact-image-min-distance-arcsec",
+        "--exact-image-precision-limit",
+        "--exact-image-displacement-tol-arcsec",
+        "--exact-image-identification-tol-arcsec",
+        "--exact-image-lm-trust-radius-arcsec",
+    }:
         with pytest.raises(SystemExit):
             _parse_args()
         return
@@ -19419,6 +19672,18 @@ def test_validation_parser_accepts_exact_image_controls() -> None:
             "1e-5",
             "--exact-image-num-iter-max",
             "80",
+            "--exact-image-finder",
+            "local-lm",
+            "--exact-image-displacement-tol-arcsec",
+            "1e-4",
+            "--exact-image-identification-tol-arcsec",
+            "1e-3",
+            "--exact-image-lm-max-iter",
+            "40",
+            "--exact-image-lm-trust-radius-arcsec",
+            "0.8",
+            "--exact-image-adaptive-max-levels",
+            "6",
         ]
     )
 
@@ -19427,6 +19692,12 @@ def test_validation_parser_accepts_exact_image_controls() -> None:
     assert args.exact_image_min_distance_arcsec == pytest.approx(0.5)
     assert args.exact_image_precision_limit == pytest.approx(1.0e-5)
     assert args.exact_image_num_iter_max == 80
+    assert args.exact_image_finder == "local-lm"
+    assert args.exact_image_displacement_tol_arcsec == pytest.approx(1.0e-4)
+    assert args.exact_image_identification_tol_arcsec == pytest.approx(1.0e-3)
+    assert args.exact_image_lm_max_iter == 40
+    assert args.exact_image_lm_trust_radius_arcsec == pytest.approx(0.8)
+    assert args.exact_image_adaptive_max_levels == 6
 
 
 @pytest.mark.parametrize(
@@ -19435,6 +19706,11 @@ def test_validation_parser_accepts_exact_image_controls() -> None:
         ("--exact-image-min-distance-arcsec", "0", "exact-image-min-distance-arcsec"),
         ("--exact-image-precision-limit", "0", "exact-image-precision-limit"),
         ("--exact-image-num-iter-max", "0", "exact-image-num-iter-max"),
+        ("--exact-image-displacement-tol-arcsec", "0", "exact-image-displacement-tol-arcsec"),
+        ("--exact-image-identification-tol-arcsec", "0", "exact-image-identification-tol-arcsec"),
+        ("--exact-image-lm-max-iter", "0", "exact-image-lm-max-iter"),
+        ("--exact-image-lm-trust-radius-arcsec", "0", "exact-image-lm-trust-radius-arcsec"),
+        ("--exact-image-adaptive-max-levels", "0", "exact-image-adaptive-max-levels"),
     ],
 )
 def test_validation_parser_rejects_invalid_exact_image_controls(
@@ -21364,6 +21640,12 @@ def test_validation_run_cluster_solver_forwards_exact_image_controls(
         exact_image_min_distance_arcsec=0.5,
         exact_image_precision_limit=1.0e-5,
         exact_image_num_iter_max=80,
+        exact_image_finder="local-lm-adaptive",
+        exact_image_displacement_tol_arcsec=1.0e-4,
+        exact_image_identification_tol_arcsec=1.0e-3,
+        exact_image_lm_max_iter=40,
+        exact_image_lm_trust_radius_arcsec=0.8,
+        exact_image_adaptive_max_levels=6,
     )
 
     validation._run_cluster_solver(tmp_path / "input.par", tmp_path / "solver", "fit", args)
@@ -21371,6 +21653,12 @@ def test_validation_run_cluster_solver_forwards_exact_image_controls(
     assert _option_values(captured["cmd"], "--exact-image-min-distance-arcsec") == ["0.5"]
     assert _option_values(captured["cmd"], "--exact-image-precision-limit") == ["1e-05"]
     assert _option_values(captured["cmd"], "--exact-image-num-iter-max") == ["80"]
+    assert _option_values(captured["cmd"], "--exact-image-finder") == ["local-lm-adaptive"]
+    assert _option_values(captured["cmd"], "--exact-image-displacement-tol-arcsec") == ["0.0001"]
+    assert _option_values(captured["cmd"], "--exact-image-identification-tol-arcsec") == ["0.001"]
+    assert _option_values(captured["cmd"], "--exact-image-lm-max-iter") == ["40"]
+    assert _option_values(captured["cmd"], "--exact-image-lm-trust-radius-arcsec") == ["0.8"]
+    assert _option_values(captured["cmd"], "--exact-image-adaptive-max-levels") == ["6"]
 
 
 def test_validation_run_cluster_solver_forwards_default_exact_image_controls(
@@ -25679,7 +25967,7 @@ def test_exact_image_solver_uses_family_bounding_box_search_center() -> None:
     assert len(captured_kwargs) == 1
     kwargs = captured_kwargs[0]
     assert kwargs["solver"] == "lenstronomy"
-    assert kwargs["min_distance"] == pytest.approx(0.2)
+    assert kwargs["min_distance"] == pytest.approx(cluster_solver.DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)
     assert kwargs["search_window"] == pytest.approx(family.search_window)
     assert kwargs["x_center"] == pytest.approx(0.5 * (np.min(family.x_obs) + np.max(family.x_obs)))
     assert kwargs["y_center"] == pytest.approx(0.5 * (np.min(family.y_obs) + np.max(family.y_obs)))
@@ -25723,6 +26011,157 @@ def test_exact_image_solver_uses_configured_search_controls() -> None:
     assert kwargs["min_distance"] == pytest.approx(0.5)
     assert kwargs["precision_limit"] == pytest.approx(1.0e-5)
     assert kwargs["num_iter_max"] == 80
+
+
+def test_exact_image_local_lm_converges_for_identity_lens() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    evaluator.exact_image_lm_max_iter = 20
+    evaluator.exact_image_lm_trust_radius_arcsec = 1.0
+    evaluator.exact_image_displacement_tol_arcsec = 1.0e-4
+    evaluator.exact_image_identification_tol_arcsec = 1.0e-3
+    evaluator.exact_image_precision_limit = 1.0e-8
+    evaluator.anchored_image_plane_lm_damping_relative = 1.0e-6
+    evaluator.anchored_image_plane_lm_damping_absolute = 1.0e-12
+
+    def identity_ray_shooting(_family, _packed_state, x, y):
+        x_arr = np.asarray(x, dtype=float)
+        y_arr = np.asarray(y, dtype=float)
+        ones = np.ones_like(x_arr)
+        zeros = np.zeros_like(x_arr)
+        return x_arr, y_arr, ones, zeros, zeros, ones
+
+    evaluator._exact_ray_shooting_and_jacobian_numpy = identity_ray_shooting
+    family = FamilyData(
+        family_id="1",
+        z_source=2.0,
+        effective_z_source=2.0,
+        sigma_arcsec=0.1,
+        image_labels=["1.a", "1.b"],
+        x_obs=np.asarray([0.35, -0.2], dtype=float),
+        y_obs=np.asarray([-0.25, 0.15], dtype=float),
+        reliability=np.ones(2, dtype=float),
+    )
+
+    result = evaluator._refine_exact_images_local_lm(
+        family,
+        packed_state={},
+        source_x=0.0,
+        source_y=0.0,
+        start_x=family.x_obs,
+        start_y=family.y_obs,
+    )
+
+    np.testing.assert_allclose(result["x"], np.zeros(2), atol=1.0e-4)
+    np.testing.assert_allclose(result["y"], np.zeros(2), atol=1.0e-4)
+    assert np.all(result["identification_pass"])
+    assert float(np.nanmax(result["final_step_arcsec"])) <= 1.0e-3
+
+
+def test_exact_image_dispatcher_compares_local_lm_to_lenstronomy_seam() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    evaluator.timing_totals = {}
+    evaluator.exact_image_lm_max_iter = 20
+    evaluator.exact_image_lm_trust_radius_arcsec = 1.0
+    evaluator.exact_image_displacement_tol_arcsec = 1.0e-4
+    evaluator.exact_image_identification_tol_arcsec = 1.0e-3
+    evaluator.exact_image_precision_limit = 1.0e-8
+    evaluator.anchored_image_plane_lm_damping_relative = 1.0e-6
+    evaluator.anchored_image_plane_lm_damping_absolute = 1.0e-12
+    evaluator.exact_image_finder = cluster_solver.EXACT_IMAGE_FINDER_LENSTRONOMY
+    evaluator._solve_exact_images_lenstronomy = lambda *_args, **_kwargs: (
+        np.asarray([0.0, 0.0], dtype=float),
+        np.asarray([0.0, 0.0], dtype=float),
+    )
+
+    def identity_ray_shooting(_family, _packed_state, x, y):
+        x_arr = np.asarray(x, dtype=float)
+        y_arr = np.asarray(y, dtype=float)
+        ones = np.ones_like(x_arr)
+        zeros = np.zeros_like(x_arr)
+        return x_arr, y_arr, ones, zeros, zeros, ones
+
+    evaluator._exact_ray_shooting_and_jacobian_numpy = identity_ray_shooting
+    family = FamilyData(
+        family_id="1",
+        z_source=2.0,
+        effective_z_source=2.0,
+        sigma_arcsec=0.1,
+        image_labels=["1.a", "1.b"],
+        x_obs=np.asarray([0.4, -0.3], dtype=float),
+        y_obs=np.asarray([0.2, -0.1], dtype=float),
+        reliability=np.ones(2, dtype=float),
+    )
+
+    len_x, len_y = evaluator._solve_exact_images(family, {}, 0.0, 0.0)
+    evaluator.exact_image_finder = cluster_solver.EXACT_IMAGE_FINDER_LOCAL_LM
+    lm_x, lm_y = evaluator._solve_exact_images(family, {}, 0.0, 0.0)
+
+    np.testing.assert_allclose(lm_x, len_x, atol=1.0e-3)
+    np.testing.assert_allclose(lm_y, len_y, atol=1.0e-3)
+    diagnostics = evaluator._last_exact_image_solver_diagnostics
+    assert diagnostics["exact_image_finder"] == cluster_solver.EXACT_IMAGE_FINDER_LOCAL_LM
+    assert np.all(diagnostics["exact_image_identification_pass"])
+
+
+def test_exact_image_local_lm_adaptive_refines_failed_anchor() -> None:
+    evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    evaluator.timing_totals = {}
+    evaluator.exact_image_finder = cluster_solver.EXACT_IMAGE_FINDER_LOCAL_LM_ADAPTIVE
+    evaluator.exact_image_lm_trust_radius_arcsec = 0.2
+    evaluator.exact_image_min_distance_arcsec = 0.2
+    evaluator.exact_image_adaptive_max_levels = 2
+    calls = {"count": 0}
+
+    def fake_refine(_family, _packed_state, _source_x, _source_y, start_x, start_y):
+        calls["count"] += 1
+        n = np.asarray(start_x, dtype=float).size
+        if calls["count"] == 1:
+            return {
+                "x": np.asarray(start_x, dtype=float),
+                "y": np.asarray(start_y, dtype=float),
+                "converged": np.zeros(n, dtype=bool),
+                "finite": np.ones(n, dtype=bool),
+                "identification_pass": np.zeros(n, dtype=bool),
+                "iterations": np.ones(n, dtype=int),
+                "final_step_arcsec": np.full(n, 1.0, dtype=float),
+                "final_source_residual_arcsec": np.full(n, 1.0, dtype=float),
+            }
+        x = np.asarray(start_x, dtype=float)
+        y = np.asarray(start_y, dtype=float)
+        best = int(np.argmin(np.square(x) + np.square(y)))
+        passed = np.zeros(n, dtype=bool)
+        passed[best] = True
+        step = np.full(n, 1.0, dtype=float)
+        step[best] = 1.0e-5
+        return {
+            "x": x * 0.0,
+            "y": y * 0.0,
+            "converged": passed.copy(),
+            "finite": np.ones(n, dtype=bool),
+            "identification_pass": passed,
+            "iterations": np.ones(n, dtype=int),
+            "final_step_arcsec": step,
+            "final_source_residual_arcsec": step,
+        }
+
+    evaluator._refine_exact_images_local_lm = fake_refine
+    family = FamilyData(
+        family_id="1",
+        z_source=2.0,
+        effective_z_source=2.0,
+        sigma_arcsec=0.1,
+        image_labels=["1.a"],
+        x_obs=np.asarray([0.0], dtype=float),
+        y_obs=np.asarray([0.0], dtype=float),
+        reliability=np.ones(1, dtype=float),
+    )
+
+    x_pred, y_pred = evaluator._solve_exact_images(family, {}, 0.0, 0.0)
+
+    np.testing.assert_allclose(x_pred, np.asarray([0.0]))
+    np.testing.assert_allclose(y_pred, np.asarray([0.0]))
+    assert calls["count"] > 1
+    assert evaluator._last_exact_image_solver_diagnostics["exact_image_adaptive_used"].tolist() == [True]
 
 
 def test_exact_family_prediction_details_reports_solver_failure_counts() -> None:

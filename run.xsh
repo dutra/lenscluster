@@ -10,7 +10,7 @@ $JAX_NUM_CPU_DEVICES = cores
 
 PYTHON = "/home/dutra/.conda/envs/lenstronomy/bin/python"
 
-output_dir = f"jun22l_loosegammaalphapriors_maxlogl_manyfree_relaxedgammaalpha_localjacobian_possigma001_median_nostage0e1e2_rcoreff_mag22_scatter_arespriors_ellipticity_faster"
+output_dir = f"jun23a_medianrecovery_newimagefinder"
 
 HFF_RGB_BANDS = ["F435W", "F606W", "F814W", "F105W", "F125W", "F140W", "F160W"]
 HFF_RGB_DISPLAY = {"q": 6.4, "stretch": 0.0145, "minimum": -5.5e-4, "red_gain": 0.47, "green_gain": 0.91, "blue_gain": 3.95}
@@ -118,7 +118,7 @@ best_par_overlay_args = ["--corner-overlay-best-par", str(BEST_PAR_PATH)] if BES
 
 # Mirrors the active solver-control settings in run_validation.xsh, but runs the
 # real-data cluster solver directly instead of the mock validation wrapper.
-mode = "critical_arc"  # "linear" or "critical_arc"
+mode = "none"  # "linear" or "critical_arc"
 stage2_forward_modes = {
     "none": "none",
     "linear": "linearized",
@@ -132,9 +132,9 @@ fit_mode = "sequential"
 
 fit_method = ["svi+nuts"]
 refresh_every = [None, 1000]
-svi_steps = [10000, 10000]
-warmup = [3000]
-samples = [2000]
+svi_steps = [5000, 5000]
+warmup = [500]
+samples = [250]
 sampling_refresh_runs = [1]
 max_tree_depth = [8]
 quick_diagnostics = False
@@ -152,8 +152,8 @@ if mode != "none":
 
 
 
-perturbation_discovery_alpha_tol_arcsec = 0.01
-perturbation_discovery_jacobian_tol = 0.01
+perturbation_discovery_alpha_tol_arcsec = 0.1
+perturbation_discovery_jacobian_tol = 0.2
 perturbation_discovery_jacobian_weight = 1.0
 softening_length_kpc = cluster_config.get("softening_length_kpc", 0.0)
 softening_length_prior_log_sigma = cluster_config.get("softening_length_prior_log_sigma", 0.15)
@@ -213,11 +213,11 @@ independent_scaling_free_log_sigma_tau_prior_median = 0.45
 independent_scaling_free_log_mass_tau_prior_median = 0.55
 independent_scaling_free_log_tau_prior_sigma = 0.30
 potfile_alpha_sigma_prior_mean = 0.25
-potfile_alpha_sigma_prior_std = 0.2
+potfile_alpha_sigma_prior_std = 0.3
 potfile_alpha_sigma_prior_lower = 0.05
 potfile_alpha_sigma_prior_upper = 0.50
 potfile_gamma_ml_prior_mean = 0.20
-potfile_gamma_ml_prior_std = 0.4
+potfile_gamma_ml_prior_std = 0.3
 potfile_gamma_ml_prior_lower = -0.80
 potfile_gamma_ml_prior_upper = 0.80
 
@@ -325,11 +325,17 @@ scatter_and_stabilizer_args = [
 
 validation_args = [
     *(["--quick-diagnostics"] if quick_diagnostics else []),
-    "--exact-image-min-distance-arcsec", 0.2,
-    "--exact-image-precision-limit", 1.0e-4,
-    "--exact-image-num-iter-max", 200,
+    "--exact-image-min-distance-arcsec", 0.5,
+    "--exact-image-precision-limit", 1.0e-2,
+    "--exact-image-num-iter-max", 100,
+    "--exact-image-finder", "local-lm-adaptive",
+    "--exact-image-displacement-tol-arcsec", 1.0e-4,
+    "--exact-image-identification-tol-arcsec", 1.0e-3,
     "--match-tolerance-arcsec", 2.0,
     "--caustic-source-redshift", 9.0,
+    "--truth-grid-mode", "posterior",
+    "--truth-grid-draws", 64,
+    "--truth-grid-size", 256,
     *(image_catalog_family_cutout_args),
     *(kappa_true_args),
     *(gamma_true_args),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import importlib
+import inspect
 import json
 import math
 import re
@@ -14,6 +15,7 @@ from typing import Any, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import astropy.units as u
+import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from astropy.coordinates import SkyCoord
@@ -93,6 +95,7 @@ MAP_RECOVERY_STAT_BINS = 16
 RECOVERY_ONE_SIGMA_PERCENTILES = (16.0, 84.0)
 RECOVERY_TWO_SIGMA_PERCENTILES = (2.5, 97.5)
 MODEL_GRID_CHUNK_PIXELS = 1024 * 1024
+DEFAULT_TRUTH_GRID_SIZE = 256
 KAPPA_RECOVERY_LIMITS = (0.0, 5.0)
 RECOVERY_IMAGE_POINT_COLUMNS = [
     "family_id",
@@ -102,6 +105,18 @@ RECOVERY_IMAGE_POINT_COLUMNS = [
     "true_value",
     "model_value",
 ]
+TRUTH_GRID_QUANTILE_PERCENTILES = (16.0, 50.0, 84.0)
+TRUTH_GRID_QUANTILE_SUFFIXES = ("q16", "median", "q84")
+TRUTH_GRID_MODE_MEDIAN = "median"
+TRUTH_GRID_MODE_POSTERIOR = "posterior"
+TRUTH_GRID_QUANTITY_OUTPUT_NAMES = {
+    "kappa": "kappa",
+    "gamma1": "gamma1",
+    "gamma2": "gamma2",
+    "detA": "detA",
+    "mu": "mu",
+    "abs_mu": "abs_mu",
+}
 CRITICAL_ARC_MIXTURE_IMAGE_PLANE_MODE = "critical-arc-mixture-image-plane"
 CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE_MODE = "critical-arc-mixture-centroid-image-plane"
 CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD = 0.5
@@ -281,7 +296,8 @@ def _plot_path(root: Path, name: str) -> Path:
     return plot_path(root, name)
 
 
-PlotTask = tuple[str, str, Callable[[], Any]]
+PlotTask = tuple[str, str, Callable[..., Any]]
+PlotStage = tuple[str, list[PlotTask]]
 
 
 def _active_sample_likelihood_mode(evaluator: Any, args: argparse.Namespace) -> str:
@@ -502,6 +518,49 @@ def _run_plot_tasks_with_progress(args: argparse.Namespace, plot_tasks: list[Plo
             _run_logged_phase(args, phase_name, task)
             progress.advance(task_id)
         progress.update(task_id, description="plots: complete")
+
+
+def _call_plot_task(task: Callable[..., Any], progress: Any | None = None) -> Any:
+    signature = inspect.signature(task)
+    if len(signature.parameters) == 0:
+        return task()
+    return task(progress)
+
+
+def _run_plot_stages_with_progress(args: argparse.Namespace, stages: list[PlotStage]) -> None:
+    active_stages = [(stage_name, tasks) for stage_name, tasks in stages if tasks]
+    if not active_stages:
+        return
+    def run_stage(stage_name: str, tasks: list[PlotTask], progress: Any | None = None) -> None:
+        subtask_id = None
+        if progress is not None:
+            subtask_id = progress.add_task(f"{stage_name}", total=len(tasks))
+        for display_name, phase_name, task in tasks:
+            if progress is not None and subtask_id is not None:
+                progress.update(subtask_id, description=f"{stage_name}: {display_name}")
+            _run_logged_phase(args, phase_name, lambda task=task, progress=progress: _call_plot_task(task, progress))
+            if progress is not None and subtask_id is not None:
+                progress.advance(subtask_id)
+        if progress is not None and subtask_id is not None:
+            progress.update(subtask_id, description=f"{stage_name}: complete")
+
+    if bool(getattr(args, "quiet", False)):
+        for stage_name, tasks in active_stages:
+            _run_logged_phase(args, f"plots.{stage_name}", lambda stage_name=stage_name, tasks=tasks: run_stage(stage_name, tasks))
+        return
+    with Progress(
+        TextColumn("{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        transient=True,
+    ) as progress:
+        stage_task_id = progress.add_task("plot stages", total=len(active_stages))
+        for stage_name, tasks in active_stages:
+            progress.update(stage_task_id, description=f"plot stages: {stage_name}")
+            _run_logged_phase(args, f"plots.{stage_name}", lambda stage_name=stage_name, tasks=tasks: run_stage(stage_name, tasks, progress))
+            progress.advance(stage_task_id)
+        progress.update(stage_task_id, description="plot stages: complete")
 
 
 def _weighted_quantile(values: np.ndarray, weights: np.ndarray, quantiles: list[float]) -> np.ndarray:
@@ -6598,6 +6657,12 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
         DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
         DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
         DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC,
+        DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
+        DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC,
+        DEFAULT_EXACT_IMAGE_FINDER,
+        DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC,
+        DEFAULT_EXACT_IMAGE_LM_MAX_ITER,
+        DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC,
         DEFAULT_EXACT_IMAGE_NUM_ITER_MAX,
         DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
         DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
@@ -6632,6 +6697,56 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
             getattr(evaluator, "exact_image_num_iter_max", DEFAULT_EXACT_IMAGE_NUM_ITER_MAX),
         )
     )
+    exact_image_finder = str(
+        getattr(
+            args,
+            "exact_image_finder",
+            getattr(evaluator, "exact_image_finder", DEFAULT_EXACT_IMAGE_FINDER),
+        )
+    )
+    exact_image_displacement_tol_arcsec = float(
+        getattr(
+            args,
+            "exact_image_displacement_tol_arcsec",
+            getattr(
+                evaluator,
+                "exact_image_displacement_tol_arcsec",
+                DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC,
+            ),
+        )
+    )
+    exact_image_identification_tol_arcsec = float(
+        getattr(
+            args,
+            "exact_image_identification_tol_arcsec",
+            getattr(
+                evaluator,
+                "exact_image_identification_tol_arcsec",
+                DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC,
+            ),
+        )
+    )
+    exact_image_lm_max_iter = int(
+        getattr(
+            args,
+            "exact_image_lm_max_iter",
+            getattr(evaluator, "exact_image_lm_max_iter", DEFAULT_EXACT_IMAGE_LM_MAX_ITER),
+        )
+    )
+    exact_image_lm_trust_radius_arcsec = float(
+        getattr(
+            args,
+            "exact_image_lm_trust_radius_arcsec",
+            getattr(evaluator, "exact_image_lm_trust_radius_arcsec", DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC),
+        )
+    )
+    exact_image_adaptive_max_levels = int(
+        getattr(
+            args,
+            "exact_image_adaptive_max_levels",
+            getattr(evaluator, "exact_image_adaptive_max_levels", DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS),
+        )
+    )
 
     return ClusterJAXEvaluator(
         state=evaluator.state,
@@ -6639,6 +6754,12 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
         exact_image_min_distance_arcsec=exact_image_min_distance_arcsec,
         exact_image_precision_limit=exact_image_precision_limit,
         exact_image_num_iter_max=exact_image_num_iter_max,
+        exact_image_finder=exact_image_finder,
+        exact_image_displacement_tol_arcsec=exact_image_displacement_tol_arcsec,
+        exact_image_identification_tol_arcsec=exact_image_identification_tol_arcsec,
+        exact_image_lm_max_iter=exact_image_lm_max_iter,
+        exact_image_lm_trust_radius_arcsec=exact_image_lm_trust_radius_arcsec,
+        exact_image_adaptive_max_levels=exact_image_adaptive_max_levels,
         sampling_engine=str(getattr(args, "sampling_engine", getattr(evaluator, "sampling_engine", "full"))),
         active_scaling_galaxies=getattr(args, "active_scaling_galaxies", None),
         active_scaling_selection=str(
@@ -8693,6 +8814,91 @@ def _validate_matching_truth_wcs(
         raise ValueError(f"{label} truth FITS WCS does not match the kappa truth FITS WCS.")
 
 
+def _truth_recovery_diagnostic_grid(
+    truth_wcs: WCS,
+    native_shape: tuple[int, int],
+    truth_grid_size: int | None,
+) -> tuple[WCS, tuple[int, int], dict[str, Any]]:
+    native_height, native_width = (int(native_shape[0]), int(native_shape[1]))
+    requested_size = int(truth_grid_size or 0)
+    if requested_size <= 0 or (native_height <= requested_size and native_width <= requested_size):
+        metadata = {
+            "native_truth_height": native_height,
+            "native_truth_width": native_width,
+            "diagnostic_grid_height": native_height,
+            "diagnostic_grid_width": native_width,
+            "truth_grid_size": 0 if requested_size <= 0 else requested_size,
+            "truth_grid_sampling": "native",
+            "native_to_diagnostic_pixel_ratio_x": 1.0,
+            "native_to_diagnostic_pixel_ratio_y": 1.0,
+        }
+        return truth_wcs.deepcopy(), (native_height, native_width), metadata
+
+    diagnostic_shape = (requested_size, requested_size)
+    scale_x = float(native_width) / float(requested_size)
+    scale_y = float(native_height) / float(requested_size)
+    diagnostic_wcs = truth_wcs.deepcopy()
+    crpix = np.asarray(diagnostic_wcs.wcs.crpix, dtype=float).copy()
+    if crpix.size >= 2:
+        offset_x = 0.5 * scale_x - 0.5
+        offset_y = 0.5 * scale_y - 0.5
+        crpix[0] = 1.0 + (crpix[0] - offset_x - 1.0) / scale_x
+        crpix[1] = 1.0 + (crpix[1] - offset_y - 1.0) / scale_y
+        diagnostic_wcs.wcs.crpix = crpix
+    pixel_scale_matrix = np.asarray(truth_wcs.pixel_scale_matrix, dtype=float)
+    if pixel_scale_matrix.shape == (2, 2):
+        diagnostic_wcs.wcs.cd = pixel_scale_matrix @ np.diag([scale_x, scale_y])
+    else:
+        cdelt = np.asarray(diagnostic_wcs.wcs.cdelt, dtype=float).copy()
+        if cdelt.size >= 2:
+            cdelt[0] *= scale_x
+            cdelt[1] *= scale_y
+            diagnostic_wcs.wcs.cdelt = cdelt
+    metadata = {
+        "native_truth_height": native_height,
+        "native_truth_width": native_width,
+        "diagnostic_grid_height": requested_size,
+        "diagnostic_grid_width": requested_size,
+        "truth_grid_size": requested_size,
+        "truth_grid_sampling": "bilinear_reduced",
+        "native_to_diagnostic_pixel_ratio_x": scale_x,
+        "native_to_diagnostic_pixel_ratio_y": scale_y,
+    }
+    return diagnostic_wcs, diagnostic_shape, metadata
+
+
+def _sample_wcs_image_on_wcs_grid(
+    image: np.ndarray,
+    image_wcs: WCS,
+    target_wcs: WCS,
+    target_shape: tuple[int, int],
+) -> np.ndarray:
+    y_pixels, x_pixels = np.indices(target_shape, dtype=float)
+    ra_deg, dec_deg = target_wcs.pixel_to_world_values(x_pixels, y_pixels)
+    source_x, source_y = image_wcs.world_to_pixel_values(ra_deg, dec_deg)
+    sampled = map_coordinates(
+        np.asarray(image, dtype=np.float64),
+        [np.asarray(source_y, dtype=float), np.asarray(source_x, dtype=float)],
+        order=1,
+        mode="constant",
+        cval=np.nan,
+    )
+    return np.asarray(sampled, dtype=np.float64).reshape(target_shape)
+
+
+def _truth_recovery_sample_truth_image(
+    image: np.ndarray,
+    image_wcs: WCS,
+    target_wcs: WCS,
+    target_shape: tuple[int, int],
+    *,
+    native_shape: tuple[int, int],
+) -> np.ndarray:
+    if tuple(int(value) for value in target_shape) == tuple(int(value) for value in native_shape):
+        return np.asarray(image, dtype=np.float64)
+    return _sample_wcs_image_on_wcs_grid(image, image_wcs, target_wcs, target_shape)
+
+
 def _signed_magnification_from_kappa_gamma(kappa: np.ndarray, gamma_x: np.ndarray, gamma_y: np.ndarray) -> np.ndarray:
     kappa = np.asarray(kappa, dtype=float)
     gamma_x = np.asarray(gamma_x, dtype=float)
@@ -8839,6 +9045,460 @@ def _lens_model_quantity_on_arcsec_grid(
     return flat_values.reshape(x_arcsec.shape)
 
 
+def _truth_grid_posterior_samples(results: PosteriorResults, max_draws: int | None = None) -> np.ndarray:
+    raw_samples = getattr(results, "samples", None)
+    if raw_samples is None:
+        raise ValueError("Truth-grid recovery requires non-empty finite posterior samples; no best-fit fallback is used.")
+    samples = np.asarray(raw_samples, dtype=float)
+    if samples.ndim != 2 or samples.shape[0] == 0 or samples.shape[1] == 0:
+        raise ValueError("Truth-grid recovery requires non-empty finite posterior samples; no best-fit fallback is used.")
+    finite_samples = _finite_sample_rows(samples)
+    if finite_samples.shape[0] == 0:
+        raise ValueError("Truth-grid recovery requires finite posterior samples; no best-fit fallback is used.")
+    if max_draws is None:
+        return finite_samples
+    max_draws_int = int(max_draws)
+    if max_draws_int <= 0:
+        raise ValueError("--truth-grid-draws must be 'all' or a positive integer.")
+    if finite_samples.shape[0] <= max_draws_int:
+        return finite_samples
+    indices = np.linspace(0, finite_samples.shape[0] - 1, max_draws_int, dtype=int)
+    return finite_samples[indices]
+
+
+def _truth_grid_median_sample(results: PosteriorResults) -> np.ndarray:
+    median_fit = getattr(results, "median_fit", None)
+    if median_fit is not None:
+        median_array = np.asarray(median_fit, dtype=float).reshape(-1)
+        if median_array.size and np.isfinite(median_array).all():
+            return median_array
+    samples = _truth_grid_posterior_samples(results, max_draws=None)
+    median_array = np.nanmedian(samples, axis=0)
+    median_array = np.asarray(median_array, dtype=float).reshape(-1)
+    if median_array.size == 0 or not np.isfinite(median_array).all():
+        raise ValueError("Truth-grid median mode requires finite posterior median parameters; no best-fit fallback is used.")
+    return median_array
+
+
+def _truth_grid_arcsec_coordinates(
+    evaluator: ClusterJAXEvaluator,
+    truth_wcs: WCS,
+    image_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    y_pixels, x_pixels = np.indices(image_shape, dtype=float)
+    ra_deg, dec_deg = truth_wcs.pixel_to_world_values(x_pixels, y_pixels)
+    return _radec_to_solver_arcsec_offsets(ra_deg, dec_deg, evaluator.state.reference)
+
+
+def _truth_grid_latent_samples(
+    evaluator: ClusterJAXEvaluator,
+    samples_physical: np.ndarray,
+) -> np.ndarray:
+    rows = [
+        _reported_physical_to_latent_vector(evaluator, np.asarray(sample, dtype=float))
+        for sample in np.asarray(samples_physical, dtype=float)
+    ]
+    if not rows:
+        return np.empty((0, 0), dtype=np.float64)
+    return np.asarray(rows, dtype=np.float64)
+
+
+def _truth_grid_jax_bulk_quantities_for_draw(
+    evaluator: ClusterJAXEvaluator,
+    latent_sample: np.ndarray,
+    z_source: float,
+    x_arcsec: np.ndarray,
+    y_arcsec: np.ndarray,
+) -> dict[str, np.ndarray]:
+    if not hasattr(evaluator, "_flat_lensing_jacobian_for_components"):
+        raise AttributeError("Evaluator does not expose a JAX bulk lensing Jacobian path.")
+    if not hasattr(evaluator, "_build_truth_grid_packed_lens_state"):
+        raise AttributeError("Evaluator does not expose trace-safe truth-grid packed lens-state construction.")
+
+    latent_jax = jnp.asarray(latent_sample, dtype=jnp.float64)
+    x_jax = jnp.asarray(x_arcsec, dtype=jnp.float64)
+    y_jax = jnp.asarray(y_arcsec, dtype=jnp.float64)
+    z_value = float(z_source)
+
+    packed_state = evaluator._build_truth_grid_packed_lens_state(latent_jax, z_value)
+    a00, a01, a10, a11 = evaluator._flat_lensing_jacobian_for_components(
+        x_jax,
+        y_jax,
+        packed_state,
+    )
+    kappa = 1.0 - 0.5 * (a00 + a11)
+    gamma1 = 0.5 * (a11 - a00)
+    gamma2 = -0.5 * (a01 + a10)
+    det_a = a00 * a11 - a01 * a10
+    mu = 1.0 / det_a
+    return {
+        "kappa": np.asarray(kappa, dtype=np.float64),
+        "gamma1": np.asarray(gamma1, dtype=np.float64),
+        "gamma2": np.asarray(gamma2, dtype=np.float64),
+        "detA": np.asarray(det_a, dtype=np.float64),
+        "mu": np.asarray(mu, dtype=np.float64),
+        "abs_mu": np.asarray(jnp.abs(mu), dtype=np.float64),
+    }
+
+
+def _write_truth_grid_quantile_fits(
+    plot_dir: Path,
+    truth_wcs: WCS,
+    quantiles: dict[str, dict[str, np.ndarray]],
+    *,
+    suffixes: Sequence[str] = TRUTH_GRID_QUANTILE_SUFFIXES,
+) -> None:
+    fits_dir = plot_dir / "fits"
+    fits_dir.mkdir(parents=True, exist_ok=True)
+    header = truth_wcs.to_header()
+    suffix_set = set(str(suffix) for suffix in suffixes)
+    for quantity, quantity_quantiles in quantiles.items():
+        output_name = TRUTH_GRID_QUANTITY_OUTPUT_NAMES.get(quantity, quantity)
+        for stale_suffix in set(TRUTH_GRID_QUANTILE_SUFFIXES) - suffix_set:
+            stale_path = fits_dir / f"truth_recovery_{output_name}_model_{stale_suffix}.fits"
+            try:
+                stale_path.unlink(missing_ok=True)
+            except TypeError:  # pragma: no cover - Python <3.8 compatibility guard
+                if stale_path.exists():
+                    stale_path.unlink()
+        for suffix in suffixes:
+            if suffix not in quantity_quantiles:
+                continue
+            image = np.asarray(quantity_quantiles[suffix], dtype=np.float64)
+            fits.PrimaryHDU(image, header=header).writeto(
+                fits_dir / f"truth_recovery_{output_name}_model_{suffix}.fits",
+                overwrite=True,
+            )
+
+
+def _write_truth_grid_summary(
+    plot_dir: Path,
+    rows: list[dict[str, Any]],
+) -> None:
+    if not rows:
+        return
+    tables_dir = plot_dir / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    path = tables_dir / "truth_recovery_summary.csv"
+    new_df = pd.DataFrame(rows)
+    if path.exists():
+        try:
+            existing = pd.read_csv(path)
+        except Exception:
+            existing = pd.DataFrame()
+        if not existing.empty and "quantity" in existing:
+            replace_quantities = set(new_df["quantity"].astype(str))
+            existing = existing[~existing["quantity"].astype(str).isin(replace_quantities)]
+            new_df = pd.concat([existing, new_df], ignore_index=True)
+    new_df.to_csv(path, index=False)
+
+
+def _truth_grid_cache_key(
+    source_truth_fits: dict[str, str | Path],
+    image_shape: tuple[int, int],
+    z_source: float,
+    max_draws: int | None,
+    truth_grid_mode: str,
+) -> tuple[Any, ...]:
+    paths = tuple(sorted((str(key), str(value)) for key, value in source_truth_fits.items()))
+    draw_key = None if max_draws is None else int(max_draws)
+    return (str(truth_grid_mode), paths, tuple(int(value) for value in image_shape), float(z_source), draw_key)
+
+
+def _posterior_truth_grid_quantiles(
+    plot_dir: Path,
+    evaluator: ClusterJAXEvaluator,
+    results: PosteriorResults,
+    truth_wcs: WCS,
+    image_shape: tuple[int, int],
+    z_source: float,
+    *,
+    source_truth_fits: dict[str, str | Path],
+    quantities: Sequence[str],
+    max_draws: int | None = None,
+    truth_grid_mode: str = TRUTH_GRID_MODE_MEDIAN,
+    cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
+    require_cache: bool = False,
+    aperture_center: dict[str, Any] | None = None,
+    aperture_kappa_true: np.ndarray | None = None,
+    aperture_n_radii: int = 40,
+    progress: Progress | None = None,
+    truth_grid_metadata: dict[str, Any] | None = None,
+) -> tuple[dict[str, dict[str, np.ndarray]], np.ndarray, np.ndarray]:
+    requested_quantities = tuple(dict.fromkeys(str(quantity) for quantity in quantities))
+    truth_grid_mode = str(truth_grid_mode)
+    if truth_grid_mode not in {TRUTH_GRID_MODE_MEDIAN, TRUTH_GRID_MODE_POSTERIOR}:
+        raise ValueError(f"Unsupported truth-grid mode: {truth_grid_mode!r}")
+    effective_max_draws = max_draws if truth_grid_mode == TRUTH_GRID_MODE_POSTERIOR else 1
+    cache_key = _truth_grid_cache_key(source_truth_fits, image_shape, z_source, effective_max_draws, truth_grid_mode)
+    if cache is not None and cache_key in cache:
+        cached = cache[cache_key]
+        cached_quantiles = cached.get("quantiles", {})
+        if set(requested_quantities).issubset(cached_quantiles):
+            return (
+                {quantity: cached_quantiles[quantity] for quantity in requested_quantities},
+                np.asarray(cached["x_arcsec"], dtype=np.float64),
+                np.asarray(cached["y_arcsec"], dtype=np.float64),
+            )
+    if require_cache:
+        raise RuntimeError(
+            "Truth-recovery plot requested posterior grids before the truth_recovery_grids stage populated them."
+        )
+    if truth_grid_mode == TRUTH_GRID_MODE_POSTERIOR:
+        samples = _truth_grid_posterior_samples(results, max_draws=max_draws)
+    else:
+        samples = _truth_grid_median_sample(results)[None, :]
+    if not hasattr(evaluator, "_build_truth_grid_packed_lens_state") or not hasattr(evaluator, "_flat_lensing_jacobian_for_components"):
+        raise RuntimeError(
+            "Truth-grid recovery requires the JAX bulk lensing Jacobian backend "
+            "(_build_truth_grid_packed_lens_state and _flat_lensing_jacobian_for_components)."
+        )
+    latent_samples = _truth_grid_latent_samples(evaluator, samples)
+    if latent_samples.shape[0] != samples.shape[0]:
+        raise RuntimeError("Truth-grid recovery failed to convert posterior samples to latent JAX parameters.")
+    backend_used = "jax_bulk_hessian"
+    truth_grid_metadata = dict(truth_grid_metadata or {})
+    x_arcsec, y_arcsec = _truth_grid_arcsec_coordinates(evaluator, truth_wcs, image_shape)
+    flat_x = np.asarray(x_arcsec, dtype=np.float64).reshape(-1)
+    flat_y = np.asarray(y_arcsec, dtype=np.float64).reshape(-1)
+    total_pixels = int(flat_x.size)
+    chunk_size = total_pixels
+    chunk_count = 1
+    estimated_grid_buffer_bytes = int(
+        samples.shape[0]
+        * total_pixels
+        * len(requested_quantities)
+        * np.dtype(np.float64).itemsize
+    )
+    _log(
+        None,
+        (
+            "[truth-grid] posterior map grids "
+            f"mode={truth_grid_mode} backend={backend_used} "
+            f"draws={samples.shape[0]} quantities={len(requested_quantities)} "
+            f"pixels={total_pixels} chunk_pixels={chunk_size} chunks={chunk_count} "
+            f"dtype=float64 estimated_grid_buffer_bytes={estimated_grid_buffer_bytes}"
+        ),
+    )
+    z_source = float(z_source)
+
+    quantiles: dict[str, dict[str, np.ndarray]] = {
+        quantity: {
+            suffix: np.full(total_pixels, np.nan, dtype=np.float64)
+            for suffix in (("median",) if truth_grid_mode == TRUTH_GRID_MODE_MEDIAN else TRUTH_GRID_QUANTILE_SUFFIXES)
+        }
+        for quantity in requested_quantities
+    }
+    aperture_profile_draw_sums: np.ndarray | None = None
+    aperture_truth_sums: np.ndarray | None = None
+    aperture_pixel_counts: np.ndarray | None = None
+    aperture_radii: np.ndarray | None = None
+    flat_aperture_radius: np.ndarray | None = None
+    flat_aperture_valid: np.ndarray | None = None
+    if aperture_center is not None and aperture_kappa_true is not None and "kappa" in requested_quantities:
+        true_values = np.asarray(aperture_kappa_true, dtype=np.float64).reshape(-1)
+        if true_values.size == total_pixels:
+            center_x = float(aperture_center["center_x_arcsec"])
+            center_y = float(aperture_center["center_y_arcsec"])
+            flat_aperture_radius = np.hypot(flat_x - center_x, flat_y - center_y)
+            flat_aperture_valid = np.isfinite(true_values) & np.isfinite(flat_aperture_radius)
+            finite_radius = flat_aperture_radius[flat_aperture_valid]
+            finite_radius = finite_radius[np.isfinite(finite_radius)]
+            if finite_radius.size:
+                pixel_scale = _truth_recovery_pixel_scale_arcsec(x_arcsec, y_arcsec)
+                r_min = float(pixel_scale)
+                r_max = float(np.nanmax(finite_radius))
+                if np.isfinite(r_max) and r_max > 0.0:
+                    if r_max < r_min:
+                        r_min = r_max
+                    aperture_radii = np.linspace(r_min, r_max, int(aperture_n_radii), dtype=np.float64)
+                    aperture_profile_draw_sums = np.zeros((samples.shape[0], aperture_radii.size), dtype=np.float64)
+                    aperture_truth_sums = np.full(aperture_radii.size, np.nan, dtype=np.float64)
+                    aperture_pixel_counts = np.zeros(aperture_radii.size, dtype=int)
+                    for radius_index, radius_arcsec in enumerate(aperture_radii):
+                        in_aperture = flat_aperture_valid & (flat_aperture_radius <= float(radius_arcsec))
+                        aperture_pixel_counts[radius_index] = int(np.count_nonzero(in_aperture))
+                        if aperture_pixel_counts[radius_index] > 0:
+                            aperture_truth_sums[radius_index] = float(np.nansum(true_values[in_aperture]))
+
+    finite = np.isfinite(flat_x) & np.isfinite(flat_y)
+    finite_indices = np.flatnonzero(finite)
+    full_grid_values = {
+        quantity: np.full((samples.shape[0], total_pixels), np.nan, dtype=np.float64)
+        for quantity in requested_quantities
+    }
+    draw_task_id = None
+    if progress is not None:
+        draw_task_id = progress.add_task("truth_recovery_grids: posterior draws", total=int(samples.shape[0]))
+    if finite_indices.size:
+        finite_x = flat_x[finite]
+        finite_y = flat_y[finite]
+        for draw_index, latent_sample in enumerate(latent_samples):
+            draw_quantities = _truth_grid_jax_bulk_quantities_for_draw(
+                evaluator,
+                latent_sample,
+                z_source,
+                finite_x,
+                finite_y,
+            )
+            for quantity in requested_quantities:
+                full_grid_values[quantity][draw_index, finite_indices] = np.asarray(
+                    draw_quantities[quantity],
+                    dtype=np.float64,
+                )
+            if draw_task_id is not None and progress is not None:
+                progress.advance(draw_task_id)
+    elif draw_task_id is not None and progress is not None:
+        progress.advance(draw_task_id, advance=int(samples.shape[0]))
+    if draw_task_id is not None and progress is not None:
+        progress.update(draw_task_id, description="truth_recovery_grids: posterior draws complete")
+
+    if (
+        aperture_profile_draw_sums is not None
+        and aperture_radii is not None
+        and flat_aperture_radius is not None
+        and flat_aperture_valid is not None
+        and "kappa" in full_grid_values
+    ):
+        kappa_draws = full_grid_values["kappa"]
+        for draw_index in range(samples.shape[0]):
+            draw_kappa = np.asarray(kappa_draws[draw_index], dtype=np.float64)
+            draw_valid = flat_aperture_valid & np.isfinite(draw_kappa)
+            if not np.any(draw_valid):
+                continue
+            for radius_index, radius_arcsec in enumerate(aperture_radii):
+                in_aperture = draw_valid & (flat_aperture_radius <= float(radius_arcsec))
+                if np.any(in_aperture):
+                    aperture_profile_draw_sums[draw_index, radius_index] = float(np.nansum(draw_kappa[in_aperture]))
+
+    for quantity, values in full_grid_values.items():
+        if truth_grid_mode == TRUTH_GRID_MODE_MEDIAN:
+            quantiles[quantity]["median"] = np.asarray(values[0], dtype=np.float64)
+        else:
+            q16, q50, q84 = np.nanpercentile(
+                values,
+                TRUTH_GRID_QUANTILE_PERCENTILES,
+                axis=0,
+            )
+            quantiles[quantity]["q16"] = np.asarray(q16, dtype=np.float64)
+            quantiles[quantity]["median"] = np.asarray(q50, dtype=np.float64)
+            quantiles[quantity]["q84"] = np.asarray(q84, dtype=np.float64)
+
+    shaped_quantiles = {
+        quantity: {
+            suffix: values.reshape(image_shape)
+            for suffix, values in quantity_quantiles.items()
+        }
+        for quantity, quantity_quantiles in quantiles.items()
+    }
+    output_suffixes = ("median",) if truth_grid_mode == TRUTH_GRID_MODE_MEDIAN else TRUTH_GRID_QUANTILE_SUFFIXES
+    _write_truth_grid_quantile_fits(plot_dir, truth_wcs, shaped_quantiles, suffixes=output_suffixes)
+    summary_rows: list[dict[str, Any]] = []
+    for quantity, quantity_quantiles in shaped_quantiles.items():
+        source_path = source_truth_fits.get(quantity) or source_truth_fits.get("kappa")
+        finite_q16_count = (
+            int(np.isfinite(quantity_quantiles["q16"]).sum())
+            if "q16" in quantity_quantiles
+            else 0
+        )
+        finite_q84_count = (
+            int(np.isfinite(quantity_quantiles["q84"]).sum())
+            if "q84" in quantity_quantiles
+            else 0
+        )
+        summary_rows.append(
+            {
+                "quantity": quantity,
+                "truth_grid_mode": truth_grid_mode,
+                "truth_grid_backend": backend_used,
+                "spread_available": bool(truth_grid_mode == TRUTH_GRID_MODE_POSTERIOR),
+                "draw_count_used": int(samples.shape[0]),
+                "total_pixels": int(total_pixels),
+                "finite_q16_pixel_count": finite_q16_count,
+                "finite_median_pixel_count": int(np.isfinite(quantity_quantiles["median"]).sum()),
+                "finite_q84_pixel_count": finite_q84_count,
+                "chunk_pixels": int(chunk_size),
+                "chunk_count": int(chunk_count),
+                "dtype": "float64",
+                "estimated_grid_buffer_memory_bytes": int(estimated_grid_buffer_bytes),
+                "estimated_grid_buffer_memory_gb": float(estimated_grid_buffer_bytes) / float(1024**3),
+                "native_truth_height": int(truth_grid_metadata.get("native_truth_height", image_shape[0])),
+                "native_truth_width": int(truth_grid_metadata.get("native_truth_width", image_shape[1])),
+                "diagnostic_grid_height": int(truth_grid_metadata.get("diagnostic_grid_height", image_shape[0])),
+                "diagnostic_grid_width": int(truth_grid_metadata.get("diagnostic_grid_width", image_shape[1])),
+                "truth_grid_size": int(truth_grid_metadata.get("truth_grid_size", image_shape[0])),
+                "truth_grid_sampling": str(truth_grid_metadata.get("truth_grid_sampling", "native")),
+                "native_to_diagnostic_pixel_ratio_x": float(
+                    truth_grid_metadata.get("native_to_diagnostic_pixel_ratio_x", 1.0)
+                ),
+                "native_to_diagnostic_pixel_ratio_y": float(
+                    truth_grid_metadata.get("native_to_diagnostic_pixel_ratio_y", 1.0)
+                ),
+                "source_truth_fits": "" if source_path is None else str(source_path),
+                "source_redshift": float(z_source),
+            }
+        )
+    _write_truth_grid_summary(plot_dir, summary_rows)
+    aperture_profile_df: pd.DataFrame | None = None
+    if (
+        aperture_profile_draw_sums is not None
+        and aperture_truth_sums is not None
+        and aperture_pixel_counts is not None
+        and aperture_radii is not None
+        and aperture_center is not None
+    ):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            draw_ratios = aperture_profile_draw_sums / aperture_truth_sums[None, :]
+        if truth_grid_mode == TRUTH_GRID_MODE_POSTERIOR:
+            ratio_q16, ratio_median, ratio_q84 = np.nanpercentile(draw_ratios, TRUTH_GRID_QUANTILE_PERCENTILES, axis=0)
+            model_sum_q16, model_sum_median, model_sum_q84 = np.nanpercentile(
+                aperture_profile_draw_sums,
+                TRUTH_GRID_QUANTILE_PERCENTILES,
+                axis=0,
+            )
+        else:
+            ratio_median = np.asarray(draw_ratios[0], dtype=np.float64)
+            ratio_q16 = np.full_like(ratio_median, np.nan, dtype=np.float64)
+            ratio_q84 = np.full_like(ratio_median, np.nan, dtype=np.float64)
+            model_sum_median = np.asarray(aperture_profile_draw_sums[0], dtype=np.float64)
+            model_sum_q16 = np.full_like(model_sum_median, np.nan, dtype=np.float64)
+            model_sum_q84 = np.full_like(model_sum_median, np.nan, dtype=np.float64)
+        rows = []
+        for radius_index, radius_arcsec in enumerate(aperture_radii):
+            rows.append(
+                {
+                    "radius_arcsec": float(radius_arcsec),
+                    "pixel_count": int(aperture_pixel_counts[radius_index]),
+                    "kappa_true_sum": float(aperture_truth_sums[radius_index]),
+                    "kappa_model_sum": float(model_sum_median[radius_index]),
+                    "kappa_model_sum_q16": float(model_sum_q16[radius_index]),
+                    "kappa_model_sum_q84": float(model_sum_q84[radius_index]),
+                    "m2d_ratio": float(ratio_median[radius_index]),
+                    "m2d_ratio_q16": float(ratio_q16[radius_index]),
+                    "m2d_ratio_median": float(ratio_median[radius_index]),
+                    "m2d_ratio_q84": float(ratio_q84[radius_index]),
+                    "center_mode": str(aperture_center["center_mode"]),
+                    "center_x_arcsec": float(aperture_center["center_x_arcsec"]),
+                    "center_y_arcsec": float(aperture_center["center_y_arcsec"]),
+                    "center_catalog_id": str(aperture_center["center_catalog_id"]),
+                    "center_catalog_mag": float(aperture_center["center_catalog_mag"]),
+                }
+            )
+        aperture_profile_df = pd.DataFrame(rows)
+        tables_dir = plot_dir / "tables"
+        tables_dir.mkdir(parents=True, exist_ok=True)
+        aperture_profile_df.to_csv(tables_dir / "truth_recovery_m2d_aperture_profile.csv", index=False)
+        _plot_truth_recovery_m2d_aperture_ratio(plot_dir, aperture_profile_df, aperture_center)
+    if cache is not None:
+        cache[cache_key] = {
+            "quantiles": shaped_quantiles,
+            "x_arcsec": x_arcsec,
+            "y_arcsec": y_arcsec,
+            "aperture_profile": aperture_profile_df,
+        }
+    return shaped_quantiles, x_arcsec, y_arcsec
+
+
 def _empty_recovery_image_points() -> pd.DataFrame:
     return pd.DataFrame(columns=RECOVERY_IMAGE_POINT_COLUMNS)
 
@@ -8889,6 +9549,85 @@ def _observed_image_recovery_points(
     points["true_value"] = true_values
     points["model_value"] = model_values
     return points
+
+
+def _observed_image_recovery_points_from_grids(
+    image_df: pd.DataFrame | None,
+    evaluator: ClusterJAXEvaluator,
+    truth_grid: np.ndarray,
+    model_grid: np.ndarray,
+    truth_wcs: WCS,
+) -> pd.DataFrame:
+    if image_df is None or image_df.empty or "x_obs_arcsec" not in image_df or "y_obs_arcsec" not in image_df:
+        return _empty_recovery_image_points()
+    x_obs = pd.to_numeric(image_df["x_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
+    y_obs = pd.to_numeric(image_df["y_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
+    finite_xy = np.isfinite(x_obs) & np.isfinite(y_obs)
+    true_values = np.full(x_obs.shape, np.nan, dtype=float)
+    model_values = np.full(x_obs.shape, np.nan, dtype=float)
+    if np.any(finite_xy):
+        true_values[finite_xy] = _sample_wcs_image_at_solver_arcsec(
+            truth_grid,
+            truth_wcs,
+            x_obs[finite_xy],
+            y_obs[finite_xy],
+            evaluator.state.reference,
+        )
+        model_values[finite_xy] = _sample_wcs_image_at_solver_arcsec(
+            model_grid,
+            truth_wcs,
+            x_obs[finite_xy],
+            y_obs[finite_xy],
+            evaluator.state.reference,
+        )
+    points = _empty_recovery_image_points()
+    for column in ("family_id", "image_label"):
+        if column in image_df:
+            points[column] = image_df[column].astype(str).to_numpy()
+    points["x_obs_arcsec"] = x_obs
+    points["y_obs_arcsec"] = y_obs
+    points["true_value"] = true_values
+    points["model_value"] = model_values
+    return points
+
+
+def _truth_recovery_member_overlay_table(evaluator: ClusterJAXEvaluator) -> pd.DataFrame:
+    records = getattr(getattr(evaluator, "state", None), "scaling_component_records", []) or []
+    rows: list[dict[str, Any]] = []
+    for raw_record in records:
+        if not isinstance(raw_record, dict):
+            continue
+        catalog_id = str(raw_record.get("catalog_id", "")).strip()
+        x_centre = _finite_float_or_nan(raw_record.get("x_centre"))
+        y_centre = _finite_float_or_nan(raw_record.get("y_centre"))
+        if not catalog_id or not (np.isfinite(x_centre) and np.isfinite(y_centre)):
+            continue
+        free_component_index_value = _finite_float_or_nan(raw_record.get("free_component_index", -1))
+        free_component_index = int(free_component_index_value) if np.isfinite(free_component_index_value) else -1
+        rows.append(
+            {
+                "catalog_id": catalog_id,
+                "x_arcsec": float(x_centre),
+                "y_arcsec": float(y_centre),
+                "free": bool(raw_record.get("selected_independent", False)) or free_component_index >= 0,
+            }
+        )
+    return pd.DataFrame(rows, columns=["catalog_id", "x_arcsec", "y_arcsec", "free"])
+
+
+def _truth_recovery_image_overlay_table(image_df: pd.DataFrame | None) -> pd.DataFrame:
+    if image_df is None or image_df.empty or "x_obs_arcsec" not in image_df or "y_obs_arcsec" not in image_df:
+        return pd.DataFrame(columns=["x_arcsec", "y_arcsec"])
+    x_obs = pd.to_numeric(image_df["x_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
+    y_obs = pd.to_numeric(image_df["y_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
+    finite = np.isfinite(x_obs) & np.isfinite(y_obs)
+    return pd.DataFrame(
+        {
+            "x_arcsec": x_obs[finite],
+            "y_arcsec": y_obs[finite],
+        },
+        columns=["x_arcsec", "y_arcsec"],
+    )
 
 
 def _model_quantity_grid_for_wcs_pixels(
@@ -9010,6 +9749,27 @@ def _central_interval_half_width(lower: float, upper: float) -> float:
     return 0.5 * abs(float(upper) - float(lower))
 
 
+def _quantity_recovery_residual_statistics(true_values: np.ndarray, model_values: np.ndarray) -> dict[str, float]:
+    true_array = np.asarray(true_values, dtype=float).reshape(-1)
+    model_array = np.asarray(model_values, dtype=float).reshape(-1)
+    finite = np.isfinite(true_array) & np.isfinite(model_array)
+    if not np.any(finite):
+        return {
+            "bias_median": float("nan"),
+            "spread_nmad": float("nan"),
+            "rmse": float("nan"),
+        }
+    residual = model_array[finite] - true_array[finite]
+    bias_median = float(np.nanmedian(residual))
+    spread_nmad = float(1.4826 * np.nanmedian(np.abs(residual - bias_median)))
+    rmse = float(np.sqrt(np.nanmean(np.square(residual))))
+    return {
+        "bias_median": bias_median,
+        "spread_nmad": spread_nmad,
+        "rmse": rmse,
+    }
+
+
 def _quantity_recovery_limits(true_values: np.ndarray, model_values: np.ndarray) -> tuple[float, float]:
     combined = np.concatenate([np.asarray(true_values, dtype=float).reshape(-1), np.asarray(model_values, dtype=float).reshape(-1)])
     finite = combined[np.isfinite(combined)]
@@ -9060,6 +9820,7 @@ def _quantity_recovery_summary_table(
         fractional_residual,
         RECOVERY_TWO_SIGMA_PERCENTILES[1],
     )
+    residual_stats = _quantity_recovery_residual_statistics(true_values, model_values)
     row = {
         "quantity": quantity,
         "total_pixel_count": int(total_pixel_count),
@@ -9074,6 +9835,9 @@ def _quantity_recovery_summary_table(
         f"{quantity}_residual_q84": residual_q84,
         f"{quantity}_residual_q97p5": residual_q97p5,
         f"{quantity}_residual_sigma": _central_interval_half_width(residual_q16, residual_q84),
+        f"{quantity}_bias_median": residual_stats["bias_median"],
+        f"{quantity}_spread_nmad": residual_stats["spread_nmad"],
+        f"{quantity}_rmse": residual_stats["rmse"],
         f"{quantity}_fractional_residual_q2p5": fractional_residual_q2p5,
         f"{quantity}_fractional_residual_q16": fractional_residual_q16,
         f"{quantity}_fractional_residual_median": fractional_residual_median,
@@ -9085,6 +9849,16 @@ def _quantity_recovery_summary_table(
         ),
     }
     return pd.DataFrame([row])
+
+
+def _format_recovery_metric(value: Any) -> str:
+    try:
+        float_value = float(value)
+    except Exception:
+        return "nan"
+    if not np.isfinite(float_value):
+        return "nan"
+    return f"{float_value:.3g}"
 
 
 def _quantity_recovery_reduced(
@@ -9165,6 +9939,24 @@ def _plot_quantity_recovery(
         summary_df = recovery["summary_table"]
         if not summary_df.empty:
             summary = summary_df.iloc[0]
+            metric_text = "\n".join(
+                [
+                    f"bias: {_format_recovery_metric(summary.get(f'{quantity}_bias_median', np.nan))}",
+                    f"NMAD: {_format_recovery_metric(summary.get(f'{quantity}_spread_nmad', np.nan))}",
+                    f"RMSE: {_format_recovery_metric(summary.get(f'{quantity}_rmse', np.nan))}",
+                    f"pixels: {int(summary.get('finite_pixel_count', 0))}",
+                ]
+            )
+            ax.text(
+                0.98,
+                0.04,
+                metric_text,
+                transform=ax.transAxes,
+                ha="right",
+                va="bottom",
+                fontsize=8,
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "0.75", "alpha": 0.88},
+            )
             one_sigma = float(summary.get(f"{quantity}_fractional_residual_sigma", np.nan))
             if np.isfinite(one_sigma):
                 for multiple, linestyle, label in [
@@ -9246,11 +10038,11 @@ def _write_kappa_recovery_from_grid(
     recovery = _quantity_recovery_reduced(kappa_true, model_kappa, "kappa", limits=KAPPA_RECOVERY_LIMITS)
     tables_dir = plot_dir / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
-    recovery["bin_table"].to_csv(tables_dir / "kappa_recovery_binned.csv", index=False)
-    recovery["summary_table"].to_csv(tables_dir / "kappa_recovery_summary.csv", index=False)
+    recovery["bin_table"].to_csv(tables_dir / "truth_recovery_kappa_recovery_binned.csv", index=False)
+    recovery["summary_table"].to_csv(tables_dir / "truth_recovery_kappa_recovery_summary.csv", index=False)
     _plot_quantity_recovery(
         recovery,
-        _plot_path(plot_dir, "kappa_recovery.pdf"),
+        _plot_path(plot_dir, "truth_recovery_kappa_recovery.pdf"),
         quantity="kappa",
         true_label=r"$\kappa_{\rm true}$",
         model_label=r"$\kappa_{\rm model}$",
@@ -9302,7 +10094,76 @@ def _plot_kappa_true_comparison_from_grid(
     x_arcsec: np.ndarray,
     y_arcsec: np.ndarray,
     z_source: float,
+    *,
+    member_overlays: pd.DataFrame | None = None,
+    image_overlays: pd.DataFrame | None = None,
 ) -> None:
+    def _plot_map_overlays(ax: Any) -> None:
+        plotted_overlay = False
+        if image_overlays is not None and not image_overlays.empty:
+            image_x = pd.to_numeric(image_overlays.get("x_arcsec"), errors="coerce").to_numpy(dtype=float)
+            image_y = pd.to_numeric(image_overlays.get("y_arcsec"), errors="coerce").to_numpy(dtype=float)
+            finite_images = np.isfinite(image_x) & np.isfinite(image_y)
+            if np.any(finite_images):
+                plotted_overlay = True
+                ax.scatter(
+                    image_x[finite_images],
+                    image_y[finite_images],
+                    marker="x",
+                    s=26,
+                    c="black",
+                    linewidths=0.85,
+                    alpha=0.9,
+                    label="observed images",
+                    zorder=6,
+                )
+        if member_overlays is not None and not member_overlays.empty:
+            member_x = pd.to_numeric(member_overlays.get("x_arcsec"), errors="coerce").to_numpy(dtype=float)
+            member_y = pd.to_numeric(member_overlays.get("y_arcsec"), errors="coerce").to_numpy(dtype=float)
+            member_free = member_overlays.get("free", pd.Series(False, index=member_overlays.index)).astype(bool).to_numpy()
+            member_ids = member_overlays.get("catalog_id", pd.Series("", index=member_overlays.index)).astype(str).to_numpy()
+            finite_members = np.isfinite(member_x) & np.isfinite(member_y)
+            for is_free, marker, edgecolor, label in [
+                (False, "s", "black", "not free"),
+                (True, "D", "gold", "free"),
+            ]:
+                mask = finite_members & (member_free == is_free)
+                if not np.any(mask):
+                    continue
+                plotted_overlay = True
+                ax.scatter(
+                    member_x[mask],
+                    member_y[mask],
+                    marker=marker,
+                    s=38 if is_free else 32,
+                    facecolors="none",
+                    edgecolors=edgecolor,
+                    linewidths=0.9,
+                    alpha=0.95,
+                    label=label,
+                    zorder=7,
+                )
+            for catalog_id, x_value, y_value, finite in zip(member_ids, member_x, member_y, finite_members, strict=False):
+                if not finite or not str(catalog_id).strip():
+                    continue
+                ax.text(
+                    float(x_value),
+                    float(y_value),
+                    str(catalog_id),
+                    fontsize=5.5,
+                    color="black",
+                    ha="left",
+                    va="bottom",
+                    zorder=8,
+                    bbox={"boxstyle": "round,pad=0.08", "facecolor": "white", "edgecolor": "none", "alpha": 0.68},
+                )
+        if plotted_overlay and hasattr(ax, "get_legend_handles_labels"):
+            _handles, labels = ax.get_legend_handles_labels()
+        else:
+            labels = []
+        if labels and hasattr(ax, "legend"):
+            ax.legend(loc="upper right", fontsize=7, frameon=True)
+
     def _plot_comparison_map(
         output_name: str,
         image_data: np.ndarray,
@@ -9312,6 +10173,7 @@ def _plot_kappa_true_comparison_from_grid(
         vmin: float | None = None,
         vmax: float | None = None,
         norm: Normalize | None = None,
+        overlays: bool = False,
     ) -> None:
         fig, ax = plt.subplots(figsize=(6.0, 5.2))
         imshow_kwargs: dict[str, Any] = {
@@ -9330,7 +10192,8 @@ def _plot_kappa_true_comparison_from_grid(
         image = ax.imshow(np.ma.masked_invalid(image_data), **imshow_kwargs)
         colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
         colorbar.set_label(colorbar_label)
-        ax.invert_xaxis()
+        if overlays:
+            _plot_map_overlays(ax)
         ax.set_xlabel("x [arcsec]")
         ax.set_ylabel("y [arcsec]")
         fig.tight_layout()
@@ -9348,7 +10211,7 @@ def _plot_kappa_true_comparison_from_grid(
     ]
 
     _plot_comparison_map(
-        "kappa_model.pdf",
+        "truth_recovery_kappa_model.pdf",
         model_kappa,
         cmap="magma",
         vmin=0.0,
@@ -9356,12 +10219,226 @@ def _plot_kappa_true_comparison_from_grid(
         colorbar_label=r"$\kappa_{\rm model}$",
     )
     _plot_comparison_map(
-        "kappa_fractional_residual.pdf",
+        "truth_recovery_kappa_fractional_residual.pdf",
         fractional_residual,
         cmap="RdBu_r",
         norm=TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=2.0),
         colorbar_label=r"$(\kappa_{\rm model} - \kappa_{\rm true}) / \kappa_{\rm true}$",
+        overlays=True,
     )
+
+
+def _brightest_member_aperture_center(evaluator: ClusterJAXEvaluator) -> dict[str, Any] | None:
+    records = getattr(getattr(evaluator, "state", None), "scaling_component_records", []) or []
+    candidates: list[dict[str, Any]] = []
+    for raw_record in records:
+        if not isinstance(raw_record, dict):
+            continue
+        catalog_mag = _finite_float_or_nan(raw_record.get("catalog_mag"))
+        x_centre = _finite_float_or_nan(raw_record.get("x_centre"))
+        y_centre = _finite_float_or_nan(raw_record.get("y_centre"))
+        if not (np.isfinite(catalog_mag) and np.isfinite(x_centre) and np.isfinite(y_centre)):
+            continue
+        candidates.append(
+            {
+                "center_mode": "brightest_galaxy",
+                "center_x_arcsec": float(x_centre),
+                "center_y_arcsec": float(y_centre),
+                "center_catalog_id": str(raw_record.get("catalog_id", "")),
+                "center_catalog_mag": float(catalog_mag),
+            }
+        )
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item["center_catalog_mag"])
+
+
+def _truth_recovery_pixel_scale_arcsec(x_arcsec: np.ndarray, y_arcsec: np.ndarray) -> float:
+    x_values = np.asarray(x_arcsec, dtype=float)
+    y_values = np.asarray(y_arcsec, dtype=float)
+    steps: list[float] = []
+    if x_values.shape[1] > 1:
+        dx = np.diff(x_values, axis=1)
+        dy = np.diff(y_values, axis=1)
+        values = np.hypot(dx, dy)
+        finite = values[np.isfinite(values) & (values > 0.0)]
+        if finite.size:
+            steps.append(float(np.nanmedian(finite)))
+    if y_values.shape[0] > 1:
+        dx = np.diff(x_values, axis=0)
+        dy = np.diff(y_values, axis=0)
+        values = np.hypot(dx, dy)
+        finite = values[np.isfinite(values) & (values > 0.0)]
+        if finite.size:
+            steps.append(float(np.nanmedian(finite)))
+    finite_steps = [value for value in steps if np.isfinite(value) and value > 0.0]
+    return float(min(finite_steps)) if finite_steps else 1.0
+
+
+def _truth_recovery_aperture_profile(
+    kappa_true: np.ndarray,
+    model_kappa: np.ndarray,
+    x_arcsec: np.ndarray,
+    y_arcsec: np.ndarray,
+    center: dict[str, Any],
+    *,
+    n_radii: int = 40,
+) -> pd.DataFrame:
+    true_values = np.asarray(kappa_true, dtype=float)
+    model_values = np.asarray(model_kappa, dtype=float)
+    x_values = np.asarray(x_arcsec, dtype=float)
+    y_values = np.asarray(y_arcsec, dtype=float)
+    valid = np.isfinite(true_values) & np.isfinite(model_values) & np.isfinite(x_values) & np.isfinite(y_values)
+    columns = [
+        "radius_arcsec",
+        "pixel_count",
+        "kappa_true_sum",
+        "kappa_model_sum",
+        "kappa_model_sum_q16",
+        "kappa_model_sum_q84",
+        "m2d_ratio",
+        "m2d_ratio_q16",
+        "m2d_ratio_median",
+        "m2d_ratio_q84",
+        "center_mode",
+        "center_x_arcsec",
+        "center_y_arcsec",
+        "center_catalog_id",
+        "center_catalog_mag",
+    ]
+    if not np.any(valid):
+        return pd.DataFrame(columns=columns)
+    radius = np.hypot(
+        x_values - float(center["center_x_arcsec"]),
+        y_values - float(center["center_y_arcsec"]),
+    )
+    valid_radius = radius[valid]
+    finite_radius = valid_radius[np.isfinite(valid_radius)]
+    if finite_radius.size == 0:
+        return pd.DataFrame(columns=columns)
+    pixel_scale = _truth_recovery_pixel_scale_arcsec(x_values, y_values)
+    r_min = float(pixel_scale)
+    r_max = float(np.nanmax(finite_radius))
+    if not np.isfinite(r_max) or r_max <= 0.0:
+        return pd.DataFrame(columns=columns)
+    if r_max < r_min:
+        r_min = r_max
+    radii = np.linspace(r_min, r_max, int(n_radii), dtype=float)
+    rows: list[dict[str, Any]] = []
+    for radius_arcsec in radii:
+        in_aperture = valid & (radius <= float(radius_arcsec))
+        pixel_count = int(np.count_nonzero(in_aperture))
+        if pixel_count == 0:
+            true_sum = model_sum = ratio = float("nan")
+        else:
+            true_sum = float(np.nansum(true_values[in_aperture]))
+            model_sum = float(np.nansum(model_values[in_aperture]))
+            ratio = model_sum / true_sum if np.isfinite(true_sum) and true_sum != 0.0 else float("nan")
+        rows.append(
+            {
+                "radius_arcsec": float(radius_arcsec),
+                "pixel_count": pixel_count,
+                "kappa_true_sum": true_sum,
+                "kappa_model_sum": model_sum,
+                "kappa_model_sum_q16": model_sum,
+                "kappa_model_sum_q84": model_sum,
+                "m2d_ratio": ratio,
+                "m2d_ratio_q16": ratio,
+                "m2d_ratio_median": ratio,
+                "m2d_ratio_q84": ratio,
+                "center_mode": str(center["center_mode"]),
+                "center_x_arcsec": float(center["center_x_arcsec"]),
+                "center_y_arcsec": float(center["center_y_arcsec"]),
+                "center_catalog_id": str(center["center_catalog_id"]),
+                "center_catalog_mag": float(center["center_catalog_mag"]),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _plot_truth_recovery_m2d_aperture_ratio(
+    plot_dir: Path,
+    profile_df: pd.DataFrame,
+    center: dict[str, Any],
+) -> None:
+    if profile_df.empty:
+        return
+    output_path = _plot_path(plot_dir, "truth_recovery_m2d_aperture_ratio.pdf")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6.3, 4.8))
+    radius = pd.to_numeric(profile_df["radius_arcsec"], errors="coerce").to_numpy(dtype=float)
+    ratio_column = "m2d_ratio_median" if "m2d_ratio_median" in profile_df else "m2d_ratio"
+    ratio = pd.to_numeric(profile_df[ratio_column], errors="coerce").to_numpy(dtype=float)
+    finite = np.isfinite(radius) & np.isfinite(ratio)
+    if np.any(finite):
+        if {"m2d_ratio_q16", "m2d_ratio_q84"}.issubset(profile_df.columns):
+            ratio_q16 = pd.to_numeric(profile_df["m2d_ratio_q16"], errors="coerce").to_numpy(dtype=float)
+            ratio_q84 = pd.to_numeric(profile_df["m2d_ratio_q84"], errors="coerce").to_numpy(dtype=float)
+            finite_band = finite & np.isfinite(ratio_q16) & np.isfinite(ratio_q84)
+            if np.any(finite_band):
+                ax.fill_between(
+                    radius[finite_band],
+                    ratio_q16[finite_band],
+                    ratio_q84[finite_band],
+                    color="tab:blue",
+                    alpha=0.18,
+                    linewidth=0.0,
+                    label="16-84% posterior",
+                )
+        ax.plot(radius[finite], ratio[finite], color="tab:blue", linewidth=1.8)
+    else:
+        ax.text(0.5, 0.5, "No finite aperture mass ratios.", ha="center", va="center", transform=ax.transAxes)
+    ax.axhline(1.0, color="0.2", linestyle="--", linewidth=1.0, label="truth")
+    ax.set_xlabel("R [arcsec]")
+    ax.set_ylabel(r"$M_{\rm 2D,model}(<R) / M_{\rm 2D,true}(<R)$")
+    ax.set_title("Projected aperture mass recovery")
+    ax.grid(True, alpha=0.25)
+    ax.text(
+        0.02,
+        0.98,
+        (
+            f"center: {center['center_catalog_id']}\n"
+            f"x={float(center['center_x_arcsec']):.3g}\"  y={float(center['center_y_arcsec']):.3g}\"\n"
+            f"mag={float(center['center_catalog_mag']):.3g}"
+        ),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "0.75", "alpha": 0.88},
+    )
+    ax.legend(loc="best", fontsize=8, frameon=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_truth_recovery_m2d_aperture_profile(
+    plot_dir: Path,
+    evaluator: ClusterJAXEvaluator,
+    kappa_true: np.ndarray,
+    model_kappa: np.ndarray,
+    x_arcsec: np.ndarray,
+    y_arcsec: np.ndarray,
+) -> None:
+    center = _brightest_member_aperture_center(evaluator)
+    if center is None:
+        _log(None, "[truth-recovery:m2d] skipped: no finite brightest member center")
+        return
+    profile_df = _truth_recovery_aperture_profile(
+        kappa_true,
+        model_kappa,
+        x_arcsec,
+        y_arcsec,
+        center,
+    )
+    if profile_df.empty:
+        _log(None, "[truth-recovery:m2d] skipped: aperture profile has no finite pixels")
+        return
+    tables_dir = plot_dir / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    profile_df.to_csv(tables_dir / "truth_recovery_m2d_aperture_profile.csv", index=False)
+    _plot_truth_recovery_m2d_aperture_ratio(plot_dir, profile_df, center)
 
 
 def _kappa_truth_grids(
@@ -9409,10 +10486,18 @@ def _plot_kappa_true_comparison(
 def _plot_kappa_truth_diagnostics(
     plot_dir: Path,
     evaluator: ClusterJAXEvaluator,
-    best_fit: np.ndarray,
+    results: PosteriorResults,
     kappa_true_fits: str | Path,
     caustic_source_redshift: float,
     image_df: pd.DataFrame | None = None,
+    *,
+    truth_grid_draws: int | None = None,
+    truth_grid_mode: str = TRUTH_GRID_MODE_MEDIAN,
+    truth_grid_size: int = DEFAULT_TRUTH_GRID_SIZE,
+    truth_grid_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
+    precompute_quantities: Sequence[str] | None = None,
+    truth_grid_source_fits: dict[str, str | Path] | None = None,
+    require_precomputed_truth_grid: bool = False,
 ) -> None:
     z_source = float(caustic_source_redshift)
     z_lens = getattr(evaluator.state, "z_lens", None)
@@ -9423,23 +10508,55 @@ def _plot_kappa_truth_diagnostics(
             f"is not behind lens redshift z={float(z_lens):g}",
         )
         return
-    kappa_true, kappa_wcs = _load_kappa_true_fits(kappa_true_fits)
-    model_kappa, x_arcsec, y_arcsec = _kappa_model_grid_for_true_fits(
-        evaluator,
-        best_fit,
-        kappa_true.shape,
-        kappa_wcs,
-        z_source,
+    native_kappa_true, native_kappa_wcs = _load_kappa_true_fits(kappa_true_fits)
+    kappa_wcs, diagnostic_shape, grid_metadata = _truth_recovery_diagnostic_grid(
+        native_kappa_wcs,
+        native_kappa_true.shape,
+        truth_grid_size,
     )
-    _plot_kappa_true_comparison_from_grid(plot_dir, kappa_true, model_kappa, x_arcsec, y_arcsec, z_source)
-    image_points = _observed_image_recovery_points(
+    kappa_true = _truth_recovery_sample_truth_image(
+        native_kappa_true,
+        native_kappa_wcs,
+        kappa_wcs,
+        diagnostic_shape,
+        native_shape=native_kappa_true.shape,
+    )
+    quantities = tuple(precompute_quantities) if precompute_quantities is not None else ("kappa",)
+    source_truth_fits = truth_grid_source_fits if truth_grid_source_fits is not None else {"kappa": kappa_true_fits}
+    quantiles, x_arcsec, y_arcsec = _posterior_truth_grid_quantiles(
+        plot_dir,
+        evaluator,
+        results,
+        kappa_wcs,
+        diagnostic_shape,
+        z_source,
+        source_truth_fits=source_truth_fits,
+        quantities=quantities,
+        max_draws=truth_grid_draws,
+        truth_grid_mode=truth_grid_mode,
+        cache=truth_grid_cache,
+        require_cache=require_precomputed_truth_grid,
+        aperture_center=_brightest_member_aperture_center(evaluator),
+        aperture_kappa_true=kappa_true,
+        truth_grid_metadata=grid_metadata,
+    )
+    model_kappa = quantiles["kappa"]["median"]
+    _plot_kappa_true_comparison_from_grid(
+        plot_dir,
+        kappa_true,
+        model_kappa,
+        x_arcsec,
+        y_arcsec,
+        z_source,
+        member_overlays=_truth_recovery_member_overlay_table(evaluator),
+        image_overlays=_truth_recovery_image_overlay_table(image_df),
+    )
+    image_points = _observed_image_recovery_points_from_grids(
         image_df,
         evaluator,
-        best_fit,
         kappa_true,
+        model_kappa,
         kappa_wcs,
-        z_source,
-        "kappa",
     )
     _write_kappa_recovery_from_grid(plot_dir, kappa_true, model_kappa, z_source, image_points=image_points)
 
@@ -9450,6 +10567,7 @@ def _absolute_mu_truth_grid(
     gammay_true_fits: str | Path,
     *,
     cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP,
+    truth_grid_size: int = 0,
 ) -> tuple[np.ndarray, WCS]:
     kappa_true, kappa_wcs = _load_kappa_true_fits(kappa_true_fits)
     gammax_true, gammax_wcs = _load_kappa_true_fits(gammax_true_fits)
@@ -9460,8 +10578,34 @@ def _absolute_mu_truth_grid(
         raise ValueError("gammay truth FITS shape does not match the kappa truth FITS shape.")
     _validate_matching_truth_wcs(kappa_wcs, gammax_wcs, kappa_true.shape, label="gammax")
     _validate_matching_truth_wcs(kappa_wcs, gammay_wcs, kappa_true.shape, label="gammay")
-    signed_mu_true = _signed_magnification_from_kappa_gamma(kappa_true, gammax_true, gammay_true)
-    return np.abs(signed_mu_true), kappa_wcs
+    truth_wcs, diagnostic_shape, _grid_metadata = _truth_recovery_diagnostic_grid(
+        kappa_wcs,
+        kappa_true.shape,
+        truth_grid_size,
+    )
+    kappa_sampled = _truth_recovery_sample_truth_image(
+        kappa_true,
+        kappa_wcs,
+        truth_wcs,
+        diagnostic_shape,
+        native_shape=kappa_true.shape,
+    )
+    gammax_sampled = _truth_recovery_sample_truth_image(
+        gammax_true,
+        gammax_wcs,
+        truth_wcs,
+        diagnostic_shape,
+        native_shape=gammax_true.shape,
+    )
+    gammay_sampled = _truth_recovery_sample_truth_image(
+        gammay_true,
+        gammay_wcs,
+        truth_wcs,
+        diagnostic_shape,
+        native_shape=gammay_true.shape,
+    )
+    signed_mu_true = _signed_magnification_from_kappa_gamma(kappa_sampled, gammax_sampled, gammay_sampled)
+    return np.abs(signed_mu_true), truth_wcs
 
 
 def _absolute_mu_truth_grids(
@@ -9473,12 +10617,14 @@ def _absolute_mu_truth_grids(
     caustic_source_redshift: float,
     *,
     cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP,
+    truth_grid_size: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     abs_mu_true, truth_wcs = _absolute_mu_truth_grid(
         kappa_true_fits,
         gammax_true_fits,
         gammay_true_fits,
         cap=cap,
+        truth_grid_size=truth_grid_size,
     )
     y_pixels, x_pixels = np.indices(abs_mu_true.shape, dtype=float)
     model_mu, x_arcsec, y_arcsec = _model_quantity_grid_for_wcs_pixels(
@@ -9513,11 +10659,11 @@ def _write_abs_mu_recovery_from_grid(
     )
     tables_dir = plot_dir / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
-    recovery["bin_table"].to_csv(tables_dir / "mu_recovery_binned.csv", index=False)
-    recovery["summary_table"].to_csv(tables_dir / "mu_recovery_summary.csv", index=False)
+    recovery["bin_table"].to_csv(tables_dir / "truth_recovery_mu_recovery_binned.csv", index=False)
+    recovery["summary_table"].to_csv(tables_dir / "truth_recovery_mu_recovery_summary.csv", index=False)
     _plot_quantity_recovery(
         recovery,
-        _plot_path(plot_dir, "mu_recovery.pdf"),
+        _plot_path(plot_dir, "truth_recovery_mu_recovery.pdf"),
         quantity="abs_mu",
         true_label=r"$|\mu_{\rm true}|$",
         model_label=r"$|\mu_{\rm model}|$",
@@ -9562,7 +10708,6 @@ def _plot_abs_mu_true_comparison_from_grid(
         image = ax.imshow(np.ma.masked_invalid(image_data), **imshow_kwargs)
         colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
         colorbar.set_label(colorbar_label)
-        ax.invert_xaxis()
         ax.set_xlabel("x [arcsec]")
         ax.set_ylabel("y [arcsec]")
         fig.tight_layout()
@@ -9582,7 +10727,7 @@ def _plot_abs_mu_true_comparison_from_grid(
     ]
 
     _plot_comparison_map(
-        "mu_model.pdf",
+        "truth_recovery_mu_model.pdf",
         abs_mu_model,
         cmap="viridis",
         vmin=0.0,
@@ -9590,7 +10735,7 @@ def _plot_abs_mu_true_comparison_from_grid(
         colorbar_label=r"$|\mu_{\rm model}|$",
     )
     _plot_comparison_map(
-        "mu_fractional_residual.pdf",
+        "truth_recovery_mu_fractional_residual.pdf",
         fractional_residual,
         cmap="RdBu_r",
         norm=TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=4.0),
@@ -9614,7 +10759,7 @@ def _plot_critical_line_recovery_from_grid(
     y_arcsec: np.ndarray,
     z_source: float,
 ) -> None:
-    output_path = _plot_path(plot_dir, "critical_line_recovery.pdf")
+    output_path = _plot_path(plot_dir, "truth_recovery_critical_line_recovery.pdf")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(6.0, 5.2))
     legend_handles: list[Line2D] = []
@@ -9647,7 +10792,6 @@ def _plot_critical_line_recovery_from_grid(
         legend_handles.append(Line2D([0], [0], color=color, linestyle=linestyle, linewidth=1.1, label=label))
     if not legend_handles:
         ax.text(0.5, 0.5, "No zero-determinant critical line in grid.", ha="center", va="center", transform=ax.transAxes)
-    ax.invert_xaxis()
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("x [arcsec]")
     ax.set_ylabel("y [arcsec]")
@@ -9662,7 +10806,7 @@ def _plot_critical_line_recovery_from_grid(
 def _plot_abs_mu_truth_diagnostics(
     plot_dir: Path,
     evaluator: ClusterJAXEvaluator,
-    best_fit: np.ndarray,
+    results: PosteriorResults,
     kappa_true_fits: str | Path,
     gammax_true_fits: str | Path,
     gammay_true_fits: str | Path,
@@ -9670,6 +10814,11 @@ def _plot_abs_mu_truth_diagnostics(
     *,
     cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP,
     image_df: pd.DataFrame | None = None,
+    truth_grid_draws: int | None = None,
+    truth_grid_mode: str = TRUTH_GRID_MODE_MEDIAN,
+    truth_grid_size: int = DEFAULT_TRUTH_GRID_SIZE,
+    truth_grid_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
+    require_precomputed_truth_grid: bool = False,
 ) -> None:
     z_source = float(caustic_source_redshift)
     z_lens = getattr(evaluator.state, "z_lens", None)
@@ -9680,29 +10829,69 @@ def _plot_abs_mu_truth_diagnostics(
             f"is not behind lens redshift z={float(z_lens):g}",
         )
         return
-    abs_mu_true, truth_wcs = _absolute_mu_truth_grid(
-        kappa_true_fits,
-        gammax_true_fits,
-        gammay_true_fits,
-        cap=cap,
+    native_kappa_true, native_kappa_wcs = _load_kappa_true_fits(kappa_true_fits)
+    native_gammax_true, native_gammax_wcs = _load_kappa_true_fits(gammax_true_fits)
+    native_gammay_true, native_gammay_wcs = _load_kappa_true_fits(gammay_true_fits)
+    if native_gammax_true.shape != native_kappa_true.shape:
+        raise ValueError("gammax truth FITS shape does not match the kappa truth FITS shape.")
+    if native_gammay_true.shape != native_kappa_true.shape:
+        raise ValueError("gammay truth FITS shape does not match the kappa truth FITS shape.")
+    _validate_matching_truth_wcs(native_kappa_wcs, native_gammax_wcs, native_kappa_true.shape, label="gammax")
+    _validate_matching_truth_wcs(native_kappa_wcs, native_gammay_wcs, native_kappa_true.shape, label="gammay")
+    truth_wcs, diagnostic_shape, grid_metadata = _truth_recovery_diagnostic_grid(
+        native_kappa_wcs,
+        native_kappa_true.shape,
+        truth_grid_size,
     )
-    y_pixels, x_pixels = np.indices(abs_mu_true.shape, dtype=float)
-    model_mu, x_arcsec, y_arcsec = _model_quantity_grid_for_wcs_pixels(
-        evaluator,
-        best_fit,
+    kappa_true = _truth_recovery_sample_truth_image(
+        native_kappa_true,
+        native_kappa_wcs,
         truth_wcs,
-        x_pixels,
-        y_pixels,
-        z_source,
-        "magnification",
+        diagnostic_shape,
+        native_shape=native_kappa_true.shape,
     )
-    abs_mu_model = np.abs(np.asarray(model_mu, dtype=float))
-    kappa_true, _kappa_wcs = _load_kappa_true_fits(kappa_true_fits)
-    gammax_true, _gammax_wcs = _load_kappa_true_fits(gammax_true_fits)
-    gammay_true, _gammay_wcs = _load_kappa_true_fits(gammay_true_fits)
+    gammax_true = _truth_recovery_sample_truth_image(
+        native_gammax_true,
+        native_gammax_wcs,
+        truth_wcs,
+        diagnostic_shape,
+        native_shape=native_gammax_true.shape,
+    )
+    gammay_true = _truth_recovery_sample_truth_image(
+        native_gammay_true,
+        native_gammay_wcs,
+        truth_wcs,
+        diagnostic_shape,
+        native_shape=native_gammay_true.shape,
+    )
+    abs_mu_true = np.abs(_signed_magnification_from_kappa_gamma(kappa_true, gammax_true, gammay_true))
+    quantiles, x_arcsec, y_arcsec = _posterior_truth_grid_quantiles(
+        plot_dir,
+        evaluator,
+        results,
+        truth_wcs,
+        diagnostic_shape,
+        z_source,
+        source_truth_fits={
+            "kappa": kappa_true_fits,
+            "gamma1": gammax_true_fits,
+            "gamma2": gammay_true_fits,
+            "detA": kappa_true_fits,
+            "mu": kappa_true_fits,
+            "abs_mu": kappa_true_fits,
+        },
+        quantities=("kappa", "gamma1", "gamma2", "detA", "mu", "abs_mu"),
+        max_draws=truth_grid_draws,
+        truth_grid_mode=truth_grid_mode,
+        cache=truth_grid_cache,
+        require_cache=require_precomputed_truth_grid,
+        aperture_center=_brightest_member_aperture_center(evaluator),
+        aperture_kappa_true=kappa_true,
+        truth_grid_metadata=grid_metadata,
+    )
+    abs_mu_model = quantiles["abs_mu"]["median"]
     truth_determinant = _critical_determinant_from_kappa_gamma(kappa_true, gammax_true, gammay_true)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        model_determinant = 1.0 / np.asarray(model_mu, dtype=float)
+    model_determinant = quantiles["detA"]["median"]
     _plot_critical_line_recovery_from_grid(
         plot_dir,
         truth_determinant,
@@ -9720,17 +10909,104 @@ def _plot_abs_mu_truth_diagnostics(
         z_source,
         cap=cap,
     )
-    image_points = _observed_image_recovery_points(
+    image_points = _observed_image_recovery_points_from_grids(
         image_df,
         evaluator,
-        best_fit,
         abs_mu_true,
+        abs_mu_model,
         truth_wcs,
-        z_source,
-        "magnification",
-        model_transform=np.abs,
     )
     _write_abs_mu_recovery_from_grid(plot_dir, abs_mu_true, abs_mu_model, z_source, cap=cap, image_points=image_points)
+
+
+def _precompute_truth_recovery_grids(
+    run_dir: Path,
+    evaluator: ClusterJAXEvaluator,
+    results: PosteriorResults,
+    args: argparse.Namespace,
+    truth_grid_cache: dict[tuple[Any, ...], dict[str, Any]],
+    progress: Progress | None = None,
+) -> bool:
+    if bool(getattr(args, "skip_grid_diagnostics", False)):
+        return False
+    kappa_true_fits = getattr(args, "kappa_true_fits", None)
+    if kappa_true_fits is None or not str(kappa_true_fits).strip():
+        return False
+    z_source = float(getattr(args, "caustic_source_redshift", 9.0))
+    z_lens = getattr(evaluator.state, "z_lens", None)
+    if z_lens is not None and np.isfinite(float(z_lens)) and z_source <= float(z_lens):
+        _log(
+            args,
+            f"[truth-recovery] skipped: caustic source redshift z={z_source:g} "
+            f"is not behind lens redshift z={float(z_lens):g}",
+        )
+        return False
+
+    gammax_true_fits = getattr(args, "gammax_true_fits", None)
+    gammay_true_fits = getattr(args, "gammay_true_fits", None)
+    truth_grid_size = int(getattr(args, "truth_grid_size", DEFAULT_TRUTH_GRID_SIZE))
+    gamma_truth_available = (
+        gammax_true_fits is not None
+        and str(gammax_true_fits).strip()
+        and gammay_true_fits is not None
+        and str(gammay_true_fits).strip()
+    )
+    native_kappa_true, native_kappa_wcs = _load_kappa_true_fits(kappa_true_fits)
+    kappa_wcs, diagnostic_shape, grid_metadata = _truth_recovery_diagnostic_grid(
+        native_kappa_wcs,
+        native_kappa_true.shape,
+        truth_grid_size,
+    )
+    kappa_true = _truth_recovery_sample_truth_image(
+        native_kappa_true,
+        native_kappa_wcs,
+        kappa_wcs,
+        diagnostic_shape,
+        native_shape=native_kappa_true.shape,
+    )
+    if gamma_truth_available:
+        native_gammax_true, native_gammax_wcs = _load_kappa_true_fits(gammax_true_fits)
+        native_gammay_true, native_gammay_wcs = _load_kappa_true_fits(gammay_true_fits)
+        if native_gammax_true.shape != native_kappa_true.shape:
+            raise ValueError("gammax truth FITS shape does not match the kappa truth FITS shape.")
+        if native_gammay_true.shape != native_kappa_true.shape:
+            raise ValueError("gammay truth FITS shape does not match the kappa truth FITS shape.")
+        _validate_matching_truth_wcs(native_kappa_wcs, native_gammax_wcs, native_kappa_true.shape, label="gammax")
+        _validate_matching_truth_wcs(native_kappa_wcs, native_gammay_wcs, native_kappa_true.shape, label="gammay")
+        source_truth_fits = {
+            "kappa": str(kappa_true_fits),
+            "gamma1": str(gammax_true_fits),
+            "gamma2": str(gammay_true_fits),
+            "detA": str(kappa_true_fits),
+            "mu": str(kappa_true_fits),
+            "abs_mu": str(kappa_true_fits),
+        }
+        quantities = ("kappa", "gamma1", "gamma2", "detA", "mu", "abs_mu")
+    else:
+        source_truth_fits = {"kappa": str(kappa_true_fits)}
+        quantities = ("kappa",)
+
+    center = _brightest_member_aperture_center(evaluator)
+    if center is None:
+        _log(args, "[truth-recovery:m2d] skipped: no finite brightest member center")
+    _posterior_truth_grid_quantiles(
+        run_dir,
+        evaluator,
+        results,
+        kappa_wcs,
+        kappa_true.shape,
+        z_source,
+        source_truth_fits=source_truth_fits,
+        quantities=quantities,
+        max_draws=getattr(args, "truth_grid_draws", None),
+        truth_grid_mode=str(getattr(args, "truth_grid_mode", TRUTH_GRID_MODE_MEDIAN)),
+        cache=truth_grid_cache,
+        aperture_center=center,
+        aperture_kappa_true=kappa_true if center is not None else None,
+        progress=progress,
+        truth_grid_metadata=grid_metadata,
+    )
+    return True
 
 
 def _empty_subhalo_properties_table() -> pd.DataFrame:
@@ -12183,6 +13459,12 @@ def _plot_image_catalog_family_cutouts(
             plt.close(fig)
 
 
+def _is_stage0_minimal_output(state: BuildState, args: argparse.Namespace) -> bool:
+    return bool(getattr(state, "perturbation_discovery_stage0", False)) or bool(
+        getattr(args, "perturbation_discovery_stage0", False)
+    )
+
+
 def _generate_plots_and_tables(
     run_dir: Path,
     state: BuildState,
@@ -12195,7 +13477,7 @@ def _generate_plots_and_tables(
 ) -> dict[str, Any]:
     tables_dir = run_dir / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
-    if bool(getattr(state, "perturbation_discovery_stage0", False)):
+    if _is_stage0_minimal_output(state, args):
         return _generate_stage0_minimal_plots_and_tables(
             run_dir=run_dir,
             tables_dir=tables_dir,
@@ -12209,96 +13491,8 @@ def _generate_plots_and_tables(
         )
     sample_likelihood_mode = _active_sample_likelihood_mode(evaluator, args)
     use_arc_aware_diagnostics = _uses_arc_aware_diagnostics(sample_likelihood_mode)
-    summary_df = _run_logged_phase(
-        args,
-        "plots.summary_table",
-        lambda: _summary_table(
-            state.parameter_specs,
-            results.samples,
-            best_fit,
-            sample_weights=results.sample_weights,
-        ),
-    )
-    family_df = _run_logged_phase(args, "plots.family_diagnostics_table", lambda: _family_diagnostics_table(evaluator, best_eval))
-    image_fit_quality_df, model_magnification_df, image_recovery_extra_df = _run_logged_phase(
-        args,
-        "plots.fit_quality_tables",
-        lambda: _fit_quality_tables(state, evaluator, best_fit, results, args),
-    )
-    cab_arc_diagnostics_df = _run_logged_phase(
-        args,
-        "plots.cab_arc_diagnostics_table",
-        lambda: _cab_arc_diagnostics_table(evaluator, best_fit),
-    )
-    image_count_recovery_df = _run_logged_phase(
-        args,
-        "plots.image_count_recovery_table",
-        lambda: _image_count_recovery_table(state, image_fit_quality_df),
-    )
-    if use_arc_aware_diagnostics:
-        arc_aware_family_df = _run_logged_phase(
-            args,
-            "plots.arc_aware_family_diagnostics_table",
-            lambda: _arc_aware_family_diagnostics_from_image_rows(image_fit_quality_df),
-        )
-        if not arc_aware_family_df.empty:
-            family_df = family_df.copy()
-            family_df["family_id"] = family_df["family_id"].astype(str)
-            arc_aware_family_df["family_id"] = arc_aware_family_df["family_id"].astype(str)
-            family_df = family_df.merge(arc_aware_family_df, on="family_id", how="left")
     max_tree_depth = _first_int_value(getattr(args, "max_tree_depth", 10), 10)
-    chain_health_df = _run_logged_phase(
-        args,
-        "plots.chain_health_table",
-        lambda: _chain_health_summary_table(
-            results,
-            state.parameter_specs,
-            max_tree_depth=max_tree_depth,
-        ),
-    )
-    chain_parameter_diagnostics_df = _run_logged_phase(
-        args,
-        "plots.chain_parameter_diagnostics_table",
-        lambda: _chain_parameter_diagnostics_table(results, state.parameter_specs),
-    )
-    run_summary = _run_logged_phase(
-        args,
-        "plots.run_summary",
-        lambda: _run_summary(
-            args,
-            state,
-            runtime_sec,
-            results,
-            best_eval.loglike,
-            evaluator,
-            image_fit_quality_df=image_fit_quality_df,
-            image_count_recovery_df=image_count_recovery_df,
-        ),
-    )
-    run_summary_text = _format_run_summary_text(run_summary)
-    scaling_specs, scaling_samples, scaling_best_fit = _run_logged_phase(
-        args,
-        "plots.potfile_corner_subset",
-        lambda: _potfile_corner_parameter_subset(state.parameter_specs, results.samples, best_fit),
-    )
-    cosmology_specs, cosmology_samples, cosmology_best_fit = _run_logged_phase(
-        args,
-        "plots.cosmology_subset",
-        lambda: _cosmology_parameter_subset(state.parameter_specs, results.samples, best_fit),
-    )
-    bayes_corner_overlay = _run_logged_phase(
-        args,
-        "plots.load_bayes_corner_overlay",
-        lambda: _load_bayes_corner_overlay(getattr(args, "corner_overlay_bayes_dat", None), state),
-    )
-    best_par_marker_values = _run_logged_phase(
-        args,
-        "plots.load_best_par_corner_marker",
-        lambda: _load_best_par_marker_values(getattr(args, "corner_overlay_best_par", None), state),
-    )
     best_fit_values = _best_fit_values_for_specs(state.parameter_specs, best_fit)
-    scaling_best_fit_values = _best_fit_values_for_specs(scaling_specs, scaling_best_fit)
-    cosmology_best_fit_values = _best_fit_values_for_specs(cosmology_specs, cosmology_best_fit)
     map_values = _fit_vector_values_for_specs(state.parameter_specs, results.map_fit)
     if not map_values:
         map_values = _map_values_for_specs(state.parameter_specs, results.samples, results.log_prob)
@@ -12312,10 +13506,6 @@ def _generate_plots_and_tables(
             results.samples,
             (results.init_diagnostics or {}).get("maximum_likelihood_sample_index"),
         )
-    scaling_map_values = _subset_values_for_specs(scaling_specs, map_values)
-    cosmology_map_values = _subset_values_for_specs(cosmology_specs, map_values)
-    scaling_maximum_likelihood_values = _subset_values_for_specs(scaling_specs, maximum_likelihood_values)
-    cosmology_maximum_likelihood_values = _subset_values_for_specs(cosmology_specs, maximum_likelihood_values)
     best_fit_latent = _reported_physical_to_latent_vector(evaluator, np.asarray(best_fit, dtype=float))
     critical_arc_singular_threshold_best_fit = _fit_quality_critical_arc_singular_threshold(
         evaluator,
@@ -12326,186 +13516,388 @@ def _generate_plots_and_tables(
         best_fit_latent,
     )
     previous_stage_best_values = getattr(state, "previous_stage_best_values", None)
-    potfile_constraint_df = _run_logged_phase(
-        args,
-        "plots.potfile_constraint_table",
-        lambda: _potfile_constraint_diagnostics_table(
-            state.parameter_specs,
-            results.samples,
-            best_fit,
-            evaluator.scaling_rank_df,
-            sample_weights=results.sample_weights,
-        ),
-    )
-    scaling_results_df = _run_logged_phase(
-        args,
-        "plots.scaling_results_summary_table",
-        lambda: _scaling_results_summary_table(
-            state.parameter_specs,
-            results.samples,
-            best_fit,
-            str(getattr(state, "scaling_relation_mode", getattr(args, "scaling_relation_mode", "lenstool-denominator"))),
-            sample_weights=results.sample_weights,
-        ),
-    )
-    independent_scaling_df = _run_logged_phase(
-        args,
-        "plots.independent_scaling_table",
-        lambda: _independent_scaling_diagnostics_table(
-            state.parameter_specs,
-            results.samples,
-            best_fit,
-            evaluator.scaling_rank_df,
-            getattr(state, "packed_lens_spec", None),
-            sample_weights=results.sample_weights,
-        ),
-    )
-    independent_scaling_plot_df = _run_logged_phase(
-        args,
-        "plots.independent_scaling_plot_table",
-        lambda: _independent_scaling_plot_table(evaluator.scaling_rank_df, independent_scaling_df),
-    )
     best_value_selected = str((results.init_diagnostics or {}).get("best_value_selected", "") or "")
     best_value_requested = str((results.init_diagnostics or {}).get("best_value_requested", "") or "")
-    scaling_relation_df = _run_logged_phase(
-        args,
-        "plots.scaling_relation_table",
-        lambda: _scaling_relation_summary_table(
-            evaluator.scaling_rank_df,
-            state.parameter_specs,
-            results.samples,
-            best_fit,
-            getattr(state, "packed_lens_spec", None),
-            sample_weights=results.sample_weights,
-            independent_scaling_df=independent_scaling_df,
-            best_value=best_value_selected or None,
-            best_value_requested=best_value_requested or None,
-        ),
-    )
-    trace_specs, trace_grouped_samples = _run_logged_phase(
-        args,
-        "plots.scaling_grouped_subset",
-        lambda: _scaling_grouped_subset(state.parameter_specs, results.grouped_samples),
-    )
-    subhalo_df = _run_logged_phase(
-        args,
-        "plots.subhalo_properties_table",
-        lambda: _subhalo_properties_table(
+
+    context: dict[str, Any] = {
+        "summary_df": pd.DataFrame(),
+        "family_df": pd.DataFrame(),
+        "image_fit_quality_df": pd.DataFrame(),
+        "model_magnification_df": pd.DataFrame(),
+        "image_recovery_extra_df": pd.DataFrame(),
+        "cab_arc_diagnostics_df": pd.DataFrame(),
+        "image_count_recovery_df": pd.DataFrame(),
+        "chain_health_df": pd.DataFrame(),
+        "chain_parameter_diagnostics_df": pd.DataFrame(),
+        "run_summary": {},
+        "run_summary_text": "",
+        "scaling_specs": [],
+        "scaling_samples": np.empty((0, 0), dtype=float),
+        "scaling_best_fit": np.empty((0,), dtype=float),
+        "cosmology_specs": [],
+        "cosmology_samples": np.empty((0, 0), dtype=float),
+        "cosmology_best_fit": np.empty((0,), dtype=float),
+        "bayes_corner_overlay": None,
+        "best_par_marker_values": {},
+        "potfile_constraint_df": pd.DataFrame(),
+        "scaling_results_df": pd.DataFrame(),
+        "independent_scaling_df": pd.DataFrame(),
+        "independent_scaling_plot_df": pd.DataFrame(),
+        "scaling_relation_df": pd.DataFrame(),
+        "trace_specs": [],
+        "trace_grouped_samples": np.empty((0, 0, 0), dtype=float),
+        "subhalo_df": pd.DataFrame(),
+        "perturbation_discovery_df": pd.DataFrame(),
+        "truth_grid_cache": {},
+    }
+
+    def _write_run_summary_files() -> None:
+        (tables_dir / "run_summary.json").write_text(
+            json.dumps(context["run_summary"], indent=2),
+            encoding="utf-8",
+        )
+        (tables_dir / "run_summary.txt").write_text(context["run_summary_text"], encoding="utf-8")
+
+    def _build_initial_run_summary() -> None:
+        context["run_summary"] = _run_summary(
+            args,
             state,
+            runtime_sec,
+            results,
+            best_eval.loglike,
             evaluator,
-            best_fit,
-            getattr(args, "caustic_source_redshift", 9.0),
-        ),
-    )
-    perturbation_discovery_df = _run_logged_phase(
-        args,
-        "plots.perturbation_discovery_diagnostics_table",
-        lambda: _load_perturbation_discovery_diagnostics_table(tables_dir),
-    )
+            image_fit_quality_df=None,
+            image_count_recovery_df=None,
+        )
+        context["run_summary"]["image_recovery_stage"] = "pending"
+        context["run_summary_text"] = _format_run_summary_text(context["run_summary"])
 
-    _run_logged_phase(args, "plots.write_potential_summary_csv", lambda: summary_df.to_csv(tables_dir / "potential_summary.csv", index=False))
-    _run_logged_phase(args, "plots.write_family_diagnostics_csv", lambda: family_df.to_csv(tables_dir / "family_diagnostics.csv", index=False))
-    _run_logged_phase(
-        args,
-        "plots.write_scaling_results_summary_csv",
-        lambda: scaling_results_df.to_csv(tables_dir / "scaling_results_summary.csv", index=False),
-    )
-    if scaling_results_df.empty:
-        _log(args, "[scaling-results] no scaling relation parameters")
-    else:
-        _log(
+    def _build_final_run_summary() -> None:
+        context["run_summary"] = _run_summary(
             args,
-            f"[scaling-results] potfiles={len(scaling_results_df)} mass_definition=\"{SCALING_RESULTS_MASS_NOTE}\"",
-            renderable=_build_scaling_results_rich_table(scaling_results_df),
+            state,
+            runtime_sec,
+            results,
+            best_eval.loglike,
+            evaluator,
+            image_fit_quality_df=context["image_fit_quality_df"],
+            image_count_recovery_df=context["image_count_recovery_df"],
         )
-    _run_logged_phase(
-        args,
-        "plots.write_image_fit_quality_csv",
-        lambda: image_fit_quality_df.to_csv(tables_dir / "image_fit_quality.csv", index=False),
-    )
-    _run_logged_phase(
-        args,
-        "plots.write_image_count_recovery_csv",
-        lambda: image_count_recovery_df.to_csv(tables_dir / "image_count_recovery.csv", index=False),
-    )
-    _run_logged_phase(
-        args,
-        "plots.write_image_recovery_extra_images_csv",
-        lambda: image_recovery_extra_df.to_csv(tables_dir / "image_recovery_extra_images.csv", index=False),
-    )
-    if not cab_arc_diagnostics_df.empty or len(cab_arc_diagnostics_df.columns) > 0:
-        _run_logged_phase(
-            args,
-            "plots.write_cab_arc_diagnostics_csv",
-            lambda: cab_arc_diagnostics_df.to_csv(tables_dir / "cab_arc_diagnostics.csv", index=False),
+        context["run_summary"]["image_recovery_stage"] = "complete"
+        context["run_summary_text"] = _format_run_summary_text(context["run_summary"])
+
+    def _scaling_corner_values() -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+        specs = context["scaling_specs"]
+        best_values = _best_fit_values_for_specs(specs, context["scaling_best_fit"])
+        return (
+            best_values,
+            _subset_values_for_specs(specs, map_values),
+            _subset_values_for_specs(specs, maximum_likelihood_values),
         )
-    _run_logged_phase(
-        args,
-        "plots.write_model_magnification_csv",
-        lambda: model_magnification_df.to_csv(tables_dir / "model_magnification.csv", index=False),
-    )
-    _run_logged_phase(
-        args,
-        "plots.write_subhalo_properties_csv",
-        lambda: subhalo_df.to_csv(tables_dir / "subhalo_properties.csv", index=False),
-    )
-    _run_logged_phase(args, "plots.write_potfile_summary_txt", lambda: _write_potfile_summary_txt(tables_dir, summary_df))
-    if not potfile_constraint_df.empty:
-        _run_logged_phase(
-            args,
-            "plots.write_potfile_constraint_csv",
-            lambda: potfile_constraint_df.to_csv(tables_dir / "potfile_constraint_diagnostics.csv", index=False),
+
+    def _cosmology_corner_values() -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+        specs = context["cosmology_specs"]
+        best_values = _best_fit_values_for_specs(specs, context["cosmology_best_fit"])
+        return (
+            best_values,
+            _subset_values_for_specs(specs, map_values),
+            _subset_values_for_specs(specs, maximum_likelihood_values),
         )
-        _run_logged_phase(
-            args,
-            "plots.write_potfile_constraint_txt",
-            lambda: _write_potfile_constraint_summary_txt(tables_dir, potfile_constraint_df),
-        )
-    if not independent_scaling_df.empty:
-        _run_logged_phase(
-            args,
-            "plots.write_independent_scaling_csv",
-            lambda: independent_scaling_df.to_csv(
-                tables_dir / "independent_scaling_diagnostics.csv",
-                index=False,
+
+    def _merge_arc_aware_family_diagnostics() -> None:
+        if not use_arc_aware_diagnostics:
+            return
+        arc_aware_family_df = _arc_aware_family_diagnostics_from_image_rows(context["image_fit_quality_df"])
+        if arc_aware_family_df.empty:
+            return
+        family_df = context["family_df"].copy()
+        family_df["family_id"] = family_df["family_id"].astype(str)
+        arc_aware_family_df["family_id"] = arc_aware_family_df["family_id"].astype(str)
+        context["family_df"] = family_df.merge(arc_aware_family_df, on="family_id", how="left")
+
+    run_diagnostics_tasks: list[PlotTask] = [
+        (
+            "summary_table",
+            "plots.run_diagnostics.summary_table",
+            lambda: context.__setitem__(
+                "summary_df",
+                _summary_table(
+                    state.parameter_specs,
+                    results.samples,
+                    best_fit,
+                    sample_weights=results.sample_weights,
+                ),
             ),
-        )
-    if not evaluator.scaling_rank_df.empty:
-        _run_logged_phase(
-            args,
-            "plots.write_scaling_rank_csv",
-            lambda: evaluator.scaling_rank_df.to_csv(tables_dir / "scaling_rank_diagnostics.csv", index=False),
-        )
-    if not scaling_relation_df.empty:
-        _run_logged_phase(
-            args,
-            "plots.write_scaling_relation_csv",
-            lambda: scaling_relation_df.to_csv(tables_dir / "scaling_relation_summary.csv", index=False),
-        )
-    if not chain_health_df.empty:
-        _run_logged_phase(
-            args,
-            "plots.write_chain_health_csv",
-            lambda: chain_health_df.to_csv(tables_dir / "chain_health_summary.csv", index=False),
-        )
-    if not chain_parameter_diagnostics_df.empty:
-        _run_logged_phase(
-            args,
-            "plots.write_chain_parameter_diagnostics_csv",
-            lambda: chain_parameter_diagnostics_df.to_csv(tables_dir / "chain_parameter_diagnostics.csv", index=False),
-        )
-    _run_logged_phase(
-        args,
-        "plots.write_run_summary_json",
-        lambda: (tables_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2), encoding="utf-8"),
-    )
-    _run_logged_phase(
-        args,
-        "plots.write_run_summary_txt",
-        lambda: (tables_dir / "run_summary.txt").write_text(run_summary_text, encoding="utf-8"),
-    )
-
-    plot_tasks: list[PlotTask] = [
+        ),
+        (
+            "family_diagnostics_table",
+            "plots.run_diagnostics.family_diagnostics_table",
+            lambda: context.__setitem__("family_df", _family_diagnostics_table(evaluator, best_eval)),
+        ),
+        (
+            "chain_health_table",
+            "plots.run_diagnostics.chain_health_table",
+            lambda: context.__setitem__(
+                "chain_health_df",
+                _chain_health_summary_table(
+                    results,
+                    state.parameter_specs,
+                    max_tree_depth=max_tree_depth,
+                ),
+            ),
+        ),
+        (
+            "chain_parameter_diagnostics_table",
+            "plots.run_diagnostics.chain_parameter_diagnostics_table",
+            lambda: context.__setitem__(
+                "chain_parameter_diagnostics_df",
+                _chain_parameter_diagnostics_table(results, state.parameter_specs),
+            ),
+        ),
+        ("run_summary_initial", "plots.run_diagnostics.run_summary_initial", _build_initial_run_summary),
+        (
+            "potfile_corner_subset",
+            "plots.run_diagnostics.potfile_corner_subset",
+            lambda: (
+                lambda subset: (
+                    context.__setitem__("scaling_specs", subset[0]),
+                    context.__setitem__("scaling_samples", subset[1]),
+                    context.__setitem__("scaling_best_fit", subset[2]),
+                )
+            )(_potfile_corner_parameter_subset(state.parameter_specs, results.samples, best_fit)),
+        ),
+        (
+            "cosmology_subset",
+            "plots.run_diagnostics.cosmology_subset",
+            lambda: (
+                lambda subset: (
+                    context.__setitem__("cosmology_specs", subset[0]),
+                    context.__setitem__("cosmology_samples", subset[1]),
+                    context.__setitem__("cosmology_best_fit", subset[2]),
+                )
+            )(_cosmology_parameter_subset(state.parameter_specs, results.samples, best_fit)),
+        ),
+        (
+            "load_bayes_corner_overlay",
+            "plots.run_diagnostics.load_bayes_corner_overlay",
+            lambda: context.__setitem__(
+                "bayes_corner_overlay",
+                _load_bayes_corner_overlay(getattr(args, "corner_overlay_bayes_dat", None), state),
+            ),
+        ),
+        (
+            "load_best_par_corner_marker",
+            "plots.run_diagnostics.load_best_par_corner_marker",
+            lambda: context.__setitem__(
+                "best_par_marker_values",
+                _load_best_par_marker_values(getattr(args, "corner_overlay_best_par", None), state),
+            ),
+        ),
+        (
+            "potfile_constraint_table",
+            "plots.run_diagnostics.potfile_constraint_table",
+            lambda: context.__setitem__(
+                "potfile_constraint_df",
+                _potfile_constraint_diagnostics_table(
+                    state.parameter_specs,
+                    results.samples,
+                    best_fit,
+                    evaluator.scaling_rank_df,
+                    sample_weights=results.sample_weights,
+                ),
+            ),
+        ),
+        (
+            "scaling_results_summary_table",
+            "plots.run_diagnostics.scaling_results_summary_table",
+            lambda: context.__setitem__(
+                "scaling_results_df",
+                _scaling_results_summary_table(
+                    state.parameter_specs,
+                    results.samples,
+                    best_fit,
+                    str(getattr(state, "scaling_relation_mode", getattr(args, "scaling_relation_mode", "lenstool-denominator"))),
+                    sample_weights=results.sample_weights,
+                ),
+            ),
+        ),
+        (
+            "independent_scaling_table",
+            "plots.run_diagnostics.independent_scaling_table",
+            lambda: context.__setitem__(
+                "independent_scaling_df",
+                _independent_scaling_diagnostics_table(
+                    state.parameter_specs,
+                    results.samples,
+                    best_fit,
+                    evaluator.scaling_rank_df,
+                    getattr(state, "packed_lens_spec", None),
+                    sample_weights=results.sample_weights,
+                ),
+            ),
+        ),
+        (
+            "independent_scaling_plot_table",
+            "plots.run_diagnostics.independent_scaling_plot_table",
+            lambda: context.__setitem__(
+                "independent_scaling_plot_df",
+                _independent_scaling_plot_table(evaluator.scaling_rank_df, context["independent_scaling_df"]),
+            ),
+        ),
+        (
+            "scaling_relation_table",
+            "plots.run_diagnostics.scaling_relation_table",
+            lambda: context.__setitem__(
+                "scaling_relation_df",
+                _scaling_relation_summary_table(
+                    evaluator.scaling_rank_df,
+                    state.parameter_specs,
+                    results.samples,
+                    best_fit,
+                    getattr(state, "packed_lens_spec", None),
+                    sample_weights=results.sample_weights,
+                    independent_scaling_df=context["independent_scaling_df"],
+                    best_value=best_value_selected or None,
+                    best_value_requested=best_value_requested or None,
+                ),
+            ),
+        ),
+        (
+            "scaling_grouped_subset",
+            "plots.run_diagnostics.scaling_grouped_subset",
+            lambda: (
+                lambda subset: (
+                    context.__setitem__("trace_specs", subset[0]),
+                    context.__setitem__("trace_grouped_samples", subset[1]),
+                )
+            )(_scaling_grouped_subset(state.parameter_specs, results.grouped_samples)),
+        ),
+        (
+            "subhalo_properties_table",
+            "plots.run_diagnostics.subhalo_properties_table",
+            lambda: context.__setitem__(
+                "subhalo_df",
+                _subhalo_properties_table(
+                    state,
+                    evaluator,
+                    best_fit,
+                    getattr(args, "caustic_source_redshift", 9.0),
+                ),
+            ),
+        ),
+        (
+            "perturbation_discovery_diagnostics_table",
+            "plots.run_diagnostics.perturbation_discovery_diagnostics_table",
+            lambda: context.__setitem__(
+                "perturbation_discovery_df",
+                _load_perturbation_discovery_diagnostics_table(tables_dir),
+            ),
+        ),
+        (
+            "write_potential_summary_csv",
+            "plots.run_diagnostics.write_potential_summary_csv",
+            lambda: context["summary_df"].to_csv(tables_dir / "potential_summary.csv", index=False),
+        ),
+        (
+            "write_family_diagnostics_csv",
+            "plots.run_diagnostics.write_family_diagnostics_csv",
+            lambda: context["family_df"].to_csv(tables_dir / "family_diagnostics.csv", index=False),
+        ),
+        (
+            "write_scaling_results_summary_csv",
+            "plots.run_diagnostics.write_scaling_results_summary_csv",
+            lambda: context["scaling_results_df"].to_csv(tables_dir / "scaling_results_summary.csv", index=False),
+        ),
+        (
+            "scaling_results_summary_log",
+            "plots.run_diagnostics.scaling_results_summary_log",
+            lambda: (
+                _log(args, "[scaling-results] no scaling relation parameters")
+                if context["scaling_results_df"].empty
+                else _log(
+                    args,
+                    f"[scaling-results] potfiles={len(context['scaling_results_df'])} mass_definition=\"{SCALING_RESULTS_MASS_NOTE}\"",
+                    renderable=_build_scaling_results_rich_table(context["scaling_results_df"]),
+                )
+            ),
+        ),
+        (
+            "write_subhalo_properties_csv",
+            "plots.run_diagnostics.write_subhalo_properties_csv",
+            lambda: context["subhalo_df"].to_csv(tables_dir / "subhalo_properties.csv", index=False),
+        ),
+        (
+            "write_potfile_summary_txt",
+            "plots.run_diagnostics.write_potfile_summary_txt",
+            lambda: _write_potfile_summary_txt(tables_dir, context["summary_df"]),
+        ),
+        (
+            "write_potfile_constraint_csv",
+            "plots.run_diagnostics.write_potfile_constraint_csv",
+            lambda: (
+                context["potfile_constraint_df"].to_csv(tables_dir / "potfile_constraint_diagnostics.csv", index=False)
+                if not context["potfile_constraint_df"].empty
+                else None
+            ),
+        ),
+        (
+            "write_potfile_constraint_txt",
+            "plots.run_diagnostics.write_potfile_constraint_txt",
+            lambda: (
+                _write_potfile_constraint_summary_txt(tables_dir, context["potfile_constraint_df"])
+                if not context["potfile_constraint_df"].empty
+                else None
+            ),
+        ),
+        (
+            "write_independent_scaling_csv",
+            "plots.run_diagnostics.write_independent_scaling_csv",
+            lambda: (
+                context["independent_scaling_df"].to_csv(
+                    tables_dir / "independent_scaling_diagnostics.csv",
+                    index=False,
+                )
+                if not context["independent_scaling_df"].empty
+                else None
+            ),
+        ),
+        (
+            "write_scaling_rank_csv",
+            "plots.run_diagnostics.write_scaling_rank_csv",
+            lambda: (
+                evaluator.scaling_rank_df.to_csv(tables_dir / "scaling_rank_diagnostics.csv", index=False)
+                if not evaluator.scaling_rank_df.empty
+                else None
+            ),
+        ),
+        (
+            "write_scaling_relation_csv",
+            "plots.run_diagnostics.write_scaling_relation_csv",
+            lambda: (
+                context["scaling_relation_df"].to_csv(tables_dir / "scaling_relation_summary.csv", index=False)
+                if not context["scaling_relation_df"].empty
+                else None
+            ),
+        ),
+        (
+            "write_chain_health_csv",
+            "plots.run_diagnostics.write_chain_health_csv",
+            lambda: (
+                context["chain_health_df"].to_csv(tables_dir / "chain_health_summary.csv", index=False)
+                if not context["chain_health_df"].empty
+                else None
+            ),
+        ),
+        (
+            "write_chain_parameter_diagnostics_csv",
+            "plots.run_diagnostics.write_chain_parameter_diagnostics_csv",
+            lambda: (
+                context["chain_parameter_diagnostics_df"].to_csv(tables_dir / "chain_parameter_diagnostics.csv", index=False)
+                if not context["chain_parameter_diagnostics_df"].empty
+                else None
+            ),
+        ),
+        ("write_initial_run_summary", "plots.run_diagnostics.write_initial_run_summary", _write_run_summary_files),
         ("numpyro_model", "plots.numpyro_model", lambda: _plot_numpyro_model(run_dir, state, evaluator, args)),
         (
             "corner",
@@ -12518,36 +13910,64 @@ def _generate_plots_and_tables(
                 map_values=map_values,
                 maximum_likelihood_values=maximum_likelihood_values,
                 previous_stage_best_values=previous_stage_best_values,
-                bayes_corner_overlay=bayes_corner_overlay,
-                best_par_marker_values=best_par_marker_values,
+                bayes_corner_overlay=context["bayes_corner_overlay"],
+                best_par_marker_values=context["best_par_marker_values"],
             ),
+        ),
+        (
+            "cosmology_corner",
+            "plots.cosmology_corner",
+            lambda: (
+                lambda values: _plot_cosmology_corner(
+                    run_dir,
+                    context["cosmology_samples"],
+                    context["cosmology_specs"],
+                    best_fit_values=values[0],
+                    map_values=values[1],
+                    maximum_likelihood_values=values[2],
+                    previous_stage_best_values=previous_stage_best_values,
+                    bayes_corner_overlay=context["bayes_corner_overlay"],
+                    best_par_marker_values=context["best_par_marker_values"],
+                )
+            )(_cosmology_corner_values()),
         ),
         (
             "potfile_corner",
             "plots.potfile_corner",
-            lambda: _plot_potfile_corner(
-                run_dir,
-                scaling_samples,
-                scaling_specs,
-                best_fit_values=scaling_best_fit_values,
-                map_values=scaling_map_values,
-                maximum_likelihood_values=scaling_maximum_likelihood_values,
-                previous_stage_best_values=previous_stage_best_values,
-                bayes_corner_overlay=bayes_corner_overlay,
-                best_par_marker_values=best_par_marker_values,
-            ),
+            lambda: (
+                lambda values: _plot_potfile_corner(
+                    run_dir,
+                    context["scaling_samples"],
+                    context["scaling_specs"],
+                    best_fit_values=values[0],
+                    map_values=values[1],
+                    maximum_likelihood_values=values[2],
+                    previous_stage_best_values=previous_stage_best_values,
+                    bayes_corner_overlay=context["bayes_corner_overlay"],
+                    best_par_marker_values=context["best_par_marker_values"],
+                )
+            )(_scaling_corner_values()),
         ),
         (
             "potfile_prior_posterior",
             "plots.potfile_prior_posterior",
-            lambda: _plot_potfile_prior_posterior(run_dir, potfile_constraint_df, results.samples, state.parameter_specs),
+            lambda: _plot_potfile_prior_posterior(
+                run_dir,
+                context["potfile_constraint_df"],
+                results.samples,
+                state.parameter_specs,
+            ),
         ),
         (
             "potfile_leverage_summary",
             "plots.potfile_leverage_summary",
-            lambda: _plot_potfile_leverage_summary(run_dir, potfile_constraint_df),
+            lambda: _plot_potfile_leverage_summary(run_dir, context["potfile_constraint_df"]),
         ),
-        ("trace", "plots.trace", lambda: _plot_trace(run_dir, trace_grouped_samples, trace_specs)),
+        (
+            "trace",
+            "plots.trace",
+            lambda: _plot_trace(run_dir, context["trace_grouped_samples"], context["trace_specs"]),
+        ),
         (
             "scaling_rank_scatter",
             "plots.scaling_rank_scatter",
@@ -12556,18 +13976,12 @@ def _generate_plots_and_tables(
         (
             "scaling_relation_summary",
             "plots.scaling_relation_summary",
-            lambda: _plot_scaling_relation_summary(run_dir, scaling_relation_df),
+            lambda: _plot_scaling_relation_summary(run_dir, context["scaling_relation_df"]),
         ),
-        *(
-            [
-                (
-                    "perturbation_discovery_diagnostics",
-                    "plots.perturbation_discovery_diagnostics",
-                    lambda: _plot_perturbation_discovery_diagnostics(run_dir, perturbation_discovery_df),
-                )
-            ]
-            if not perturbation_discovery_df.empty
-            else []
+        (
+            "perturbation_discovery_diagnostics",
+            "plots.perturbation_discovery_diagnostics",
+            lambda: _plot_perturbation_discovery_diagnostics(run_dir, context["perturbation_discovery_df"]),
         ),
         (
             "chain_health",
@@ -12585,171 +13999,37 @@ def _generate_plots_and_tables(
             lambda: _plot_source_plane_residual_histogram(run_dir, state, best_eval),
         ),
         (
-            "image_recovery",
-            "plots.image_recovery",
-            lambda: _plot_image_recovery_fit_quality(
-                image_fit_quality_df,
-                _plot_path(run_dir, "image_recovery.pdf"),
-                image_recovery_extra_df,
-                use_arc_aware_diagnostics=use_arc_aware_diagnostics,
-            ),
-        ),
-        *(
-            [
-                (
-                    "image_catalog_family_cutouts",
-                    "plots.image_catalog_family_cutouts",
-                    lambda: _plot_image_catalog_family_cutouts(
-                        run_dir,
-                        state,
-                        evaluator,
-                        best_fit,
-                        image_fit_quality_df,
-                        image_recovery_extra_df,
-                        args,
-                    ),
-                )
-            ]
-            if _image_catalog_family_cluster_enabled(args, run_dir)
-            else []
-        ),
-        (
-            "image_count_recovery",
-            "plots.image_count_recovery",
-            lambda: _plot_image_count_recovery(
-                image_count_recovery_df,
-                _plot_path(run_dir, "image_count_recovery.pdf"),
-                use_arc_aware_diagnostics=use_arc_aware_diagnostics,
-            ),
-        ),
-        (
-            "model_magnification",
-            "plots.model_magnification",
-            lambda: _plot_model_magnification_fit_quality(model_magnification_df, _plot_path(run_dir, "model_magnification.pdf")),
-        ),
-        (
-            "normalized_image_residuals",
-            "plots.normalized_image_residuals",
-            lambda: _plot_normalized_image_residuals(image_fit_quality_df, _plot_path(run_dir, "normalized_image_residuals.pdf")),
-        ),
-        (
-            "image_residual_histogram",
-            "plots.image_residual_histogram",
-            lambda: _plot_image_residual_histogram(
-                image_fit_quality_df,
-                _plot_path(run_dir, "image_residual_histogram.pdf"),
-                use_arc_aware_diagnostics=use_arc_aware_diagnostics,
-            ),
-        ),
-        (
-            "residual_vs_magnification",
-            "plots.residual_vs_magnification",
-            lambda: _plot_residual_vs_magnification(
-                image_fit_quality_df,
-                model_magnification_df,
-                _plot_path(run_dir, "residual_vs_magnification.pdf"),
-            ),
-        ),
-        (
-            "residual_geometry_trends",
-            "plots.residual_geometry_trends",
-            lambda: _plot_residual_geometry_trends(image_fit_quality_df, _plot_path(run_dir, "residual_geometry_trends.pdf")),
-        ),
-        (
             "subhalo_mass_function",
             "plots.subhalo_mass_function",
-            lambda: _plot_subhalo_mass_function(subhalo_df, _plot_path(run_dir, "subhalo_mass_function.pdf")),
+            lambda: _plot_subhalo_mass_function(context["subhalo_df"], _plot_path(run_dir, "subhalo_mass_function.pdf")),
         ),
         (
             "subhalo_radial_distribution",
             "plots.subhalo_radial_distribution",
-            lambda: _plot_subhalo_radial_distribution(subhalo_df, _plot_path(run_dir, "subhalo_radial_distribution.pdf")),
+            lambda: _plot_subhalo_radial_distribution(context["subhalo_df"], _plot_path(run_dir, "subhalo_radial_distribution.pdf")),
         ),
         (
             "per_potential_summary",
             "plots.per_potential_summary",
             lambda: _plot_per_potential_summary(
                 run_dir,
-                summary_df,
-                best_par_marker_values=best_par_marker_values,
+                context["summary_df"],
+                best_par_marker_values=context["best_par_marker_values"],
                 previous_stage_best_values=previous_stage_best_values,
                 parameter_specs=state.parameter_specs,
             ),
         ),
         ("timing_profile", "plots.timing_profile", lambda: _plot_timing_profile(run_dir, evaluator)),
-    ]
-    if use_arc_aware_diagnostics:
-        plot_tasks.extend(
-            [
-                (
-                    "critical_arc_support_histogram",
-                    "plots.critical_arc_support_histogram",
-                    lambda: _plot_critical_arc_support_histogram(
-                        image_fit_quality_df,
-                        _plot_path(run_dir, "critical_arc_support_histogram.pdf"),
-                        arc_recovery_p_arc_threshold=float(
-                            getattr(evaluator, "arc_recovery_p_arc_threshold", CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD)
-                        ),
-                        critical_arc_base_prob=float(getattr(evaluator, "critical_arc_base_prob", CRITICAL_ARC_BASE_PROB)),
-                        critical_arc_max_prob=float(getattr(evaluator, "critical_arc_max_prob", CRITICAL_ARC_MAX_PROB)),
-                        singular_threshold=float(critical_arc_singular_threshold_best_fit),
-                        singular_softness=float(critical_arc_singular_softness_best_fit),
-                    ),
-                ),
-                (
-                    "critical_arc_support_phase_space",
-                    "plots.critical_arc_support_phase_space",
-                    lambda: _plot_critical_arc_support_phase_space(
-                        image_fit_quality_df,
-                        _plot_path(run_dir, "critical_arc_support_phase_space.pdf"),
-                        arc_recovery_p_arc_threshold=float(
-                            getattr(evaluator, "arc_recovery_p_arc_threshold", CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD)
-                        ),
-                        critical_arc_base_prob=float(getattr(evaluator, "critical_arc_base_prob", CRITICAL_ARC_BASE_PROB)),
-                        critical_arc_max_prob=float(getattr(evaluator, "critical_arc_max_prob", CRITICAL_ARC_MAX_PROB)),
-                        singular_threshold=float(critical_arc_singular_threshold_best_fit),
-                        singular_softness=float(critical_arc_singular_softness_best_fit),
-                    ),
-                ),
-                (
-                    "critical_arc_recovery_by_family",
-                    "plots.critical_arc_recovery_by_family",
-                    lambda: _plot_critical_arc_recovery_by_family(
-                        image_count_recovery_df,
-                        _plot_path(run_dir, "critical_arc_recovery_by_family.pdf"),
-                    ),
-                ),
-            ]
-        )
-    if cosmology_specs:
-        plot_tasks.insert(
-            1,
-            (
-                "cosmology_corner",
-                "plots.cosmology_corner",
-                lambda: _plot_cosmology_corner(
-                    run_dir,
-                    cosmology_samples,
-                    cosmology_specs,
-                    best_fit_values=cosmology_best_fit_values,
-                    map_values=cosmology_map_values,
-                    maximum_likelihood_values=cosmology_maximum_likelihood_values,
-                    previous_stage_best_values=previous_stage_best_values,
-                    bayes_corner_overlay=bayes_corner_overlay,
-                    best_par_marker_values=best_par_marker_values,
-                ),
-            )
-        )
-    if results.ns_diagnostics:
-        plot_tasks.extend(
+        *(
             [
                 ("ns_diagnostics", "plots.ns_diagnostics", lambda: _plot_ns_diagnostics(run_dir, results.ns_diagnostics)),
                 ("ns_trace", "plots.ns_trace", lambda: _plot_ns_trace(run_dir, results.ns_diagnostics, state.parameter_specs)),
                 ("ns_weight_diagnostics", "plots.ns_weight_diagnostics", lambda: _plot_ns_weight_diagnostics(run_dir, results.ns_diagnostics)),
             ]
-        )
-    if _has_smc_plot_data(results):
-        plot_tasks.extend(
+            if results.ns_diagnostics
+            else []
+        ),
+        *(
             [
                 ("smc_diagnostics", "plots.smc_diagnostics", lambda: _plot_smc_diagnostics(run_dir, results)),
                 ("smc_weight_diagnostics", "plots.smc_weight_diagnostics", lambda: _plot_smc_weight_diagnostics(run_dir, results)),
@@ -12768,57 +14048,299 @@ def _generate_plots_and_tables(
                     ),
                 ),
             ]
+            if _has_smc_plot_data(results)
+            else []
+        ),
+    ]
+
+    image_recovery_tasks: list[PlotTask] = [
+        (
+            "fit_quality_tables",
+            "plots.image_recovery.fit_quality_tables",
+            lambda: (
+                lambda tables: (
+                    context.__setitem__("image_fit_quality_df", tables[0]),
+                    context.__setitem__("model_magnification_df", tables[1]),
+                    context.__setitem__("image_recovery_extra_df", tables[2]),
+                )
+            )(_fit_quality_tables(state, evaluator, best_fit, results, args)),
+        ),
+        (
+            "cab_arc_diagnostics_table",
+            "plots.image_recovery.cab_arc_diagnostics_table",
+            lambda: context.__setitem__("cab_arc_diagnostics_df", _cab_arc_diagnostics_table(evaluator, best_fit)),
+        ),
+        (
+            "image_count_recovery_table",
+            "plots.image_recovery.image_count_recovery_table",
+            lambda: context.__setitem__("image_count_recovery_df", _image_count_recovery_table(state, context["image_fit_quality_df"])),
+        ),
+        (
+            "arc_aware_family_diagnostics_table",
+            "plots.image_recovery.arc_aware_family_diagnostics_table",
+            _merge_arc_aware_family_diagnostics,
+        ),
+        ("run_summary_final", "plots.image_recovery.run_summary_final", _build_final_run_summary),
+        (
+            "write_family_diagnostics_csv",
+            "plots.image_recovery.write_family_diagnostics_csv",
+            lambda: context["family_df"].to_csv(tables_dir / "family_diagnostics.csv", index=False),
+        ),
+        (
+            "write_image_fit_quality_csv",
+            "plots.image_recovery.write_image_fit_quality_csv",
+            lambda: context["image_fit_quality_df"].to_csv(tables_dir / "image_fit_quality.csv", index=False),
+        ),
+        (
+            "write_image_count_recovery_csv",
+            "plots.image_recovery.write_image_count_recovery_csv",
+            lambda: context["image_count_recovery_df"].to_csv(tables_dir / "image_count_recovery.csv", index=False),
+        ),
+        (
+            "write_image_recovery_extra_images_csv",
+            "plots.image_recovery.write_image_recovery_extra_images_csv",
+            lambda: context["image_recovery_extra_df"].to_csv(tables_dir / "image_recovery_extra_images.csv", index=False),
+        ),
+        (
+            "write_cab_arc_diagnostics_csv",
+            "plots.image_recovery.write_cab_arc_diagnostics_csv",
+            lambda: (
+                context["cab_arc_diagnostics_df"].to_csv(tables_dir / "cab_arc_diagnostics.csv", index=False)
+                if not context["cab_arc_diagnostics_df"].empty or len(context["cab_arc_diagnostics_df"].columns) > 0
+                else None
+            ),
+        ),
+        (
+            "write_model_magnification_csv",
+            "plots.image_recovery.write_model_magnification_csv",
+            lambda: context["model_magnification_df"].to_csv(tables_dir / "model_magnification.csv", index=False),
+        ),
+        ("write_final_run_summary", "plots.image_recovery.write_final_run_summary", _write_run_summary_files),
+        (
+            "image_recovery",
+            "plots.image_recovery",
+            lambda: _plot_image_recovery_fit_quality(
+                context["image_fit_quality_df"],
+                _plot_path(run_dir, "image_recovery.pdf"),
+                context["image_recovery_extra_df"],
+                use_arc_aware_diagnostics=use_arc_aware_diagnostics,
+            ),
+        ),
+        *(
+            [
+                (
+                    "image_catalog_family_cutouts",
+                    "plots.image_catalog_family_cutouts",
+                    lambda: _plot_image_catalog_family_cutouts(
+                        run_dir,
+                        state,
+                        evaluator,
+                        best_fit,
+                        context["image_fit_quality_df"],
+                        context["image_recovery_extra_df"],
+                        args,
+                    ),
+                )
+            ]
+            if _image_catalog_family_cluster_enabled(args, run_dir)
+            else []
+        ),
+        (
+            "image_count_recovery",
+            "plots.image_count_recovery",
+            lambda: _plot_image_count_recovery(
+                context["image_count_recovery_df"],
+                _plot_path(run_dir, "image_count_recovery.pdf"),
+                use_arc_aware_diagnostics=use_arc_aware_diagnostics,
+            ),
+        ),
+        (
+            "model_magnification",
+            "plots.model_magnification",
+            lambda: _plot_model_magnification_fit_quality(context["model_magnification_df"], _plot_path(run_dir, "model_magnification.pdf")),
+        ),
+        (
+            "normalized_image_residuals",
+            "plots.normalized_image_residuals",
+            lambda: _plot_normalized_image_residuals(context["image_fit_quality_df"], _plot_path(run_dir, "normalized_image_residuals.pdf")),
+        ),
+        (
+            "image_residual_histogram",
+            "plots.image_residual_histogram",
+            lambda: _plot_image_residual_histogram(
+                context["image_fit_quality_df"],
+                _plot_path(run_dir, "image_residual_histogram.pdf"),
+                use_arc_aware_diagnostics=use_arc_aware_diagnostics,
+            ),
+        ),
+        (
+            "residual_vs_magnification",
+            "plots.residual_vs_magnification",
+            lambda: _plot_residual_vs_magnification(
+                context["image_fit_quality_df"],
+                context["model_magnification_df"],
+                _plot_path(run_dir, "residual_vs_magnification.pdf"),
+            ),
+        ),
+        (
+            "residual_geometry_trends",
+            "plots.residual_geometry_trends",
+            lambda: _plot_residual_geometry_trends(context["image_fit_quality_df"], _plot_path(run_dir, "residual_geometry_trends.pdf")),
+        ),
+    ]
+    if use_arc_aware_diagnostics:
+        image_recovery_tasks.extend(
+            [
+                (
+                    "critical_arc_support_histogram",
+                    "plots.critical_arc_support_histogram",
+                    lambda: _plot_critical_arc_support_histogram(
+                        context["image_fit_quality_df"],
+                        _plot_path(run_dir, "critical_arc_support_histogram.pdf"),
+                        arc_recovery_p_arc_threshold=float(
+                            getattr(evaluator, "arc_recovery_p_arc_threshold", CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD)
+                        ),
+                        critical_arc_base_prob=float(getattr(evaluator, "critical_arc_base_prob", CRITICAL_ARC_BASE_PROB)),
+                        critical_arc_max_prob=float(getattr(evaluator, "critical_arc_max_prob", CRITICAL_ARC_MAX_PROB)),
+                        singular_threshold=float(critical_arc_singular_threshold_best_fit),
+                        singular_softness=float(critical_arc_singular_softness_best_fit),
+                    ),
+                ),
+                (
+                    "critical_arc_support_phase_space",
+                    "plots.critical_arc_support_phase_space",
+                    lambda: _plot_critical_arc_support_phase_space(
+                        context["image_fit_quality_df"],
+                        _plot_path(run_dir, "critical_arc_support_phase_space.pdf"),
+                        arc_recovery_p_arc_threshold=float(
+                            getattr(evaluator, "arc_recovery_p_arc_threshold", CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD)
+                        ),
+                        critical_arc_base_prob=float(getattr(evaluator, "critical_arc_base_prob", CRITICAL_ARC_BASE_PROB)),
+                        critical_arc_max_prob=float(getattr(evaluator, "critical_arc_max_prob", CRITICAL_ARC_MAX_PROB)),
+                        singular_threshold=float(critical_arc_singular_threshold_best_fit),
+                        singular_softness=float(critical_arc_singular_softness_best_fit),
+                    ),
+                ),
+                (
+                    "critical_arc_recovery_by_family",
+                    "plots.critical_arc_recovery_by_family",
+                    lambda: _plot_critical_arc_recovery_by_family(
+                        context["image_count_recovery_df"],
+                        _plot_path(run_dir, "critical_arc_recovery_by_family.pdf"),
+                    ),
+                ),
+            ]
         )
+
+    truth_recovery_tasks: list[PlotTask] = []
     skip_grid_diagnostics = bool(getattr(args, "skip_grid_diagnostics", False))
     if skip_grid_diagnostics:
         _log(args, "[plots] grid diagnostics skipped by skip_grid_diagnostics=True")
     kappa_true_fits = getattr(args, "kappa_true_fits", None)
     gammax_true_fits = getattr(args, "gammax_true_fits", None)
     gammay_true_fits = getattr(args, "gammay_true_fits", None)
+    truth_grid_draws = getattr(args, "truth_grid_draws", None)
+    truth_grid_mode = str(getattr(args, "truth_grid_mode", TRUTH_GRID_MODE_MEDIAN))
+    truth_grid_size = int(getattr(args, "truth_grid_size", DEFAULT_TRUTH_GRID_SIZE))
     if not skip_grid_diagnostics and kappa_true_fits is not None and str(kappa_true_fits).strip():
-        plot_tasks.append(
-            (
-                "kappa_truth_diagnostics",
-                "plots.kappa_truth_diagnostics",
-                lambda: _plot_kappa_truth_diagnostics(
-                    run_dir,
-                    evaluator,
-                    best_fit,
-                    str(kappa_true_fits),
-                    getattr(args, "caustic_source_redshift", 9.0),
-                    image_df=image_fit_quality_df,
-                ),
-            )
-        )
-        if (
+        gamma_truth_available = (
             gammax_true_fits is not None
             and str(gammax_true_fits).strip()
             and gammay_true_fits is not None
             and str(gammay_true_fits).strip()
-        ):
-            plot_tasks.append(
+        )
+        truth_grid_source_fits = {"kappa": str(kappa_true_fits)}
+        if gamma_truth_available:
+            truth_grid_source_fits = {
+                "kappa": str(kappa_true_fits),
+                "gamma1": str(gammax_true_fits),
+                "gamma2": str(gammay_true_fits),
+                "detA": str(kappa_true_fits),
+                "mu": str(kappa_true_fits),
+                "abs_mu": str(kappa_true_fits),
+            }
+            truth_recovery_tasks.append(
+                (
+                    "truth_recovery_grids",
+                    "plots.truth_recovery.truth_recovery_grids",
+                    lambda progress=None: _precompute_truth_recovery_grids(
+                        run_dir,
+                        evaluator,
+                        results,
+                        args,
+                        context["truth_grid_cache"],
+                        progress=progress,
+                    ),
+                )
+            )
+            truth_recovery_tasks.append(
                 (
                     "mu_truth_diagnostics",
                     "plots.mu_truth_diagnostics",
                     lambda: _plot_abs_mu_truth_diagnostics(
                         run_dir,
                         evaluator,
-                        best_fit,
+                        results,
                         str(kappa_true_fits),
                         str(gammax_true_fits),
                         str(gammay_true_fits),
                         getattr(args, "caustic_source_redshift", 9.0),
-                        image_df=image_fit_quality_df,
+                        image_df=context["image_fit_quality_df"],
+                        truth_grid_draws=truth_grid_draws,
+                        truth_grid_mode=truth_grid_mode,
+                        truth_grid_size=truth_grid_size,
+                        truth_grid_cache=context["truth_grid_cache"],
+                        require_precomputed_truth_grid=True,
                     ),
                 )
             )
+        if not gamma_truth_available:
+            truth_recovery_tasks.append(
+                (
+                    "truth_recovery_grids",
+                    "plots.truth_recovery.truth_recovery_grids",
+                    lambda progress=None: _precompute_truth_recovery_grids(
+                        run_dir,
+                        evaluator,
+                        results,
+                        args,
+                        context["truth_grid_cache"],
+                        progress=progress,
+                    ),
+                )
+            )
+        truth_recovery_tasks.append(
+            (
+                "kappa_truth_diagnostics",
+                "plots.kappa_truth_diagnostics",
+                lambda: _plot_kappa_truth_diagnostics(
+                    run_dir,
+                    evaluator,
+                    results,
+                    str(kappa_true_fits),
+                    getattr(args, "caustic_source_redshift", 9.0),
+                    image_df=context["image_fit_quality_df"],
+                    truth_grid_draws=truth_grid_draws,
+                    truth_grid_mode=truth_grid_mode,
+                    truth_grid_size=truth_grid_size,
+                    truth_grid_cache=context["truth_grid_cache"],
+                    require_precomputed_truth_grid=True,
+                    precompute_quantities=(
+                        ("kappa", "gamma1", "gamma2", "detA", "mu", "abs_mu")
+                        if gamma_truth_available
+                        else ("kappa",)
+                    ),
+                    truth_grid_source_fits=truth_grid_source_fits,
+                ),
+            )
+        )
     if not skip_grid_diagnostics:
         caustic_plot_grid_scale_arcsec = getattr(
             args,
             "caustic_plot_grid_scale_arcsec",
             CAUSTIC_PLOT_GRID_SCALE_ARCSEC,
         )
-        plot_tasks.append(
+        truth_recovery_tasks.append(
             (
                 "absolute_magnification",
                 "plots.absolute_magnification",
@@ -12831,7 +14353,7 @@ def _generate_plots_and_tables(
                 ),
             )
         )
-        plot_tasks.append(
+        truth_recovery_tasks.append(
             (
                 "caustic_overlay",
                 "plots.caustic_overlay",
@@ -12844,9 +14366,16 @@ def _generate_plots_and_tables(
                 ),
             )
         )
-    _run_plot_tasks_with_progress(args, plot_tasks)
-    _log(args, "[done] run summary\n" + run_summary_text.rstrip())
-    return run_summary
+    _run_plot_stages_with_progress(
+        args,
+        [
+            ("run_diagnostics", run_diagnostics_tasks),
+            ("image_recovery", image_recovery_tasks),
+            ("truth_recovery", truth_recovery_tasks),
+        ],
+    )
+    _log(args, "[done] run summary\n" + str(context["run_summary_text"]).rstrip())
+    return context["run_summary"]
 
 
 def _generate_stage0_minimal_plots_and_tables(
