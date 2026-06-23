@@ -10,7 +10,7 @@ $JAX_NUM_CPU_DEVICES = cores
 
 PYTHON = "/home/dutra/.conda/envs/lenstronomy/bin/python"
 
-output_dir = f"jun22fh_mag22_scatter_arespriors_ellipticity_faster"
+output_dir = f"jun22l_loosegammaalphapriors_maxlogl_manyfree_relaxedgammaalpha_localjacobian_possigma001_median_nostage0e1e2_rcoreff_mag22_scatter_arespriors_ellipticity_faster"
 
 HFF_RGB_BANDS = ["F435W", "F606W", "F814W", "F105W", "F125W", "F140W", "F160W"]
 HFF_RGB_DISPLAY = {"q": 6.4, "stretch": 0.0145, "minimum": -5.5e-4, "red_gain": 0.47, "green_gain": 0.91, "blue_gain": 3.95}
@@ -118,23 +118,23 @@ best_par_overlay_args = ["--corner-overlay-best-par", str(BEST_PAR_PATH)] if BES
 
 # Mirrors the active solver-control settings in run_validation.xsh, but runs the
 # real-data cluster solver directly instead of the mock validation wrapper.
-mode = "none"  # "linear" or "critical_arc"
+mode = "critical_arc"  # "linear" or "critical_arc"
 stage2_forward_modes = {
     "none": "none",
     "linear": "linearized",
     "critical_arc": "critical-arc",
 }
 stage2_forward_mode = stage2_forward_modes[mode]
-stage1_likelihood = "source" #"local-jacobian"
+stage1_likelihood = "local-jacobian"
 
 run_name = f"{cluster_config['cluster_key']}_S1{stage1_likelihood}_S2{mode}"
 fit_mode = "sequential"
 
 fit_method = ["svi+nuts"]
 refresh_every = [None, 1000]
-svi_steps = [5000, 5000]
-warmup = [2000]
-samples = [500]
+svi_steps = [10000, 10000]
+warmup = [3000]
+samples = [2000]
 sampling_refresh_runs = [1]
 max_tree_depth = [8]
 quick_diagnostics = False
@@ -152,8 +152,8 @@ if mode != "none":
 
 
 
-perturbation_discovery_alpha_tol_arcsec = 0.2
-perturbation_discovery_jacobian_tol = 0.5
+perturbation_discovery_alpha_tol_arcsec = 0.01
+perturbation_discovery_jacobian_tol = 0.01
 perturbation_discovery_jacobian_weight = 1.0
 softening_length_kpc = cluster_config.get("softening_length_kpc", 0.0)
 softening_length_prior_log_sigma = cluster_config.get("softening_length_prior_log_sigma", 0.15)
@@ -212,8 +212,16 @@ stage2_sampling_engine = "refreshing_surrogate_flat"
 independent_scaling_free_log_sigma_tau_prior_median = 0.45
 independent_scaling_free_log_mass_tau_prior_median = 0.55
 independent_scaling_free_log_tau_prior_sigma = 0.30
+potfile_alpha_sigma_prior_mean = 0.25
+potfile_alpha_sigma_prior_std = 0.2
+potfile_alpha_sigma_prior_lower = 0.05
+potfile_alpha_sigma_prior_upper = 0.50
+potfile_gamma_ml_prior_mean = 0.20
+potfile_gamma_ml_prior_std = 0.4
+potfile_gamma_ml_prior_lower = -0.80
+potfile_gamma_ml_prior_upper = 0.80
 
-pos_sigma_arcsec = 0.1
+pos_sigma_arcsec = 0.01
 
 critical_arc_args = [
     "--critical-arc-critical-direction-sigma-arcsec", 10.0,
@@ -253,7 +261,7 @@ smc_args = [
 
 workflow_args = [
     "--best-value", "maximum-likelihood",
-    "--potfile-member-mag-max", 22.0,
+    "--potfile-member-mag-max", 25.0,
     "--sampling-refresh-runs", *sampling_refresh_runs,
     "--fit-mode", fit_mode,
     "--stage1-sampling-engine", stage1_sampling_engine,
@@ -287,6 +295,14 @@ discovery_args = [
     "--independent-scaling-free-log-sigma-tau-prior-median", independent_scaling_free_log_sigma_tau_prior_median,
     "--independent-scaling-free-log-mass-tau-prior-median", independent_scaling_free_log_mass_tau_prior_median,
     "--independent-scaling-free-log-tau-prior-sigma", independent_scaling_free_log_tau_prior_sigma,
+    "--potfile-alpha-sigma-prior-mean", potfile_alpha_sigma_prior_mean,
+    "--potfile-alpha-sigma-prior-std", potfile_alpha_sigma_prior_std,
+    "--potfile-alpha-sigma-prior-lower", potfile_alpha_sigma_prior_lower,
+    "--potfile-alpha-sigma-prior-upper", potfile_alpha_sigma_prior_upper,
+    "--potfile-gamma-ml-prior-mean", potfile_gamma_ml_prior_mean,
+    "--potfile-gamma-ml-prior-std", potfile_gamma_ml_prior_std,
+    "--potfile-gamma-ml-prior-lower", potfile_gamma_ml_prior_lower,
+    "--potfile-gamma-ml-prior-upper", potfile_gamma_ml_prior_upper,
     *(softening_length_args),
 ]
 

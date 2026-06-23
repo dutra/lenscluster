@@ -2123,6 +2123,63 @@ def test_cluster_solver_parses_best_value(monkeypatch: pytest.MonkeyPatch) -> No
     assert args.best_value == cluster_solver.BEST_VALUE_MEDIAN
 
 
+def test_cluster_solver_parses_potfile_scaling_prior_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--par-path", "input.par"])
+    default_args = _parse_args()
+    assert default_args.potfile_alpha_sigma_prior_mean == pytest.approx(
+        cluster_solver.DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN
+    )
+    assert default_args.potfile_alpha_sigma_prior_std == pytest.approx(
+        cluster_solver.DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD
+    )
+    assert default_args.potfile_alpha_sigma_prior_lower == pytest.approx(
+        cluster_solver.DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER
+    )
+    assert default_args.potfile_alpha_sigma_prior_upper == pytest.approx(
+        cluster_solver.DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER
+    )
+    assert default_args.potfile_gamma_ml_prior_mean == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN)
+    assert default_args.potfile_gamma_ml_prior_std == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD)
+    assert default_args.potfile_gamma_ml_prior_lower == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER)
+    assert default_args.potfile_gamma_ml_prior_upper == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "input.par",
+            "--potfile-alpha-sigma-prior-mean",
+            "0.24",
+            "--potfile-alpha-sigma-prior-std",
+            "0.08",
+            "--potfile-alpha-sigma-prior-lower",
+            "0.05",
+            "--potfile-alpha-sigma-prior-upper",
+            "0.50",
+            "--potfile-gamma-ml-prior-mean",
+            "-0.05",
+            "--potfile-gamma-ml-prior-std",
+            "0.25",
+            "--potfile-gamma-ml-prior-lower",
+            "-0.80",
+            "--potfile-gamma-ml-prior-upper",
+            "0.80",
+        ],
+    )
+    args = _parse_args()
+
+    assert args.potfile_alpha_sigma_prior_mean == pytest.approx(0.24)
+    assert args.potfile_alpha_sigma_prior_std == pytest.approx(0.08)
+    assert args.potfile_alpha_sigma_prior_lower == pytest.approx(0.05)
+    assert args.potfile_alpha_sigma_prior_upper == pytest.approx(0.50)
+    assert args.potfile_gamma_ml_prior_mean == pytest.approx(-0.05)
+    assert args.potfile_gamma_ml_prior_std == pytest.approx(0.25)
+    assert args.potfile_gamma_ml_prior_lower == pytest.approx(-0.80)
+    assert args.potfile_gamma_ml_prior_upper == pytest.approx(0.80)
+
+
 @pytest.mark.parametrize("flag", ["--scaling-scatter-fields", "--scaling-scatter-max"])
 def test_cluster_solver_rejects_removed_scaling_scatter_field_controls(
     monkeypatch: pytest.MonkeyPatch,
@@ -5343,12 +5400,7 @@ def test_perturbation_discovery_stage0_initial_build_keeps_members_on_scaling_re
     assert len(state.scaling_component_records) == 3
     assert not any(bool(record.get("selected_independent", False)) for record in state.scaling_component_records)
     independent_specs = [spec for spec in state.parameter_specs if spec.component_family == "independent_scaling"]
-    assert len(independent_specs) == 6
-    assert {spec.field for spec in independent_specs} == {"independent_free_e1", "independent_free_e2"}
-    assert all(spec.prior_kind == "truncated_normal" for spec in independent_specs)
-    assert all(spec.std == pytest.approx(0.25) for spec in independent_specs)
-    assert all(spec.lower == pytest.approx(-0.35) for spec in independent_specs)
-    assert all(spec.upper == pytest.approx(0.35) for spec in independent_specs)
+    assert independent_specs == []
     scaling_scatter_specs = [spec for spec in state.parameter_specs if spec.component_family == "scaling_scatter"]
     assert scaling_scatter_specs == []
     assert evaluator.independent_scaling_component_indices.size == 0
@@ -5357,8 +5409,10 @@ def test_perturbation_discovery_stage0_initial_build_keeps_members_on_scaling_re
     np.testing.assert_array_equal(evaluator.exact_scaling_component_indices, evaluator.scaling_component_indices)
     assert evaluator.cached_scaling_component_indices.size == 0
     scaling_indices = [int(record["component_index"]) for record in state.scaling_component_records]
-    assert all(int(state.packed_lens_spec.e1_param_index[idx]) >= 0 for idx in scaling_indices)
-    assert all(int(state.packed_lens_spec.e2_param_index[idx]) >= 0 for idx in scaling_indices)
+    assert all(int(state.packed_lens_spec.e1_param_index[idx]) == -1 for idx in scaling_indices)
+    assert all(int(state.packed_lens_spec.e2_param_index[idx]) == -1 for idx in scaling_indices)
+    np.testing.assert_allclose(np.asarray(state.packed_lens_spec.e1_base)[scaling_indices], 0.0)
+    np.testing.assert_allclose(np.asarray(state.packed_lens_spec.e2_base)[scaling_indices], 0.0)
 
 
 def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free(
@@ -5388,19 +5442,6 @@ def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free
     final_args.perturbation_discovery_stage0 = False
     final_args.refresh_every = 250
     old_theta = cluster_solver._default_theta(old_state.parameter_specs)
-    learned_shapes = {
-        "faint": (0.11, -0.12),
-        "bright": (0.21, -0.22),
-        "mid": (-0.13, 0.14),
-    }
-    for idx, spec in enumerate(old_state.parameter_specs):
-        for catalog_id, (e1_value, e2_value) in learned_shapes.items():
-            if f".{catalog_id}." not in str(spec.name):
-                continue
-            if spec.field == "independent_free_e1":
-                old_theta[idx] = e1_value
-            elif spec.field == "independent_free_e2":
-                old_theta[idx] = e2_value
 
     state, evaluator, _sample_model, _theta, diagnostics = cluster_solver._rebuild_perturbation_discovery_state_from_union(
         final_args,
@@ -5426,21 +5467,21 @@ def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free
     assert int(state.packed_lens_spec.e2_param_index[scaling_component_index]) == -1
     np.testing.assert_allclose(
         state.packed_lens_spec.e1_base[free_component_index],
-        learned_shapes["bright"][0],
+        0.0,
     )
     np.testing.assert_allclose(
         state.packed_lens_spec.e2_base[free_component_index],
-        learned_shapes["bright"][1],
+        0.0,
     )
     free_e1_spec = state.parameter_specs[int(state.packed_lens_spec.e1_param_index[free_component_index])]
     free_e2_spec = state.parameter_specs[int(state.packed_lens_spec.e2_param_index[free_component_index])]
-    assert free_e1_spec.mean == pytest.approx(learned_shapes["bright"][0])
-    assert free_e2_spec.mean == pytest.approx(learned_shapes["bright"][1])
+    assert free_e1_spec.mean == pytest.approx(0.0)
+    assert free_e2_spec.mean == pytest.approx(0.0)
     assert _theta[int(state.packed_lens_spec.e1_param_index[free_component_index])] == pytest.approx(
-        learned_shapes["bright"][0]
+        0.0
     )
     assert _theta[int(state.packed_lens_spec.e2_param_index[free_component_index])] == pytest.approx(
-        learned_shapes["bright"][1]
+        0.0
     )
     for record in state.scaling_component_records:
         if int(record["catalog_row_index"]) == 1:
@@ -5448,9 +5489,8 @@ def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free
         component_index = int(record["component_index"])
         assert int(state.packed_lens_spec.e1_param_index[component_index]) == -1
         assert int(state.packed_lens_spec.e2_param_index[component_index]) == -1
-        expected_shape = learned_shapes[str(record["catalog_id"])]
-        np.testing.assert_allclose(state.packed_lens_spec.e1_base[component_index], expected_shape[0])
-        np.testing.assert_allclose(state.packed_lens_spec.e2_base[component_index], expected_shape[1])
+        np.testing.assert_allclose(state.packed_lens_spec.e1_base[component_index], 0.0)
+        np.testing.assert_allclose(state.packed_lens_spec.e2_base[component_index], 0.0)
     np.testing.assert_array_equal(
         evaluator.cached_scaling_component_indices,
         np.asarray(
@@ -5460,6 +5500,7 @@ def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free
     )
     assert diagnostics["strict_active"] is True
     assert diagnostics["active_equals_independent"] is True
+    assert diagnostics["member_shape_inherited"] == 0
     assert len(evaluator.active_scaling_component_indices) == 1
     assert len(evaluator.cached_scaling_component_indices) == 2
     records_by_id = {str(record["catalog_id"]): record for record in state.scaling_component_records}
@@ -12876,6 +12917,42 @@ def test_scaling_parameter_specs_use_direct_exponent_mode_only() -> None:
     assert gamma_spec.upper == pytest.approx(cluster_solver.DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER)
 
 
+def test_scaling_parameter_specs_use_configured_alpha_gamma_priors() -> None:
+    potfiles = [
+        {
+            "id": "members",
+            "type": cluster_solver.DP_IE_PROFILE,
+            "catalog_df": pd.DataFrame({"id": ["member"]}),
+            "core_arcsec": 0.1,
+            "sigma": [9, 245.0, 55.0, 190.0, 300.0],
+            "cut": [9, 5.25, 4.75, 0.5, 10.0],
+        }
+    ]
+    specs, param_indices, _ = cluster_solver._build_scaling_parameter_specs(
+        potfiles,
+        kpc_per_arcsec=10.0,
+        alpha_sigma_prior_mean=0.24,
+        alpha_sigma_prior_std=0.08,
+        alpha_sigma_prior_lower=0.05,
+        alpha_sigma_prior_upper=0.50,
+        gamma_ml_prior_mean=-0.05,
+        gamma_ml_prior_std=0.25,
+        gamma_ml_prior_lower=-0.80,
+        gamma_ml_prior_upper=0.80,
+    )
+
+    alpha_spec = specs[param_indices[0]["alpha_sigma"]]
+    gamma_spec = specs[param_indices[0]["gamma_ml"]]
+    assert alpha_spec.mean == pytest.approx(0.24)
+    assert alpha_spec.std == pytest.approx(0.08)
+    assert alpha_spec.lower == pytest.approx(0.05)
+    assert alpha_spec.upper == pytest.approx(0.50)
+    assert gamma_spec.mean == pytest.approx(-0.05)
+    assert gamma_spec.std == pytest.approx(0.25)
+    assert gamma_spec.lower == pytest.approx(-0.80)
+    assert gamma_spec.upper == pytest.approx(0.80)
+
+
 def _log_uniform_image_plane_scatter_spec(floor_arcsec: float = 0.1, upper_arcsec: float = 0.5) -> ParameterSpec:
     return cluster_solver._build_image_scatter_parameter_spec(
         0,
@@ -16642,6 +16719,41 @@ def test_cluster_solver_rejects_negative_refresh_every(monkeypatch: pytest.Monke
 
     with pytest.raises(SystemExit):
         _parse_args()
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--potfile-alpha-sigma-prior-lower", "0.30", "--potfile-alpha-sigma-prior-upper", "0.20"],
+        ["--potfile-alpha-sigma-prior-mean", "0.80"],
+        ["--potfile-gamma-ml-prior-lower", "0.10", "--potfile-gamma-ml-prior-upper", "-0.10"],
+        ["--potfile-gamma-ml-prior-mean", "1.20"],
+    ],
+)
+def test_cluster_solver_rejects_invalid_potfile_scaling_prior_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    extra_args: list[str],
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cluster_solver",
+            "--par-path",
+            "data/clustersim/input.par",
+            "--svi-steps",
+            "1000",
+            "600",
+            "--refresh-every",
+            "100",
+            "60",
+            *extra_args,
+        ],
+    )
+
+    args = _parse_args()
+    with pytest.raises(SystemExit):
+        _normalize_stage_fit_controls(args)
 
 
 def test_validation_maps_disabled_stage_refresh_every_controls() -> None:

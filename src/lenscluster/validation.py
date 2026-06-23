@@ -6312,6 +6312,14 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+        DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER,
+        DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN,
+        DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD,
+        DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER,
+        DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER,
+        DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN,
+        DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD,
+        DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER,
         DEFAULT_REFRESH_EVERY,
         DEFAULT_SOFTENING_LENGTH_KPC,
         DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA,
@@ -6413,6 +6421,22 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
                 DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
             )
         ),
+        "--potfile-alpha-sigma-prior-mean",
+        str(getattr(args, "potfile_alpha_sigma_prior_mean", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN)),
+        "--potfile-alpha-sigma-prior-std",
+        str(getattr(args, "potfile_alpha_sigma_prior_std", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD)),
+        "--potfile-alpha-sigma-prior-lower",
+        str(getattr(args, "potfile_alpha_sigma_prior_lower", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER)),
+        "--potfile-alpha-sigma-prior-upper",
+        str(getattr(args, "potfile_alpha_sigma_prior_upper", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER)),
+        "--potfile-gamma-ml-prior-mean",
+        str(getattr(args, "potfile_gamma_ml_prior_mean", DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN)),
+        "--potfile-gamma-ml-prior-std",
+        str(getattr(args, "potfile_gamma_ml_prior_std", DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD)),
+        "--potfile-gamma-ml-prior-lower",
+        str(getattr(args, "potfile_gamma_ml_prior_lower", DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER)),
+        "--potfile-gamma-ml-prior-upper",
+        str(getattr(args, "potfile_gamma_ml_prior_upper", DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER)),
         "--softening-length-kpc",
         str(getattr(args, "softening_length_kpc", DEFAULT_SOFTENING_LENGTH_KPC)),
         "--softening-length-prior-log-sigma",
@@ -7599,6 +7623,14 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
     )
+    parser.add_argument("--potfile-alpha-sigma-prior-mean", type=float, default=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN)
+    parser.add_argument("--potfile-alpha-sigma-prior-std", type=float, default=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD)
+    parser.add_argument("--potfile-alpha-sigma-prior-lower", type=float, default=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER)
+    parser.add_argument("--potfile-alpha-sigma-prior-upper", type=float, default=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER)
+    parser.add_argument("--potfile-gamma-ml-prior-mean", type=float, default=DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN)
+    parser.add_argument("--potfile-gamma-ml-prior-std", type=float, default=DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD)
+    parser.add_argument("--potfile-gamma-ml-prior-lower", type=float, default=DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER)
+    parser.add_argument("--potfile-gamma-ml-prior-upper", type=float, default=DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER)
     parser.add_argument("--softening-length-kpc", type=float, default=DEFAULT_SOFTENING_LENGTH_KPC)
     parser.add_argument(
         "--softening-length-prior-log-sigma",

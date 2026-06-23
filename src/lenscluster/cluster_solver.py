@@ -1490,6 +1490,54 @@ def _parse_args() -> argparse.Namespace:
         help="Member-galaxy scaling-law parametrization. The live model samples alpha_sigma and gamma_ml, deriving beta_radius.",
     )
     parser.add_argument(
+        "--potfile-alpha-sigma-prior-mean",
+        type=_finite_float_arg,
+        default=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN,
+        help="Mean of the truncated-normal prior for the potfile member sigma luminosity exponent alpha_sigma.",
+    )
+    parser.add_argument(
+        "--potfile-alpha-sigma-prior-std",
+        type=_positive_float_arg,
+        default=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD,
+        help="Standard deviation of the truncated-normal prior for alpha_sigma.",
+    )
+    parser.add_argument(
+        "--potfile-alpha-sigma-prior-lower",
+        type=_finite_float_arg,
+        default=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER,
+        help="Lower bound of the truncated-normal prior for alpha_sigma.",
+    )
+    parser.add_argument(
+        "--potfile-alpha-sigma-prior-upper",
+        type=_finite_float_arg,
+        default=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER,
+        help="Upper bound of the truncated-normal prior for alpha_sigma.",
+    )
+    parser.add_argument(
+        "--potfile-gamma-ml-prior-mean",
+        type=_finite_float_arg,
+        default=DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN,
+        help="Mean of the truncated-normal prior for the potfile member mass-to-light tilt gamma_ml.",
+    )
+    parser.add_argument(
+        "--potfile-gamma-ml-prior-std",
+        type=_positive_float_arg,
+        default=DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD,
+        help="Standard deviation of the truncated-normal prior for gamma_ml.",
+    )
+    parser.add_argument(
+        "--potfile-gamma-ml-prior-lower",
+        type=_finite_float_arg,
+        default=DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER,
+        help="Lower bound of the truncated-normal prior for gamma_ml.",
+    )
+    parser.add_argument(
+        "--potfile-gamma-ml-prior-upper",
+        type=_finite_float_arg,
+        default=DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER,
+        help="Upper bound of the truncated-normal prior for gamma_ml.",
+    )
+    parser.add_argument(
         "--scaling-scatter",
         action="store_true",
         help="Add Bergamini sigma/mass intrinsic log-scatter to member-galaxy scaling relations.",
@@ -10345,7 +10393,6 @@ def _rebuild_perturbation_discovery_state_from_union(
     normalized = _normalize_selected_by_potfile(selected_by_potfile, len(getattr(old_state, "potfiles", [])))
     old_components = _selected_component_set_from_state(old_state)
     source_position_prior_values = _source_position_prior_values_from_state(old_state)
-    member_shape_values = _member_shape_values_from_state(old_state, old_theta)
     new_state = _build_state_from_inputs(
         args,
         fit_mode_override=str(getattr(old_state, "fit_mode", getattr(args, "fit_mode", FIT_MODE_JOINT))),
@@ -10353,7 +10400,6 @@ def _rebuild_perturbation_discovery_state_from_union(
         source_position_prior_values=source_position_prior_values,
         frozen_active_scaling_component_indices=getattr(old_state, "frozen_active_scaling_component_indices", None),
         perturbation_discovery_independent_override_by_potfile=normalized,
-        member_shape_values_by_potfile=member_shape_values,
     )
     requested_components = _selected_by_potfile_component_set(new_state, normalized)
     if str(reason) == "perturbation_discovery_final":
@@ -10397,10 +10443,10 @@ def _rebuild_perturbation_discovery_state_from_union(
         "requested_components": int(len(requested_components)),
         "counts_by_potfile": _selected_by_potfile_counts(new_state, normalized),
         "source_position_prior_families": int(len(source_position_prior_values or {})),
-        "member_shape_inherited": int(sum(len(values) for values in member_shape_values)),
+        "member_shape_inherited": 0,
         "member_shape_sampled_free": int(sum(len(values) for values in normalized)),
         "member_shape_fixed_inactive": int(
-            max(sum(len(values) for values in member_shape_values) - sum(len(values) for values in normalized), 0)
+            max(len(getattr(new_state, "scaling_component_records", [])) - sum(len(values) for values in normalized), 0)
         ),
         "strict_active": bool(strict_diag.get("strict_active", False)),
         "active_equals_independent": bool(strict_diag.get("active_equals_independent", False)),
@@ -13738,6 +13784,23 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     ):
         _fail("--smc-mala-step-size must be positive.")
     _validate_microcanonical_controls(args)
+    try:
+        _validate_truncated_normal_prior_controls(
+            name="alpha_sigma",
+            mean=float(getattr(args, "potfile_alpha_sigma_prior_mean", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN)),
+            std=float(getattr(args, "potfile_alpha_sigma_prior_std", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD)),
+            lower=float(getattr(args, "potfile_alpha_sigma_prior_lower", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER)),
+            upper=float(getattr(args, "potfile_alpha_sigma_prior_upper", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER)),
+        )
+        _validate_truncated_normal_prior_controls(
+            name="gamma_ml",
+            mean=float(getattr(args, "potfile_gamma_ml_prior_mean", DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN)),
+            std=float(getattr(args, "potfile_gamma_ml_prior_std", DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD)),
+            lower=float(getattr(args, "potfile_gamma_ml_prior_lower", DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER)),
+            upper=float(getattr(args, "potfile_gamma_ml_prior_upper", DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER)),
+        )
+    except ValueError as exc:
+        _fail(str(exc))
     if float(getattr(args, "linearized_beta_prior_sigma_arcsec", DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC)) <= 0.0:
         _fail("--linearized-beta-prior-sigma-arcsec must be positive.")
     critical_det_threshold = float(
@@ -15760,6 +15823,14 @@ def _build_scaling_parameter_specs(
     start_index: int = 0,
     kpc_per_arcsec: float = 1.0,
     scaling_relation_mode: str = DEFAULT_SCALING_RELATION_MODE,
+    alpha_sigma_prior_mean: float = DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN,
+    alpha_sigma_prior_std: float = DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD,
+    alpha_sigma_prior_lower: float = DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER,
+    alpha_sigma_prior_upper: float = DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER,
+    gamma_ml_prior_mean: float = DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN,
+    gamma_ml_prior_std: float = DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD,
+    gamma_ml_prior_lower: float = DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER,
+    gamma_ml_prior_upper: float = DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER,
 ) -> tuple[list[ParameterSpec], list[dict[str, int]], list[str]]:
     specs: list[ParameterSpec] = []
     param_index_by_potfile: list[dict[str, int]] = []
@@ -15809,19 +15880,19 @@ def _build_scaling_parameter_specs(
             },
             "alpha_sigma": {
                 "prior_kind": "truncated_normal",
-                "lower": DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER,
-                "upper": DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER,
-                "mean": DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN,
-                "std": DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD,
+                "lower": float(alpha_sigma_prior_lower),
+                "upper": float(alpha_sigma_prior_upper),
+                "mean": float(alpha_sigma_prior_mean),
+                "std": float(alpha_sigma_prior_std),
                 "step": 0.02,
                 "transform_kind": "identity",
             },
             "gamma_ml": {
                 "prior_kind": "truncated_normal",
-                "lower": DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER,
-                "upper": DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER,
-                "mean": DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN,
-                "std": DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD,
+                "lower": float(gamma_ml_prior_lower),
+                "upper": float(gamma_ml_prior_upper),
+                "mean": float(gamma_ml_prior_mean),
+                "std": float(gamma_ml_prior_std),
                 "step": 0.05,
                 "transform_kind": "identity",
             },
@@ -16910,6 +16981,7 @@ def _build_scaling_components(
     start_component_index: int,
     kpc_per_arcsec: float = 1.0,
     member_shape_values_by_potfile: list[dict[int, tuple[float, float]]] | None = None,
+    member_shapes_circular: bool = False,
 ) -> tuple[list[dict[str, Any]], list[list[tuple[str, int]]], list[dict[str, Any]], list[dict[str, Any]]]:
     _, ra0_deg, dec0_deg = reference
     components: list[dict[str, Any]] = []
@@ -16961,18 +17033,22 @@ def _build_scaling_components(
         alpha_sigma_base_value = DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN
         gamma_ml_base_value = DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN
         for row_index, row in enumerate(catalog_df.itertuples(index=False)):
-            ellipticite, angle_pos = _catalog_shape_to_ellipticity(row.catalog_a, row.catalog_b, row.catalog_theta)
-            direct_shape = (
-                member_shape_values_by_potfile[potfile_order].get(int(row_index))
-                if potfile_order < len(member_shape_values_by_potfile)
-                else None
-            )
-            if member_shape_values_by_potfile and any(member_shape_values_by_potfile) and direct_shape is None:
-                raise ValueError(
-                    "Missing inherited member ellipticity for "
-                    f"potfile_order={potfile_order} catalog_row_index={row_index}; "
-                    "stage1/stage2 production must inherit all member shapes from the previous stage."
+            if member_shapes_circular:
+                ellipticite, angle_pos = 0.0, 0.0
+                direct_shape = (0.0, 0.0)
+            else:
+                ellipticite, angle_pos = _catalog_shape_to_ellipticity(row.catalog_a, row.catalog_b, row.catalog_theta)
+                direct_shape = (
+                    member_shape_values_by_potfile[potfile_order].get(int(row_index))
+                    if potfile_order < len(member_shape_values_by_potfile)
+                    else None
                 )
+                if member_shape_values_by_potfile and any(member_shape_values_by_potfile) and direct_shape is None:
+                    raise ValueError(
+                        "Missing inherited member ellipticity for "
+                        f"potfile_order={potfile_order} catalog_row_index={row_index}; "
+                        "stage1/stage2 production must inherit all member shapes from the previous stage."
+                    )
             direct_shape_payload = (
                 {"e1_base": float(direct_shape[0]), "e2_base": float(direct_shape[1])}
                 if direct_shape is not None
@@ -17191,6 +17267,28 @@ def _validate_independent_scaling_log_displacement_hyperparameters(
     if not np.isfinite(tau_sigma) or tau_sigma <= 0.0:
         raise ValueError("--independent-scaling-free-log-tau-prior-sigma must be finite and positive.")
     return tau_sigma_value, tau_mass_value
+
+
+def _validate_truncated_normal_prior_controls(
+    *,
+    name: str,
+    mean: float,
+    std: float,
+    lower: float,
+    upper: float,
+) -> None:
+    mean = float(mean)
+    std = float(std)
+    lower = float(lower)
+    upper = float(upper)
+    if not all(np.isfinite(value) for value in (mean, std, lower, upper)):
+        raise ValueError(f"{name} prior controls must be finite.")
+    if std <= 0.0:
+        raise ValueError(f"{name} prior std must be positive.")
+    if not lower < upper:
+        raise ValueError(f"{name} prior bounds must satisfy lower < upper.")
+    if not lower < mean < upper:
+        raise ValueError(f"{name} prior mean must lie strictly inside the bounds.")
 
 
 def _rank_potfile_scaling_rows(
@@ -25463,6 +25561,30 @@ def _save_plot_bundle_h5(
                         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
                     )
                 ),
+                "potfile_alpha_sigma_prior_mean": float(
+                    getattr(state, "potfile_alpha_sigma_prior_mean", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN)
+                ),
+                "potfile_alpha_sigma_prior_std": float(
+                    getattr(state, "potfile_alpha_sigma_prior_std", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD)
+                ),
+                "potfile_alpha_sigma_prior_lower": float(
+                    getattr(state, "potfile_alpha_sigma_prior_lower", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER)
+                ),
+                "potfile_alpha_sigma_prior_upper": float(
+                    getattr(state, "potfile_alpha_sigma_prior_upper", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER)
+                ),
+                "potfile_gamma_ml_prior_mean": float(
+                    getattr(state, "potfile_gamma_ml_prior_mean", DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN)
+                ),
+                "potfile_gamma_ml_prior_std": float(
+                    getattr(state, "potfile_gamma_ml_prior_std", DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD)
+                ),
+                "potfile_gamma_ml_prior_lower": float(
+                    getattr(state, "potfile_gamma_ml_prior_lower", DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER)
+                ),
+                "potfile_gamma_ml_prior_upper": float(
+                    getattr(state, "potfile_gamma_ml_prior_upper", DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER)
+                ),
                 "softening_length_kpc": float(getattr(state, "softening_length_kpc", DEFAULT_SOFTENING_LENGTH_KPC)),
                 "softening_length_prior_log_sigma": float(
                     getattr(
@@ -25687,6 +25809,28 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
                     "independent_scaling_free_log_tau_prior_sigma",
                     DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
                 )
+            ),
+            potfile_alpha_sigma_prior_mean=float(
+                meta.get("potfile_alpha_sigma_prior_mean", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN)
+            ),
+            potfile_alpha_sigma_prior_std=float(
+                meta.get("potfile_alpha_sigma_prior_std", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD)
+            ),
+            potfile_alpha_sigma_prior_lower=float(
+                meta.get("potfile_alpha_sigma_prior_lower", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER)
+            ),
+            potfile_alpha_sigma_prior_upper=float(
+                meta.get("potfile_alpha_sigma_prior_upper", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER)
+            ),
+            potfile_gamma_ml_prior_mean=float(
+                meta.get("potfile_gamma_ml_prior_mean", DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN)
+            ),
+            potfile_gamma_ml_prior_std=float(meta.get("potfile_gamma_ml_prior_std", DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD)),
+            potfile_gamma_ml_prior_lower=float(
+                meta.get("potfile_gamma_ml_prior_lower", DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER)
+            ),
+            potfile_gamma_ml_prior_upper=float(
+                meta.get("potfile_gamma_ml_prior_upper", DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER)
             ),
             softening_length_kpc=float(meta.get("softening_length_kpc", DEFAULT_SOFTENING_LENGTH_KPC)),
             softening_length_prior_log_sigma=float(
@@ -26451,13 +26595,13 @@ def _build_state_from_inputs(
                 args,
                 (
                     "[input] perturbation_discovery_independent_candidates={} "
-                    "total=0 source=stage0-scaling-only-full-flat shape_sampling=all_members"
+                    "total=0 source=stage0-scaling-only-full-flat shape_sampling=disabled_circular"
                 ),
             )
         shape_selected_by_potfile = (
-            [set(range(len(potfile["catalog_df"]))) for potfile in potfiles]
-            if bool(getattr(args, "perturbation_discovery_stage0", False))
-            else active_selected_by_potfile
+            active_selected_by_potfile
+            if not bool(getattr(args, "perturbation_discovery_stage0", False))
+            else [set() for _ in potfiles]
         )
         inherited_member_shape_values = member_shape_values_by_potfile or [{} for _ in potfiles]
         if active_selected_counts:
@@ -26474,6 +26618,26 @@ def _build_state_from_inputs(
             start_index=len(parameter_specs),
             kpc_per_arcsec=scaling_kpc_per_arcsec,
             scaling_relation_mode=str(getattr(args, "scaling_relation_mode", DEFAULT_SCALING_RELATION_MODE)),
+            alpha_sigma_prior_mean=float(
+                getattr(args, "potfile_alpha_sigma_prior_mean", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN)
+            ),
+            alpha_sigma_prior_std=float(
+                getattr(args, "potfile_alpha_sigma_prior_std", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD)
+            ),
+            alpha_sigma_prior_lower=float(
+                getattr(args, "potfile_alpha_sigma_prior_lower", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER)
+            ),
+            alpha_sigma_prior_upper=float(
+                getattr(args, "potfile_alpha_sigma_prior_upper", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER)
+            ),
+            gamma_ml_prior_mean=float(getattr(args, "potfile_gamma_ml_prior_mean", DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN)),
+            gamma_ml_prior_std=float(getattr(args, "potfile_gamma_ml_prior_std", DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD)),
+            gamma_ml_prior_lower=float(
+                getattr(args, "potfile_gamma_ml_prior_lower", DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER)
+            ),
+            gamma_ml_prior_upper=float(
+                getattr(args, "potfile_gamma_ml_prior_upper", DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER)
+            ),
         )
         parameter_specs.extend(scaling_parameter_specs)
         scaling_scatter_specs, scaling_scatter_indices = (
@@ -26525,6 +26689,7 @@ def _build_state_from_inputs(
             start_component_index=len(base_components),
             kpc_per_arcsec=scaling_kpc_per_arcsec,
             member_shape_values_by_potfile=inherited_member_shape_values,
+            member_shapes_circular=bool(getattr(args, "perturbation_discovery_stage0", False)),
         )
         component_param_assignments.extend(scaling_assignments)
         lens_model_list.extend([ORIGINAL_DPIE_PROFILE_NAME for _ in scaling_components])
@@ -26913,6 +27078,26 @@ def _build_state_from_inputs(
                 "independent_scaling_free_log_tau_prior_sigma",
                 DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
             )
+        ),
+        potfile_alpha_sigma_prior_mean=float(
+            getattr(args, "potfile_alpha_sigma_prior_mean", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN)
+        ),
+        potfile_alpha_sigma_prior_std=float(
+            getattr(args, "potfile_alpha_sigma_prior_std", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD)
+        ),
+        potfile_alpha_sigma_prior_lower=float(
+            getattr(args, "potfile_alpha_sigma_prior_lower", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER)
+        ),
+        potfile_alpha_sigma_prior_upper=float(
+            getattr(args, "potfile_alpha_sigma_prior_upper", DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER)
+        ),
+        potfile_gamma_ml_prior_mean=float(getattr(args, "potfile_gamma_ml_prior_mean", DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN)),
+        potfile_gamma_ml_prior_std=float(getattr(args, "potfile_gamma_ml_prior_std", DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD)),
+        potfile_gamma_ml_prior_lower=float(
+            getattr(args, "potfile_gamma_ml_prior_lower", DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER)
+        ),
+        potfile_gamma_ml_prior_upper=float(
+            getattr(args, "potfile_gamma_ml_prior_upper", DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER)
         ),
         softening_length_kpc=float(getattr(args, "softening_length_kpc", DEFAULT_SOFTENING_LENGTH_KPC)),
         softening_length_prior_log_sigma=float(
@@ -29672,7 +29857,6 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
     stage0_artifacts_dir = stage0_run_dir / "artifacts"
     stage0_init_values = _physical_best_fit_values_from_artifacts(stage0_artifacts_dir)
     stage0_selected_by_potfile = _selected_independent_by_potfile_from_artifacts(stage0_artifacts_dir)
-    stage0_member_shape_values = _member_shape_values_from_artifacts(stage0_artifacts_dir)
     stage0_selected_count = int(sum(len(values) for values in stage0_selected_by_potfile))
     _log(
         args,
@@ -29708,7 +29892,6 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
             svi_init_physical_values=stage0_init_values,
             previous_stage_best_values=stage0_init_values,
             perturbation_discovery_independent_override_by_potfile=stage0_selected_by_potfile,
-            member_shape_values_by_potfile=stage0_member_shape_values,
         )
 
     summary_payload: dict[str, Any] = {

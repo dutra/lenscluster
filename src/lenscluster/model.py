@@ -301,6 +301,14 @@ class BuildState:
     independent_scaling_free_log_sigma_tau_prior_median: float = 0.10
     independent_scaling_free_log_mass_tau_prior_median: float = 0.20
     independent_scaling_free_log_tau_prior_sigma: float = 0.25
+    potfile_alpha_sigma_prior_mean: float = 0.25
+    potfile_alpha_sigma_prior_std: float = 0.04
+    potfile_alpha_sigma_prior_lower: float = 0.10
+    potfile_alpha_sigma_prior_upper: float = 0.40
+    potfile_gamma_ml_prior_mean: float = 0.00
+    potfile_gamma_ml_prior_std: float = 0.12
+    potfile_gamma_ml_prior_lower: float = -0.40
+    potfile_gamma_ml_prior_upper: float = 0.40
     softening_length_kpc: float = 0.0
     softening_length_prior_log_sigma: float = 0.15
     log_softening_length_param_index: int = -1
