@@ -6461,7 +6461,7 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
     else:
         cmd.append("--no-mchmc-random-trajectory-length")
     _append_stage_option(cmd, "--svi-steps", args.svi_steps)
-    _append_stage_option(cmd, "--refresh-every", args.refresh_every)
+    _append_stage_option(cmd, "--refresh-every", getattr(args, "refresh_every", DEFAULT_REFRESH_EVERY))
     _append_stage_option(cmd, "--max-tree-depth", args.max_tree_depth)
     if getattr(args, "fix_image_sigma_int_arcsec", None) is not None:
         cmd.extend(["--fix-image-sigma-int-arcsec", str(float(args.fix_image_sigma_int_arcsec))])
@@ -7685,7 +7685,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--best-value",
         choices=BEST_VALUE_CHOICES,
         default=DEFAULT_BEST_VALUE,
-        help="Pass-through selected posterior sample convention for solver validation and lensing plots.",
+        help="Pass-through selected posterior value convention for solver validation and lensing plots.",
     )
     parser.add_argument("--quiet", action="store_true", help="Suppress validation wrapper logs while keeping solver output.")
     return parser

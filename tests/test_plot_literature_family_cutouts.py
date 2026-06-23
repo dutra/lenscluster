@@ -260,17 +260,22 @@ def test_find_rgb_band_paths_falls_back_when_requested_scale_missing(tmp_path: P
 
 
 def test_find_rgb_band_paths_supports_ff_sims_simulation_names(tmp_path: Path) -> None:
-    root = tmp_path / "fits"
+    root = tmp_path / "ff_sims"
     bands = ("F435W", "F606W", "F814W")
     expected = {}
     for band in bands:
-        path = root / "ares" / f"simulation_hst_{band.lower()}.fits"
+        path = root / "published" / "ares" / f"simulation_hst_{band.lower()}.fits"
         path.parent.mkdir(parents=True, exist_ok=True)
         fits.PrimaryHDU(np.ones((20, 20), dtype=np.float32), header=_wcs_header(ra=0.0, dec=0.0)).writeto(path)
         expected[band] = path
 
     actual_from_root = plotter.find_rgb_band_paths(root, cluster="ares", bands=bands, image_scale="auto")
-    actual_from_cluster_dir = plotter.find_rgb_band_paths(root / "ares", cluster="ares", bands=bands, image_scale="auto")
+    actual_from_cluster_dir = plotter.find_rgb_band_paths(
+        root / "published" / "ares",
+        cluster="ares",
+        bands=bands,
+        image_scale="auto",
+    )
 
     assert actual_from_root == expected
     assert actual_from_cluster_dir == expected

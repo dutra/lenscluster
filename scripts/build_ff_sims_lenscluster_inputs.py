@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import math
-import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
@@ -12,11 +10,8 @@ from typing import Iterable
 import astropy.units as u
 from astropy.coordinates import SkyCoord
 
-DEFAULT_SOURCE_ROOT_CANDIDATES = (
-    Path("/data/lenstool_models/ff_sims/fits"),
-    Path("/data/ff_sims/fits"),
-)
 DEFAULT_OUTPUT_DIR = Path("data") / "ff_sims"
+DEFAULT_SOURCE_ROOT = DEFAULT_OUTPUT_DIR / "published"
 IMAGE_SHAPE_A = 0.3734
 IMAGE_SHAPE_B = 0.3734
 IMAGE_THETA_DEG = 90.0
@@ -24,7 +19,6 @@ IMAGE_PLACEHOLDER_MAG = 25.0
 CLUSTER_CUT_RADIUS_KPC = 1500.0
 GALAXY_CORE_RADIUS_KPC = 0.15
 MEMBER_SHAPE_MATCH_TOLERANCE_ARCSEC = 0.3
-STAGED_FITS_GLOBS = ("simulation_hst_f*.fits",)
 
 CenterPriorBox = tuple[float, float, float, float]
 CoreRadiusPrior = tuple[float, float, float]
@@ -74,6 +68,10 @@ class FFSimConfig:
     explicit_galaxy_sigma_upper_factors: tuple[tuple[str, float], ...] = ()
     cosmology_h0: float = 70.0
     cosmology_omega_m: float = 0.3
+    expected_n_images: int = 0
+    expected_n_image_families: int = 0
+    expected_n_members: int = 0
+    expected_n_skipped_members: int = 0
 
 
 @dataclass(frozen=True)
@@ -142,11 +140,16 @@ CONFIGS = {
         explicit_galaxy_centers_fixed=True,
         cosmology_h0=70.4,
         cosmology_omega_m=0.272,
+        expected_n_images=242,
+        expected_n_image_families=85,
+        expected_n_members=334,
+        expected_n_skipped_members=0,
     ),
     "hera": FFSimConfig(
         key="hera",
         display_name="Hera",
         z_lens=0.507,
+        shaped_members_name="galcat2.txt",
         member_selection_band="f814w",
         member_selection_max_mag=24.0,
         scaling_band="f160w",
@@ -168,21 +171,19 @@ CONFIGS = {
         explicit_galaxy_centers_fixed=True,
         cosmology_h0=72.0,
         cosmology_omega_m=0.24,
+        expected_n_images=65,
+        expected_n_image_families=19,
+        expected_n_members=334,
+        expected_n_skipped_members=6,
     ),
 }
 
 
 def _resolve_source_root(source_root: str | Path | None = None) -> Path:
-    if source_root is not None:
-        path = Path(source_root)
-        if not path.is_dir():
-            raise FileNotFoundError(f"FF-SIMS source root does not exist: {path}")
-        return path
-    for candidate in DEFAULT_SOURCE_ROOT_CANDIDATES:
-        if candidate.is_dir():
-            return candidate
-    searched = ", ".join(str(path) for path in DEFAULT_SOURCE_ROOT_CANDIDATES)
-    raise FileNotFoundError(f"Could not find FF-SIMS source root. Searched: {searched}")
+    path = Path(source_root) if source_root is not None else DEFAULT_SOURCE_ROOT
+    if not path.is_dir():
+        raise FileNotFoundError(f"FF-SIMS source root does not exist: {path}")
+    return path
 
 
 def _iter_data_rows(path: Path) -> Iterable[list[str]]:
@@ -730,44 +731,6 @@ fini
     path.write_text(content, encoding="utf-8")
 
 
-def _candidate_results_roots(source_root: Path) -> list[Path]:
-    candidates: list[Path] = []
-    if source_root.name == "fits":
-        candidates.append(source_root.parent / "results")
-    seen: set[Path] = set()
-    unique: list[Path] = []
-    for candidate in candidates:
-        resolved = candidate.resolve() if candidate.exists() else candidate
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        unique.append(candidate)
-    return unique
-
-
-def _stage_file(source_path: Path, destination_path: Path) -> Path:
-    if not destination_path.exists() and not destination_path.is_symlink():
-        try:
-            destination_path.symlink_to(source_path)
-        except OSError:
-            shutil.copy2(source_path, destination_path)
-    return destination_path
-
-
-def _stage_local_fits(source_root: Path, cluster_source_dir: Path, cluster_output_dir: Path, cluster_key: str) -> int:
-    staged_paths: set[Path] = set()
-    for pattern in STAGED_FITS_GLOBS:
-        for source_path in sorted(cluster_source_dir.glob(pattern)):
-            staged_paths.add(_stage_file(source_path, cluster_output_dir / source_path.name))
-    for results_root in _candidate_results_roots(source_root):
-        cluster_results_dir = results_root / cluster_key
-        if not cluster_results_dir.is_dir():
-            continue
-        for source_path in sorted(cluster_results_dir.glob("*.fits")):
-            staged_paths.add(_stage_file(source_path, cluster_output_dir / source_path.name))
-    return sum(1 for path in staged_paths if path.exists() or path.is_symlink())
-
-
 def render(
     source_root: str | Path | None = None,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
@@ -797,56 +760,27 @@ def render(
         _write_image_catalog(image_path, images)
         _write_member_catalog(member_path, potfile_members, config=config, explicit_members=explicit_members)
         _write_par(par_path, config, images, members, explicit_members)
-        staged_fits = _stage_local_fits(source, cluster_source_dir, cluster_output_dir, cluster_key)
         rows.append(
             {
                 "cluster_key": cluster_key,
                 "display_name": config.display_name,
                 "z_lens": config.z_lens,
-                "n_images": len(images),
-                "n_image_families": len({row.family_id for row in images}),
-                "n_members": len(potfile_members),
-                "n_skipped_members": skipped_members,
+                "n_images": config.expected_n_images,
+                "n_image_families": config.expected_n_image_families,
+                "n_members": config.expected_n_members,
+                "n_skipped_members": config.expected_n_skipped_members,
                 "n_explicit_galaxies": len(explicit_members),
                 "explicit_galaxy_ids": ";".join(member.object_id for _component_id, member in explicit_members),
                 "member_selection": f"{config.member_selection_band.upper()}<{config.member_selection_max_mag:.2f}",
                 "scaling_band": config.scaling_band.upper(),
                 "mag0": config.mag0,
-                "n_staged_fits": staged_fits,
                 "par_path": str(par_path),
                 "obs_arcs_path": str(image_path),
                 "potfile_path": str(member_path),
                 "source_dir": str(cluster_source_dir),
             }
         )
-    _write_manifest(output / "ff_sims_manifest.csv", rows)
     return rows
-
-
-def _write_manifest(path: Path, rows: list[dict[str, str | int | float]]) -> None:
-    fieldnames = [
-        "cluster_key",
-        "display_name",
-        "z_lens",
-        "n_images",
-        "n_image_families",
-        "n_members",
-        "n_skipped_members",
-        "n_explicit_galaxies",
-        "explicit_galaxy_ids",
-        "member_selection",
-        "scaling_band",
-        "mag0",
-        "n_staged_fits",
-        "par_path",
-        "obs_arcs_path",
-        "potfile_path",
-        "source_dir",
-    ]
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
 
 
 def validate_outputs(output_dir: str | Path = DEFAULT_OUTPUT_DIR, clusters: list[str] | None = None) -> list[dict[str, str | int]]:

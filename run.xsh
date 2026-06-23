@@ -10,7 +10,7 @@ $JAX_NUM_CPU_DEVICES = cores
 
 PYTHON = "/home/dutra/.conda/envs/lenstronomy/bin/python"
 
-output_dir = f"jun22d_mag22_scatter_arespriors"
+output_dir = f"jun22fg_mag22_scatter_arespriors_ellipticity"
 
 HFF_RGB_BANDS = ["F435W", "F606W", "F814W", "F105W", "F125W", "F140W", "F160W"]
 HFF_RGB_DISPLAY = {"q": 6.4, "stretch": 0.0145, "minimum": -5.5e-4, "red_gain": 0.47, "green_gain": 0.91, "blue_gain": 3.95}
@@ -69,9 +69,9 @@ BERGAMINI_CLUSTERS = {
         "image_catalog_family_cutout_image_scale": "auto",
         "image_catalog_family_cutout_bands": ["F435W", "F606W", "F814W"],
         "image_catalog_family_cutout_rgb": dict(FF_RGB_DISPLAY),
-        "kappa_true_fits": "data/ff_sims/ares/kappa_z9_0.fits",
-        "gammax_true_fits": "data/ff_sims/ares/gammax_z9_0.fits",
-        "gammay_true_fits": "data/ff_sims/ares/gammay_z9_0.fits",
+        "kappa_true_fits": "data/ff_sims/published/ares/kappa_z9_0.fits",
+        "gammax_true_fits": "data/ff_sims/published/ares/gammax_z9_0.fits",
+        "gammay_true_fits": "data/ff_sims/published/ares/gammay_z9_0.fits",
     },
     "HERA": {
         "cluster_key": "hera",
@@ -81,9 +81,9 @@ BERGAMINI_CLUSTERS = {
         "image_catalog_family_cutout_image_scale": "auto",
         "image_catalog_family_cutout_bands": ["F435W", "F606W", "F814W"],
         "image_catalog_family_cutout_rgb": dict(FF_RGB_DISPLAY),
-        "kappa_true_fits": "data/ff_sims/hera/kappa_z9_0.fits",
-        "gammax_true_fits": "data/ff_sims/hera/gammax_z9_0.fits",
-        "gammay_true_fits": "data/ff_sims/hera/gammay_z9_0.fits",
+        "kappa_true_fits": "data/ff_sims/published/hera/kappa_z9_0.fits",
+        "gammax_true_fits": "data/ff_sims/published/hera/gammax_z9_0.fits",
+        "gammay_true_fits": "data/ff_sims/published/hera/gammay_z9_0.fits",
     },
 }
 CLUSTER_ALIASES = {}
@@ -122,7 +122,7 @@ stage2_forward_modes = {
     "critical_arc": "critical-arc",
 }
 stage2_forward_mode = stage2_forward_modes[mode]
-stage1_likelihood = "local-jacobian"
+stage1_likelihood = "source" #"local-jacobian"
 
 run_name = f"{cluster_config['cluster_key']}_S1{stage1_likelihood}_S2{mode}"
 fit_mode = "sequential"
@@ -149,8 +149,8 @@ if mode != "none":
 
 
 
-perturbation_discovery_alpha_tol_arcsec = 0.1
-perturbation_discovery_jacobian_tol = 0.3
+perturbation_discovery_alpha_tol_arcsec = 0.2
+perturbation_discovery_jacobian_tol = 0.5
 perturbation_discovery_jacobian_weight = 1.0
 
 exact_image_diagnostics_stage2 = True
@@ -333,7 +333,7 @@ OUTPUT_DIR = f"{OUTPUT_DIR}_PD{perturbation_discovery_alpha_tol_arcsec:g}_{pertu
 
 _run_start_monotonic = time.monotonic()
 try:
-    @(PYTHON) -m lenscluster.cluster_solver --resume fast \
+    @(PYTHON) -m lenscluster.cluster_solver --resume all \
       --par-path @(PAR_PATH) \
       --output-dir @(OUTPUT_DIR) \
       --run-name @(run_name) \

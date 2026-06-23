@@ -182,7 +182,8 @@ DEFAULT_TARGET_ACCEPT = 0.85
 DEFAULT_MAX_TREE_DEPTH = 10
 BEST_VALUE_MAP = "map"
 BEST_VALUE_MAXIMUM_LIKELIHOOD = "maximum-likelihood"
-BEST_VALUE_CHOICES = (BEST_VALUE_MAP, BEST_VALUE_MAXIMUM_LIKELIHOOD)
+BEST_VALUE_MEDIAN = "median"
+BEST_VALUE_CHOICES = (BEST_VALUE_MAP, BEST_VALUE_MAXIMUM_LIKELIHOOD, BEST_VALUE_MEDIAN)
 DEFAULT_BEST_VALUE = BEST_VALUE_MAP
 DEFAULT_INITIAL_STEP_SIZE = 1.0e-3
 DEFAULT_ACTIVE_SCALING_GALAXIES = 64
@@ -300,6 +301,10 @@ DEFAULT_SCALING_SCATTER_PRIOR_LOG_SIGMA = 0.5
 DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN = 0.10
 DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN = 0.20
 DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA = 0.25
+DEFAULT_INDEPENDENT_SCALING_FREE_E_STD = 0.25
+DEFAULT_INDEPENDENT_SCALING_FREE_E_CENTER_CLIP = 0.30
+DEFAULT_INDEPENDENT_SCALING_FREE_E_LOWER = -0.35
+DEFAULT_INDEPENDENT_SCALING_FREE_E_UPPER = 0.35
 DEFAULT_SOLVER_POTFILE_SIGMA_REF_MEAN = 100.0
 DEFAULT_SOLVER_POTFILE_SIGMA_REF_STD = 40.0
 DEFAULT_SOLVER_POTFILE_SIGMA_REF_LOWER = 20.0
@@ -802,6 +807,23 @@ def _check_physical_sample_matrix(
     _log(None, message)
 
 
+def _finite_columnwise_median(samples: np.ndarray) -> np.ndarray | None:
+    sample_matrix = np.asarray(samples, dtype=float)
+    if sample_matrix.ndim != 2 or sample_matrix.shape[0] == 0:
+        return None
+    medians: list[float] = []
+    for col_index in range(sample_matrix.shape[1]):
+        column = sample_matrix[:, col_index]
+        finite = column[np.isfinite(column)]
+        if finite.size == 0:
+            return None
+        medians.append(float(np.median(finite)))
+    median = np.asarray(medians, dtype=float)
+    if median.shape != (sample_matrix.shape[1],) or not np.all(np.isfinite(median)):
+        return None
+    return median
+
+
 def _posterior_results_to_physical(results: PosteriorResults, parameter_specs: list[ParameterSpec]) -> PosteriorResults:
     # PosteriorResults are kept in latent space during inference and converted once here for output/reporting.
     grouped_samples = None
@@ -820,6 +842,18 @@ def _posterior_results_to_physical(results: PosteriorResults, parameter_specs: l
             return np.asarray(converted_samples[index], dtype=float)
         return None
 
+    def _candidate_fit_from_vector(vector: np.ndarray | None) -> np.ndarray | None:
+        if vector is None:
+            return None
+        arr = np.asarray(vector, dtype=float).reshape(-1)
+        if arr.size != len(parameter_specs) or not np.all(np.isfinite(arr)):
+            return None
+        return _convert_sample_matrix_to_physical(arr.reshape(1, -1), parameter_specs).reshape(-1)
+
+    median_fit = _candidate_fit_from_vector(results.median_fit)
+    if median_fit is None:
+        median_fit = _finite_columnwise_median(converted_samples)
+
     converted = replace(
         results,
         samples=converted_samples,
@@ -829,6 +863,7 @@ def _posterior_results_to_physical(results: PosteriorResults, parameter_specs: l
         ns_diagnostics=ns_diagnostics,
         map_fit=_candidate_fit_from_index("map_sample_index"),
         maximum_likelihood_fit=_candidate_fit_from_index("maximum_likelihood_sample_index"),
+        median_fit=median_fit,
     )
     _check_physical_sample_matrix(converted.samples, parameter_specs, context="posterior.samples")
     _check_physical_sample_matrix(converted.grouped_samples, parameter_specs, context="posterior.grouped_samples")
@@ -967,7 +1002,7 @@ def _maybe_convert_loaded_posterior_arrays_to_physical(
         return normalized, False
     converted = dict(normalized)
     converted["samples"] = _convert_sample_matrix_to_physical(np.asarray(normalized["samples"], dtype=float), parameter_specs)
-    for key in ("map_fit", "maximum_likelihood_fit"):
+    for key in ("map_fit", "maximum_likelihood_fit", "median_fit"):
         if key in normalized:
             converted[key] = _convert_sample_matrix_to_physical(
                 np.asarray(normalized[key], dtype=float).reshape(1, -1),
@@ -1168,8 +1203,9 @@ def _parse_args() -> argparse.Namespace:
         choices=BEST_VALUE_CHOICES,
         default=DEFAULT_BEST_VALUE,
         help=(
-            "Posterior sample used as the selected realization for validation and lensing plots. "
-            "'map' uses max posterior log probability; 'maximum-likelihood' uses max source/image likelihood."
+            "Posterior value used as the selected realization for validation and lensing plots. "
+            "'map' uses max posterior log probability; 'maximum-likelihood' uses max source/image "
+            "likelihood; 'median' uses the elementwise posterior median in physical parameter space."
         ),
     )
     parser.add_argument(
@@ -2519,6 +2555,8 @@ def _log_state_summary(args: argparse.Namespace, state: BuildState) -> None:
     parameter_families = Counter(str(spec.component_family) for spec in state.parameter_specs)
     prior_kinds = Counter(str(spec.prior_kind) for spec in state.parameter_specs)
     transform_kinds = Counter(str(spec.transform_kind) for spec in state.parameter_specs)
+    sample_sites = _parameter_sample_sites(state.parameter_specs)
+    vector_sample_sites = sum(1 for site in sample_sites if len(site.indices) > 1)
     positive_transforms = sum(
         1 for spec in state.parameter_specs if str(spec.transform_kind) in {"log_positive", "log_offset_positive"}
     )
@@ -2547,7 +2585,7 @@ def _log_state_summary(args: argparse.Namespace, state: BuildState) -> None:
         (
             f"[parameters] total={len(state.parameter_specs)} by_family={_format_count_map(parameter_families)} "
             f"priors={_format_count_map(prior_kinds)} transforms={_format_count_map(transform_kinds)} "
-            f"positive={positive_transforms}"
+            f"positive={positive_transforms} sample_sites={len(sample_sites)} vector_sample_sites={vector_sample_sites}"
         ),
     )
     if potfile_rows:
@@ -10054,6 +10092,9 @@ def _perturbation_discovery_final_model_log_message(
         f"perturbation_discovery_final_strict_active={strict_active} "
         f"active_equals_independent={active_equals_independent} "
         f"sampled_free_members={int(counts.get('free_correction_candidates', 0))} "
+        f"inherited_member_shapes={int(rebuild_diag.get('member_shape_inherited', 0))} "
+        f"sampled_free_shapes={int(rebuild_diag.get('member_shape_sampled_free', 0))} "
+        f"fixed_inactive_shapes={int(rebuild_diag.get('member_shape_fixed_inactive', 0))} "
         f"old_parameters={int(old_parameter_count)} "
         f"new_parameters={int(new_parameter_count)}"
     )
@@ -10204,6 +10245,75 @@ def _source_position_prior_values_from_state(state: BuildState) -> dict[str, tup
     return priors
 
 
+def _component_e1e2_from_state(
+    state: BuildState,
+    physical_theta: np.ndarray,
+    component_index: int,
+) -> tuple[float, float]:
+    spec = state.packed_lens_spec
+    component = int(component_index)
+    e1 = float(np.asarray(spec.e1_base, dtype=float)[component])
+    e2 = float(np.asarray(spec.e2_base, dtype=float)[component])
+    e1_param_index = int(np.asarray(spec.e1_param_index, dtype=np.int32)[component])
+    e2_param_index = int(np.asarray(spec.e2_param_index, dtype=np.int32)[component])
+    theta = np.asarray(physical_theta, dtype=float).reshape(-1)
+    if e1_param_index >= 0:
+        if e1_param_index >= theta.size or not np.isfinite(float(theta[e1_param_index])):
+            raise ValueError(f"Cannot inherit member e1: invalid parameter index {e1_param_index}.")
+        e1 = float(theta[e1_param_index])
+    if e2_param_index >= 0:
+        if e2_param_index >= theta.size or not np.isfinite(float(theta[e2_param_index])):
+            raise ValueError(f"Cannot inherit member e2: invalid parameter index {e2_param_index}.")
+        e2 = float(theta[e2_param_index])
+    if not (np.isfinite(e1) and np.isfinite(e2)):
+        raise ValueError(f"Cannot inherit non-finite member shape for component {component}.")
+    return e1, e2
+
+
+def _member_shape_values_from_state(
+    state: BuildState,
+    theta: np.ndarray,
+    *,
+    theta_is_physical: bool = False,
+) -> list[dict[int, tuple[float, float]]]:
+    physical_theta = (
+        np.asarray(theta, dtype=float)
+        if theta_is_physical
+        else _convert_theta_to_physical(np.asarray(theta, dtype=float), list(getattr(state, "parameter_specs", [])))
+    )
+    shape_values: list[dict[int, tuple[float, float]]] = [dict() for _ in getattr(state, "potfiles", [])]
+    records = list(getattr(state, "scaling_component_records", []))
+    for record in records:
+        potfile_order = int(record.get("potfile_order", -1))
+        row_index = int(record.get("catalog_row_index", -1))
+        if not (0 <= potfile_order < len(shape_values) and row_index >= 0):
+            continue
+        free_component_index = int(record.get("free_component_index", -1))
+        component_index = (
+            free_component_index
+            if free_component_index >= 0
+            else int(record.get("component_index", -1))
+        )
+        if component_index < 0:
+            raise ValueError(
+                "Cannot inherit member ellipticity: missing component index for "
+                f"potfile_order={potfile_order} catalog_row_index={row_index}."
+            )
+        shape_values[potfile_order][row_index] = _component_e1e2_from_state(
+            state,
+            physical_theta,
+            component_index,
+        )
+    expected = int(len(records))
+    found = int(sum(len(values) for values in shape_values))
+    if found != expected:
+        raise ValueError(
+            "Cannot inherit member ellipticity: recovered "
+            f"{found} shapes for {expected} scaling records."
+        )
+    return shape_values
+
+
 def _rebuild_perturbation_discovery_state_from_union(
     args: argparse.Namespace,
     old_state: BuildState,
@@ -10215,6 +10325,7 @@ def _rebuild_perturbation_discovery_state_from_union(
     normalized = _normalize_selected_by_potfile(selected_by_potfile, len(getattr(old_state, "potfiles", [])))
     old_components = _selected_component_set_from_state(old_state)
     source_position_prior_values = _source_position_prior_values_from_state(old_state)
+    member_shape_values = _member_shape_values_from_state(old_state, old_theta)
     new_state = _build_state_from_inputs(
         args,
         fit_mode_override=str(getattr(old_state, "fit_mode", getattr(args, "fit_mode", FIT_MODE_JOINT))),
@@ -10222,6 +10333,7 @@ def _rebuild_perturbation_discovery_state_from_union(
         source_position_prior_values=source_position_prior_values,
         frozen_active_scaling_component_indices=getattr(old_state, "frozen_active_scaling_component_indices", None),
         perturbation_discovery_independent_override_by_potfile=normalized,
+        member_shape_values_by_potfile=member_shape_values,
     )
     requested_components = _selected_by_potfile_component_set(new_state, normalized)
     if str(reason) == "perturbation_discovery_final":
@@ -10265,6 +10377,11 @@ def _rebuild_perturbation_discovery_state_from_union(
         "requested_components": int(len(requested_components)),
         "counts_by_potfile": _selected_by_potfile_counts(new_state, normalized),
         "source_position_prior_families": int(len(source_position_prior_values or {})),
+        "member_shape_inherited": int(sum(len(values) for values in member_shape_values)),
+        "member_shape_sampled_free": int(sum(len(values) for values in normalized)),
+        "member_shape_fixed_inactive": int(
+            max(sum(len(values) for values in member_shape_values) - sum(len(values) for values in normalized), 0)
+        ),
         "strict_active": bool(strict_diag.get("strict_active", False)),
         "active_equals_independent": bool(strict_diag.get("active_equals_independent", False)),
         **{f"theta_transfer_{key}": value for key, value in transfer_diag.items()},
@@ -11306,6 +11423,17 @@ def _maximum_likelihood_best_fit_candidate(
     return np.asarray(samples[best_index], dtype=float), best_index, float(source_loglike[best_index]), sample_log_prob
 
 
+def _posterior_median_best_fit_candidate(
+    evaluator: Any,
+    posterior: PosteriorResults,
+) -> tuple[np.ndarray, float | None] | None:
+    samples = np.asarray(posterior.samples, dtype=float)
+    median_fit = _finite_columnwise_median(samples)
+    if median_fit is None:
+        return None
+    return median_fit, _safe_source_loglike(evaluator, median_fit)
+
+
 def _select_best_fit_from_posterior(
     args: argparse.Namespace,
     evaluator: Any,
@@ -11346,6 +11474,19 @@ def _select_best_fit_from_posterior(
         diagnostics["max_likelihood_source_loglike"] = float(ml_loglike)
         diagnostics["max_likelihood_sample_log_prob"] = ml_log_prob
 
+    median_candidate = _posterior_median_best_fit_candidate(evaluator, posterior)
+    if median_candidate is None:
+        posterior.median_fit = None
+        diagnostics["median_sample_index"] = None
+        diagnostics["median_sample_log_prob"] = None
+        diagnostics["median_source_loglike"] = None
+    else:
+        median_fit, median_source_loglike = median_candidate
+        posterior.median_fit = np.asarray(median_fit, dtype=float)
+        diagnostics["median_sample_index"] = None
+        diagnostics["median_sample_log_prob"] = None
+        diagnostics["median_source_loglike"] = median_source_loglike
+
     selected_kind = requested
     selected_fit: np.ndarray | None = None
     selected_index: int | None = None
@@ -11357,6 +11498,10 @@ def _select_best_fit_from_posterior(
         selected_fit, selected_index, selected_log_prob = map_candidate
     elif requested == BEST_VALUE_MAXIMUM_LIKELIHOOD and ml_candidate is not None:
         selected_fit, selected_index, selected_source_loglike, selected_log_prob = ml_candidate
+    elif requested == BEST_VALUE_MEDIAN and median_candidate is not None:
+        selected_fit, selected_source_loglike = median_candidate
+        selected_index = None
+        selected_log_prob = None
     else:
         fallback_reason = f"requested_{requested}_unavailable"
         if map_candidate is not None:
@@ -15767,6 +15912,8 @@ def _build_independent_scaling_parameter_specs(
     selected_by_potfile: list[set[int]],
     *,
     start_index: int,
+    shape_selected_by_potfile: list[set[int]] | None = None,
+    member_shape_values_by_potfile: list[dict[int, tuple[float, float]]] | None = None,
     log_sigma_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
     log_mass_tau_prior_median: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
     log_tau_prior_sigma: float = DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
@@ -15779,6 +15926,20 @@ def _build_independent_scaling_parameter_specs(
     tau_prior_sigma = float(log_tau_prior_sigma)
     specs: list[ParameterSpec] = []
     indices_by_potfile: list[dict[int, dict[str, int]]] = []
+    if shape_selected_by_potfile is None:
+        shape_selected_by_potfile = selected_by_potfile
+    member_shape_values_by_potfile = member_shape_values_by_potfile or [{} for _ in potfiles]
+
+    def _catalog_shape_e1e2(catalog_df: pd.DataFrame, row_index: int) -> tuple[float, float]:
+        if {"catalog_a", "catalog_b", "catalog_theta"}.issubset(catalog_df.columns):
+            row = catalog_df.iloc[int(row_index)]
+            ellipticite, angle_pos = _catalog_shape_to_ellipticity(
+                float(row["catalog_a"]),
+                float(row["catalog_b"]),
+                float(row["catalog_theta"]),
+            )
+            return _lenstool_shape_to_e1e2(ellipticite, angle_pos)
+        return 0.0, 0.0
 
     def _unit_delta_spec(
         *,
@@ -15830,8 +15991,14 @@ def _build_independent_scaling_parameter_specs(
 
     for potfile_order, potfile in enumerate(potfiles):
         selected_rows = sorted(selected_by_potfile[potfile_order]) if potfile_order < len(selected_by_potfile) else []
+        shape_rows = (
+            sorted(shape_selected_by_potfile[potfile_order])
+            if potfile_order < len(shape_selected_by_potfile)
+            else selected_rows
+        )
+        all_rows = sorted({int(row_index) for row_index in selected_rows} | {int(row_index) for row_index in shape_rows})
         row_indices: dict[int, dict[str, int]] = {}
-        if not selected_rows:
+        if not all_rows:
             indices_by_potfile.append(row_indices)
             continue
         potfile_id = str(potfile["id"])
@@ -15842,15 +16009,17 @@ def _build_independent_scaling_parameter_specs(
             "independent_free_log_mass_delta_unit": _sample_name(potfile_id, "independent_free_log_mass_delta_unit"),
         }
         tau_indices: dict[str, int] = {}
-        for field_name, median in (
-            ("independent_free_log_sigma_tau", tau_medians[0]),
-            ("independent_free_log_mass_tau", tau_medians[1]),
-        ):
-            tau_indices[field_name] = start_index + len(specs)
-            specs.append(_tau_spec(potfile_id=potfile_id, field_name=field_name, median=float(median)))
+        if selected_rows:
+            for field_name, median in (
+                ("independent_free_log_sigma_tau", tau_medians[0]),
+                ("independent_free_log_mass_tau", tau_medians[1]),
+            ):
+                tau_indices[field_name] = start_index + len(specs)
+                specs.append(_tau_spec(potfile_id=potfile_id, field_name=field_name, median=float(median)))
         for site_index, row_index in enumerate(selected_rows):
             catalog_id = str(catalog_ids[int(row_index)])
-            row_lookup = dict(tau_indices)
+            row_lookup = row_indices.setdefault(int(row_index), {})
+            row_lookup.update(tau_indices)
             for field_name in (
                 "independent_free_log_sigma_delta_unit",
                 "independent_free_log_mass_delta_unit",
@@ -15867,7 +16036,54 @@ def _build_independent_scaling_parameter_specs(
                     )
                 )
                 row_lookup[field_name] = index
-            row_indices[int(row_index)] = row_lookup
+        e_lower = float(DEFAULT_INDEPENDENT_SCALING_FREE_E_LOWER)
+        e_upper = float(DEFAULT_INDEPENDENT_SCALING_FREE_E_UPPER)
+        e_center_clip = float(DEFAULT_INDEPENDENT_SCALING_FREE_E_CENTER_CLIP)
+        e_std = float(DEFAULT_INDEPENDENT_SCALING_FREE_E_STD)
+        shape_site_name = _sample_name(potfile_id, "independent_free_e_shape")
+        for shape_site_row, row_index in enumerate(shape_rows):
+            catalog_id = str(catalog_ids[int(row_index)])
+            shape_override = (
+                member_shape_values_by_potfile[potfile_order].get(int(row_index))
+                if potfile_order < len(member_shape_values_by_potfile)
+                else None
+            )
+            catalog_e1, catalog_e2 = (
+                (float(shape_override[0]), float(shape_override[1]))
+                if shape_override is not None
+                else _catalog_shape_e1e2(catalog_df, int(row_index))
+            )
+            row_lookup = row_indices.setdefault(int(row_index), {})
+            for field_name, catalog_value in (
+                ("independent_free_e1", catalog_e1),
+                ("independent_free_e2", catalog_e2),
+            ):
+                index = start_index + len(specs)
+                mean = float(np.clip(float(catalog_value), -e_center_clip, e_center_clip))
+                specs.append(
+                    ParameterSpec(
+                        name=f"{potfile_id}.{catalog_id}.{field_name}",
+                        sample_name=_sample_name(f"{potfile_id}.{catalog_id}", field_name),
+                        potential_id=potfile_id,
+                        profile_type=DP_IE_PROFILE,
+                        field=field_name,
+                        prior_kind="truncated_normal",
+                        lower=e_lower,
+                        upper=e_upper,
+                        step=0.05,
+                        mean=mean,
+                        std=e_std,
+                        component_family="independent_scaling",
+                        transform_kind="identity",
+                        physical_lower=e_lower,
+                        physical_upper=e_upper,
+                        physical_mean=mean,
+                        physical_std=e_std,
+                        sample_site_name=shape_site_name,
+                        sample_site_index=2 * shape_site_row + (0 if field_name == "independent_free_e1" else 1),
+                    )
+                )
+                row_lookup[field_name] = index
         indices_by_potfile.append(row_indices)
     return specs, indices_by_potfile
 
@@ -16488,11 +16704,16 @@ def _build_packed_lens_spec(
         component_family[idx] = int(component.get("component_family_code", COMPONENT_FAMILY_LARGE))
         x_center_base[idx] = float(component.get("x_centre", 0.0))
         y_center_base[idx] = float(component.get("y_centre", 0.0))
+        if "e1_base" in component or "e2_base" in component:
+            e1_base[idx] = float(component.get("e1_base", 0.0))
+            e2_base[idx] = float(component.get("e2_base", 0.0))
+        else:
+            angle_pos = float(component.get("angle_pos", 0.0))
+            e1_base[idx], e2_base[idx] = _lenstool_shape_to_e1e2(
+                float(component.get("ellipticite", 0.0)),
+                angle_pos,
+            )
         angle_pos = float(component.get("angle_pos", 0.0))
-        e1_base[idx], e2_base[idx] = _lenstool_shape_to_e1e2(
-            float(component.get("ellipticite", 0.0)),
-            angle_pos,
-        )
         gamma1_base[idx], gamma2_base[idx] = _shear_polar_to_gamma1gamma2(
             float(component.get("gamma", 0.0)),
             angle_pos,
@@ -16624,6 +16845,7 @@ def _build_scaling_components(
     independent_rank_info: dict[tuple[int, int], dict[str, Any]] | None,
     start_component_index: int,
     kpc_per_arcsec: float = 1.0,
+    member_shape_values_by_potfile: list[dict[int, tuple[float, float]]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[list[tuple[str, int]]], list[dict[str, Any]], list[dict[str, Any]]]:
     _, ra0_deg, dec0_deg = reference
     components: list[dict[str, Any]] = []
@@ -16633,6 +16855,7 @@ def _build_scaling_components(
     scaling_scatter_indices = scaling_scatter_indices or [{} for _ in potfiles]
     independent_scaling_indices = independent_scaling_indices or [{} for _ in potfiles]
     independent_rank_info = independent_rank_info or {}
+    member_shape_values_by_potfile = member_shape_values_by_potfile or [{} for _ in potfiles]
     for potfile_order, (
         potfile,
         param_index_lookup,
@@ -16675,8 +16898,38 @@ def _build_scaling_components(
         gamma_ml_base_value = DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN
         for row_index, row in enumerate(catalog_df.itertuples(index=False)):
             ellipticite, angle_pos = _catalog_shape_to_ellipticity(row.catalog_a, row.catalog_b, row.catalog_theta)
+            direct_shape = (
+                member_shape_values_by_potfile[potfile_order].get(int(row_index))
+                if potfile_order < len(member_shape_values_by_potfile)
+                else None
+            )
+            if member_shape_values_by_potfile and any(member_shape_values_by_potfile) and direct_shape is None:
+                raise ValueError(
+                    "Missing inherited member ellipticity for "
+                    f"potfile_order={potfile_order} catalog_row_index={row_index}; "
+                    "stage1/stage2 production must inherit all member shapes from the previous stage."
+                )
+            direct_shape_payload = (
+                {"e1_base": float(direct_shape[0]), "e2_base": float(direct_shape[1])}
+                if direct_shape is not None
+                else {}
+            )
             component_index = start_component_index + len(components)
             independent_lookup = independent_index_lookup.get(int(row_index), {})
+            has_free_residual = "independent_free_log_sigma_delta_unit" in independent_lookup
+            shape_assignments = [
+                (field_name, int(independent_lookup[field_name]))
+                for field_name in ("independent_free_e1", "independent_free_e2")
+                if field_name in independent_lookup
+            ]
+            scaling_shape_assignments = [] if has_free_residual else [
+                ("e1" if field_name == "independent_free_e1" else "e2", index)
+                for field_name, index in shape_assignments
+            ]
+            free_shape_assignments = [
+                ("e1" if field_name == "independent_free_e1" else "e2", index)
+                for field_name, index in shape_assignments
+            ]
             components.append(
                 {
                     "id": f"{potfile['id']}.{row.id}",
@@ -16690,11 +16943,12 @@ def _build_scaling_components(
                     "v_disp": float(potfile["sigma_nominal"]),
                     "z_lens": float(potfile["zlens"]),
                     "component_family_code": COMPONENT_FAMILY_SCALING,
+                    **direct_shape_payload,
                 }
             )
-            assignments.append([])
+            assignments.append(scaling_shape_assignments)
             free_component_index = -1
-            branch_role = INDEPENDENT_BRANCH_SCALING if independent_lookup else INDEPENDENT_BRANCH_NONE
+            branch_role = INDEPENDENT_BRANCH_SCALING if has_free_residual else INDEPENDENT_BRANCH_NONE
             scaling_component_assignments.append(
                 {
                     "component_index": component_index,
@@ -16715,7 +16969,7 @@ def _build_scaling_components(
                     "independent_magnitude_feature": float(magnitude_feature[row_index]),
                 }
             )
-            if independent_lookup:
+            if has_free_residual:
                 free_component_index = start_component_index + len(components)
                 components.append(
                     {
@@ -16747,9 +17001,10 @@ def _build_scaling_components(
                         "independent_free_log_mass_delta_unit_param_index": int(independent_lookup.get("independent_free_log_mass_delta_unit", -1)),
                         "independent_free_log_sigma_tau_param_index": int(independent_lookup.get("independent_free_log_sigma_tau", -1)),
                         "independent_free_log_mass_tau_param_index": int(independent_lookup.get("independent_free_log_mass_tau", -1)),
+                        **direct_shape_payload,
                     }
                 )
-                assignments.append([])
+                assignments.append(free_shape_assignments)
             rank_item = independent_rank_info.get((int(potfile_order), int(row_index)), {})
             scaling_component_records.append(
                 {
@@ -16763,7 +17018,7 @@ def _build_scaling_components(
                     "independent_magnitude_feature": float(magnitude_feature[row_index]),
                     "x_centre": float(x_offsets[row_index]),
                     "y_centre": float(y_offsets[row_index]),
-                    "selected_independent": bool(independent_lookup),
+                    "selected_independent": bool(has_free_residual),
                     "free_component_index": int(free_component_index),
                     "independent_rank": int(rank_item["rank"]) if rank_item else None,
                     "independent_importance": float(rank_item["importance"]) if rank_item else None,
@@ -25002,6 +25257,16 @@ def _save_plot_bundle_h5(
                 continue
             if samples.ndim == 2 and 0 <= sample_index < samples.shape[0]:
                 posterior_group.create_dataset(dataset_name, data=np.asarray(samples[sample_index], dtype=float))
+        median_fit = None
+        if results.median_fit is not None:
+            median_fit = np.asarray(results.median_fit, dtype=float).reshape(-1)
+        if median_fit is None or median_fit.size == 0 and samples.ndim == 2 and samples.shape[1] > 0:
+            median_fit = _finite_columnwise_median(samples)
+        if median_fit is not None:
+            median_fit = np.asarray(median_fit, dtype=float).reshape(-1)
+            expected_size = int(samples.shape[1]) if samples.ndim == 2 else median_fit.size
+            if median_fit.size == expected_size and np.all(np.isfinite(median_fit)):
+                posterior_group.create_dataset("median_fit", data=median_fit)
         posterior_group.attrs["best_value"] = str(diagnostics.get("best_value_selected", getattr(args, "best_value", DEFAULT_BEST_VALUE)))
         posterior_group.attrs["best_value_requested"] = str(
             diagnostics.get("best_value_requested", getattr(args, "best_value", DEFAULT_BEST_VALUE))
@@ -25398,6 +25663,18 @@ def _physical_best_fit_values_from_artifacts(artifacts_dir: Path) -> dict[str, f
             f"does not match {len(state.parameter_specs)} parameters."
         )
     return {spec.sample_name: float(best_fit[idx]) for idx, spec in enumerate(state.parameter_specs)}
+
+
+def _member_shape_values_from_artifacts(artifacts_dir: Path) -> list[dict[int, tuple[float, float]]]:
+    state, _cli_args, arrays, init_diagnostics = _load_artifacts(artifacts_dir)
+    arrays, _converted = _maybe_convert_loaded_posterior_arrays_to_physical(arrays, state.parameter_specs, init_diagnostics)
+    best_fit = np.asarray(arrays["best_fit"], dtype=float)
+    if best_fit.shape[0] != len(state.parameter_specs):
+        raise ValueError(
+            f"Cannot inherit member shapes from {artifacts_dir}: best_fit length {best_fit.shape[0]} "
+            f"does not match {len(state.parameter_specs)} parameters."
+        )
+    return _member_shape_values_from_state(state, best_fit, theta_is_physical=True)
 
 
 def _selected_independent_by_potfile_from_artifacts(artifacts_dir: Path) -> list[set[int]]:
@@ -25933,6 +26210,7 @@ def _build_state_from_inputs(
     frozen_active_scaling_source_run_dir: str | Path | None = None,
     frozen_active_scaling_source_path: str | Path | None = None,
     perturbation_discovery_independent_override_by_potfile: list[set[int]] | None = None,
+    member_shape_values_by_potfile: list[dict[int, tuple[float, float]]] | None = None,
 ) -> BuildState:
     fit_mode = fit_mode_override or args.fit_mode
     model_fit_mode = FIT_MODE_JOINT if fit_mode == FIT_MODE_EVIDENCE_NS else fit_mode
@@ -26049,9 +26327,15 @@ def _build_state_from_inputs(
                 args,
                 (
                     "[input] perturbation_discovery_independent_candidates={} "
-                    "total=0 source=stage0-scaling-only-full-flat"
+                    "total=0 source=stage0-scaling-only-full-flat shape_sampling=all_members"
                 ),
             )
+        shape_selected_by_potfile = (
+            [set(range(len(potfile["catalog_df"]))) for potfile in potfiles]
+            if bool(getattr(args, "perturbation_discovery_stage0", False))
+            else active_selected_by_potfile
+        )
+        inherited_member_shape_values = member_shape_values_by_potfile or [{} for _ in potfiles]
         if active_selected_counts:
             _log(
                 args,
@@ -26082,6 +26366,8 @@ def _build_state_from_inputs(
             potfiles,
             active_selected_by_potfile,
             start_index=len(parameter_specs),
+            shape_selected_by_potfile=shape_selected_by_potfile,
+            member_shape_values_by_potfile=inherited_member_shape_values,
             log_sigma_tau_prior_median=float(
                 getattr(
                     args,
@@ -26114,6 +26400,7 @@ def _build_state_from_inputs(
             active_rank_info,
             start_component_index=len(base_components),
             kpc_per_arcsec=scaling_kpc_per_arcsec,
+            member_shape_values_by_potfile=inherited_member_shape_values,
         )
         component_param_assignments.extend(scaling_assignments)
         lens_model_list.extend([ORIGINAL_DPIE_PROFILE_NAME for _ in scaling_components])
@@ -27994,6 +28281,15 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                         "perturbation_discovery_final_active_equals_independent": bool(
                             final_rebuild_diag.get("active_equals_independent", False)
                         ),
+                        "perturbation_discovery_final_member_shape_inherited": int(
+                            final_rebuild_diag.get("member_shape_inherited", 0)
+                        ),
+                        "perturbation_discovery_final_member_shape_sampled_free": int(
+                            final_rebuild_diag.get("member_shape_sampled_free", 0)
+                        ),
+                        "perturbation_discovery_final_member_shape_fixed_inactive": int(
+                            final_rebuild_diag.get("member_shape_fixed_inactive", 0)
+                        ),
                         **_perturbation_discovery_svi_final_diagnostics(
                             final_union_diag,
                             final_rebuild_diag,
@@ -28557,6 +28853,7 @@ def _rerender_plots(
             if "maximum_likelihood_fit" in arrays
             else None
         ),
+        median_fit=np.asarray(arrays["median_fit"], dtype=float) if "median_fit" in arrays else None,
     )
     _log_posterior_summary(args, "plots_only_loaded", posterior)
     plot_start = time.time()
@@ -28803,6 +29100,7 @@ def _run_single_stage(
     source_position_prior_values: dict[str, tuple[float, float]] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
     perturbation_discovery_independent_override_by_potfile: list[set[int]] | None = None,
+    member_shape_values_by_potfile: list[dict[int, tuple[float, float]]] | None = None,
     frozen_active_scaling_source_run_dir: str | Path | None = None,
     require_frozen_active_scaling: bool = False,
 ) -> Path:
@@ -28842,6 +29140,7 @@ def _run_single_stage(
             perturbation_discovery_independent_override_by_potfile=(
                 perturbation_discovery_independent_override_by_potfile
             ),
+            member_shape_values_by_potfile=member_shape_values_by_potfile,
         ),
         detail=f"fit_mode={fit_mode}",
     )
@@ -28872,6 +29171,7 @@ def _run_single_stage_spawn_worker(
     source_position_prior_values: dict[str, tuple[float, float]] | None,
     previous_stage_best_values: dict[str, float] | None,
     perturbation_discovery_independent_override_by_potfile: list[set[int]] | None,
+    member_shape_values_by_potfile: list[dict[int, tuple[float, float]]] | None,
     frozen_active_scaling_source_run_dir: str | Path | None,
     require_frozen_active_scaling: bool,
 ) -> None:
@@ -28888,6 +29188,7 @@ def _run_single_stage_spawn_worker(
             perturbation_discovery_independent_override_by_potfile=(
                 perturbation_discovery_independent_override_by_potfile
             ),
+            member_shape_values_by_potfile=member_shape_values_by_potfile,
             frozen_active_scaling_source_run_dir=frozen_active_scaling_source_run_dir,
             require_frozen_active_scaling=require_frozen_active_scaling,
         )
@@ -28910,6 +29211,7 @@ def _run_single_stage_in_fresh_process(
     source_position_prior_values: dict[str, tuple[float, float]] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
     perturbation_discovery_independent_override_by_potfile: list[set[int]] | None = None,
+    member_shape_values_by_potfile: list[dict[int, tuple[float, float]]] | None = None,
     frozen_active_scaling_source_run_dir: str | Path | None = None,
     require_frozen_active_scaling: bool = False,
 ) -> Path:
@@ -28935,6 +29237,7 @@ def _run_single_stage_in_fresh_process(
             source_position_prior_values,
             previous_stage_best_values,
             perturbation_discovery_independent_override_by_potfile,
+            member_shape_values_by_potfile,
             frozen_active_scaling_source_run_dir,
             require_frozen_active_scaling,
         ),
@@ -29229,6 +29532,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
     stage0_artifacts_dir = stage0_run_dir / "artifacts"
     stage0_init_values = _physical_best_fit_values_from_artifacts(stage0_artifacts_dir)
     stage0_selected_by_potfile = _selected_independent_by_potfile_from_artifacts(stage0_artifacts_dir)
+    stage0_member_shape_values = _member_shape_values_from_artifacts(stage0_artifacts_dir)
     stage0_selected_count = int(sum(len(values) for values in stage0_selected_by_potfile))
     _log(
         args,
@@ -29264,6 +29568,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
             svi_init_physical_values=stage0_init_values,
             previous_stage_best_values=stage0_init_values,
             perturbation_discovery_independent_override_by_potfile=stage0_selected_by_potfile,
+            member_shape_values_by_potfile=stage0_member_shape_values,
         )
 
     summary_payload: dict[str, Any] = {
@@ -29302,6 +29607,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
         stage2_init_artifacts = stage1_run_dir / "artifacts"
         stage2_init_values = _physical_best_fit_values_from_artifacts(stage2_init_artifacts)
         stage2_selected_by_potfile = _selected_independent_by_potfile_from_artifacts(stage2_init_artifacts)
+        stage2_member_shape_values = _member_shape_values_from_artifacts(stage2_init_artifacts)
         source_position_priors = _source_position_prior_values_from_artifacts(stage2_init_artifacts)
         stage2_runs_fresh = bool(getattr(args, "stage2_fresh_process", True)) and not fast_resume
         stage2_run_dir = maybe_run_stage(
@@ -29314,6 +29620,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
             source_position_prior_values=source_position_priors,
             previous_stage_best_values=stage2_init_values,
             perturbation_discovery_independent_override_by_potfile=stage2_selected_by_potfile,
+            member_shape_values_by_potfile=stage2_member_shape_values,
         )
         summary_payload["stage2_run_dir"] = str(stage2_run_dir)
         summary_payload["stage2_sample_likelihood_mode"] = str(stage2_likelihood)
@@ -29985,7 +30292,7 @@ def _main_dispatch(args: argparse.Namespace, stage_fit_controls: dict[str, Stage
 def main() -> None:
     try:
         args = _parse_args()
-        stage_fit_controls = _normalize_stage_fit_controls(args)
+        stage_fit_controls = {} if bool(getattr(args, "plots_only", False)) else _normalize_stage_fit_controls(args)
         if args.seed is not None:
             np.random.seed(args.seed)
         inferred_run_name = args.run_name

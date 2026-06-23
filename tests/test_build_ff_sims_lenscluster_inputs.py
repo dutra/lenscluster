@@ -21,8 +21,9 @@ spec.loader.exec_module(builder)
 
 
 def _write_ff_sims_fixture(root: Path) -> Path:
-    ares = root / "ares"
-    hera = root / "hera"
+    published = root / "published"
+    ares = published / "ares"
+    hera = published / "hera"
     ares.mkdir(parents=True)
     hera.mkdir(parents=True)
     ares.joinpath("multimages.txt").write_text(
@@ -102,7 +103,7 @@ def _write_ff_sims_fixture(root: Path) -> Path:
     for cluster_dir in (ares, hera):
         for band in ("f435w", "f606w", "f814w"):
             cluster_dir.joinpath(f"simulation_hst_{band}.fits").write_bytes(b"fixture")
-    return root
+    return published
 
 
 def _limit_block(par_text: str, component_id: str) -> str:
@@ -117,9 +118,9 @@ def _limit_line(par_text: str, component_id: str, field_name: str) -> str:
     raise AssertionError(f"missing {field_name} limit for {component_id}")
 
 
-def test_resolve_source_root_uses_first_existing_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_source_root_uses_default_published_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     source = _write_ff_sims_fixture(tmp_path / "source")
-    monkeypatch.setattr(builder, "DEFAULT_SOURCE_ROOT_CANDIDATES", (tmp_path / "missing", source))
+    monkeypatch.setattr(builder, "DEFAULT_SOURCE_ROOT", source)
 
     assert builder._resolve_source_root() == source
 
@@ -150,8 +151,8 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     rows = builder.render(source_root=source, output_dir=output)
 
     assert {row["cluster_key"] for row in rows} == {"ares", "hera"}
-    assert {row["cluster_key"]: row["n_skipped_members"] for row in rows} == {"ares": 0, "hera": 1}
-    assert {row["cluster_key"]: row["n_members"] for row in rows} == {"ares": 11, "hera": 10}
+    assert {row["cluster_key"]: row["n_skipped_members"] for row in rows} == {"ares": 0, "hera": 6}
+    assert {row["cluster_key"]: row["n_members"] for row in rows} == {"ares": 334, "hera": 334}
     assert {row["cluster_key"]: row["n_explicit_galaxies"] for row in rows} == {"ares": 0, "hera": 0}
     assert {row["cluster_key"]: row["explicit_galaxy_ids"] for row in rows} == {
         "ares": "",
@@ -162,29 +163,19 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
         "hera": "F814W<24.00",
     }
     assert {row["cluster_key"]: row["scaling_band"] for row in rows} == {"ares": "F160W", "hera": "F160W"}
-    assert {row["cluster_key"]: row["n_staged_fits"] for row in rows} == {"ares": 3, "hera": 3}
-    manifest = (output / "ff_sims_manifest.csv").read_text(encoding="utf-8").splitlines()
-    assert manifest[0].split(",")[:13] == [
-        "cluster_key",
-        "display_name",
-        "z_lens",
-        "n_images",
-        "n_image_families",
-        "n_members",
-        "n_skipped_members",
-        "n_explicit_galaxies",
-        "explicit_galaxy_ids",
-        "member_selection",
-        "scaling_band",
-        "mag0",
-        "n_staged_fits",
-    ]
+    assert {row["cluster_key"]: row["n_images"] for row in rows} == {"ares": 242, "hera": 65}
+    assert {row["cluster_key"]: row["n_image_families"] for row in rows} == {"ares": 85, "hera": 19}
+    assert {row["cluster_key"]: row["source_dir"] for row in rows} == {
+        "ares": str(source / "ares"),
+        "hera": str(source / "hera"),
+    }
+    assert not (output / "ff_sims_manifest.csv").exists()
     ares_image_lines = (output / "ares" / "ares_obs_arcs.cat").read_text(encoding="utf-8").splitlines()
     assert ares_image_lines[0] == "#REFERENCE 3"
     assert ares_image_lines[1].split()[:4] == ["1.a", "-10.00000000", "-2.00000000", "0.3734"]
     assert ares_image_lines[2].split()[0] == "1.b"
-    assert (output / "ares" / "simulation_hst_f435w.fits").is_file()
-    assert (output / "hera" / "simulation_hst_f814w.fits").is_file()
+    assert not list((output / "ares").glob("*.fits"))
+    assert not list((output / "hera").glob("*.fits"))
 
     ares_members = (output / "ares" / "ares_cluster_members_potfile.cat").read_text(encoding="utf-8").splitlines()
     assert ares_members[1] == "# FF-SIMS scaling-law member potfile generated from clgal_cat.txt."
@@ -210,6 +201,7 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     assert active_ares_member_lines[0].split()[:4] == ["1", "-5.00000000", "6.00000000", "1.00000000"]
     assert active_ares_member_lines[0].split()[6] == "18.000000"
     assert all(len(line.split()) == 9 for line in active_ares_member_lines)
+    assert all(line.split()[3:6] == ["1.00000000", "1.00000000", "0.0000"] for line in active_ares_member_lines)
     assert active_ares_member_lines[0].split()[8] == "1.000000"
 
     hera_members = (output / "hera" / "hera_cluster_members_potfile.cat").read_text(encoding="utf-8").splitlines()
@@ -218,6 +210,22 @@ def test_render_converts_catalogs_and_writes_loadable_pars(tmp_path: Path) -> No
     assert len(active_hera_member_lines) == 10
     assert [line.split()[0] for line in active_hera_member_lines] == ["1", "2", "3", "4", "60", "5", "6", "7", "8", "9"]
     assert {"1", "2", "3", "4", "5", "6"} <= {line.split()[0] for line in active_hera_member_lines}
+    assert active_hera_member_lines[0].split()[:6] == [
+        "1",
+        "9.00000000",
+        "1.00000000",
+        "0.90000000",
+        "0.45000000",
+        "35.0000",
+    ]
+    assert active_hera_member_lines[1].split()[:6] == [
+        "2",
+        "-2.00000000",
+        "3.00000000",
+        "1.00000000",
+        "1.00000000",
+        "0.0000",
+    ]
     assert active_hera_member_lines[4].split()[:6] == [
         "60",
         "-1.50000000",

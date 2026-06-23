@@ -245,6 +245,7 @@ class PosteriorResults:
     ns_diagnostics: dict[str, np.ndarray] | None = None
     map_fit: np.ndarray | None = None
     maximum_likelihood_fit: np.ndarray | None = None
+    median_fit: np.ndarray | None = None
 
 
 @dataclass(frozen=True)

@@ -2119,8 +2119,8 @@ def test_cluster_solver_parses_best_value(monkeypatch: pytest.MonkeyPatch) -> No
         "argv",
         ["cluster_solver", "--par-path", "input.par", "--best-value", "median"],
     )
-    with pytest.raises(SystemExit):
-        _parse_args()
+    args = _parse_args()
+    assert args.best_value == cluster_solver.BEST_VALUE_MEDIAN
 
 
 @pytest.mark.parametrize("flag", ["--scaling-scatter-fields", "--scaling-scatter-max"])
@@ -5256,7 +5256,12 @@ def test_perturbation_discovery_stage0_initial_build_keeps_members_on_scaling_re
     assert len(state.scaling_component_records) == 3
     assert not any(bool(record.get("selected_independent", False)) for record in state.scaling_component_records)
     independent_specs = [spec for spec in state.parameter_specs if spec.component_family == "independent_scaling"]
-    assert independent_specs == []
+    assert len(independent_specs) == 6
+    assert {spec.field for spec in independent_specs} == {"independent_free_e1", "independent_free_e2"}
+    assert all(spec.prior_kind == "truncated_normal" for spec in independent_specs)
+    assert all(spec.std == pytest.approx(0.25) for spec in independent_specs)
+    assert all(spec.lower == pytest.approx(-0.35) for spec in independent_specs)
+    assert all(spec.upper == pytest.approx(0.35) for spec in independent_specs)
     scaling_scatter_specs = [spec for spec in state.parameter_specs if spec.component_family == "scaling_scatter"]
     assert scaling_scatter_specs == []
     assert evaluator.independent_scaling_component_indices.size == 0
@@ -5264,6 +5269,9 @@ def test_perturbation_discovery_stage0_initial_build_keeps_members_on_scaling_re
     assert evaluator.free_correction_free_component_indices.size == 0
     np.testing.assert_array_equal(evaluator.exact_scaling_component_indices, evaluator.scaling_component_indices)
     assert evaluator.cached_scaling_component_indices.size == 0
+    scaling_indices = [int(record["component_index"]) for record in state.scaling_component_records]
+    assert all(int(state.packed_lens_spec.e1_param_index[idx]) >= 0 for idx in scaling_indices)
+    assert all(int(state.packed_lens_spec.e2_param_index[idx]) >= 0 for idx in scaling_indices)
 
 
 def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free(
@@ -5293,6 +5301,19 @@ def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free
     final_args.perturbation_discovery_stage0 = False
     final_args.refresh_every = 250
     old_theta = cluster_solver._default_theta(old_state.parameter_specs)
+    learned_shapes = {
+        "faint": (0.11, -0.12),
+        "bright": (0.21, -0.22),
+        "mid": (-0.13, 0.14),
+    }
+    for idx, spec in enumerate(old_state.parameter_specs):
+        for catalog_id, (e1_value, e2_value) in learned_shapes.items():
+            if f".{catalog_id}." not in str(spec.name):
+                continue
+            if spec.field == "independent_free_e1":
+                old_theta[idx] = e1_value
+            elif spec.field == "independent_free_e2":
+                old_theta[idx] = e2_value
 
     state, evaluator, _sample_model, _theta, diagnostics = cluster_solver._rebuild_perturbation_discovery_state_from_union(
         final_args,
@@ -5308,6 +5329,41 @@ def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free
     np.testing.assert_array_equal(evaluator.free_correction_scaling_component_indices, expected_active)
     np.testing.assert_array_equal(evaluator.active_scaling_component_indices, expected_active)
     np.testing.assert_array_equal(evaluator.exact_scaling_component_indices, expected_active)
+    selected_record = next(record for record in state.scaling_component_records if int(record["catalog_row_index"]) == 1)
+    free_component_index = int(selected_record["free_component_index"])
+    scaling_component_index = int(selected_record["component_index"])
+    assert free_component_index >= 0
+    assert int(state.packed_lens_spec.e1_param_index[free_component_index]) >= 0
+    assert int(state.packed_lens_spec.e2_param_index[free_component_index]) >= 0
+    assert int(state.packed_lens_spec.e1_param_index[scaling_component_index]) == -1
+    assert int(state.packed_lens_spec.e2_param_index[scaling_component_index]) == -1
+    np.testing.assert_allclose(
+        state.packed_lens_spec.e1_base[free_component_index],
+        learned_shapes["bright"][0],
+    )
+    np.testing.assert_allclose(
+        state.packed_lens_spec.e2_base[free_component_index],
+        learned_shapes["bright"][1],
+    )
+    free_e1_spec = state.parameter_specs[int(state.packed_lens_spec.e1_param_index[free_component_index])]
+    free_e2_spec = state.parameter_specs[int(state.packed_lens_spec.e2_param_index[free_component_index])]
+    assert free_e1_spec.mean == pytest.approx(learned_shapes["bright"][0])
+    assert free_e2_spec.mean == pytest.approx(learned_shapes["bright"][1])
+    assert _theta[int(state.packed_lens_spec.e1_param_index[free_component_index])] == pytest.approx(
+        learned_shapes["bright"][0]
+    )
+    assert _theta[int(state.packed_lens_spec.e2_param_index[free_component_index])] == pytest.approx(
+        learned_shapes["bright"][1]
+    )
+    for record in state.scaling_component_records:
+        if int(record["catalog_row_index"]) == 1:
+            continue
+        component_index = int(record["component_index"])
+        assert int(state.packed_lens_spec.e1_param_index[component_index]) == -1
+        assert int(state.packed_lens_spec.e2_param_index[component_index]) == -1
+        expected_shape = learned_shapes[str(record["catalog_id"])]
+        np.testing.assert_allclose(state.packed_lens_spec.e1_base[component_index], expected_shape[0])
+        np.testing.assert_allclose(state.packed_lens_spec.e2_base[component_index], expected_shape[1])
     np.testing.assert_array_equal(
         evaluator.cached_scaling_component_indices,
         np.asarray(
@@ -5324,7 +5380,7 @@ def test_perturbation_discovery_final_rebuild_makes_only_selected_exact_and_free
     assert records_by_id["faint"]["selected_independent"] is False
     assert records_by_id["mid"]["selected_independent"] is False
     independent_specs = [spec for spec in state.parameter_specs if spec.component_family == "independent_scaling"]
-    assert len(independent_specs) == 4
+    assert len(independent_specs) == 6
 
 
 def test_perturbation_discovery_score_table_matches_threshold_rule() -> None:
@@ -6392,7 +6448,14 @@ def test_independent_scaling_parameter_specs_log_displacement_replaces_direct_fr
         {
             "id": "members",
             "type": cluster_solver.DP_IE_PROFILE,
-            "catalog_df": pd.DataFrame({"id": ["g1", "g2"]}),
+            "catalog_df": pd.DataFrame(
+                {
+                    "id": ["g1", "g2"],
+                    "catalog_a": [2.0, 20.0],
+                    "catalog_b": [1.0, 1.0],
+                    "catalog_theta": [0.0, 45.0],
+                }
+            ),
         }
     ]
 
@@ -6412,12 +6475,37 @@ def test_independent_scaling_parameter_specs_log_displacement_replaces_direct_fr
     for field_name in (
         "independent_free_log_sigma_delta_unit",
         "independent_free_log_mass_delta_unit",
+        "independent_free_e1",
+        "independent_free_e2",
     ):
         field_specs = [spec for spec in specs if spec.field == field_name]
         assert len(field_specs) == 2
+        assert all(spec.transform_kind == "identity" for spec in field_specs)
+    for field_name in (
+        "independent_free_log_sigma_delta_unit",
+        "independent_free_log_mass_delta_unit",
+    ):
+        field_specs = [spec for spec in specs if spec.field == field_name]
         assert {spec.sample_site_index for spec in field_specs} == {0, 1}
         assert all(spec.prior_kind == "normal" for spec in field_specs)
-        assert all(spec.transform_kind == "identity" for spec in field_specs)
+    shape_specs = [spec for spec in specs if spec.field in {"independent_free_e1", "independent_free_e2"}]
+    assert shape_specs
+    assert all(spec.prior_kind == "truncated_normal" for spec in shape_specs)
+    assert all(spec.std == pytest.approx(0.25) for spec in shape_specs)
+    assert all(spec.lower == pytest.approx(-0.35) for spec in shape_specs)
+    assert all(spec.upper == pytest.approx(0.35) for spec in shape_specs)
+    assert all(abs(float(spec.mean)) <= 0.30 for spec in shape_specs)
+    assert {spec.sample_site_name for spec in shape_specs} == {"members_independent_free_e_shape"}
+    assert [spec.sample_site_index for spec in shape_specs] == [0, 1, 2, 3]
+    sites = cluster_solver._parameter_sample_sites(specs)
+    shape_sites = [
+        site
+        for site in sites
+        if any(specs[index].field in {"independent_free_e1", "independent_free_e2"} for index in site.indices)
+    ]
+    assert len(shape_sites) == 1
+    assert len(shape_sites[0].indices) == 4
+    assert len(sites) == 5
     for field_name, median in (
         ("independent_free_log_sigma_tau", 0.22),
         ("independent_free_log_mass_tau", 0.33),
@@ -6432,6 +6520,8 @@ def test_independent_scaling_parameter_specs_log_displacement_replaces_direct_fr
     assert not any("residual" in field for field in fields)
     assert indices[0][0]["independent_free_log_sigma_delta_unit"] >= 0
     assert indices[0][1]["independent_free_log_sigma_delta_unit"] >= 0
+    assert indices[0][0]["independent_free_e1"] >= 0
+    assert indices[0][0]["independent_free_e2"] >= 0
     assert indices[0][0]["independent_free_log_sigma_tau"] == indices[0][1][
         "independent_free_log_sigma_tau"
     ]
@@ -14813,7 +14903,7 @@ def test_cluster_solver_accepts_ff_sims_cutout_image_args(monkeypatch: pytest.Mo
             "--par-path",
             "data/clustersim/input.par",
             "--image-catalog-family-cutout-image-dir",
-            "/data/ff_sims/fits",
+            "data/ff_sims",
             "--image-catalog-family-cutout-image-scale",
             "auto",
             "--image-catalog-family-cutout-bands",
@@ -14821,22 +14911,22 @@ def test_cluster_solver_accepts_ff_sims_cutout_image_args(monkeypatch: pytest.Mo
             "F606W",
             "F814W",
             "--kappa-true-fits",
-            "data/ff_sims/hera/kappa_z9_0.fits",
+            "data/ff_sims/published/hera/kappa_z9_0.fits",
             "--gammax-true-fits",
-            "data/ff_sims/hera/gammax_z9_0.fits",
+            "data/ff_sims/published/hera/gammax_z9_0.fits",
             "--gammay-true-fits",
-            "data/ff_sims/hera/gammay_z9_0.fits",
+            "data/ff_sims/published/hera/gammay_z9_0.fits",
         ],
     )
 
     args = _parse_args()
 
-    assert args.image_catalog_family_cutout_image_dir == "/data/ff_sims/fits"
+    assert args.image_catalog_family_cutout_image_dir == "data/ff_sims"
     assert args.image_catalog_family_cutout_image_scale == "auto"
     assert args.image_catalog_family_cutout_bands == ["F435W", "F606W", "F814W"]
-    assert args.kappa_true_fits == "data/ff_sims/hera/kappa_z9_0.fits"
-    assert args.gammax_true_fits == "data/ff_sims/hera/gammax_z9_0.fits"
-    assert args.gammay_true_fits == "data/ff_sims/hera/gammay_z9_0.fits"
+    assert args.kappa_true_fits == "data/ff_sims/published/hera/kappa_z9_0.fits"
+    assert args.gammax_true_fits == "data/ff_sims/published/hera/gammax_z9_0.fits"
+    assert args.gammay_true_fits == "data/ff_sims/published/hera/gammay_z9_0.fits"
 
 
 def test_cluster_solver_parse_args_rejects_incomplete_or_invalid_gamma_truth_maps(
@@ -14850,9 +14940,9 @@ def test_cluster_solver_parse_args_rejects_incomplete_or_invalid_gamma_truth_map
             "--par-path",
             "data/clustersim/input.par",
             "--kappa-true-fits",
-            "data/ff_sims/hera/kappa_z9_0.fits",
+            "data/ff_sims/published/hera/kappa_z9_0.fits",
             "--gammax-true-fits",
-            "data/ff_sims/hera/gammax_z9_0.fits",
+            "data/ff_sims/published/hera/gammax_z9_0.fits",
         ],
     )
     args = _parse_args()
@@ -14867,9 +14957,9 @@ def test_cluster_solver_parse_args_rejects_incomplete_or_invalid_gamma_truth_map
             "--par-path",
             "data/clustersim/input.par",
             "--gammax-true-fits",
-            "data/ff_sims/hera/gammax_z9_0.fits",
+            "data/ff_sims/published/hera/gammax_z9_0.fits",
             "--gammay-true-fits",
-            "data/ff_sims/hera/gammay_z9_0.fits",
+            "data/ff_sims/published/hera/gammay_z9_0.fits",
         ],
     )
     args = _parse_args()
@@ -14884,11 +14974,11 @@ def test_cluster_solver_parse_args_rejects_incomplete_or_invalid_gamma_truth_map
             "--par-path",
             "data/clustersim/input.par",
             "--kappa-true-fits",
-            "data/ff_sims/hera/kappa_z9_0.fits",
+            "data/ff_sims/published/hera/kappa_z9_0.fits",
             "--gammax-true-fits",
             "data/ff_sims/hera/does_not_exist.fits",
             "--gammay-true-fits",
-            "data/ff_sims/hera/gammay_z9_0.fits",
+            "data/ff_sims/published/hera/gammay_z9_0.fits",
         ],
     )
     args = _parse_args()
@@ -18916,18 +19006,18 @@ def test_run_xsh_critical_arc_mode_selects_new_image_plane_mode() -> None:
     assert '"--arc-aware-max-arclength-arcsec", 10.0' in text
     assert '"--arc-aware-curve-step-arcsec", 0.01' in text
     assert "validation_args = [" in text
-    assert '"--exact-image-min-distance-arcsec", 0.5' in text
-    assert '"--exact-image-precision-limit", 1.0e-2' in text
-    assert '"--exact-image-num-iter-max", 50' in text
+    assert '"--exact-image-min-distance-arcsec", 0.2' in text
+    assert '"--exact-image-precision-limit", 1.0e-4' in text
+    assert '"--exact-image-num-iter-max", 200' in text
     assert '"--match-tolerance-arcsec", 2.0' in text
     assert 'source_plane_covariance_mode = "magnification"' in text
     assert '"--source-plane-covariance-mode", source_plane_covariance_mode' in text
-    assert '"kappa_true_fits": "data/ff_sims/ares/kappa_z9_0.fits"' in text
-    assert '"kappa_true_fits": "data/ff_sims/hera/kappa_z9_0.fits"' in text
-    assert '"gammax_true_fits": "data/ff_sims/ares/gammax_z9_0.fits"' in text
-    assert '"gammay_true_fits": "data/ff_sims/ares/gammay_z9_0.fits"' in text
-    assert '"gammax_true_fits": "data/ff_sims/hera/gammax_z9_0.fits"' in text
-    assert '"gammay_true_fits": "data/ff_sims/hera/gammay_z9_0.fits"' in text
+    assert '"kappa_true_fits": "data/ff_sims/published/ares/kappa_z9_0.fits"' in text
+    assert '"kappa_true_fits": "data/ff_sims/published/hera/kappa_z9_0.fits"' in text
+    assert '"gammax_true_fits": "data/ff_sims/published/ares/gammax_z9_0.fits"' in text
+    assert '"gammay_true_fits": "data/ff_sims/published/ares/gammay_z9_0.fits"' in text
+    assert '"gammax_true_fits": "data/ff_sims/published/hera/gammax_z9_0.fits"' in text
+    assert '"gammay_true_fits": "data/ff_sims/published/hera/gammay_z9_0.fits"' in text
     assert '"image_catalog_family_cutout_image_dir": "data/ff_sims"' in text
     assert 'kappa_true_args = ["--kappa-true-fits", kappa_true_fits] if kappa_true_fits else []' in text
     assert '"--gammax-true-fits", gammax_true_fits' in text
@@ -22608,6 +22698,48 @@ def test_select_best_fit_from_posterior_can_choose_maximum_likelihood(
     assert diagnostics["best_value_selected_source_loglike"] == pytest.approx(4.0)
 
 
+def test_select_best_fit_from_posterior_can_choose_median(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posterior = PosteriorResults(
+        samples=np.asarray([[0.0, 10.0], [2.0, 20.0], [100.0, 30.0]], dtype=float),
+        log_prob=np.asarray([-3.0, -1.0, -2.0], dtype=float),
+        accept_prob=np.empty((0,), dtype=float),
+        diverging=np.empty((0,), dtype=bool),
+        num_steps=np.empty((0,), dtype=float),
+        warmup_steps=0,
+        sample_steps=3,
+        num_chains=1,
+        init_diagnostics={},
+    )
+    monkeypatch.setattr(
+        cluster_solver,
+        "_source_loglike_matrix",
+        lambda _evaluator, _samples: np.asarray([0.0, 1.0, 4.0]),
+    )
+
+    class Evaluator:
+        def source_loglike(self, theta: np.ndarray) -> float:
+            return -float(np.sum((np.asarray(theta, dtype=float) - np.asarray([2.0, 20.0])) ** 2))
+
+    selected = cluster_solver._select_best_fit_from_posterior(
+        argparse.Namespace(best_value=cluster_solver.BEST_VALUE_MEDIAN, quiet=True),
+        Evaluator(),
+        posterior,
+        np.asarray([-99.0, -99.0], dtype=float),
+    )
+
+    np.testing.assert_allclose(selected, [2.0, 20.0])
+    np.testing.assert_allclose(posterior.median_fit, [2.0, 20.0])
+    diagnostics = posterior.init_diagnostics
+    assert diagnostics["best_value_selected"] == cluster_solver.BEST_VALUE_MEDIAN
+    assert diagnostics["best_value_selected_sample_index"] is None
+    assert diagnostics["best_value_selected_log_prob"] is None
+    assert diagnostics["best_value_selected_source_loglike"] == pytest.approx(0.0)
+    assert diagnostics["median_sample_index"] is None
+    assert diagnostics["median_sample_log_prob"] is None
+
+
 def test_select_best_fit_from_posterior_falls_back_when_requested_candidate_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -22636,6 +22768,37 @@ def test_select_best_fit_from_posterior_falls_back_when_requested_candidate_miss
     assert diagnostics["best_value_requested"] == cluster_solver.BEST_VALUE_MAXIMUM_LIKELIHOOD
     assert diagnostics["best_value_selected"] == cluster_solver.BEST_VALUE_MAP
     assert diagnostics["best_value_fallback_reason"] == "requested_maximum-likelihood_unavailable"
+
+
+def test_select_best_fit_from_posterior_falls_back_when_median_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posterior = PosteriorResults(
+        samples=np.asarray([[0.0, np.nan], [1.0, np.nan]], dtype=float),
+        log_prob=np.asarray([-2.0, -1.0], dtype=float),
+        accept_prob=np.empty((0,), dtype=float),
+        diverging=np.empty((0,), dtype=bool),
+        num_steps=np.empty((0,), dtype=float),
+        warmup_steps=0,
+        sample_steps=2,
+        num_chains=1,
+        init_diagnostics={},
+    )
+    monkeypatch.setattr(cluster_solver, "_source_loglike_matrix", lambda _evaluator, _samples: np.asarray([np.nan, np.nan]))
+
+    selected = cluster_solver._select_best_fit_from_posterior(
+        argparse.Namespace(best_value=cluster_solver.BEST_VALUE_MEDIAN, quiet=True),
+        object(),
+        posterior,
+        np.asarray([-99.0, -99.0], dtype=float),
+    )
+
+    np.testing.assert_allclose(selected, [1.0, np.nan], equal_nan=True)
+    diagnostics = posterior.init_diagnostics
+    assert diagnostics["best_value_requested"] == cluster_solver.BEST_VALUE_MEDIAN
+    assert diagnostics["best_value_selected"] == cluster_solver.BEST_VALUE_MAP
+    assert diagnostics["best_value_fallback_reason"] == "requested_median_unavailable"
+    assert posterior.median_fit is None
 
 
 def test_plot_bundle_round_trips_ns_diagnostics(tmp_path: Path) -> None:
@@ -22762,6 +22925,7 @@ def test_plot_bundle_persists_best_value_candidates(tmp_path: Path) -> None:
         np.testing.assert_allclose(posterior_group["best_fit"][()], [30.0])
         np.testing.assert_allclose(posterior_group["map_fit"][()], [20.0])
         np.testing.assert_allclose(posterior_group["maximum_likelihood_fit"][()], [30.0])
+        np.testing.assert_allclose(posterior_group["median_fit"][()], [20.0])
         assert posterior_group.attrs["best_value"] == cluster_solver.BEST_VALUE_MAXIMUM_LIKELIHOOD
         assert posterior_group.attrs["best_value_requested"] == cluster_solver.BEST_VALUE_MAXIMUM_LIKELIHOOD
 

@@ -2687,7 +2687,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         runtime_sec=0.0,
         args=argparse.Namespace(
             quiet=True,
-            kappa_true_fits="data/ff_sims/hera/kappa_z9_0.fits",
+            kappa_true_fits="data/ff_sims/published/hera/kappa_z9_0.fits",
             caustic_source_redshift=9.0,
         ),
     )
@@ -2712,9 +2712,9 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
             quiet=True,
             caustic_plot_grid_scale_arcsec=0.2,
             caustic_source_redshift=9.0,
-            kappa_true_fits="data/ff_sims/hera/kappa_z9_0.fits",
-            gammax_true_fits="data/ff_sims/hera/gammax_z9_0.fits",
-            gammay_true_fits="data/ff_sims/hera/gammay_z9_0.fits",
+            kappa_true_fits="data/ff_sims/published/hera/kappa_z9_0.fits",
+            gammax_true_fits="data/ff_sims/published/hera/gammax_z9_0.fits",
+            gammay_true_fits="data/ff_sims/published/hera/gammay_z9_0.fits",
         ),
     )
     assert "numpyro_model" in captured_tasks
@@ -2737,9 +2737,9 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
             quick_diagnostics=True,
             caustic_plot_grid_scale_arcsec=0.2,
             caustic_source_redshift=9.0,
-            kappa_true_fits="data/ff_sims/hera/kappa_z9_0.fits",
-            gammax_true_fits="data/ff_sims/hera/gammax_z9_0.fits",
-            gammay_true_fits="data/ff_sims/hera/gammay_z9_0.fits",
+            kappa_true_fits="data/ff_sims/published/hera/kappa_z9_0.fits",
+            gammax_true_fits="data/ff_sims/published/hera/gammax_z9_0.fits",
+            gammay_true_fits="data/ff_sims/published/hera/gammay_z9_0.fits",
         ),
     )
     assert "numpyro_model" in captured_tasks
@@ -3833,18 +3833,18 @@ def test_parse_args_caustic_source_redshift_default_and_explicit(monkeypatch: An
             "--caustic-source-redshift",
             "9.5",
             "--kappa-true-fits",
-            "data/ff_sims/hera/kappa_z9_0.fits",
+            "data/ff_sims/published/hera/kappa_z9_0.fits",
             "--gammax-true-fits",
-            "data/ff_sims/hera/gammax_z9_0.fits",
+            "data/ff_sims/published/hera/gammax_z9_0.fits",
             "--gammay-true-fits",
-            "data/ff_sims/hera/gammay_z9_0.fits",
+            "data/ff_sims/published/hera/gammay_z9_0.fits",
         ],
     )
     args = cluster_solver._parse_args()
     assert args.caustic_source_redshift == pytest.approx(9.5)
-    assert args.kappa_true_fits == "data/ff_sims/hera/kappa_z9_0.fits"
-    assert args.gammax_true_fits == "data/ff_sims/hera/gammax_z9_0.fits"
-    assert args.gammay_true_fits == "data/ff_sims/hera/gammay_z9_0.fits"
+    assert args.kappa_true_fits == "data/ff_sims/published/hera/kappa_z9_0.fits"
+    assert args.gammax_true_fits == "data/ff_sims/published/hera/gammax_z9_0.fits"
+    assert args.gammay_true_fits == "data/ff_sims/published/hera/gammay_z9_0.fits"
 
 
 def test_parse_args_image_catalog_rgb_display_controls(monkeypatch: Any) -> None:
