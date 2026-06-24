@@ -376,8 +376,16 @@ The observed magnitude is corrected back to an estimated source magnitude:
 $$
 \hat{m}_{s,i}
 =
-m_i + 2.5 \log_{10} \left(|\mu_i| + \mu_{\rm floor}\right).
+m_i + 2.5 \log_{10} \left(|\mu_i| + \mu_{\rm floor}\right)
+- \Delta m_{\rm arc}\,g(s_{\min,i}).
 $$
+
+The final term is an inferred arc-dependent magnitude bias. It is included
+because extended arcs can have biased catalog magnitudes relative to a
+point-source magnification evaluated at the catalog centroid. A positive
+\(\Delta m_{\rm arc}\) means arc-like images are systematically fainter than the
+point-magnification prediction. The prior is centered on zero, so the model can
+turn this correction off when the data do not support it.
 
 Images from the same source family should have the same intrinsic source
 magnitude after this correction. The implementation analytically estimates the
@@ -403,8 +411,12 @@ $$
 \sigma_{m,i,\rm eff}^2
 =
 \sigma_{m,\rm floor}^2
-+ \sigma_{m,\rm int}^2
-+ g(s_{\min,i}) \sigma_{m,\rm arc}^2.
++
+\left[
+\sigma_{m,\rm int}
++ g(s_{\min,i})
+\left(\sigma_{m,\rm arc}-\sigma_{m,\rm int}\right)
+\right]^2.
 $$
 
 The user sets only the floor term, \(\sigma_{m,\rm floor}\). It is a minimum
@@ -414,9 +426,11 @@ nuisance parameters with broad positive priors:
 
 - \(\sigma_{m,\rm int}\): ordinary family-level intrinsic or catalog scatter.
 - \(\sigma_{m,\rm arc}\): extra scatter for arc-like images.
+- \(\Delta m_{\rm arc}\): arc-like magnitude bias, with a broad prior centered
+  on zero.
 
-The final term adds extra scatter for arc-like images, where fluxes are often
-less reliable. It uses the same smooth gate as the critical-arc likelihood:
+The scatter and bias terms use the same smooth gate as the critical-arc
+likelihood:
 
 $$
 g(s_{\min,i})
@@ -450,8 +464,10 @@ $$
 There is no separate magnitude likelihood weight. The strength of this term is
 controlled by inferred scatter terms. If the magnitude measurements are
 uncertain, especially for arcs, the posterior can broaden
-\(\sigma_{m,\rm int}\) or \(\sigma_{m,\rm arc}\) rather than requiring a
-hand-tuned global downweighting factor.
+\(\sigma_{m,\rm int}\) or \(\sigma_{m,\rm arc}\). If arc magnitudes are
+systematically offset rather than merely noisy, the posterior can move
+\(\Delta m_{\rm arc}\) away from zero rather than forcing the lens model to
+explain the photometric bias.
 
 ## Scientific Interpretation
 
