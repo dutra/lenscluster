@@ -270,19 +270,21 @@ def _stage_likelihood_sample_mode(likelihood: str, *, field_name: str) -> str:
         return likelihood
     if likelihood == "critical-arc":
         return "critical-arc-mixture-image-plane"
+    if likelihood == "critical-arc-anisotropic":
+        return "critical-arc-anisotropic-image-plane"
     raise ValueError(f"Unsupported {field_name}={likelihood!r}.")
 
 
 def _stage_likelihood_family(likelihood: str, *, field_name: str) -> str:
     if likelihood in {"source", "local-jacobian"}:
         return likelihood
-    if likelihood == "critical-arc":
+    if likelihood in {"critical-arc", "critical-arc-anisotropic"}:
         return "critical-arc"
     raise ValueError(f"Unsupported {field_name}={likelihood!r}.")
 
 
 def _stage_likelihood_source_position_policy(likelihood: str) -> str:
-    return "centroid-fixed" if likelihood == "critical-arc" else "sampled"
+    return "centroid-fixed" if likelihood in {"critical-arc", "critical-arc-anisotropic"} else "sampled"
 
 
 def _stage1_sample_likelihood_mode(stage1_likelihood: str) -> str:
@@ -302,13 +304,15 @@ def _stage2_sample_likelihood_mode(stage2_forward_mode: str) -> str:
         return "linearized-forward-beta-image-plane"
     if stage2_forward_mode == "critical-arc":
         return "critical-arc-mixture-image-plane"
+    if stage2_forward_mode == "critical-arc-anisotropic":
+        return "critical-arc-anisotropic-image-plane"
     raise ValueError(f"Unsupported stage2_forward_mode={stage2_forward_mode!r}.")
 
 
 def _stage2_likelihood_family(stage2_forward_mode: str) -> str:
     if stage2_forward_mode == "linearized":
         return "linearized"
-    if stage2_forward_mode == "critical-arc":
+    if stage2_forward_mode in {"critical-arc", "critical-arc-anisotropic"}:
         return "critical-arc"
     raise ValueError(f"Unsupported stage2_forward_mode={stage2_forward_mode!r}.")
 

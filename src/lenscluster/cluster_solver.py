@@ -494,6 +494,7 @@ SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE = "linearized-forward-beta
 SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE = "forward-metric-image-plane"
 SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE = "anchored-solved-forward-beta-image-plane"
 SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE = "critical-arc-mixture-image-plane"
+SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE = "critical-arc-anisotropic-image-plane"
 SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE = "fold-regularized-forward-beta-image-plane"
 SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE = "catastrophe-normal-form-image-plane"
 CRITICAL_ARC_SOURCE_POSITION_POLICY_CENTROID_FIXED = "centroid-fixed"
@@ -526,17 +527,20 @@ IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA_BLOCKED = "linearized-forward-beta-bloc
 IMAGE_PLANE_MODE_FORWARD_METRIC = "forward-metric-image-plane"
 IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA = "anchored-solved-forward-beta-image-plane"
 IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE = "critical-arc-mixture-image-plane"
+IMAGE_PLANE_MODE_CRITICAL_ARC_ANISOTROPIC = "critical-arc-anisotropic-image-plane"
 IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA = "fold-regularized-forward-beta-image-plane"
 IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM = "catastrophe-normal-form-image-plane"
 STAGE3_IMAGE_PLANE_MODE_AUTO = "auto"
 STAGE3_IMAGE_PLANE_MODE_NONE = "none"
 STAGE3_IMAGE_PLANE_MODE_LOCAL_JACOBIAN = IMAGE_PLANE_MODE_LOCAL_JACOBIAN
 STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE = IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
+STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_ANISOTROPIC = IMAGE_PLANE_MODE_CRITICAL_ARC_ANISOTROPIC
 STAGE3_IMAGE_PLANE_MODES = (
     STAGE3_IMAGE_PLANE_MODE_AUTO,
     STAGE3_IMAGE_PLANE_MODE_NONE,
     STAGE3_IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
     STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+    STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_ANISOTROPIC,
 )
 FIT_MODE_SEQUENTIAL = "sequential"
 FIT_MODE_LARGE_ONLY = "large-only"
@@ -548,18 +552,22 @@ STAGE2_FREE_SOURCE_FORWARD_FIT_DIR = "stage2_free_source_forward_fit"
 STAGE1_LIKELIHOOD_SOURCE = "source"
 STAGE1_LIKELIHOOD_LOCAL_JACOBIAN = "local-jacobian"
 STAGE1_LIKELIHOOD_CRITICAL_ARC = "critical-arc"
+STAGE1_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC = "critical-arc-anisotropic"
 STAGE1_LIKELIHOODS = (
     STAGE1_LIKELIHOOD_SOURCE,
     STAGE1_LIKELIHOOD_LOCAL_JACOBIAN,
     STAGE1_LIKELIHOOD_CRITICAL_ARC,
+    STAGE1_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC,
 )
 STAGE2_FORWARD_MODE_NONE = "none"
 STAGE2_FORWARD_MODE_LINEARIZED = "linearized"
 STAGE2_FORWARD_MODE_CRITICAL_ARC = "critical-arc"
+STAGE2_FORWARD_MODE_CRITICAL_ARC_ANISOTROPIC = "critical-arc-anisotropic"
 STAGE2_FORWARD_MODES = (
     STAGE2_FORWARD_MODE_NONE,
     STAGE2_FORWARD_MODE_LINEARIZED,
     STAGE2_FORWARD_MODE_CRITICAL_ARC,
+    STAGE2_FORWARD_MODE_CRITICAL_ARC_ANISOTROPIC,
 )
 STAGE2_SAMPLING_ENGINE_INHERIT = "inherit"
 STAGE2_SAMPLING_ENGINE_CHOICES = (
@@ -1493,6 +1501,12 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
             f"critical_direction_sigma_arcsec={float(getattr(evaluator, 'critical_arc_critical_direction_sigma_arcsec', DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)):.4g} "
             f"arc_recovery_p_arc_threshold={float(getattr(evaluator, 'arc_recovery_p_arc_threshold', DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)):.4g} "
             f"arc_max_arclength_arcsec={float(getattr(evaluator, 'arc_aware_max_arclength_arcsec', DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)):.4g}"
+        )
+    elif sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE:
+        items.append(
+            "sample_likelihood=critical-arc-anisotropic-image-plane "
+            f"source_positions={getattr(evaluator, 'critical_arc_source_position_policy', CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED)} "
+            f"critical_direction_sigma_arcsec={float(getattr(evaluator, 'critical_arc_critical_direction_sigma_arcsec', DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)):.4g}"
         )
     if _sample_likelihood_uses_image_plane_jacobian(sample_likelihood_mode):
         image_presence_weight = float(getattr(evaluator, "image_presence_penalty_weight", 0.0))
@@ -5686,6 +5700,100 @@ def _critical_arc_mixture_image_plane_terms(
     )
 
 
+def _critical_arc_anisotropic_image_plane_terms(
+    residual_x: jnp.ndarray,
+    residual_y: jnp.ndarray,
+    sigma_per_image: jnp.ndarray,
+    reliability_per_image: jnp.ndarray,
+    image_sigma_int: jnp.ndarray,
+    covariance_floor: float,
+    outlier_sigma_arcsec: float,
+    singular_min: jnp.ndarray,
+    critical_direction_projector_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    *,
+    residual_loss: str = DEFAULT_LIKELIHOOD_STABILIZER_RESIDUAL_LOSS,
+    student_t_nu: float = DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU,
+    critical_direction_sigma_arcsec: float = DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+    base_prob: float = DEFAULT_CRITICAL_ARC_BASE_PROB,
+    max_prob: float = DEFAULT_CRITICAL_ARC_MAX_PROB,
+    singular_threshold: float = DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+    singular_softness: float = DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
+    scatter_cov00: jnp.ndarray | None = None,
+    scatter_cov01: jnp.ndarray | None = None,
+    scatter_cov11: jnp.ndarray | None = None,
+) -> _CriticalArcMixtureTerms:
+    sigma2 = _image_plane_effective_sigma2(
+        sigma_per_image,
+        image_sigma_int,
+        covariance_floor,
+    )
+    reliability = jnp.clip(reliability_per_image, 1.0e-6, 1.0 - 1.0e-6)
+    critical_p00, critical_p01, critical_p11 = critical_direction_projector_entries
+    critical_quad, noncritical_quad = _critical_arc_projected_quadratics(
+        residual_x,
+        residual_y,
+        critical_p00,
+        critical_p01,
+        critical_p11,
+    )
+    projector_det = jnp.maximum(
+        critical_p00 * critical_p11 - jnp.square(critical_p01),
+        jnp.asarray(0.0, dtype=jnp.float64),
+    )
+    singular_min_gate = jax.lax.stop_gradient(singular_min)
+    arc_gate = jax.nn.sigmoid(
+        (jnp.asarray(singular_threshold, dtype=jnp.float64) - singular_min_gate)
+        / jnp.maximum(jnp.asarray(singular_softness, dtype=jnp.float64), jnp.asarray(1.0e-12, dtype=jnp.float64))
+    )
+    fold_singular = jnp.maximum(
+        singular_min_gate, jnp.asarray(CRITICAL_ARC_FOLD_SINGULAR_FLOOR, dtype=jnp.float64)
+    )
+    fold_cap = jnp.square(jnp.asarray(CRITICAL_ARC_FOLD_MAX_ARC_SIGMA_ARCSEC, dtype=jnp.float64))
+    lensing_extra_var = jnp.minimum(
+        jnp.square(sigma_per_image / fold_singular),
+        fold_cap,
+    )
+    morphology_extra_var = jnp.square(
+        jnp.asarray(float(critical_direction_sigma_arcsec), dtype=jnp.float64)
+    )
+    extra_var = arc_gate * (lensing_extra_var + morphology_extra_var)
+    aniso_quad, aniso_logdet = _critical_arc_aniso_quad_logdet(
+        residual_x,
+        residual_y,
+        sigma2,
+        extra_var,
+        critical_p00,
+        critical_p01,
+        critical_p11,
+        projector_det,
+        scatter_cov00=scatter_cov00,
+        scatter_cov01=scatter_cov01,
+        scatter_cov11=scatter_cov11,
+    )
+    if str(residual_loss) == LIKELIHOOD_STABILIZER_RESIDUAL_LOSS_STUDENT_T:
+        inlier_ll = _student_t_2d_loglike_from_quad_logdet(aniso_quad, aniso_logdet, student_t_nu)
+    else:
+        inlier_ll = -0.5 * (aniso_quad + 2.0 * jnp.log(2.0 * jnp.pi) + aniso_logdet)
+    outlier_sigma2 = jnp.square(jnp.asarray(outlier_sigma_arcsec, dtype=jnp.float64))
+    outlier_ll = -0.5 * (
+        (jnp.square(residual_x) + jnp.square(residual_y)) / outlier_sigma2
+        + 2.0 * jnp.log(2.0 * jnp.pi * outlier_sigma2)
+    )
+    mixture_ll = jnp.logaddexp(jnp.log(reliability) + inlier_ll, jnp.log1p(-reliability) + outlier_ll)
+    return _CriticalArcMixtureTerms(
+        sigma2=sigma2,
+        reliability=reliability,
+        critical_quad=critical_quad,
+        noncritical_quad=noncritical_quad,
+        arc_prob=arc_gate,
+        point_ll=inlier_ll,
+        arc_ll=inlier_ll,
+        outlier_ll=outlier_ll,
+        inlier_ll=inlier_ll,
+        mixture_ll=mixture_ll,
+    )
+
+
 def _critical_arc_mixture_image_plane_responsibilities(
     terms: _CriticalArcMixtureTerms,
 ) -> _CriticalArcMixtureResponsibilities:
@@ -6069,6 +6177,137 @@ def _critical_arc_mixture_image_plane_bin_loglike(
         ) / probability_span_safe
         arc_gate = jnp.where(probability_span > 1.0e-12, normalized_arc_gate, terms.arc_prob)
         arc_gate = jnp.clip(arc_gate, 0.0, 1.0)
+        presence_probability = point_presence_probability + arc_gate * (
+            arc_presence_probability - point_presence_probability
+        )
+        bin_loglike = bin_loglike + _soft_observed_image_presence_loglike_from_probability(
+            presence_probability=presence_probability,
+            family_idx=family_idx,
+            n_families=int(n_families),
+            reliability_per_image=terms.reliability,
+            image_has_constraint=image_has_constraint,
+            penalty_weight=float(image_presence_penalty_weight),
+            count_softness=float(image_presence_count_softness),
+            count_margin=float(image_presence_count_margin),
+        )
+    scatter_finite = jnp.asarray(True)
+    if scatter_cov00 is not None:
+        scatter_finite = scatter_finite & jnp.all(jnp.isfinite(scatter_cov00))
+    if scatter_cov01 is not None:
+        scatter_finite = scatter_finite & jnp.all(jnp.isfinite(scatter_cov01))
+    if scatter_cov11 is not None:
+        scatter_finite = scatter_finite & jnp.all(jnp.isfinite(scatter_cov11))
+    finite = (
+        jnp.all(frame_finite)
+        & jnp.all(jnp.isfinite(residual_x))
+        & jnp.all(jnp.isfinite(residual_y))
+        & scatter_finite
+        & jnp.all(jnp.isfinite(terms.sigma2))
+        & jnp.all(jnp.isfinite(singular_min))
+        & jnp.all(jnp.isfinite(singular_max))
+        & jnp.isfinite(bin_loglike)
+    )
+    return jnp.where(finite, bin_loglike, jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64))
+
+
+def _critical_arc_anisotropic_image_plane_bin_loglike(
+    residual_x: jnp.ndarray,
+    residual_y: jnp.ndarray,
+    jac_a00: jnp.ndarray,
+    jac_a01: jnp.ndarray,
+    jac_a10: jnp.ndarray,
+    jac_a11: jnp.ndarray,
+    family_idx: jnp.ndarray | None,
+    n_families: int | None,
+    sigma_per_image: jnp.ndarray,
+    reliability_per_image: jnp.ndarray,
+    image_has_constraint: jnp.ndarray,
+    image_sigma_int: jnp.ndarray,
+    covariance_floor: float,
+    outlier_sigma_arcsec: float,
+    image_presence_penalty_weight: float = 0.0,
+    image_presence_match_radius_arcsec: float = DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC,
+    image_presence_temperature_arcsec: float = DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC,
+    image_presence_count_softness: float = DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS,
+    image_presence_count_margin: float = DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN,
+    residual_loss: str = DEFAULT_LIKELIHOOD_STABILIZER_RESIDUAL_LOSS,
+    student_t_nu: float = DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU,
+    critical_direction_sigma_arcsec: float = DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+    base_prob: float = DEFAULT_CRITICAL_ARC_BASE_PROB,
+    max_prob: float = DEFAULT_CRITICAL_ARC_MAX_PROB,
+    singular_threshold: float = DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+    singular_softness: float = DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
+    singular_min_precomputed: jnp.ndarray | None = None,
+    singular_max_precomputed: jnp.ndarray | None = None,
+    critical_direction_projector_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray] | None = None,
+    scatter_cov00: jnp.ndarray | None = None,
+    scatter_cov01: jnp.ndarray | None = None,
+    scatter_cov11: jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    del base_prob, max_prob
+    if (
+        singular_min_precomputed is None
+        or singular_max_precomputed is None
+        or critical_direction_projector_entries is None
+    ):
+        (
+            singular_min,
+            singular_max,
+            critical_p00,
+            critical_p01,
+            critical_p11,
+            frame_finite,
+        ) = _critical_arc_geometry_from_jacobian(
+            jac_a00,
+            jac_a01,
+            jac_a10,
+            jac_a11,
+        )
+    else:
+        singular_min = singular_min_precomputed
+        singular_max = singular_max_precomputed
+        critical_p00, critical_p01, critical_p11 = critical_direction_projector_entries
+        frame_finite = (
+            jnp.isfinite(singular_min)
+            & jnp.isfinite(singular_max)
+            & jnp.isfinite(critical_p00)
+            & jnp.isfinite(critical_p01)
+            & jnp.isfinite(critical_p11)
+        )
+    terms = _critical_arc_anisotropic_image_plane_terms(
+        residual_x=residual_x,
+        residual_y=residual_y,
+        sigma_per_image=sigma_per_image,
+        reliability_per_image=reliability_per_image,
+        image_sigma_int=image_sigma_int,
+        covariance_floor=covariance_floor,
+        outlier_sigma_arcsec=outlier_sigma_arcsec,
+        singular_min=singular_min,
+        critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+        residual_loss=residual_loss,
+        student_t_nu=student_t_nu,
+        critical_direction_sigma_arcsec=critical_direction_sigma_arcsec,
+        singular_threshold=singular_threshold,
+        singular_softness=singular_softness,
+        scatter_cov00=scatter_cov00,
+        scatter_cov01=scatter_cov01,
+        scatter_cov11=scatter_cov11,
+    )
+    bin_loglike = jnp.sum(jnp.where(image_has_constraint, terms.mixture_ll, 0.0))
+    if (
+        float(image_presence_penalty_weight) > 0.0
+        and family_idx is not None
+        and n_families is not None
+    ):
+        point_residual2 = jnp.square(residual_x) + jnp.square(residual_y)
+        radius2 = jnp.square(jnp.asarray(image_presence_match_radius_arcsec, dtype=jnp.float64))
+        temperature2 = jnp.maximum(
+            jnp.square(jnp.asarray(image_presence_temperature_arcsec, dtype=jnp.float64)),
+            jnp.asarray(1.0e-18, dtype=jnp.float64),
+        )
+        point_presence_probability = jax.nn.sigmoid((radius2 - point_residual2) / temperature2)
+        arc_presence_probability = jax.nn.sigmoid((radius2 - terms.noncritical_quad) / temperature2)
+        arc_gate = jnp.clip(terms.arc_prob, 0.0, 1.0)
         presence_probability = point_presence_probability + arc_gate * (
             arc_presence_probability - point_presence_probability
         )
@@ -12359,7 +12598,10 @@ def _anchored_solved_stage_enabled(args: argparse.Namespace) -> bool:
 
 
 def _critical_arc_mixture_stage_enabled(args: argparse.Namespace) -> bool:
-    return str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) == IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
+    return str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) in {
+        IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        IMAGE_PLANE_MODE_CRITICAL_ARC_ANISOTROPIC,
+    }
 
 
 def _fold_regularized_stage_enabled(args: argparse.Namespace) -> bool:
@@ -12397,6 +12639,7 @@ def _sample_likelihood_uses_explicit_beta(sample_likelihood_mode: str) -> bool:
         SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
     }
@@ -12409,6 +12652,7 @@ def _sample_likelihood_uses_image_scatter(sample_likelihood_mode: str) -> bool:
 def _sample_likelihood_uses_critical_arc_terms(sample_likelihood_mode: str) -> bool:
     return str(sample_likelihood_mode) in {
         SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
     }
 
 
@@ -12435,6 +12679,7 @@ def _sample_likelihood_uses_image_plane_jacobian(sample_likelihood_mode: str) ->
         SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
     }
@@ -12467,6 +12712,7 @@ def _effective_image_presence_penalty_weight(
         SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
     }:
@@ -12481,6 +12727,7 @@ def _effective_image_presence_penalty_weight(
         IMAGE_PLANE_MODE_FORWARD_METRIC,
         IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        IMAGE_PLANE_MODE_CRITICAL_ARC_ANISOTROPIC,
         IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
     }:
@@ -12523,6 +12770,8 @@ def _stage4_sample_likelihood_mode(args: argparse.Namespace) -> str | None:
         return SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE
     if mode == IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE:
         return SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+    if mode == IMAGE_PLANE_MODE_CRITICAL_ARC_ANISOTROPIC:
+        return SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE
     if mode == IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA:
         return SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE
     if mode == IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM:
@@ -12535,8 +12784,10 @@ def _stage4_run_directory_name(args: argparse.Namespace) -> str:
         return "stage4_forward_metric_image_plane"
     if _anchored_solved_stage_enabled(args):
         return "stage4_anchored_solved_image_plane"
-    if _critical_arc_mixture_stage_enabled(args):
+    if str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) == IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE:
         return "stage4_critical_arc_mixture_image_plane"
+    if str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE)) == IMAGE_PLANE_MODE_CRITICAL_ARC_ANISOTROPIC:
+        return "stage4_critical_arc_anisotropic_image_plane"
     if _fold_regularized_stage_enabled(args):
         return "stage4_fold_regularized_image_plane"
     if _catastrophe_normal_form_stage_enabled(args):
@@ -12554,6 +12805,7 @@ def _auto_local_jacobian_stage_enabled(args: argparse.Namespace) -> bool:
         IMAGE_PLANE_MODE_FORWARD_METRIC,
         IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        IMAGE_PLANE_MODE_CRITICAL_ARC_ANISOTROPIC,
         IMAGE_PLANE_MODE_FOLD_REGULARIZED_FORWARD_BETA,
         IMAGE_PLANE_MODE_CATASTROPHE_NORMAL_FORM,
     }:
@@ -12573,7 +12825,10 @@ def _local_jacobian_stage_enabled(args: argparse.Namespace) -> bool:
 
 
 def _critical_arc_centroid_stage_enabled(args: argparse.Namespace) -> bool:
-    return _stage3_image_plane_mode(args) == STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
+    return _stage3_image_plane_mode(args) in {
+        STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
+        STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_ANISOTROPIC,
+    }
 
 
 def _stage3_image_plane_enabled(args: argparse.Namespace) -> bool:
@@ -12586,6 +12841,8 @@ def _stage3_sample_likelihood_mode(args: argparse.Namespace) -> str | None:
         return SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
     if mode == STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE:
         return SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+    if mode == STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_ANISOTROPIC:
+        return SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE
     return None
 
 
@@ -16817,6 +17074,7 @@ class ClusterJAXEvaluator:
             SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+            SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
         }:
@@ -16825,15 +17083,18 @@ class ClusterJAXEvaluator:
             SAMPLE_LIKELIHOOD_SOURCE,
             SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+            SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
         }:
             raise ValueError(
                 f"sampling_engine={self.sampling_engine!r} currently only supports "
-                "source, local-jacobian, and critical-arc-mixture-image-plane."
+                "source, local-jacobian, critical-arc-mixture-image-plane, and "
+                "critical-arc-anisotropic-image-plane."
             )
         if self.sampling_engine == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT and self.sample_likelihood_mode not in {
             SAMPLE_LIKELIHOOD_SOURCE,
             SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+            SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
         }:
             raise ValueError(
                 "sampling_engine='refreshing_surrogate_flat' does not yet support "
@@ -19809,7 +20070,12 @@ class ClusterJAXEvaluator:
             | (~jnp.all(residual_finite))
             | (~jnp.all(scatter_cov_finite))
         )
-        flat_loglike = _critical_arc_mixture_image_plane_bin_loglike(
+        critical_arc_bin_loglike = (
+            _critical_arc_anisotropic_image_plane_bin_loglike
+            if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE
+            else _critical_arc_mixture_image_plane_bin_loglike
+        )
+        flat_loglike = critical_arc_bin_loglike(
             residual_x=residual_x,
             residual_y=residual_y,
             jac_a00=observed_jacobian_entries[0],
@@ -20057,7 +20323,12 @@ class ClusterJAXEvaluator:
             | (~jnp.all(residual_finite))
             | (~jnp.all(scatter_cov_finite))
         )
-        flat_loglike = _critical_arc_mixture_image_plane_bin_loglike(
+        critical_arc_bin_loglike = (
+            _critical_arc_anisotropic_image_plane_bin_loglike
+            if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE
+            else _critical_arc_mixture_image_plane_bin_loglike
+        )
+        flat_loglike = critical_arc_bin_loglike(
             residual_x=residual_x,
             residual_y=residual_y,
             jac_a00=observed_jacobian_entries[0],
@@ -22659,7 +22930,10 @@ class ClusterJAXEvaluator:
                 return self._flat_refreshing_surrogate_source_loglike_impl(params)
             if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
                 return self._flat_refreshing_surrogate_local_jacobian_source_loglike_impl(params)
-            if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE:
+            if self.sample_likelihood_mode in {
+                SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+                SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
+            }:
                 return self._flat_refreshing_surrogate_critical_arc_source_loglike_impl(params)
             return jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64)
         if (
@@ -22677,7 +22951,10 @@ class ClusterJAXEvaluator:
         if (
             str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
             in {SAMPLING_ENGINE_FULL_FLAT}
-            and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+            and self.sample_likelihood_mode in {
+                SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+                SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
+            }
         ):
             return self._flat_critical_arc_source_loglike_impl(params)
 
@@ -22706,6 +22983,7 @@ class ClusterJAXEvaluator:
         if self.sample_likelihood_mode in {
             SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+            SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
         }:
             fit_component_indices = None
         sampled_kpc_per_arcsec = None
@@ -23009,7 +23287,12 @@ class ClusterJAXEvaluator:
                     | (~jnp.all(residual_finite))
                     | (~jnp.all(scatter_cov_finite))
                 )
-                bin_loglike = _critical_arc_mixture_image_plane_bin_loglike(
+                critical_arc_bin_loglike = (
+                    _critical_arc_anisotropic_image_plane_bin_loglike
+                    if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE
+                    else _critical_arc_mixture_image_plane_bin_loglike
+                )
+                bin_loglike = critical_arc_bin_loglike(
                     residual_x=residual_x,
                     residual_y=residual_y,
                     jac_a00=observed_jacobian_entries[0],
@@ -29471,12 +29754,14 @@ def _stage_likelihood_sample_mode(requested: Any, *, field_name: str) -> str:
         return SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
     if requested == STAGE1_LIKELIHOOD_CRITICAL_ARC:
         return SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+    if requested == STAGE1_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC:
+        return SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE
     raise ValueError(f"Unsupported {field_name}={requested!r}.")
 
 
 def _stage_likelihood_source_position_policy(requested: Any) -> str:
     requested = str(requested)
-    if requested == STAGE1_LIKELIHOOD_CRITICAL_ARC:
+    if requested in {STAGE1_LIKELIHOOD_CRITICAL_ARC, STAGE1_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC}:
         return CRITICAL_ARC_SOURCE_POSITION_POLICY_CENTROID_FIXED
     return CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED
 
@@ -29521,6 +29806,8 @@ def _stage2_sample_likelihood_mode(args: argparse.Namespace) -> str | None:
         return SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
     if requested == STAGE2_FORWARD_MODE_CRITICAL_ARC:
         return SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+    if requested == STAGE2_FORWARD_MODE_CRITICAL_ARC_ANISOTROPIC:
+        return SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE
     raise ValueError(f"Unsupported stage2_forward_mode={requested!r}.")
 
 

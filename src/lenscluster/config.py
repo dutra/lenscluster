@@ -299,12 +299,22 @@ def _jsonable(value: Any) -> Any:
 def validate_config(config: LensClusterSolverConfig) -> None:
     _validate_model_config(config.model)
     workflow = config.workflow
-    if workflow.stage0_likelihood not in {"source", "local-jacobian", "critical-arc"}:
-        raise ValueError("stage0_likelihood must be 'source', 'local-jacobian', or 'critical-arc'.")
-    if workflow.stage1_likelihood not in {"source", "local-jacobian", "critical-arc"}:
-        raise ValueError("stage1_likelihood must be 'source', 'local-jacobian', or 'critical-arc'.")
-    if workflow.stage2_forward_mode not in {"none", "linearized", "critical-arc"}:
-        raise ValueError("stage2_forward_mode must be 'none', 'linearized', or 'critical-arc'.")
+    stage_likelihoods = {"source", "local-jacobian", "critical-arc", "critical-arc-anisotropic"}
+    if workflow.stage0_likelihood not in stage_likelihoods:
+        raise ValueError(
+            "stage0_likelihood must be 'source', 'local-jacobian', 'critical-arc', "
+            "or 'critical-arc-anisotropic'."
+        )
+    if workflow.stage1_likelihood not in stage_likelihoods:
+        raise ValueError(
+            "stage1_likelihood must be 'source', 'local-jacobian', 'critical-arc', "
+            "or 'critical-arc-anisotropic'."
+        )
+    if workflow.stage2_forward_mode not in {"none", "linearized", "critical-arc", "critical-arc-anisotropic"}:
+        raise ValueError(
+            "stage2_forward_mode must be 'none', 'linearized', 'critical-arc', "
+            "or 'critical-arc-anisotropic'."
+        )
     schedule = config.schedule
     expected_stages = _expected_stage_count(workflow)
     if len(schedule.svi_steps) != expected_stages:

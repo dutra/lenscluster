@@ -165,14 +165,15 @@ def _stage_scalar(value: Any, default: Any) -> Any:
 def _finish_figure(fig: Any, path: Path, *, dpi: int = 180, bbox_inches: str | None = "tight") -> None:
     fig.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
     if _DISPLAY_PLOTS_IN_NOTEBOOK:
-        try:
-            from IPython.display import display
+        from base64 import b64encode
+        from io import BytesIO
 
-            display(fig)
-        except Exception:
-            plt.show()
-        finally:
-            plt.close(fig)
+        from IPython.display import display
+
+        buffer = BytesIO()
+        fig.savefig(buffer, format="png", dpi=dpi, bbox_inches=bbox_inches)
+        display({"image/png": b64encode(buffer.getvalue()).decode("ascii")}, raw=True)
+        plt.close(fig)
     else:
         plt.close(fig)
 
@@ -7698,8 +7699,7 @@ def _plot_image_count_recovery(
     ax.legend(loc="best", fontsize=8)
     ax.grid(axis="x", alpha=0.25)
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _plot_model_magnification_fit_quality(magnification_df: pd.DataFrame, path: Path) -> None:
@@ -7737,8 +7737,7 @@ def _plot_model_magnification_fit_quality(magnification_df: pd.DataFrame, path: 
         ax.set_xticklabels(magnification_df["image_label"].astype(str), rotation=90, fontsize=7)
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _plot_normalized_image_residuals(image_df: pd.DataFrame, path: Path) -> None:
@@ -8422,8 +8421,7 @@ def _plot_residual_vs_magnification(image_df: pd.DataFrame, magnification_df: pd
         if positive.size and float(np.nanmax(positive)) / max(float(np.nanmin(positive)), 1.0e-12) > 20.0:
             ax.set_xscale("log")
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _plot_residual_geometry_trends(image_df: pd.DataFrame, path: Path) -> None:
@@ -8453,8 +8451,7 @@ def _plot_residual_geometry_trends(image_df: pd.DataFrame, path: Path) -> None:
         plt.close(fig)
         return
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _plot_exact_vs_approx_prediction_error(family_df: pd.DataFrame, path: Path) -> None:
