@@ -15016,12 +15016,43 @@ def test_rejects_legacy_pjaffe_artifacts() -> None:
 
 
 def test_bulk_lensing_jacobian_matches_manual_dpie_finite_difference() -> None:
+    class ForbiddenBulkModel:
+        def ray_shooting(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("old LensModelBulk.ray_shooting path should not be used")
+
+        def hessian(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("old LensModelBulk.hessian path should not be used")
+
     fake = SimpleNamespace(
         use_bulk_ray_shooting=True,
         bulk_index_list=np.asarray([0], dtype=np.int32),
-        models_by_effective_z={2.0: cluster_solver.LensModelBulk(unique_lens_model_list=["DPIE_NIE"], multi_plane=False)},
+        models_by_effective_z={2.0: ForbiddenBulkModel()},
+        state=SimpleNamespace(
+            lens_model_list=["DPIE_NIE"],
+            packed_lens_spec=SimpleNamespace(profile_type=np.asarray([cluster_solver.DP_IE_PROFILE], dtype=np.int32)),
+        ),
     )
-    fake._bulk_ray_shooting_kwargs_from_indices = cluster_solver.ClusterJAXEvaluator._bulk_ray_shooting_kwargs_from_indices.__get__(
+    fake._component_indices_np = cluster_solver.ClusterJAXEvaluator._component_indices_np.__get__(
+        fake,
+        type(fake),
+    )
+    fake._split_grouped_component_indices = cluster_solver.ClusterJAXEvaluator._split_grouped_component_indices.__get__(
+        fake,
+        type(fake),
+    )
+    fake._take_packed_components = cluster_solver.ClusterJAXEvaluator._take_packed_components.__get__(
+        fake,
+        type(fake),
+    )
+    fake._grouped_dpie_params = cluster_solver.ClusterJAXEvaluator._grouped_dpie_params.__get__(
+        fake,
+        type(fake),
+    )
+    fake._grouped_shear_alpha_and_hessian = cluster_solver.ClusterJAXEvaluator._grouped_shear_alpha_and_hessian.__get__(
+        fake,
+        type(fake),
+    )
+    fake._grouped_alpha_and_hessian_for_components = cluster_solver.ClusterJAXEvaluator._grouped_alpha_and_hessian_for_components.__get__(
         fake,
         type(fake),
     )
@@ -15041,12 +15072,34 @@ def test_bulk_lensing_jacobian_matches_manual_dpie_finite_difference() -> None:
     eps = jnp.asarray(1.0e-5, dtype=jnp.float64)
 
     jacobian = cluster_solver.ClusterJAXEvaluator._lensing_jacobian_for_components(fake, 2.0, x, y, packed_state)
-    kwargs = fake._bulk_ray_shooting_kwargs_from_indices(packed_state)
-    model = fake.models_by_effective_z[2.0]
-    beta_x_plus, beta_y_plus = model.ray_shooting(x + eps, y, kwargs)
-    beta_x_minus, beta_y_minus = model.ray_shooting(x - eps, y, kwargs)
-    beta_x_y_plus, beta_y_y_plus = model.ray_shooting(x, y + eps, kwargs)
-    beta_x_y_minus, beta_y_y_minus = model.ray_shooting(x, y - eps, kwargs)
+    beta_x_plus, beta_y_plus = cluster_solver.ClusterJAXEvaluator._ray_shooting_for_components(
+        fake,
+        2.0,
+        x + eps,
+        y,
+        packed_state,
+    )
+    beta_x_minus, beta_y_minus = cluster_solver.ClusterJAXEvaluator._ray_shooting_for_components(
+        fake,
+        2.0,
+        x - eps,
+        y,
+        packed_state,
+    )
+    beta_x_y_plus, beta_y_y_plus = cluster_solver.ClusterJAXEvaluator._ray_shooting_for_components(
+        fake,
+        2.0,
+        x,
+        y + eps,
+        packed_state,
+    )
+    beta_x_y_minus, beta_y_y_minus = cluster_solver.ClusterJAXEvaluator._ray_shooting_for_components(
+        fake,
+        2.0,
+        x,
+        y - eps,
+        packed_state,
+    )
     expected = (
         (beta_x_plus - beta_x_minus) / (2.0 * eps),
         (beta_x_y_plus - beta_x_y_minus) / (2.0 * eps),
@@ -15056,6 +15109,98 @@ def test_bulk_lensing_jacobian_matches_manual_dpie_finite_difference() -> None:
 
     for value, reference in zip(jacobian, expected):
         np.testing.assert_allclose(np.asarray(value), np.asarray(reference), atol=1.0e-5, rtol=1.0e-5)
+
+
+def test_grouped_lensing_backend_rejects_unsupported_profile_code() -> None:
+    fake = SimpleNamespace(
+        state=SimpleNamespace(
+            lens_model_list=["DPIE_NIE", "UNSUPPORTED"],
+            packed_lens_spec=SimpleNamespace(
+                profile_type=np.asarray([cluster_solver.DP_IE_PROFILE, 999], dtype=np.int32)
+            ),
+        ),
+    )
+    fake._component_indices_np = cluster_solver.ClusterJAXEvaluator._component_indices_np.__get__(
+        fake,
+        type(fake),
+    )
+
+    with pytest.raises(RuntimeError, match="Mandatory grouped lensing backend"):
+        cluster_solver.ClusterJAXEvaluator._split_grouped_component_indices(fake)
+
+
+def test_grouped_dpie_shear_backend_matches_lensmodelbulk_reference() -> None:
+    lens_model_list = ["DPIE_NIE", "DPIE_NIE", "SHEAR"]
+    packed_state = {
+        "sigma0": jnp.asarray([1.2, 0.7, 0.0], dtype=jnp.float64),
+        "Ra": jnp.asarray([0.15, 0.08, 0.0], dtype=jnp.float64),
+        "Rs": jnp.asarray([3.0, 1.8, 0.0], dtype=jnp.float64),
+        "e1": jnp.asarray([0.05, -0.04, 0.0], dtype=jnp.float64),
+        "e2": jnp.asarray([-0.02, 0.03, 0.0], dtype=jnp.float64),
+        "center_x": jnp.asarray([0.1, -0.3, 0.0], dtype=jnp.float64),
+        "center_y": jnp.asarray([-0.1, 0.2, 0.0], dtype=jnp.float64),
+        "gamma1": jnp.asarray([0.0, 0.0, 0.04], dtype=jnp.float64),
+        "gamma2": jnp.asarray([0.0, 0.0, -0.015], dtype=jnp.float64),
+    }
+    fake = SimpleNamespace(
+        state=SimpleNamespace(
+            lens_model_list=lens_model_list,
+            packed_lens_spec=SimpleNamespace(
+                profile_type=np.asarray(
+                    [cluster_solver.DP_IE_PROFILE, cluster_solver.DP_IE_PROFILE, cluster_solver.SHEAR_PROFILE],
+                    dtype=np.int32,
+                )
+            ),
+        ),
+    )
+    for name in (
+        "_component_indices_np",
+        "_split_grouped_component_indices",
+        "_take_packed_components",
+        "_grouped_dpie_params",
+        "_grouped_shear_alpha_and_hessian",
+        "_grouped_alpha_and_hessian_for_components",
+    ):
+        setattr(fake, name, getattr(cluster_solver.ClusterJAXEvaluator, name).__get__(fake, type(fake)))
+
+    x = jnp.asarray([-1.2, 0.2, 1.0, 2.5], dtype=jnp.float64)
+    y = jnp.asarray([0.7, -0.4, 1.5, -2.0], dtype=jnp.float64)
+    grouped_beta = cluster_solver.ClusterJAXEvaluator._ray_shooting_for_components(fake, 2.0, x, y, packed_state)
+    grouped_jacobian = cluster_solver.ClusterJAXEvaluator._lensing_jacobian_for_components(fake, 2.0, x, y, packed_state)
+
+    model = cluster_solver.LensModelBulk(unique_lens_model_list=["DPIE_NIE", "SHEAR"], multi_plane=False)
+    kwargs = model.prepare_ray_shooting_kwargs(
+        lens_model_list,
+        [
+            {
+                "sigma0": 1.2,
+                "Ra": 0.15,
+                "Rs": 3.0,
+                "e1": 0.05,
+                "e2": -0.02,
+                "center_x": 0.1,
+                "center_y": -0.1,
+            },
+            {
+                "sigma0": 0.7,
+                "Ra": 0.08,
+                "Rs": 1.8,
+                "e1": -0.04,
+                "e2": 0.03,
+                "center_x": -0.3,
+                "center_y": 0.2,
+            },
+            {"gamma1": 0.04, "gamma2": -0.015, "ra_0": 0.0, "dec_0": 0.0},
+        ],
+    )
+    reference_beta = model.ray_shooting(x, y, kwargs)
+    h_xx, h_xy, h_yx, h_yy = model.hessian(x, y, kwargs)
+    reference_jacobian = (1.0 - h_xx, -h_xy, -h_yx, 1.0 - h_yy)
+
+    for value, reference in zip(grouped_beta, reference_beta):
+        np.testing.assert_allclose(np.asarray(value), np.asarray(reference), atol=1.0e-10, rtol=1.0e-10)
+    for value, reference in zip(grouped_jacobian, reference_jacobian):
+        np.testing.assert_allclose(np.asarray(value), np.asarray(reference), atol=1.0e-10, rtol=1.0e-10)
 
 
 def test_cluster_solver_rejects_removed_likelihood_mode(monkeypatch: pytest.MonkeyPatch) -> None:

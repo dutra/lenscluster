@@ -101,6 +101,7 @@ matplotlib_use("Agg")
 jax_config.update("jax_enable_x64", True)
 
 from jaxtronomy.LensModel.lens_model_bulk import LensModelBulk
+from jaxtronomy.LensModel.Profiles.dpie_nie import DPIENIE
 from .config import IndependentMemberHaloConfig, LensModelConfig, MemberPopulationConfig, PriorConfig
 from .lenstool_parser import (
     _load_arc_constraints_catalog as _load_declared_arc_constraints_catalog,
@@ -748,6 +749,220 @@ UNSUPPORTED_PJAFFE_PROFILE_NAMES = {
     "PJAFFE_ELLIPSE_POTENTIAL",
     "PJAFFE_ELLIPSE_POTENTIAL_COMPACT",
 }
+GROUPED_DPIE_BACKEND_LABEL = "grouped_dpie_nie"
+
+
+def _grouped_dpie_derivatives(
+    x: jnp.ndarray,
+    y: jnp.ndarray,
+    sigma0: jnp.ndarray,
+    ra: jnp.ndarray,
+    rs: jnp.ndarray,
+    e1: jnp.ndarray,
+    e2: jnp.ndarray,
+    center_x: jnp.ndarray,
+    center_y: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def one_component(
+        sigma0_i: jnp.ndarray,
+        ra_i: jnp.ndarray,
+        rs_i: jnp.ndarray,
+        e1_i: jnp.ndarray,
+        e2_i: jnp.ndarray,
+        center_x_i: jnp.ndarray,
+        center_y_i: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        return DPIENIE.derivatives(x, y, sigma0_i, ra_i, rs_i, e1_i, e2_i, center_x_i, center_y_i)
+
+    alpha_x, alpha_y = jax.vmap(one_component)(sigma0, ra, rs, e1, e2, center_x, center_y)
+    return jnp.sum(alpha_x, axis=0), jnp.sum(alpha_y, axis=0)
+
+
+def _grouped_dpie_hessian(
+    x: jnp.ndarray,
+    y: jnp.ndarray,
+    sigma0: jnp.ndarray,
+    ra: jnp.ndarray,
+    rs: jnp.ndarray,
+    e1: jnp.ndarray,
+    e2: jnp.ndarray,
+    center_x: jnp.ndarray,
+    center_y: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def one_component(
+        sigma0_i: jnp.ndarray,
+        ra_i: jnp.ndarray,
+        rs_i: jnp.ndarray,
+        e1_i: jnp.ndarray,
+        e2_i: jnp.ndarray,
+        center_x_i: jnp.ndarray,
+        center_y_i: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        return DPIENIE.hessian(x, y, sigma0_i, ra_i, rs_i, e1_i, e2_i, center_x_i, center_y_i)
+
+    h_xx, h_xy, h_yx, h_yy = jax.vmap(one_component)(sigma0, ra, rs, e1, e2, center_x, center_y)
+    return jnp.sum(h_xx, axis=0), jnp.sum(h_xy, axis=0), jnp.sum(h_yx, axis=0), jnp.sum(h_yy, axis=0)
+
+
+def _grouped_dpie_derivatives_and_hessian(
+    x: jnp.ndarray,
+    y: jnp.ndarray,
+    sigma0: jnp.ndarray,
+    ra: jnp.ndarray,
+    rs: jnp.ndarray,
+    e1: jnp.ndarray,
+    e2: jnp.ndarray,
+    center_x: jnp.ndarray,
+    center_y: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def one_component(
+        sigma0_i: jnp.ndarray,
+        ra_i: jnp.ndarray,
+        rs_i: jnp.ndarray,
+        e1_i: jnp.ndarray,
+        e2_i: jnp.ndarray,
+        center_x_i: jnp.ndarray,
+        center_y_i: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        alpha_x, alpha_y = DPIENIE.derivatives(
+            x,
+            y,
+            sigma0_i,
+            ra_i,
+            rs_i,
+            e1_i,
+            e2_i,
+            center_x_i,
+            center_y_i,
+        )
+        h_xx, h_xy, h_yx, h_yy = DPIENIE.hessian(
+            x,
+            y,
+            sigma0_i,
+            ra_i,
+            rs_i,
+            e1_i,
+            e2_i,
+            center_x_i,
+            center_y_i,
+        )
+        return alpha_x, alpha_y, h_xx, h_xy, h_yx, h_yy
+
+    alpha_x, alpha_y, h_xx, h_xy, h_yx, h_yy = jax.vmap(one_component)(
+        sigma0,
+        ra,
+        rs,
+        e1,
+        e2,
+        center_x,
+        center_y,
+    )
+    return (
+        jnp.sum(alpha_x, axis=0),
+        jnp.sum(alpha_y, axis=0),
+        jnp.sum(h_xx, axis=0),
+        jnp.sum(h_xy, axis=0),
+        jnp.sum(h_yx, axis=0),
+        jnp.sum(h_yy, axis=0),
+    )
+
+
+def _grouped_dpie_rows_derivatives_and_hessian(
+    x: jnp.ndarray,
+    y: jnp.ndarray,
+    sigma0: jnp.ndarray,
+    ra: jnp.ndarray,
+    rs: jnp.ndarray,
+    e1: jnp.ndarray,
+    e2: jnp.ndarray,
+    center_x: jnp.ndarray,
+    center_y: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def one_component(
+        sigma0_i: jnp.ndarray,
+        ra_i: jnp.ndarray,
+        rs_i: jnp.ndarray,
+        e1_i: jnp.ndarray,
+        e2_i: jnp.ndarray,
+        center_x_i: jnp.ndarray,
+        center_y_i: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        alpha_x, alpha_y = DPIENIE.derivatives(
+            x,
+            y,
+            sigma0_i,
+            ra_i,
+            rs_i,
+            e1_i,
+            e2_i,
+            center_x_i,
+            center_y_i,
+        )
+        h_xx, h_xy, h_yx, h_yy = DPIENIE.hessian(
+            x,
+            y,
+            sigma0_i,
+            ra_i,
+            rs_i,
+            e1_i,
+            e2_i,
+            center_x_i,
+            center_y_i,
+        )
+        return alpha_x, alpha_y, -h_xx, -h_xy, -h_yx, -h_yy
+
+    return jax.vmap(one_component)(sigma0, ra, rs, e1, e2, center_x, center_y)
+
+
+def _grouped_dpie_pair_derivatives_and_hessian(
+    x: jnp.ndarray,
+    y: jnp.ndarray,
+    sigma0: jnp.ndarray,
+    ra: jnp.ndarray,
+    rs: jnp.ndarray,
+    e1: jnp.ndarray,
+    e2: jnp.ndarray,
+    center_x: jnp.ndarray,
+    center_y: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def one_component(
+        x_i: jnp.ndarray,
+        y_i: jnp.ndarray,
+        sigma0_i: jnp.ndarray,
+        ra_i: jnp.ndarray,
+        rs_i: jnp.ndarray,
+        e1_i: jnp.ndarray,
+        e2_i: jnp.ndarray,
+        center_x_i: jnp.ndarray,
+        center_y_i: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        x_one = jnp.reshape(x_i, (1,))
+        y_one = jnp.reshape(y_i, (1,))
+        alpha_x, alpha_y = DPIENIE.derivatives(
+            x_one,
+            y_one,
+            sigma0_i,
+            ra_i,
+            rs_i,
+            e1_i,
+            e2_i,
+            center_x_i,
+            center_y_i,
+        )
+        h_xx, h_xy, h_yx, h_yy = DPIENIE.hessian(
+            x_one,
+            y_one,
+            sigma0_i,
+            ra_i,
+            rs_i,
+            e1_i,
+            e2_i,
+            center_x_i,
+            center_y_i,
+        )
+        return alpha_x[0], alpha_y[0], -h_xx[0], -h_xy[0], -h_yx[0], -h_yy[0]
+
+    return jax.vmap(one_component)(x, y, sigma0, ra, rs, e1, e2, center_x, center_y)
 
 
 def _validate_supported_lens_model_list(lens_model_list: list[str], context: str) -> None:
@@ -2342,6 +2557,16 @@ def _log_evaluator_summary(args: argparse.Namespace, evaluator: Any) -> None:
         (
             f"[source-position] parameterization={getattr(evaluator, 'source_position_parameterization', 'direct')} "
             f"n_parameters={sum(spec.component_family == 'source_position' for spec in state.parameter_specs)}"
+        ),
+    )
+    _log(
+        args,
+        (
+            "[lensing-backend] "
+            f"backend={getattr(evaluator, 'grouped_lensing_backend', 'unknown')} "
+            f"mandatory_grouped_dpie=true "
+            f"dpie_components={int(getattr(evaluator, 'grouped_dpie_component_count', 0))} "
+            f"shear_components={int(getattr(evaluator, 'grouped_shear_component_count', 0))}"
         ),
     )
     max_gain = float(getattr(evaluator, "likelihood_stabilizer_max_gain", DEFAULT_LIKELIHOOD_STABILIZER_MAX_GAIN))
@@ -17337,6 +17562,19 @@ class ClusterJAXEvaluator:
         self.invalid_state_reason_counts = {name: 0 for name in INVALID_STATE_REASON_NAMES}
         self.use_bulk_ray_shooting = True
         _validate_supported_lens_model_list(state.lens_model_list, "BuildState")
+        unsupported_grouped_profiles = sorted(set(str(name) for name in state.lens_model_list) - {ORIGINAL_DPIE_PROFILE_NAME, "SHEAR"})
+        if unsupported_grouped_profiles:
+            raise RuntimeError(
+                "Mandatory grouped lensing backend supports only DPIE_NIE and SHEAR profiles; "
+                f"unsupported profiles={unsupported_grouped_profiles}."
+            )
+        if ORIGINAL_DPIE_PROFILE_NAME in set(str(name) for name in state.lens_model_list) and not (
+            callable(getattr(DPIENIE, "derivatives", None)) and callable(getattr(DPIENIE, "hessian", None))
+        ):
+            raise RuntimeError("DPIE_NIE requires grouped JAXtronomy bulk backend")
+        self.grouped_lensing_backend = GROUPED_DPIE_BACKEND_LABEL
+        self.grouped_dpie_component_count = int(sum(str(name) == ORIGINAL_DPIE_PROFILE_NAME for name in state.lens_model_list))
+        self.grouped_shear_component_count = int(sum(str(name) == "SHEAR" for name in state.lens_model_list))
         unique_lens_model_list = list(dict.fromkeys(state.lens_model_list))
         self.unique_lens_model_list = unique_lens_model_list
         self.bulk_index_list = np.asarray([unique_lens_model_list.index(name) for name in state.lens_model_list], dtype=np.int32)
@@ -21218,6 +21456,163 @@ class ClusterJAXEvaluator:
             reason_flags,
         )
 
+    def _component_indices_np(self, component_indices: np.ndarray | None = None) -> np.ndarray:
+        if component_indices is None:
+            return np.arange(len(self.state.lens_model_list), dtype=np.int32)
+        return np.asarray(component_indices, dtype=np.int32).reshape(-1)
+
+    def _split_grouped_component_indices(self, component_indices: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        indices = self._component_indices_np(component_indices)
+        if indices.size == 0:
+            return indices, indices
+        profile_type = np.asarray(self.state.packed_lens_spec.profile_type, dtype=np.int32)
+        selected_profiles = profile_type[indices]
+        unsupported = sorted(set(int(value) for value in selected_profiles.tolist()) - {DP_IE_PROFILE, SHEAR_PROFILE})
+        if unsupported:
+            raise RuntimeError(
+                "Mandatory grouped lensing backend supports only DPIE_NIE and SHEAR profiles; "
+                f"unsupported profile codes={unsupported}."
+            )
+        dpie_indices = indices[selected_profiles == DP_IE_PROFILE].astype(np.int32)
+        shear_indices = indices[selected_profiles == SHEAR_PROFILE].astype(np.int32)
+        return dpie_indices, shear_indices
+
+    def _take_packed_components(
+        self,
+        packed_state: dict[str, Any],
+        field: str,
+        component_indices: np.ndarray,
+    ) -> jnp.ndarray:
+        return jnp.take(
+            jnp.asarray(packed_state[field], dtype=jnp.float64),
+            jnp.asarray(component_indices, dtype=jnp.int32),
+            axis=0,
+        )
+
+    def _grouped_dpie_params(
+        self,
+        packed_state: dict[str, Any],
+        component_indices: np.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        return (
+            self._take_packed_components(packed_state, "sigma0", component_indices),
+            self._take_packed_components(packed_state, "Ra", component_indices),
+            self._take_packed_components(packed_state, "Rs", component_indices),
+            self._take_packed_components(packed_state, "e1", component_indices),
+            self._take_packed_components(packed_state, "e2", component_indices),
+            self._take_packed_components(packed_state, "center_x", component_indices),
+            self._take_packed_components(packed_state, "center_y", component_indices),
+        )
+
+    def _grouped_shear_alpha_and_hessian(
+        self,
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        packed_state: dict[str, Any],
+        component_indices: np.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        if component_indices.size == 0:
+            zeros = jnp.zeros_like(x, dtype=jnp.float64)
+            return zeros, zeros, zeros, zeros, zeros, zeros
+        gamma1 = self._take_packed_components(packed_state, "gamma1", component_indices)
+        gamma2 = self._take_packed_components(packed_state, "gamma2", component_indices)
+        gamma1_sum = jnp.sum(gamma1)
+        gamma2_sum = jnp.sum(gamma2)
+        alpha_x = gamma1_sum * x + gamma2_sum * y
+        alpha_y = gamma2_sum * x - gamma1_sum * y
+        ones = jnp.ones_like(x, dtype=jnp.float64)
+        h_xx = gamma1_sum * ones
+        h_xy = gamma2_sum * ones
+        h_yx = gamma2_sum * ones
+        h_yy = -gamma1_sum * ones
+        return alpha_x, alpha_y, h_xx, h_xy, h_yx, h_yy
+
+    def _grouped_alpha_and_hessian_for_components(
+        self,
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        packed_state: dict[str, Any],
+        component_indices: np.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        dpie_indices, shear_indices = self._split_grouped_component_indices(component_indices)
+        zeros = jnp.zeros_like(x, dtype=jnp.float64)
+        alpha_x = zeros
+        alpha_y = zeros
+        h_xx = zeros
+        h_xy = zeros
+        h_yx = zeros
+        h_yy = zeros
+        if dpie_indices.size:
+            dpie_values = _grouped_dpie_derivatives_and_hessian(
+                x,
+                y,
+                *self._grouped_dpie_params(packed_state, dpie_indices),
+            )
+            alpha_x = alpha_x + dpie_values[0]
+            alpha_y = alpha_y + dpie_values[1]
+            h_xx = h_xx + dpie_values[2]
+            h_xy = h_xy + dpie_values[3]
+            h_yx = h_yx + dpie_values[4]
+            h_yy = h_yy + dpie_values[5]
+        if shear_indices.size:
+            shear_values = self._grouped_shear_alpha_and_hessian(x, y, packed_state, shear_indices)
+            alpha_x = alpha_x + shear_values[0]
+            alpha_y = alpha_y + shear_values[1]
+            h_xx = h_xx + shear_values[2]
+            h_xy = h_xy + shear_values[3]
+            h_yx = h_yx + shear_values[4]
+            h_yy = h_yy + shear_values[5]
+        return alpha_x, alpha_y, h_xx, h_xy, h_yx, h_yy
+
+    def _grouped_component_rows_for_components(
+        self,
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        packed_state: dict[str, Any],
+        component_indices: np.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        indices = self._component_indices_np(component_indices)
+        if indices.size == 0:
+            empty = jnp.zeros((0, x.shape[0]), dtype=jnp.float64)
+            return empty, empty, empty, empty, empty, empty
+        profile_type = np.asarray(self.state.packed_lens_spec.profile_type, dtype=np.int32)
+        selected_profiles = profile_type[indices]
+        unsupported = sorted(set(int(value) for value in selected_profiles.tolist()) - {DP_IE_PROFILE, SHEAR_PROFILE})
+        if unsupported:
+            raise RuntimeError(
+                "Mandatory grouped lensing backend supports only DPIE_NIE and SHEAR profiles; "
+                f"unsupported profile codes={unsupported}."
+            )
+        rows = [jnp.zeros((indices.size, x.shape[0]), dtype=jnp.float64) for _ in range(6)]
+        dpie_mask_np = selected_profiles == DP_IE_PROFILE
+        if np.any(dpie_mask_np):
+            dpie_rows = _grouped_dpie_rows_derivatives_and_hessian(
+                x,
+                y,
+                *self._grouped_dpie_params(packed_state, indices[dpie_mask_np].astype(np.int32)),
+            )
+            dpie_positions = jnp.asarray(np.where(dpie_mask_np)[0], dtype=jnp.int32)
+            rows = [row.at[dpie_positions].set(value) for row, value in zip(rows, dpie_rows)]
+        shear_mask_np = selected_profiles == SHEAR_PROFILE
+        if np.any(shear_mask_np):
+            shear_indices = indices[shear_mask_np].astype(np.int32)
+            gamma1 = self._take_packed_components(packed_state, "gamma1", shear_indices)[:, jnp.newaxis]
+            gamma2 = self._take_packed_components(packed_state, "gamma2", shear_indices)[:, jnp.newaxis]
+            x_row = x[jnp.newaxis, :]
+            y_row = y[jnp.newaxis, :]
+            ones = jnp.ones_like(x_row, dtype=jnp.float64)
+            shear_rows = (
+                gamma1 * x_row + gamma2 * y_row,
+                gamma2 * x_row - gamma1 * y_row,
+                -gamma1 * ones,
+                -gamma2 * ones,
+                -gamma2 * ones,
+                gamma1 * ones,
+            )
+            shear_positions = jnp.asarray(np.where(shear_mask_np)[0], dtype=jnp.int32)
+            rows = [row.at[shear_positions].set(value) for row, value in zip(rows, shear_rows)]
+        return tuple(rows)  # type: ignore[return-value]
+
     def _ray_shooting_for_components(
         self,
         z_source: float,
@@ -21226,13 +21621,9 @@ class ClusterJAXEvaluator:
         packed_state: dict[str, Any],
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        model = self.models_by_effective_z[z_source]
-        if self.use_bulk_ray_shooting:
-            kwargs = self._bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices)
-            return model.ray_shooting(x, y, kwargs)
-        if component_indices is not None:
-            return model.ray_shooting(x, y, packed_state, k=tuple(int(idx) for idx in component_indices.tolist()))
-        return model.ray_shooting(x, y, packed_state)
+        del z_source
+        alpha_x, alpha_y, *_ = self._grouped_alpha_and_hessian_for_components(x, y, packed_state, component_indices)
+        return x - alpha_x, y - alpha_y
 
     def _flat_ray_shooting_for_components(
         self,
@@ -21241,8 +21632,8 @@ class ClusterJAXEvaluator:
         packed_state: dict[str, Any],
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        kwargs = self._flat_bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices)
-        return self.flat_lens_model.ray_shooting(x, y, kwargs)
+        alpha_x, alpha_y, *_ = self._grouped_alpha_and_hessian_for_components(x, y, packed_state, component_indices)
+        return x - alpha_x, y - alpha_y
 
     def _lensing_jacobian_for_components(
         self,
@@ -21252,12 +21643,14 @@ class ClusterJAXEvaluator:
         packed_state: dict[str, Any],
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        if not self.use_bulk_ray_shooting:
-            raise RuntimeError("Analytic image-plane Jacobians require LensModelBulk.hessian.")
-        model = self.models_by_effective_z[z_source]
-        kwargs = self._bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices)
-        f_xx, f_xy, f_yx, f_yy = model.hessian(x, y, kwargs)
-        return 1.0 - f_xx, -f_xy, -f_yx, 1.0 - f_yy
+        del z_source
+        _, _, h_xx, h_xy, h_yx, h_yy = self._grouped_alpha_and_hessian_for_components(
+            x,
+            y,
+            packed_state,
+            component_indices,
+        )
+        return 1.0 - h_xx, -h_xy, -h_yx, 1.0 - h_yy
 
     def _flat_lensing_jacobian_for_components(
         self,
@@ -21266,9 +21659,13 @@ class ClusterJAXEvaluator:
         packed_state: dict[str, Any],
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        kwargs = self._flat_bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices)
-        f_xx, f_xy, f_yx, f_yy = self.flat_lens_model.hessian(x, y, kwargs)
-        return 1.0 - f_xx, -f_xy, -f_yx, 1.0 - f_yy
+        _, _, h_xx, h_xy, h_yx, h_yy = self._grouped_alpha_and_hessian_for_components(
+            x,
+            y,
+            packed_state,
+            component_indices,
+        )
+        return 1.0 - h_xx, -h_xy, -h_yx, 1.0 - h_yy
 
     def _flat_component_alpha_and_jacobian_delta_for_pairs(
         self,
@@ -21290,105 +21687,43 @@ class ClusterJAXEvaluator:
             image_indices_np = np.asarray(image_indices, dtype=np.int32).reshape(-1)
         if int(image_indices_np.size) != int(component_indices_np.size):
             raise ValueError("Sparse flat component pair evaluation requires one image index per component.")
-
-        bulk_model = getattr(self.flat_lens_model, "lens_model", None)
-        if bulk_model is None or not all(
-            hasattr(bulk_model, attr)
-            for attr in ("_derivatives_list", "_hessian_list", "_compact_profile_mask", "_compact_skip_factor")
-        ):
-            alpha_x = jnp.zeros_like(x, dtype=jnp.float64)
-            alpha_y = jnp.zeros_like(y, dtype=jnp.float64)
-            jac00 = jnp.zeros_like(x, dtype=jnp.float64)
-            jac01 = jnp.zeros_like(x, dtype=jnp.float64)
-            jac10 = jnp.zeros_like(y, dtype=jnp.float64)
-            jac11 = jnp.zeros_like(y, dtype=jnp.float64)
-            for component_index in sorted(set(int(value) for value in component_indices_np.tolist())):
-                component = np.asarray([component_index], dtype=np.int32)
-                mask = jnp.asarray(component_indices_np == component_index, dtype=bool)
-                beta_x, beta_y = self._flat_ray_shooting_for_components(x, y, packed_state, component)
-                jac_a00, jac_a01, jac_a10, jac_a11 = self._flat_lensing_jacobian_for_components(
-                    x,
-                    y,
-                    packed_state,
-                    component,
-                )
-                alpha_x = jnp.where(mask, x - beta_x, alpha_x)
-                alpha_y = jnp.where(mask, y - beta_y, alpha_y)
-                jac00 = jnp.where(mask, jac_a00 - 1.0, jac00)
-                jac01 = jnp.where(mask, jac_a01, jac01)
-                jac10 = jnp.where(mask, jac_a10, jac10)
-                jac11 = jnp.where(mask, jac_a11 - 1.0, jac11)
-            return alpha_x, alpha_y, jac00, jac01, jac10, jac11
-
-        kwargs = self._flat_bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices_np)
-        all_kwargs = kwargs["all_kwargs"]
-        index_list = kwargs["index_list"]
-        image_indices_jax = jnp.asarray(image_indices_np, dtype=jnp.int32)
-
-        def zero_entries(x_i: jnp.ndarray) -> tuple[
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-        ]:
-            zero = jnp.zeros_like(x_i)
-            return zero, zero, zero, zero, zero, zero
-
-        def body_fun(xs: tuple[dict[str, jnp.ndarray], jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> tuple[
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-        ]:
-            component_kwargs, index, x_i, y_i, image_i = xs[0], xs[1], xs[2], xs[3], xs[4]
-            component_kwargs = {
-                key: (jnp.take(value, image_i, axis=-1) if jnp.ndim(value) > 0 else value)
-                for key, value in component_kwargs.items()
-            }
-            is_compact = bulk_model._compact_profile_mask[index]
-
-            def eval_component(_operand: Any) -> tuple[
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-            ]:
-                x_one = jnp.reshape(x_i, (1,))
-                y_one = jnp.reshape(y_i, (1,))
-                f_x, f_y = jax.lax.switch(index, bulk_model._derivatives_list, x_one, y_one, component_kwargs)
-                f_xx, f_xy, f_yx, f_yy = jax.lax.switch(index, bulk_model._hessian_list, x_one, y_one, component_kwargs)
-                return f_x[0], f_y[0], -f_xx[0], -f_xy[0], -f_yx[0], -f_yy[0]
-
-            def compact_body(_operand: Any) -> tuple[
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-            ]:
-                support_radius = bulk_model._compact_skip_factor[index] * component_kwargs["Rs"]
-                x_shift = x_i - component_kwargs["center_x"]
-                y_shift = y_i - component_kwargs["center_y"]
-                inside_support = jnp.square(x_shift) + jnp.square(y_shift) <= jnp.square(
-                    jnp.maximum(support_radius, 0.0)
-                )
-                return jax.lax.cond(
-                    inside_support,
-                    eval_component,
-                    lambda __operand: zero_entries(x_i),
-                    operand=None,
-                )
-
-            return jax.lax.cond(is_compact, compact_body, eval_component, operand=None)
-
-        return jax.lax.map(body_fun, xs=(all_kwargs, index_list, x, y, image_indices_jax))
+        del image_indices_np
+        profile_type = np.asarray(self.state.packed_lens_spec.profile_type, dtype=np.int32)
+        selected_profiles = profile_type[component_indices_np]
+        unsupported = sorted(set(int(value) for value in selected_profiles.tolist()) - {DP_IE_PROFILE, SHEAR_PROFILE})
+        if unsupported:
+            raise RuntimeError(
+                "Mandatory grouped lensing backend supports only DPIE_NIE and SHEAR profiles; "
+                f"unsupported profile codes={unsupported}."
+            )
+        outputs = [jnp.zeros_like(x, dtype=jnp.float64) for _ in range(6)]
+        dpie_mask_np = selected_profiles == DP_IE_PROFILE
+        if np.any(dpie_mask_np):
+            dpie_positions = jnp.asarray(np.where(dpie_mask_np)[0], dtype=jnp.int32)
+            dpie_values = _grouped_dpie_pair_derivatives_and_hessian(
+                jnp.take(x, dpie_positions, axis=0),
+                jnp.take(y, dpie_positions, axis=0),
+                *self._grouped_dpie_params(packed_state, component_indices_np[dpie_mask_np].astype(np.int32)),
+            )
+            outputs = [out.at[dpie_positions].set(value) for out, value in zip(outputs, dpie_values)]
+        shear_mask_np = selected_profiles == SHEAR_PROFILE
+        if np.any(shear_mask_np):
+            shear_indices = component_indices_np[shear_mask_np].astype(np.int32)
+            gamma1 = self._take_packed_components(packed_state, "gamma1", shear_indices)
+            gamma2 = self._take_packed_components(packed_state, "gamma2", shear_indices)
+            shear_positions = jnp.asarray(np.where(shear_mask_np)[0], dtype=jnp.int32)
+            x_shear = x[shear_positions]
+            y_shear = y[shear_positions]
+            shear_values = (
+                gamma1 * x_shear + gamma2 * y_shear,
+                gamma2 * x_shear - gamma1 * y_shear,
+                -gamma1,
+                -gamma2,
+                -gamma2,
+                gamma1,
+            )
+            outputs = [out.at[shear_positions].set(value) for out, value in zip(outputs, shear_values)]
+        return tuple(outputs)  # type: ignore[return-value]
 
     def _flat_component_alpha_and_jacobian_delta_rows_for_components(
         self,
@@ -21397,117 +21732,7 @@ class ClusterJAXEvaluator:
         packed_state: dict[str, Any],
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        if component_indices is None:
-            component_indices_np = np.arange(len(self.state.lens_model_list), dtype=np.int32)
-        else:
-            component_indices_np = np.asarray(component_indices, dtype=np.int32).reshape(-1)
-        if component_indices_np.size == 0:
-            empty = jnp.zeros((0, x.shape[0]), dtype=jnp.float64)
-            return empty, empty, empty, empty, empty, empty
-
-        bulk_model = getattr(self.flat_lens_model, "lens_model", None)
-        if bulk_model is None or not all(
-            hasattr(bulk_model, attr)
-            for attr in ("_derivatives_list", "_hessian_list", "_compact_profile_mask", "_compact_skip_factor")
-        ):
-            alpha_x_rows: list[jnp.ndarray] = []
-            alpha_y_rows: list[jnp.ndarray] = []
-            jac00_rows: list[jnp.ndarray] = []
-            jac01_rows: list[jnp.ndarray] = []
-            jac10_rows: list[jnp.ndarray] = []
-            jac11_rows: list[jnp.ndarray] = []
-            for component_index in component_indices_np.tolist():
-                component = np.asarray([int(component_index)], dtype=np.int32)
-                beta_x, beta_y = self._flat_ray_shooting_for_components(x, y, packed_state, component)
-                alpha_x_rows.append(x - beta_x)
-                alpha_y_rows.append(y - beta_y)
-                jac_a00, jac_a01, jac_a10, jac_a11 = self._flat_lensing_jacobian_for_components(
-                    x,
-                    y,
-                    packed_state,
-                    component,
-                )
-                jac00_rows.append(jac_a00 - 1.0)
-                jac01_rows.append(jac_a01)
-                jac10_rows.append(jac_a10)
-                jac11_rows.append(jac_a11 - 1.0)
-            return (
-                jnp.stack(alpha_x_rows, axis=0),
-                jnp.stack(alpha_y_rows, axis=0),
-                jnp.stack(jac00_rows, axis=0),
-                jnp.stack(jac01_rows, axis=0),
-                jnp.stack(jac10_rows, axis=0),
-                jnp.stack(jac11_rows, axis=0),
-            )
-
-        kwargs = self._flat_bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices_np)
-        all_kwargs = kwargs["all_kwargs"]
-        index_list = kwargs["index_list"]
-
-        def zero_entries() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-            zeros = jnp.zeros_like(x)
-            return zeros, zeros, zeros, zeros, zeros, zeros
-
-        def body_fun(xs: tuple[dict[str, jnp.ndarray], jnp.ndarray]) -> tuple[
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-        ]:
-            component_kwargs, index = xs[0], xs[1]
-            is_compact = bulk_model._compact_profile_mask[index]
-
-            def eval_component(_operand: Any) -> tuple[
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-            ]:
-                f_x, f_y = jax.lax.switch(index, bulk_model._derivatives_list, x, y, component_kwargs)
-                f_xx, f_xy, f_yx, f_yy = jax.lax.switch(index, bulk_model._hessian_list, x, y, component_kwargs)
-                return f_x, f_y, -f_xx, -f_xy, -f_yx, -f_yy
-
-            def compact_body(_operand: Any) -> tuple[
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-            ]:
-                support_radius = bulk_model._compact_skip_factor[index] * component_kwargs["Rs"]
-                x_shift = x - component_kwargs["center_x"]
-                y_shift = y - component_kwargs["center_y"]
-                inside_support = jnp.square(x_shift) + jnp.square(y_shift) <= jnp.square(
-                    jnp.maximum(support_radius, 0.0)
-                )
-
-                def eval_compact(__operand: Any) -> tuple[
-                    jnp.ndarray,
-                    jnp.ndarray,
-                    jnp.ndarray,
-                    jnp.ndarray,
-                    jnp.ndarray,
-                    jnp.ndarray,
-                ]:
-                    values = eval_component(None)
-                    zeros = jnp.zeros_like(values[0])
-                    return tuple(jnp.where(inside_support, value, zeros) for value in values)
-
-                return jax.lax.cond(
-                    jnp.any(inside_support),
-                    eval_compact,
-                    lambda __operand: zero_entries(),
-                    operand=None,
-                )
-
-            return jax.lax.cond(is_compact, compact_body, eval_component, operand=None)
-
-        return jax.lax.map(body_fun, xs=(all_kwargs, index_list))
+        return self._grouped_component_rows_for_components(x, y, packed_state, component_indices)
 
     def _flat_component_alpha_rows_for_components(
         self,
@@ -21516,62 +21741,8 @@ class ClusterJAXEvaluator:
         packed_state: dict[str, Any],
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        if component_indices is None:
-            component_indices_np = np.arange(len(self.state.lens_model_list), dtype=np.int32)
-        else:
-            component_indices_np = np.asarray(component_indices, dtype=np.int32).reshape(-1)
-        if component_indices_np.size == 0:
-            empty = jnp.zeros((0, x.shape[0]), dtype=jnp.float64)
-            return empty, empty
-
-        bulk_model = getattr(self.flat_lens_model, "lens_model", None)
-        if bulk_model is None or not all(
-            hasattr(bulk_model, attr)
-            for attr in ("_derivatives_list", "_compact_profile_mask", "_compact_skip_factor")
-        ):
-            raise RuntimeError(
-                "Alpha-only flat component rows require LensModelBulk derivative internals; "
-                "legacy per-component fallback is intentionally unsupported."
-            )
-
-        kwargs = self._flat_bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices_np)
-        all_kwargs = kwargs["all_kwargs"]
-        index_list = kwargs["index_list"]
-
-        def zero_entries() -> tuple[jnp.ndarray, jnp.ndarray]:
-            zeros = jnp.zeros_like(x)
-            return zeros, zeros
-
-        def body_fun(xs: tuple[dict[str, jnp.ndarray], jnp.ndarray]) -> tuple[jnp.ndarray, jnp.ndarray]:
-            component_kwargs, index = xs[0], xs[1]
-            is_compact = bulk_model._compact_profile_mask[index]
-
-            def eval_component(_operand: Any) -> tuple[jnp.ndarray, jnp.ndarray]:
-                return jax.lax.switch(index, bulk_model._derivatives_list, x, y, component_kwargs)
-
-            def compact_body(_operand: Any) -> tuple[jnp.ndarray, jnp.ndarray]:
-                support_radius = bulk_model._compact_skip_factor[index] * component_kwargs["Rs"]
-                x_shift = x - component_kwargs["center_x"]
-                y_shift = y - component_kwargs["center_y"]
-                inside_support = jnp.square(x_shift) + jnp.square(y_shift) <= jnp.square(
-                    jnp.maximum(support_radius, 0.0)
-                )
-
-                def eval_compact(__operand: Any) -> tuple[jnp.ndarray, jnp.ndarray]:
-                    values = eval_component(None)
-                    zeros = jnp.zeros_like(values[0])
-                    return tuple(jnp.where(inside_support, value, zeros) for value in values)
-
-                return jax.lax.cond(
-                    jnp.any(inside_support),
-                    eval_compact,
-                    lambda __operand: zero_entries(),
-                    operand=None,
-                )
-
-            return jax.lax.cond(is_compact, compact_body, eval_component, operand=None)
-
-        return jax.lax.map(body_fun, xs=(all_kwargs, index_list))
+        alpha_x, alpha_y, *_ = self._grouped_component_rows_for_components(x, y, packed_state, component_indices)
+        return alpha_x, alpha_y
 
     def _flat_ray_shooting_and_lensing_jacobian_for_components(
         self,
@@ -21580,94 +21751,12 @@ class ClusterJAXEvaluator:
         packed_state: dict[str, Any],
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        bulk_model = getattr(self.flat_lens_model, "lens_model", None)
-        if bulk_model is None or not all(
-            hasattr(bulk_model, attr)
-            for attr in ("_derivatives_list", "_hessian_list", "_compact_profile_mask", "_compact_skip_factor")
-        ):
-            beta_x, beta_y = self._flat_ray_shooting_for_components(x, y, packed_state, component_indices)
-            jacobian_entries = self._flat_lensing_jacobian_for_components(x, y, packed_state, component_indices)
-            return beta_x, beta_y, *jacobian_entries
-
-        kwargs = self._flat_bulk_ray_shooting_kwargs_from_indices(packed_state, component_indices)
-        all_kwargs = kwargs["all_kwargs"]
-        index_list = kwargs["index_list"]
-
-        def zero_entries() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-            zeros = jnp.zeros_like(x)
-            return zeros, zeros, zeros, zeros, zeros, zeros
-
-        def body_fun(xs: tuple[dict[str, jnp.ndarray], jnp.ndarray]) -> tuple[
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-        ]:
-            component_kwargs, index = xs[0], xs[1]
-            is_compact = bulk_model._compact_profile_mask[index]
-
-            def eval_component(_operand: Any) -> tuple[
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-            ]:
-                f_x, f_y = jax.lax.switch(index, bulk_model._derivatives_list, x, y, component_kwargs)
-                f_xx, f_xy, f_yx, f_yy = jax.lax.switch(index, bulk_model._hessian_list, x, y, component_kwargs)
-                return f_x, f_y, f_xx, f_xy, f_yx, f_yy
-
-            def compact_body(_operand: Any) -> tuple[
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-                jnp.ndarray,
-            ]:
-                support_radius = bulk_model._compact_skip_factor[index] * component_kwargs["Rs"]
-                x_shift = x - component_kwargs["center_x"]
-                y_shift = y - component_kwargs["center_y"]
-                inside_support = jnp.square(x_shift) + jnp.square(y_shift) <= jnp.square(
-                    jnp.maximum(support_radius, 0.0)
-                )
-
-                def eval_compact(__operand: Any) -> tuple[
-                    jnp.ndarray,
-                    jnp.ndarray,
-                    jnp.ndarray,
-                    jnp.ndarray,
-                    jnp.ndarray,
-                    jnp.ndarray,
-                ]:
-                    values = eval_component(None)
-                    zeros = jnp.zeros_like(values[0])
-                    return tuple(jnp.where(inside_support, value, zeros) for value in values)
-
-                return jax.lax.cond(
-                    jnp.any(inside_support),
-                    eval_compact,
-                    lambda __operand: zero_entries(),
-                    operand=None,
-                )
-
-            return jax.lax.cond(
-                is_compact,
-                compact_body,
-                eval_component,
-                operand=None,
-            )
-
-        f_x, f_y, f_xx, f_xy, f_yx, f_yy = jax.lax.map(body_fun, xs=(all_kwargs, index_list))
-        alpha_x = jnp.sum(f_x, axis=0)
-        alpha_y = jnp.sum(f_y, axis=0)
-        h_xx = jnp.sum(f_xx, axis=0)
-        h_xy = jnp.sum(f_xy, axis=0)
-        h_yx = jnp.sum(f_yx, axis=0)
-        h_yy = jnp.sum(f_yy, axis=0)
+        alpha_x, alpha_y, h_xx, h_xy, h_yx, h_yy = self._grouped_alpha_and_hessian_for_components(
+            x,
+            y,
+            packed_state,
+            component_indices,
+        )
         return x - alpha_x, y - alpha_y, 1.0 - h_xx, -h_xy, -h_yx, 1.0 - h_yy
 
     def _cab_morphology_predictions_for_anchors(
@@ -23920,23 +24009,13 @@ class ClusterJAXEvaluator:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         x_jax = jnp.asarray(x, dtype=jnp.float64)
         y_jax = jnp.asarray(y, dtype=jnp.float64)
-        try:
-            beta_x, beta_y = self._ray_shooting_for_components(family.z_source, x_jax, y_jax, packed_state)
-            jac_a00, jac_a01, jac_a10, jac_a11 = self._lensing_jacobian_for_components(
-                family.z_source,
-                x_jax,
-                y_jax,
-                packed_state,
-            )
-        except Exception:
-            model, _solver = self._get_exact_model_solver(family.z_source)
-            kwargs_lens = self._packed_to_kwargs_lens(packed_state)
-            beta_x, beta_y = model.ray_shooting(x_jax, y_jax, kwargs_lens)
-            f_xx, f_xy, f_yx, f_yy = model.hessian(x_jax, y_jax, kwargs_lens)
-            jac_a00 = 1.0 - f_xx
-            jac_a01 = -f_xy
-            jac_a10 = -f_yx
-            jac_a11 = 1.0 - f_yy
+        beta_x, beta_y = self._ray_shooting_for_components(family.z_source, x_jax, y_jax, packed_state)
+        jac_a00, jac_a01, jac_a10, jac_a11 = self._lensing_jacobian_for_components(
+            family.z_source,
+            x_jax,
+            y_jax,
+            packed_state,
+        )
         return (
             np.asarray(beta_x, dtype=float),
             np.asarray(beta_y, dtype=float),
