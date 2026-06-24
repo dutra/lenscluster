@@ -1,9 +1,11 @@
 import argparse
+from contextlib import nullcontext
 import os
 import re
 import resource
 import time
 import traceback
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -11,12 +13,14 @@ from typing import Any
 import pandas as pd
 from astropy.coordinates import SkyCoord
 import astropy.units as u
+from astropy.wcs import FITSFixedWarning
 import numpy as np
 
 from .jax_cosmology import kpc_per_arcsec_from_config
 
 try:
     from rich.console import Console
+    from rich.progress import Progress as _RichProgress
     from rich.table import Table
     from rich.text import Text
     RICH_AVAILABLE = True
@@ -42,6 +46,25 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only in minimal test
 
         def print(self, value: Any) -> None:
             print(getattr(value, "plain", value))
+
+    class _RichProgress:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "_RichProgress":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+            return False
+
+        def add_task(self, description: str, total: int | None = None) -> int:
+            return 0
+
+        def update(self, task_id: int, **kwargs: Any) -> None:
+            pass
+
+        def advance(self, task_id: int, advance: int = 1) -> None:
+            pass
 
     class Table:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -101,6 +124,94 @@ _CONSOLE_VISIBLE_TAGS = {
     "exception",
 }
 _STAGE_BANNER_RE = re.compile(r"^(\s*)(=+)(\s+)(.*?)(\s+)(=+)$")
+_RADECSYS_WARNING_RE = r"(?s).*RADECSYS.*deprecated.*RADESYS.*"
+
+
+class _NoOpProgress:
+    def __enter__(self) -> "_NoOpProgress":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        return False
+
+    def add_task(self, description: str, *, total: int | None = None) -> int:
+        return 0
+
+    def update(self, task_id: int, **kwargs: Any) -> None:
+        pass
+
+    def advance(self, task_id: int, advance: int = 1) -> None:
+        pass
+
+
+class _NotebookTqdmProgress:
+    def __init__(self) -> None:
+        self._bars: dict[int, Any] = {}
+        self._next_task_id = 0
+
+    def __enter__(self) -> "_NotebookTqdmProgress":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        for bar in list(self._bars.values()):
+            try:
+                bar.close()
+            except Exception:
+                pass
+        self._bars.clear()
+        return False
+
+    def add_task(self, description: str, *, total: int | None = None) -> int:
+        from tqdm.notebook import tqdm
+
+        self._next_task_id += 1
+        task_id = self._next_task_id
+        self._bars[task_id] = tqdm(total=total, desc=str(description), leave=False)
+        return task_id
+
+    def update(self, task_id: int, **kwargs: Any) -> None:
+        bar = self._bars.get(int(task_id))
+        if bar is None:
+            return
+        if "description" in kwargs:
+            bar.set_description_str(str(kwargs["description"]))
+        if "total" in kwargs and kwargs["total"] is not None:
+            bar.total = int(kwargs["total"])
+        try:
+            bar.refresh()
+        except Exception:
+            pass
+
+    def advance(self, task_id: int, advance: int = 1) -> None:
+        bar = self._bars.get(int(task_id))
+        if bar is None:
+            return
+        bar.update(int(advance))
+
+
+def is_notebook_environment() -> bool:
+    try:
+        get_ipython = __import__("IPython").get_ipython
+        shell = get_ipython()
+    except Exception:
+        return False
+    return shell is not None and shell.__class__.__name__ == "ZMQInteractiveShell"
+
+
+def progress_context(args: argparse.Namespace | None, *columns: Any, **kwargs: Any) -> Any:
+    if bool(getattr(args, "quiet", False)):
+        return nullcontext(None)
+    if is_notebook_environment():
+        return _NotebookTqdmProgress()
+    return _RichProgress(*columns, **kwargs)
+
+
+def install_astropy_wcs_warning_filters() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=_RADECSYS_WARNING_RE,
+        category=FITSFixedWarning,
+    )
 
 
 def parse_bool_env(name: str) -> bool:

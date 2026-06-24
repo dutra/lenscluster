@@ -79,7 +79,6 @@ from lenscluster.cluster_solver import (
     _soft_observed_image_presence_loglike,
     _local_jacobian_bin_loglike,
     _normalize_stage_fit_controls,
-    _parse_args,
     _validation_metrics_summary,
 )
 from lenscluster.lenstool_parser import _load_arc_constraints_catalog, _split_image_label, load_best_par

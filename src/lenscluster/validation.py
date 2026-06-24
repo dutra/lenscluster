@@ -119,6 +119,7 @@ from .utils import (
     log_exception as _log_exception,
     log_message as _log,
     log_stage_banner as _log_stage_banner,
+    progress_context as _progress_context,
     run_logged_phase as _run_logged_phase,
 )
 
@@ -271,16 +272,18 @@ POSTERIOR_DIAGNOSTIC_MODES = (
 
 class _ValidationRecoveryProgress:
     def __init__(self, args: argparse.Namespace | None = None) -> None:
+        self.args = args
         self.enabled = not bool(getattr(args, "quiet", False))
-        self._progress_cm: Progress | None = None
-        self._progress: Progress | None = None
+        self._progress_cm: Any | None = None
+        self._progress: Any | None = None
         self._parent_task: int | None = None
         self._parent_total = 0
 
     def __enter__(self) -> "_ValidationRecoveryProgress":
         if not self.enabled:
             return self
-        self._progress_cm = Progress(
+        self._progress_cm = _progress_context(
+            self.args,
             TextColumn("{task.description}"),
             BarColumn(),
             MofNCompleteColumn(),
@@ -333,15 +336,16 @@ class _ValidationMockProgress:
     def __init__(self, args: argparse.Namespace | None = None) -> None:
         self.args = args
         self.enabled = not bool(getattr(args, "quiet", False))
-        self._progress_cm: Progress | None = None
-        self._progress: Progress | None = None
+        self._progress_cm: Any | None = None
+        self._progress: Any | None = None
         self._redshift_task: int | None = None
         self._family_task: int | None = None
 
     def __enter__(self) -> "_ValidationMockProgress":
         if not self.enabled:
             return self
-        self._progress_cm = Progress(
+        self._progress_cm = _progress_context(
+            self.args,
             TextColumn("{task.description}"),
             BarColumn(),
             MofNCompleteColumn(),

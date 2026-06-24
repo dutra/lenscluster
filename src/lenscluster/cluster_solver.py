@@ -100,7 +100,13 @@ matplotlib_use("Agg")
 jax_config.update("jax_enable_x64", True)
 
 from jaxtronomy.LensModel.lens_model_bulk import LensModelBulk
-from .lenstool_parser import load_best_par
+from .config import IndependentMemberHaloConfig, LensModelConfig, MemberPopulationConfig, PriorConfig
+from .lenstool_parser import (
+    _load_arc_constraints_catalog as _load_declared_arc_constraints_catalog,
+    _load_dat_catalog as _load_declared_dat_catalog,
+    _load_multiple_images_catalog as _load_declared_multiple_images_catalog,
+    _normalize_potential_definition as _normalize_declared_potential_definition,
+)
 from .jax_cosmology import (
     DEFAULT_JAX_COSMO_DISTANCE_STEPS,
     cosmology_config_from_parsed as _cosmology_config_from_parsed,
@@ -161,6 +167,7 @@ from .utils import (
     log_stage_banner as _log_stage_banner,
     make_run_name as _make_run_name,
     parse_bool_env as _parse_bool_env,
+    progress_context as _progress_context,
     run_logged_phase as _run_logged_phase,
     Table as _RichTable,
 )
@@ -644,20 +651,6 @@ class BlockedNUTSParameterBlock:
     name: str
     indices: tuple[int, ...]
 
-
-def _parse_optional_positive_int(value: str) -> int | None:
-    text = str(value).strip()
-    if text.lower() in {"none", "null"}:
-        return None
-    try:
-        parsed = int(text)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("expected a positive integer or 'none'") from exc
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("expected a positive integer or 'none'")
-    return parsed
-
-
 @dataclass(frozen=True)
 class TracedBinData:
     effective_z_source: float
@@ -1042,96 +1035,11 @@ def _maybe_convert_loaded_posterior_arrays_to_physical(
     return converted, True
 
 
-def _positive_float_arg(value: str) -> float:
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a finite positive float") from exc
-    if not np.isfinite(parsed) or parsed <= 0.0:
-        raise argparse.ArgumentTypeError("must be a finite positive float")
-    return parsed
-
-
-def _positive_int_arg(value: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a positive integer") from exc
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return parsed
-
-
-def _truth_grid_draws_arg(value: str) -> int | None:
-    text = str(value).strip().lower()
-    if text == "all":
-        return None
-    try:
-        parsed = int(text)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be 'all' or a positive integer") from exc
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be 'all' or a positive integer")
-    return parsed
-
-
-def _truth_grid_size_arg(value: str) -> int:
-    text = str(value).strip().lower()
-    if text == "native":
-        return 0
-    try:
-        parsed = int(text)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be 'native', 0, or a positive integer") from exc
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("must be 'native', 0, or a positive integer")
-    return parsed
 
 
 TRUTH_GRID_MODE_MEDIAN = "median"
 TRUTH_GRID_MODE_POSTERIOR = "posterior"
-TRUTH_GRID_MODE_CHOICES = (TRUTH_GRID_MODE_MEDIAN, TRUTH_GRID_MODE_POSTERIOR)
 DEFAULT_TRUTH_GRID_SIZE = 256
-
-
-def _nonnegative_int_arg(value: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a nonnegative integer") from exc
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("must be a nonnegative integer")
-    return parsed
-
-
-def _nonnegative_float_arg(value: str) -> float:
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a finite nonnegative float") from exc
-    if not np.isfinite(parsed) or parsed < 0.0:
-        raise argparse.ArgumentTypeError("must be a finite nonnegative float")
-    return parsed
-
-
-def _finite_float_arg(value: str) -> float:
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a finite float") from exc
-    if not np.isfinite(parsed):
-        raise argparse.ArgumentTypeError("must be a finite float")
-    return parsed
-
-
-def _probability_float_arg(value: str) -> float:
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a finite float in [0, 1]") from exc
-    if not np.isfinite(parsed) or parsed < 0.0 or parsed > 1.0:
-        raise argparse.ArgumentTypeError("must be a finite float in [0, 1]")
-    return parsed
 
 
 def _resume_mode(args: argparse.Namespace) -> str | None:
@@ -1140,1320 +1048,12 @@ def _resume_mode(args: argparse.Namespace) -> str | None:
         return None
     mode = str(value)
     if mode not in RESUME_MODES:
-        raise SystemExit(f"--resume must be one of {', '.join(RESUME_MODES)}.")
+        raise SystemExit(f"resume must be one of {', '.join(RESUME_MODES)}.")
     return mode
 
 
 def _resume_mode_is_fast(args: argparse.Namespace) -> bool:
     return _resume_mode(args) == RESUME_MODE_FAST
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Cluster dPIE solver with JAXtronomy + NumPyro.")
-    parser.add_argument("--par-path", required=False, help="Path to input_a_sl.par")
-    parser.add_argument("--output-dir", default="plots", help="Base output directory")
-    parser.add_argument("--run-name", default=None, help="Optional run name")
-    parser.add_argument(
-        "--pos-sigma-arcsec",
-        type=float,
-        default=None,
-        help="Override positional uncertainty in arcsec",
-    )
-    parser.add_argument(
-        "--fov-limit-radius",
-        type=float,
-        default=None,
-        metavar="ARCSEC",
-        help="Ignore catalog image/member rows outside this inclusive circular FOV radius in solver arcsec coordinates.",
-    )
-    parser.add_argument(
-        "--fov-limit-x",
-        type=float,
-        nargs=2,
-        default=None,
-        metavar=("X_LEFT", "X_RIGHT"),
-        help=(
-            "Ignore catalog image/member rows outside these inclusive x arcsec bounds. "
-            "Values are order-insensitive."
-        ),
-    )
-    parser.add_argument(
-        "--fov-limit-y",
-        type=float,
-        nargs=2,
-        default=None,
-        metavar=("Y_BOTTOM", "Y_TOP"),
-        help=(
-            "Ignore catalog image/member rows outside these inclusive y arcsec bounds. "
-            "Values are order-insensitive."
-        ),
-    )
-    parser.add_argument(
-        "--potfile-member-brightest-n",
-        type=_positive_int_arg,
-        nargs="+",
-        default=None,
-        metavar="N",
-        help=(
-            "At ingestion, keep only the N brightest rows from each potfile member catalog before "
-            "building scaling components and active-scaling ranks. Pass one value for all potfiles "
-            "or one value per potfile. Brightest means smallest catalog magnitude."
-        ),
-    )
-    parser.add_argument(
-        "--potfile-member-mag-max",
-        type=_finite_float_arg,
-        nargs="+",
-        default=None,
-        metavar="MAG",
-        help=(
-            "At ingestion, keep only potfile member catalog rows with catalog_mag <= MAG before "
-            "building scaling components and active-scaling ranks. Pass one value for all potfiles "
-            "or one value per potfile."
-        ),
-    )
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument(
-        "--jax-default-device",
-        choices=JAX_DEVICE_CHOICES,
-        default=JAX_DEVICE_AUTO,
-        help="Default JAX device for solver setup, non-SMC sampling, validation, and plotting.",
-    )
-    parser.add_argument(
-        "--smc-device",
-        choices=JAX_DEVICE_CHOICES,
-        default=JAX_DEVICE_AUTO,
-        help="JAX device used only by the BlackJAX SMC sampler.",
-    )
-    parser.add_argument("--plots-only", action="store_true")
-    parser.add_argument(
-        "--resume",
-        nargs="?",
-        const=RESUME_MODE_ALL,
-        default=False,
-        choices=RESUME_MODES,
-        metavar="{all,fast}",
-        help=(
-            "Reuse completed run/stage artifacts and continue from the first incomplete stage. "
-            "'all' is the default; 'fast' skips earlier sequential stages and runs only the final enabled stage."
-        ),
-    )
-    parser.add_argument(
-        "--skip-validation",
-        action="store_true",
-        help="Debug mode: skip the post-fit source-plane validation summary after sampling.",
-    )
-    parser.add_argument(
-        "--skip-plots",
-        action="store_true",
-        help="Debug mode: skip plot/table generation after artifacts are saved to isolate plotting memory spikes.",
-    )
-    parser.add_argument(
-        "--best-value",
-        choices=BEST_VALUE_CHOICES,
-        default=DEFAULT_BEST_VALUE,
-        help=(
-            "Posterior value used as the selected realization for validation and lensing plots. "
-            "'map' uses max posterior log probability; 'maximum-likelihood' uses max source/image "
-            "likelihood; 'median' uses the elementwise posterior median in physical parameter space."
-        ),
-    )
-    parser.add_argument(
-        "--quick-diagnostics",
-        action="store_true",
-        help=(
-            "Fast post-fit diagnostics: skip exact image-position fit-quality diagnostics and "
-            "exact image-position fit-quality draws while still writing recovery plots."
-        ),
-    )
-    parser.add_argument(
-        "--debug-sampler-diagnostics",
-        action="store_true",
-        help=(
-            "Write bounded post-hoc NUTS diagnostics for stuck chains, including adapted step size, "
-            "mass-matrix summaries, local gradients, direction scans, and critical-arc likelihood terms."
-        ),
-    )
-    parser.add_argument(
-        "--exact-image-diagnostics-stage2",
-        action="store_true",
-        help=(
-            "Sequential-only diagnostic override: run exact image matching and residual diagnostics for "
-            "stage2_joint even when a later image-plane stage is enabled."
-        ),
-    )
-    parser.add_argument(
-        "--exact-image-diagnostics-stage3",
-        action="store_true",
-        help=(
-            "Sequential-only diagnostic override: run exact image matching and residual diagnostics for "
-            "stage3_image_plane even when a stage 4 image-plane stage is enabled."
-        ),
-    )
-    parser.add_argument(
-        "--image-catalog-family-cutout-image-dir",
-        default=None,
-        help=(
-            "Optional BUFFALO/HFF image directory. When set, write an image-catalog family cutout diagnostic "
-            "PDF for eligible exact image-plane stages."
-        ),
-    )
-    parser.add_argument(
-        "--image-catalog-family-cutout-image-scale",
-        choices=("auto", "30mas", "60mas"),
-        default="60mas",
-        help="Image scale for --image-catalog-family-cutout-image-dir.",
-    )
-    parser.add_argument(
-        "--image-catalog-family-cutout-bands",
-        nargs="+",
-        default=None,
-        metavar="BAND",
-        help=(
-            "Optional three or more FITS bands for image-catalog family cutout diagnostics. "
-            "Defaults to the plotting helper's RGB bands."
-        ),
-    )
-    parser.add_argument("--image-catalog-family-cutout-rgb-q", type=_positive_float_arg, default=None)
-    parser.add_argument("--image-catalog-family-cutout-rgb-stretch", type=_positive_float_arg, default=None)
-    parser.add_argument("--image-catalog-family-cutout-rgb-minimum", type=_finite_float_arg, default=None)
-    parser.add_argument("--image-catalog-family-cutout-rgb-red-gain", type=_positive_float_arg, default=None)
-    parser.add_argument("--image-catalog-family-cutout-rgb-green-gain", type=_positive_float_arg, default=None)
-    parser.add_argument("--image-catalog-family-cutout-rgb-blue-gain", type=_positive_float_arg, default=None)
-    parser.add_argument(
-        "--image-catalog-family-cutout-mode",
-        choices=("full", "fast"),
-        default="full",
-        help=(
-            "Rendering mode for image-catalog family cutout diagnostics. "
-            "'full' preserves publication-quality output; 'fast' lowers DPI, downsamples embedded cutouts, "
-            "and skips critical-line overlays unless overridden."
-        ),
-    )
-    parser.add_argument(
-        "--image-catalog-family-cutout-dpi",
-        type=_positive_int_arg,
-        default=None,
-        help="Optional DPI override for image-catalog family cutout diagnostics.",
-    )
-    parser.add_argument(
-        "--image-catalog-family-cutout-max-side-pixels",
-        type=_positive_int_arg,
-        default=None,
-        help="Optional cap on embedded RGB cutout image side length for image-catalog family cutout diagnostics.",
-    )
-    parser.add_argument(
-        "--image-catalog-family-cutout-critical-lines",
-        choices=("auto", "on", "off"),
-        default="auto",
-        help="Critical-line overlay policy for image-catalog family cutouts. 'auto' means on in full mode and off in fast mode.",
-    )
-    parser.add_argument(
-        "--image-catalog-family-cutouts",
-        dest="image_catalog_family_cutouts",
-        action="store_true",
-        help="Generate the detailed image_catalog_family_cutouts.pdf in the final stage.",
-    )
-    parser.add_argument(
-        "--no-image-catalog-family-cutouts",
-        dest="image_catalog_family_cutouts",
-        action="store_false",
-        help="Disable only the detailed image_catalog_family_cutouts.pdf; the family-cluster RGB overview can still be written.",
-    )
-    parser.set_defaults(image_catalog_family_cutouts=True)
-    parser.add_argument(
-        "--kappa-true-fits",
-        default=None,
-        help=(
-            "Optional true convergence FITS image. When set, write kappa truth diagnostics at "
-            "--caustic-source-redshift. Combine with --gammax-true-fits and --gammay-true-fits "
-            "to also write absolute-magnification truth recovery plots."
-        ),
-    )
-    parser.add_argument(
-        "--gammax-true-fits",
-        default=None,
-        help="Optional true gamma1/shear-x FITS image paired with --gammay-true-fits for mu truth recovery.",
-    )
-    parser.add_argument(
-        "--gammay-true-fits",
-        default=None,
-        help="Optional true gamma2/shear-y FITS image paired with --gammax-true-fits for mu truth recovery.",
-    )
-    parser.add_argument(
-        "--truth-grid-mode",
-        choices=TRUTH_GRID_MODE_CHOICES,
-        default=TRUTH_GRID_MODE_MEDIAN,
-        help=(
-            "Truth-map recovery grid convention. 'median' evaluates one elementwise posterior-median "
-            "realization; 'posterior' evaluates posterior draws and writes q16/median/q84 grids."
-        ),
-    )
-    parser.add_argument(
-        "--truth-grid-draws",
-        type=_truth_grid_draws_arg,
-        default=64,
-        help=(
-            "Posterior draw cap for --truth-grid-mode posterior. Use 'all' to evaluate every retained "
-            "posterior sample; a positive integer selects deterministic evenly spaced draws."
-        ),
-    )
-    parser.add_argument(
-        "--truth-grid-size",
-        type=_truth_grid_size_arg,
-        default=DEFAULT_TRUTH_GRID_SIZE,
-        help=(
-            "Truth-recovery diagnostic grid side length. The default 256 follows Meneghetti et al. "
-            "Use 0 or 'native' to evaluate on the native truth FITS grid."
-        ),
-    )
-    parser.add_argument(
-        "--corner-overlay-bayes-dat",
-        default=None,
-        help=(
-            "Optional Lenstool bayes.dat chain to overlay as unfilled contours on matching corner plots. "
-            "Missing or unmatched columns are skipped during plotting."
-        ),
-    )
-    parser.add_argument(
-        "--corner-overlay-best-par",
-        default=None,
-        help=(
-            "Optional Lenstool best.par file to overlay as a gold marker on matching corner plots. "
-            "Potfile reference values are inferred from optimized member potentials when possible."
-        ),
-    )
-    parser.add_argument(
-        "--fit-quality-draws",
-        type=int,
-        default=0,
-        help=(
-            "Maximum posterior draws used for fit-quality image and model magnification uncertainty intervals. "
-            "Defaults to 0, which runs exact image diagnostics for the best fit only."
-        ),
-    )
-    parser.add_argument(
-        "--exact-image-min-distance-arcsec",
-        type=_positive_float_arg,
-        default=DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC,
-        help=(
-            "Lenstronomy exact image search grid spacing in arcsec for post-fit diagnostics. "
-            "Larger values reduce grid size and speed up exact fit-quality plots."
-        ),
-    )
-    parser.add_argument(
-        "--exact-image-precision-limit",
-        type=_positive_float_arg,
-        default=DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
-        help="Lenstronomy exact image solver precision limit for post-fit diagnostics.",
-    )
-    parser.add_argument(
-        "--exact-image-num-iter-max",
-        type=int,
-        default=DEFAULT_EXACT_IMAGE_NUM_ITER_MAX,
-        help="Maximum Lenstronomy exact image solver iterations for post-fit diagnostics.",
-    )
-    parser.add_argument(
-        "--exact-image-finder",
-        choices=EXACT_IMAGE_FINDER_CHOICES,
-        default=DEFAULT_EXACT_IMAGE_FINDER,
-        help=(
-            "Exact image-finding backend for post-fit diagnostics. lenstronomy keeps the global reference "
-            "solver; local-lm refines known image anchors; local-lm-adaptive adds local fallback near failures."
-        ),
-    )
-    parser.add_argument(
-        "--exact-image-displacement-tol-arcsec",
-        type=_positive_float_arg,
-        default=DEFAULT_EXACT_IMAGE_DISPLACEMENT_TOL_ARCSEC,
-        help="Internal local-LM image displacement convergence tolerance in arcsec.",
-    )
-    parser.add_argument(
-        "--exact-image-identification-tol-arcsec",
-        type=_positive_float_arg,
-        default=DEFAULT_EXACT_IMAGE_IDENTIFICATION_TOL_ARCSEC,
-        help="Required local image-root identification accuracy in arcsec for local exact image solvers.",
-    )
-    parser.add_argument(
-        "--exact-image-lm-max-iter",
-        type=int,
-        default=DEFAULT_EXACT_IMAGE_LM_MAX_ITER,
-        help="Maximum local Levenberg-Marquardt iterations per observed image.",
-    )
-    parser.add_argument(
-        "--exact-image-lm-trust-radius-arcsec",
-        type=_positive_float_arg,
-        default=DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC,
-        help="Maximum local Levenberg-Marquardt step size in arcsec.",
-    )
-    parser.add_argument(
-        "--exact-image-adaptive-max-levels",
-        type=int,
-        default=DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
-        help="Maximum local adaptive search refinement levels for local-lm-adaptive.",
-    )
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress stage logs and NS progress output; NumPyro SVI/NUTS progress bars may still render.",
-    )
-    parser.add_argument(
-        "--sampling-engine",
-        choices=SINGLE_STAGE_SAMPLING_ENGINES,
-        default=SAMPLING_ENGINE_REFRESHING_SURROGATE,
-        help=(
-            "Use the exact full likelihood or a first-order inactive-scaling surrogate "
-            "for single-stage/non-sequential runs."
-        ),
-    )
-    parser.add_argument(
-        "--stage1-sampling-engine",
-        choices=STAGE1_SAMPLING_ENGINE_CHOICES,
-        default=SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
-        help="Sampling engine used after stage-0 discovery for stage1_backprojected_centroid_fit.",
-    )
-    parser.add_argument(
-        "--stage1-likelihood",
-        choices=STAGE1_LIKELIHOODS,
-        default=STAGE1_LIKELIHOOD_LOCAL_JACOBIAN,
-        help="Likelihood/covariance used by stage1_backprojected_centroid_fit.",
-    )
-    parser.add_argument(
-        "--stage2-forward-mode",
-        choices=STAGE2_FORWARD_MODES,
-        default=STAGE2_FORWARD_MODE_NONE,
-        help="Optional stage2_free_source_forward_fit mode.",
-    )
-    parser.add_argument(
-        "--stage2-sampling-engine",
-        choices=STAGE2_SAMPLING_ENGINE_CHOICES,
-        default=SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
-        help="Stage-2 sampling engine. 'inherit' uses --stage1-sampling-engine.",
-    )
-    parser.add_argument(
-        "--stage2-fresh-process",
-        dest="stage2_fresh_process",
-        action="store_true",
-        help="Run optional stage 2 in a fresh spawned Python/JAX process.",
-    )
-    parser.add_argument(
-        "--no-stage2-fresh-process",
-        dest="stage2_fresh_process",
-        action="store_false",
-        help="Run optional stage 2 in the current process.",
-    )
-    parser.set_defaults(stage2_fresh_process=True)
-    parser.add_argument(
-        "--perturbation-discovery-alpha-tol-arcsec",
-        type=_positive_float_arg,
-        default=DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC,
-        help="Stage-0 alpha perturbation tolerance in arcsec for selecting exact/free member galaxies.",
-    )
-    parser.add_argument(
-        "--perturbation-discovery-jacobian-tol",
-        type=_positive_float_arg,
-        default=DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL,
-        help="Stage-0 Jacobian perturbation tolerance for selecting exact/free member galaxies.",
-    )
-    parser.add_argument(
-        "--perturbation-discovery-jacobian-weight",
-        type=_nonnegative_float_arg,
-        default=DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_WEIGHT,
-        help="Relative nonnegative weight of Jacobian perturbations in the stage-0 perturbation score.",
-    )
-    parser.add_argument(
-        "--source-plane-covariance-floor",
-        type=float,
-        default=1.0e-6,
-        help="Source-plane covariance diagonal floor in arcsec^2 for magnification-weighted source-plane errors.",
-    )
-    parser.add_argument(
-        "--source-plane-covariance-mode",
-        choices=SOURCE_PLANE_COVARIANCE_MODES,
-        default=SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
-        help=(
-            "How to convert image-position uncertainty into source-plane covariance. "
-            "'magnification' uses the cached local lensing metric; 'unit' uses inv_abs_mu=1 "
-            "for fast source-plane clustering."
-        ),
-    )
-    parser.add_argument(
-        "--independent-scaling-free-log-sigma-tau-prior-median",
-        type=float,
-        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
-        help="Lognormal prior median for selected free-galaxy log-sigma displacement tau.",
-    )
-    parser.add_argument(
-        "--independent-scaling-free-log-mass-tau-prior-median",
-        type=float,
-        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
-        help="Lognormal prior median for selected free-galaxy log-mass displacement tau.",
-    )
-    parser.add_argument(
-        "--independent-scaling-free-log-tau-prior-sigma",
-        type=float,
-        default=DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
-        help="Shared lognormal prior log-sigma for selected free-galaxy sigma/mass displacement tau parameters.",
-    )
-    parser.add_argument(
-        "--scaling-relation-mode",
-        choices=SCALING_RELATION_MODES,
-        default=DEFAULT_SCALING_RELATION_MODE,
-        help="Member-galaxy scaling-law parametrization. The live model samples alpha_sigma and gamma_ml, deriving beta_radius.",
-    )
-    parser.add_argument(
-        "--potfile-alpha-sigma-prior-mean",
-        type=_finite_float_arg,
-        default=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN,
-        help="Mean of the truncated-normal prior for the potfile member sigma luminosity exponent alpha_sigma.",
-    )
-    parser.add_argument(
-        "--potfile-alpha-sigma-prior-std",
-        type=_positive_float_arg,
-        default=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD,
-        help="Standard deviation of the truncated-normal prior for alpha_sigma.",
-    )
-    parser.add_argument(
-        "--potfile-alpha-sigma-prior-lower",
-        type=_finite_float_arg,
-        default=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER,
-        help="Lower bound of the truncated-normal prior for alpha_sigma.",
-    )
-    parser.add_argument(
-        "--potfile-alpha-sigma-prior-upper",
-        type=_finite_float_arg,
-        default=DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_UPPER,
-        help="Upper bound of the truncated-normal prior for alpha_sigma.",
-    )
-    parser.add_argument(
-        "--potfile-gamma-ml-prior-mean",
-        type=_finite_float_arg,
-        default=DEFAULT_SOLVER_POTFILE_GAMMA_ML_MEAN,
-        help="Mean of the truncated-normal prior for the potfile member mass-to-light tilt gamma_ml.",
-    )
-    parser.add_argument(
-        "--potfile-gamma-ml-prior-std",
-        type=_positive_float_arg,
-        default=DEFAULT_SOLVER_POTFILE_GAMMA_ML_STD,
-        help="Standard deviation of the truncated-normal prior for gamma_ml.",
-    )
-    parser.add_argument(
-        "--potfile-gamma-ml-prior-lower",
-        type=_finite_float_arg,
-        default=DEFAULT_SOLVER_POTFILE_GAMMA_ML_LOWER,
-        help="Lower bound of the truncated-normal prior for gamma_ml.",
-    )
-    parser.add_argument(
-        "--potfile-gamma-ml-prior-upper",
-        type=_finite_float_arg,
-        default=DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER,
-        help="Upper bound of the truncated-normal prior for gamma_ml.",
-    )
-    parser.add_argument(
-        "--scaling-scatter",
-        action="store_true",
-        help="Add Bergamini sigma/mass intrinsic log-scatter to member-galaxy scaling relations.",
-    )
-    parser.add_argument(
-        "--softening-length-kpc",
-        type=_nonnegative_float_arg,
-        default=DEFAULT_SOFTENING_LENGTH_KPC,
-        help=(
-            "Reference simulation softening length in kpc. When positive, sample "
-            "log_softening_length_kpc and use sqrt(core_radius_kpc^2 + softening_length_kpc^2) "
-            "as the dPIE core radius passed to lensing."
-        ),
-    )
-    parser.add_argument(
-        "--softening-length-prior-log-sigma",
-        type=_positive_float_arg,
-        default=DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA,
-        help="Normal-prior sigma for log_softening_length_kpc when --softening-length-kpc is positive.",
-    )
-    parser.add_argument(
-        "--refresh-every",
-        type=_parse_refresh_every_value,
-        nargs="+",
-        default=[DEFAULT_REFRESH_EVERY],
-        help=(
-            "SVI refresh cadence per stage. In sequential stage0/stage1 runs, pass two values; "
-            "when stage2_free_source_forward_fit is enabled, pass three values."
-        ),
-    )
-    parser.add_argument(
-        "--refresh-param-drift-frac",
-        type=float,
-        default=DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
-        help="Fraction of the prior width used for surrogate finite-difference steps and drift thresholds.",
-    )
-    parser.add_argument(
-        "--jax-clear-caches-after-svi-refresh",
-        action=argparse.BooleanOptionalAction,
-        default=DEFAULT_JAX_CLEAR_CACHES_AFTER_SVI_REFRESH,
-        help=(
-            "Clear JAX's in-process compilation caches after the initial evaluator refresh and each blocked SVI cache refresh. "
-            "Enabled by default to reduce peak memory in refreshing-surrogate stage-4 runs; "
-            "pass --no-jax-clear-caches-after-svi-refresh to favor compile reuse."
-        ),
-    )
-    parser.add_argument(
-        "--fit-method",
-        nargs="+",
-        choices=(
-            FIT_METHOD_SVI,
-            FIT_METHOD_SVI_NUTS,
-            FIT_METHOD_NUTS,
-            FIT_METHOD_ACTIVE_BLOCKED_NUTS,
-            FIT_METHOD_NS,
-            FIT_METHOD_SMC,
-            FIT_METHOD_MCHMC,
-            FIT_METHOD_MCLMC,
-        ),
-        default=[FIT_METHOD_SVI_NUTS],
-        metavar="{svi,svi+nuts,nuts,active-blocked-nuts,ns,smc,mchmc,mclmc}",
-        help=(
-            "Use SVI only, SVI initialized NUTS, or a direct sampler. "
-            "active-blocked-nuts runs SVI initialization followed by random active-galaxy conditional NUTS blocks. "
-            "The ns value is accepted only for backwards-compatible parsing and is reserved for --fit-mode evidence-ns; "
-            "nuts and smc are accepted only for non-blocked sequential stage 4 image-plane modes. "
-            "mchmc and mclmc are direct BlackJAX microcanonical samplers for sampled stages. "
-            "In sequential image-plane runs, pass one value for all sampled stages, two values for stage 2 and "
-            "stage 3, or three values when a final stage 4 image-plane mode is enabled."
-        ),
-    )
-    parser.add_argument(
-        "--image-plane-mode",
-        choices=(
-            IMAGE_PLANE_MODE_NONE,
-            IMAGE_PLANE_MODE_LOCAL_JACOBIAN,
-            IMAGE_PLANE_MODE_LINEARIZED_FORWARD_BETA,
-            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
-        ),
-        default=IMAGE_PLANE_MODE_NONE,
-        help=(
-            "Low-level likelihood selector for non-sequential/debug runs. "
-            "Sequential production runs should use --stage1-likelihood and --stage2-forward-mode."
-        ),
-    )
-    parser.add_argument(
-        "--critical-det-diagnostic-threshold",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_DET_DIAGNOSTIC_THRESHOLD,
-        help=(
-            "Post-stage-3 diagnostic threshold for tiny local lensing Jacobian determinants. "
-            "Images with abs(det A) below this value are logged and written to critical_det_images.csv."
-        ),
-    )
-    parser.add_argument(
-        "--skip-critical-det-diagnostic",
-        action="store_true",
-        help="Disable the post-stage-3 tiny-detA image diagnostic before stage 4.",
-    )
-    parser.add_argument(
-        "--image-plane-newton-steps",
-        type=int,
-        choices=(0, 1, 2, 3),
-        default=0,
-        help=(
-            "Additional Newton updates after the initial linearized image-plane correction in stage 4. "
-            "Zero still performs one local linear solve at each observed image."
-        ),
-    )
-    parser.add_argument(
-        "--critical-arc-critical-direction-sigma-arcsec",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
-        help="Broad along-arc image-plane sigma for critical-arc mixture stage 4.",
-    )
-    parser.add_argument(
-        "--critical-arc-base-prob",
-        type=float,
-        default=DEFAULT_CRITICAL_ARC_BASE_PROB,
-        help="Baseline prior probability that a catalog row is a critical-arc support point.",
-    )
-    parser.add_argument(
-        "--critical-arc-max-prob",
-        type=float,
-        default=DEFAULT_CRITICAL_ARC_MAX_PROB,
-        help="Maximum prior probability for the critical-arc branch near singular local Jacobians.",
-    )
-    parser.add_argument(
-        "--critical-arc-singular-threshold",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
-        help="Smallest-singular-value threshold where the critical-arc branch prior starts increasing.",
-    )
-    parser.add_argument(
-        "--sample-critical-arc-singular-threshold",
-        action="store_true",
-        help=(
-            "Sample the critical-arc smallest-singular-value threshold as a global hyperparameter. "
-            "Only valid for critical-arc-mixture image-plane stage 4."
-        ),
-    )
-    parser.add_argument(
-        "--critical-arc-singular-threshold-prior-median",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_MEDIAN,
-        help="Median of the truncated log-normal prior for sampled critical_arc_singular_threshold.",
-    )
-    parser.add_argument(
-        "--critical-arc-singular-threshold-prior-log-sigma",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_PRIOR_LOG_SIGMA,
-        help="Log-space standard deviation for the sampled critical_arc_singular_threshold prior.",
-    )
-    parser.add_argument(
-        "--critical-arc-singular-threshold-lower",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_LOWER,
-        help="Physical lower bound for sampled critical_arc_singular_threshold.",
-    )
-    parser.add_argument(
-        "--critical-arc-singular-threshold-upper",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD_UPPER,
-        help="Physical upper bound for sampled critical_arc_singular_threshold.",
-    )
-    parser.add_argument(
-        "--critical-arc-singular-softness",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
-        help="Softness for the critical-arc prior transition as the smallest singular value approaches zero.",
-    )
-    parser.add_argument(
-        "--sample-critical-arc-singular-softness",
-        action="store_true",
-        help=(
-            "Sample the critical-arc smallest-singular-value transition softness as a global hyperparameter. "
-            "Only valid for critical-arc-mixture image-plane stage 4."
-        ),
-    )
-    parser.add_argument(
-        "--critical-arc-singular-softness-prior-median",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_MEDIAN,
-        help="Median of the truncated log-normal prior for sampled critical_arc_singular_softness.",
-    )
-    parser.add_argument(
-        "--critical-arc-singular-softness-prior-log-sigma",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_PRIOR_LOG_SIGMA,
-        help="Log-space standard deviation for the sampled critical_arc_singular_softness prior.",
-    )
-    parser.add_argument(
-        "--critical-arc-singular-softness-lower",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_LOWER,
-        help="Physical lower bound for sampled critical_arc_singular_softness.",
-    )
-    parser.add_argument(
-        "--critical-arc-singular-softness-upper",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER,
-        help="Physical upper bound for sampled critical_arc_singular_softness.",
-    )
-    parser.add_argument(
-        "--critical-arc-lm-damping-relative",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE,
-        help="Relative LM damping added to A.T A for critical-arc mixture image-plane displacements.",
-    )
-    parser.add_argument(
-        "--critical-arc-lm-damping-absolute",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE,
-        help="Absolute LM damping added to A.T A for critical-arc mixture image-plane displacements.",
-    )
-    parser.add_argument(
-        "--critical-arc-lm-trust-radius-arcsec",
-        type=_positive_float_arg,
-        default=DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC,
-        help="Large smooth finite guard radius for critical-arc mixture LM image-plane displacements.",
-    )
-    parser.add_argument(
-        "--arc-recovery-p-arc-threshold",
-        type=_probability_float_arg,
-        default=DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD,
-        help=(
-            "Minimum critical-arc mixture arc-vs-point inlier responsibility required for "
-            "arc-supported image recovery."
-        ),
-    )
-    parser.add_argument(
-        "--arc-aware-max-arclength-arcsec",
-        type=_positive_float_arg,
-        default=DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC,
-        help="Maximum traced arclength in each direction for arc-aware image recovery validation.",
-    )
-    parser.add_argument(
-        "--arc-aware-curve-step-arcsec",
-        type=_positive_float_arg,
-        default=DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC,
-        help="Curve tracing step size for arc-aware image recovery validation.",
-    )
-    parser.add_argument(
-        "--cab-likelihood-weight",
-        type=float,
-        default=None,
-        help=(
-            "Weight for optional CAB-informed arc morphology constraints. "
-            "Defaults to 1.0 when parsed arc constraints exist and 0.0 otherwise."
-        ),
-    )
-    parser.add_argument(
-        "--cab-finite-difference-step-arcsec",
-        type=_positive_float_arg,
-        default=DEFAULT_CAB_FINITE_DIFFERENCE_STEP_ARCSEC,
-        help="Finite-difference step in arcsec for CAB tangent-direction curvature.",
-    )
-    parser.add_argument(
-        "--cab-tangent-sigma-floor-rad",
-        type=_positive_float_arg,
-        default=DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD,
-        help="Minimum tangent-angle sigma in radians for CAB morphology constraints.",
-    )
-    parser.add_argument(
-        "--cab-curvature-sigma-floor-arcsec-inv",
-        type=_positive_float_arg,
-        default=DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV,
-        help="Minimum curvature sigma in arcsec^-1 for CAB morphology constraints.",
-    )
-    parser.add_argument(
-        "--linearized-beta-prior-sigma-arcsec",
-        type=float,
-        default=DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC,
-        help="Normal-prior sigma for explicit stage-4 source coordinates, centered on stage-3 source centroids.",
-    )
-    parser.add_argument(
-        "--source-position-parameterization",
-        choices=SOURCE_POSITION_PARAMETERIZATIONS,
-        default=SOURCE_POSITION_PARAMETERIZATION_PRIOR_WHITENED,
-        help=(
-            "Stage-4 explicit source-position sampling coordinate. direct samples beta in arcsec; "
-            "prior-whitened samples unit prior offsets and maps beta=mu+sigma*eta; "
-            "conditional-whitened is experimental."
-        ),
-    )
-    parser.add_argument(
-        "--evidence-source-prior-sigma-arcsec",
-        type=float,
-        default=None,
-        help=(
-            "Required for --fit-mode evidence-ns. Isotropic Gaussian source-position prior sigma, "
-            "shared by all families."
-        ),
-    )
-    parser.add_argument(
-        "--evidence-source-prior-mean-x-arcsec",
-        type=float,
-        default=0.0,
-        help="Gaussian source-position prior mean beta_x for --fit-mode evidence-ns.",
-    )
-    parser.add_argument(
-        "--evidence-source-prior-mean-y-arcsec",
-        type=float,
-        default=0.0,
-        help="Gaussian source-position prior mean beta_y for --fit-mode evidence-ns.",
-    )
-    parser.add_argument(
-        "--evidence-likelihood-mode",
-        choices=EVIDENCE_LIKELIHOOD_MODES,
-        default=DEFAULT_EVIDENCE_LIKELIHOOD_MODE,
-        help=(
-            "Likelihood target for --fit-mode evidence-ns. "
-            "linearized-forward-beta-image-plane samples one source position per family and fits "
-            "the linearized image-plane residuals."
-        ),
-    )
-    parser.add_argument(
-        "--image-plane-scatter-upper-arcsec",
-        type=float,
-        default=DEFAULT_IMAGE_SIGMA_INT_UPPER_ARCSEC,
-        help="Upper bound for the sampled stage-4 intrinsic image-plane scatter parameter.",
-    )
-    parser.add_argument(
-        "--image-plane-scatter-floor-arcsec",
-        type=float,
-        default=DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
-        help="Lower bound for the sampled stage-4 intrinsic image-plane scatter parameter.",
-    )
-    parser.add_argument(
-        "--image-plane-scatter-prior",
-        choices=IMAGE_PLANE_SCATTER_PRIORS,
-        default=DEFAULT_IMAGE_PLANE_SCATTER_PRIOR,
-        help=(
-            "Prior for the stage-4 intrinsic image-plane scatter. log-uniform preserves legacy behavior; "
-            "lognormal applies a Normal prior to log(image_sigma_int)."
-        ),
-    )
-    parser.add_argument(
-        "--image-plane-scatter-prior-median-arcsec",
-        type=float,
-        default=DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_MEDIAN_ARCSEC,
-        help="Median image_sigma_int for --image-plane-scatter-prior lognormal.",
-    )
-    parser.add_argument(
-        "--image-plane-scatter-prior-log-sigma",
-        type=float,
-        default=DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_LOG_SIGMA,
-        help="Standard deviation of log(image_sigma_int) for --image-plane-scatter-prior lognormal.",
-    )
-    parser.add_argument(
-        "--fix-image-sigma-int-arcsec",
-        type=_nonnegative_float_arg,
-        default=None,
-        help=(
-            "Use a deterministic intrinsic image-plane scatter instead of sampling image.sigma_int. "
-            "Accepts 0.0 to disable extra intrinsic image scatter."
-        ),
-    )
-    parser.add_argument(
-        "--image-presence-penalty-weight",
-        type=float,
-        default=None,
-        help=(
-            "Weight for the smooth observed-image presence penalty in explicit-beta image-plane modes. "
-            "Defaults to 2.0 for sequential stage 4 and 0.0 otherwise; set 0.0 to disable."
-        ),
-    )
-    parser.add_argument(
-        "--image-presence-match-radius-arcsec",
-        type=float,
-        default=DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC,
-        help="Image-plane residual radius where an observed image is counted as softly present.",
-    )
-    parser.add_argument(
-        "--image-presence-temperature-arcsec",
-        type=float,
-        default=DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC,
-        help="Smooth transition scale for observed-image presence probabilities.",
-    )
-    parser.add_argument(
-        "--image-presence-count-softness",
-        type=float,
-        default=DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS,
-        help="Softplus scale for the family-level observed-image count shortfall.",
-    )
-    parser.add_argument(
-        "--image-presence-count-margin",
-        type=float,
-        default=DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN,
-        help="Reliability-weighted image-count margin before the presence penalty activates.",
-    )
-    parser.add_argument(
-        "--likelihood-stabilizer-max-gain",
-        type=float,
-        default=DEFAULT_LIKELIHOOD_STABILIZER_MAX_GAIN,
-        help=(
-            "Shared optional likelihood gain cap for source-plane, local-Jacobian, and linearized image-plane modes. "
-            "Set 0 to disable."
-        ),
-    )
-    parser.add_argument(
-        "--likelihood-stabilizer-max-residual-arcsec",
-        type=float,
-        default=DEFAULT_LIKELIHOOD_STABILIZER_MAX_RESIDUAL_ARCSEC,
-        help=(
-            "Shared optional smooth tanh cap for source-plane, local-Jacobian, and linearized image-plane residuals in arcsec. "
-            "Set 0 to disable."
-        ),
-    )
-    parser.add_argument(
-        "--likelihood-stabilizer-residual-loss",
-        choices=LIKELIHOOD_STABILIZER_RESIDUAL_LOSSES,
-        default=DEFAULT_LIKELIHOOD_STABILIZER_RESIDUAL_LOSS,
-        help=(
-            "Shared inlier residual density for source-plane, local-Jacobian, and linearized-forward-beta "
-            "image-plane modes. Marginalized evidence remains Gaussian."
-        ),
-    )
-    parser.add_argument(
-        "--likelihood-stabilizer-student-t-nu",
-        type=float,
-        default=DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU,
-        help="Degrees of freedom for --likelihood-stabilizer-residual-loss student-t.",
-    )
-    parser.add_argument(
-        "--source-plane-outlier-sigma-arcsec",
-        type=float,
-        default=DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
-        help="Broad source-plane sigma for fixed reliability-weighted candidate-family mixture terms.",
-    )
-    parser.add_argument(
-        "--z-bin-efficiency-tol",
-        type=float,
-        default=DEFAULT_Z_BIN_EFFICIENCY_TOL,
-        help=(
-            "Fractional tolerance for grouping source planes by lensing efficiency D_ls / D_s. "
-            "Higher-redshift sources are binned more coarsely because their efficiency changes slowly."
-        ),
-    )
-    parser.add_argument(
-        "--fit-cosmology-flat-wcdm",
-        action="store_true",
-        help=(
-            "Sample a flat wCDM cosmology with fixed H0 and free Omega_m,w0. "
-            "In sequential runs this is applied only to stage 3 and stage 4; "
-            "stage 1 and stage 2 use fixed FlatLambdaCDM(H0=70, Om0=0.3)."
-        ),
-    )
-    parser.add_argument(
-        "--cosmology-init-om0",
-        type=float,
-        default=None,
-        help="Optional SVI start value for sampled flat-wCDM Omega_m; ignored unless --fit-cosmology-flat-wcdm is on.",
-    )
-    parser.add_argument(
-        "--cosmology-init-w0",
-        type=float,
-        default=None,
-        help="Optional SVI start value for sampled flat-wCDM w0; ignored unless --fit-cosmology-flat-wcdm is on.",
-    )
-    parser.add_argument(
-        "--match-tolerance-arcsec",
-        type=float,
-        default=DEFAULT_MATCH_TOLERANCE,
-        help="Maximum assignment residual for exact image matching.",
-    )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        nargs="+",
-        default=[DEFAULT_WARMUP],
-        help=(
-            "NUTS warmup steps. In sequential image-plane runs, pass one value for all sampled stages, "
-            "two values for stage 2 and stage 3, or three values when a final stage 4 image-plane mode is enabled."
-        ),
-    )
-    parser.add_argument(
-        "--samples",
-        type=int,
-        nargs="+",
-        default=[DEFAULT_SAMPLES],
-        help=(
-            "Posterior draws per chain. In sequential image-plane runs, pass one value for all sampled stages, "
-            "two values for stage 2 and stage 3, or three values when a final stage 4 image-plane mode is enabled."
-        ),
-    )
-    parser.add_argument(
-        "--sampling-refresh-runs",
-        type=int,
-        nargs="+",
-        default=[DEFAULT_SAMPLING_REFRESH_RUNS],
-        help=(
-            "Total posterior sampler runs per sampled stage. Values resolve like --samples; "
-            "1 preserves the current single-run behavior."
-        ),
-    )
-    parser.add_argument("--chains", type=int, default=1)
-    parser.add_argument("--thin", type=int, default=1)
-    parser.add_argument(
-        "--fit-mode",
-        choices=(FIT_MODE_SEQUENTIAL, FIT_MODE_LARGE_ONLY, FIT_MODE_JOINT, FIT_MODE_EVIDENCE_NS),
-        default=FIT_MODE_SEQUENTIAL,
-        help=(
-            "Workflow to run. sequential runs large-only then joint; joint runs one stage with all parameters "
-            "and is faster for iteration when stage-1 tightening is not needed. evidence-ns runs one joint "
-            "nested-sampling evidence target."
-        ),
-    )
-    parser.set_defaults(sampler="numpyro_nuts", stage1_run_dir=None, sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE)
-    parser.add_argument(
-        "--max-tree-depth",
-        type=int,
-        nargs="+",
-        default=[DEFAULT_MAX_TREE_DEPTH],
-        help=(
-            "NUTS max tree depth. In sequential image-plane runs, pass one value for all sampled stages, "
-            "two values for stage 2 and stage 3, or three values when a final stage 4 image-plane mode is enabled."
-        ),
-    )
-    parser.add_argument("--target-accept", type=float, default=DEFAULT_TARGET_ACCEPT)
-    parser.add_argument(
-        "--initial-step-size",
-        type=float,
-        default=DEFAULT_INITIAL_STEP_SIZE,
-        help="Initial NUTS step size before warmup adaptation. Small defaults avoid invalid dPIE states during early warmup.",
-    )
-    parser.add_argument(
-        "--dense-mass",
-        choices=NUTS_DENSE_MASS_CHOICES,
-        default=DEFAULT_NUTS_DENSE_MASS,
-        help=(
-            "NumPyro NUTS mass-matrix adaptation: 'structured' uses dense blocks for explicit "
-            "source-position stages, 'full' uses one full dense matrix, and 'diagonal' disables dense mass."
-        ),
-    )
-    parser.add_argument(
-        "--numpyro-print-summary",
-        action=argparse.BooleanOptionalAction,
-        default=DEFAULT_NUMPYRO_PRINT_SUMMARY,
-        help=(
-            "Print NumPyro's textual MCMC summary after NUTS. Disabled by default because the summary "
-            "can be slow and memory-expensive for large parallel stage-4 runs; saved diagnostics still include "
-            "acceptance, divergence, step-count, and log-probability summaries."
-        ),
-    )
-    parser.add_argument(
-        "--nuts-chain-method",
-        choices=NUTS_CHAIN_METHOD_CHOICES,
-        default=DEFAULT_NUTS_CHAIN_METHOD,
-        help=(
-            "NumPyro MCMC chain method. The default 'parallel' requires at least one visible JAX device "
-            "per chain and raises if that is not available. Use 'sequential' only for explicit low-device "
-            "or lower-memory runs."
-        ),
-    )
-    parser.add_argument(
-        "--blocked-nuts-cycles",
-        type=int,
-        default=None,
-        help=(
-            "Production blocked-NUTS cycles for linearized-forward-beta-blocked-image-plane. "
-            "Defaults to the stage sample count."
-        ),
-    )
-    parser.add_argument(
-        "--blocked-nuts-pilot-warmup",
-        type=int,
-        default=None,
-        help=(
-            "Pilot warmup steps for each blocked-NUTS conditional block. "
-            "Defaults to the stage warmup count."
-        ),
-    )
-    parser.add_argument(
-        "--active-blocked-nuts-block-size",
-        type=int,
-        default=None,
-        help="Number of active independent-scaling galaxies updated in each active-blocked-nuts conditional block.",
-    )
-    parser.add_argument(
-        "--active-blocked-nuts-cycles",
-        type=int,
-        default=None,
-        help="Production active-blocked-nuts cycles. Defaults to the stage sample count.",
-    )
-    parser.add_argument(
-        "--active-blocked-nuts-global-period",
-        type=int,
-        default=1,
-        help="Update the global/non-galaxy block every N active-blocked-nuts cycles.",
-    )
-    parser.add_argument(
-        "--active-blocked-nuts-block-library-size",
-        type=int,
-        default=None,
-        help=(
-            "Number of seeded random active-galaxy subset blocks to compile and recycle. "
-            "Defaults to enough blocks for two shuffled active-galaxy sweeps."
-        ),
-    )
-    parser.set_defaults(nuts_init_strategy="svi")
-    parser.add_argument(
-        "--nuts-init-boundary-frac",
-        type=float,
-        default=DEFAULT_NUTS_INIT_BOUNDARY_FRAC,
-        help="Clip seed proposals away from uniform-prior support edges by this fraction of the support width.",
-    )
-    parser.add_argument(
-        "--nuts-init-jitter-frac",
-        type=float,
-        default=DEFAULT_NUTS_INIT_JITTER_FRAC,
-        help="Constrained-space jitter scale for uniform-prior NUTS seeds, as a fraction of prior width.",
-    )
-    parser.add_argument(
-        "--svi-steps",
-        type=int,
-        nargs="+",
-        default=[DEFAULT_SVI_STEPS],
-        help=(
-            "Number of SVI steps used to initialize NUTS chains. In sequential image-plane runs, "
-            "pass one value for all sampled stages, two values for stage 2 and stage 3, or three "
-            "values when a final stage 4 image-plane mode is enabled."
-        ),
-    )
-    parser.add_argument(
-        "--svi-learning-rate",
-        type=float,
-        default=DEFAULT_SVI_LEARNING_RATE,
-        help="Learning rate for the SVI initializer.",
-    )
-    parser.add_argument(
-        "--ns-num-live-points",
-        type=int,
-        default=None,
-        help="JAXNS live points for --fit-mode evidence-ns. Defaults to 25 times the number of free parameters.",
-    )
-    parser.add_argument(
-        "--ns-max-samples",
-        type=_parse_optional_positive_int,
-        default=DEFAULT_NS_MAX_SAMPLES,
-        help="JAXNS maximum nested-sampling samples for --fit-mode evidence-ns. Defaults to unlimited; pass a positive integer to cap.",
-    )
-    parser.add_argument(
-        "--ns-dlogz",
-        type=float,
-        default=DEFAULT_NS_DLOGZ,
-        help="JAXNS dlogZ termination threshold for --fit-mode evidence-ns.",
-    )
-    parser.add_argument(
-        "--smc-particles",
-        type=int,
-        default=DEFAULT_SMC_PARTICLES,
-        help="BlackJAX SMC particle count for non-blocked sequential stage 4 when --fit-method smc is selected.",
-    )
-    parser.add_argument(
-        "--smc-mcmc-kernel",
-        choices=SMC_MCMC_KERNELS,
-        default=DEFAULT_SMC_MCMC_KERNEL,
-        help="BlackJAX mutation kernel for stage-4 SMC.",
-    )
-    parser.add_argument(
-        "--smc-mcmc-steps",
-        type=int,
-        default=DEFAULT_SMC_MCMC_STEPS,
-        help="Mutation steps per adaptive SMC temperature update.",
-    )
-    parser.add_argument(
-        "--smc-target-ess-frac",
-        type=float,
-        default=DEFAULT_SMC_TARGET_ESS_FRAC,
-        help="Target ESS fraction used to choose adaptive SMC temperature increments.",
-    )
-    parser.add_argument(
-        "--smc-max-temperature-steps",
-        type=int,
-        default=DEFAULT_SMC_MAX_TEMPERATURE_STEPS,
-        help="Maximum adaptive SMC temperature updates before requiring posterior temperature 1.",
-    )
-    parser.add_argument(
-        "--smc-rmh-scale",
-        type=float,
-        default=DEFAULT_SMC_RMH_SCALE,
-        help="Isotropic normalized-space proposal scale for the RMH SMC mutation kernel.",
-    )
-    parser.add_argument(
-        "--smc-mala-step-size",
-        type=float,
-        default=DEFAULT_SMC_MALA_STEP_SIZE,
-        help="Normalized-space MALA step size for the SMC mutation kernel.",
-    )
-    parser.add_argument(
-        "--microcanonical-diagonal-preconditioning",
-        action=argparse.BooleanOptionalAction,
-        default=DEFAULT_MICROCANONICAL_DIAGONAL_PRECONDITIONING,
-        help="Enable diagonal mass preconditioning during BlackJAX MCHMC/MCLMC tuning.",
-    )
-    parser.add_argument(
-        "--microcanonical-tune-frac1",
-        type=float,
-        default=DEFAULT_MICROCANONICAL_TUNE_FRAC1,
-        help="First adaptation fraction for BlackJAX MCHMC/MCLMC tuning.",
-    )
-    parser.add_argument(
-        "--microcanonical-tune-frac2",
-        type=float,
-        default=DEFAULT_MICROCANONICAL_TUNE_FRAC2,
-        help="Second adaptation fraction for BlackJAX MCHMC/MCLMC tuning.",
-    )
-    parser.add_argument(
-        "--microcanonical-tune-frac3",
-        type=float,
-        default=DEFAULT_MICROCANONICAL_TUNE_FRAC3,
-        help="Third adaptation fraction for BlackJAX MCHMC/MCLMC tuning.",
-    )
-    parser.add_argument(
-        "--mclmc-desired-energy-var",
-        type=float,
-        default=DEFAULT_MCLMC_DESIRED_ENERGY_VAR,
-        help="Desired per-step energy variance target used by BlackJAX MCLMC tuning.",
-    )
-    parser.add_argument(
-        "--mclmc-trust-in-estimate",
-        type=float,
-        default=DEFAULT_MCLMC_TRUST_IN_ESTIMATE,
-        help="Trust factor for BlackJAX MCLMC step-size estimation.",
-    )
-    parser.add_argument(
-        "--mclmc-num-effective-samples",
-        type=int,
-        default=DEFAULT_MCLMC_NUM_EFFECTIVE_SAMPLES,
-        help="Effective-sample target used by BlackJAX MCLMC adaptation.",
-    )
-    parser.add_argument(
-        "--mclmc-lfactor",
-        type=float,
-        default=DEFAULT_MCLMC_LFACTOR,
-        help="Momentum decoherence length scaling factor used by BlackJAX MCLMC L adaptation.",
-    )
-    parser.add_argument(
-        "--mchmc-target-accept",
-        type=float,
-        default=DEFAULT_MCHMC_TARGET_ACCEPT,
-        help="Target Metropolis acceptance probability for adjusted dynamic MCHMC tuning.",
-    )
-    parser.add_argument(
-        "--mchmc-random-trajectory-length",
-        action=argparse.BooleanOptionalAction,
-        default=DEFAULT_MCHMC_RANDOM_TRAJECTORY_LENGTH,
-        help="Randomize adjusted dynamic MCHMC trajectory length from the tuned L/step-size ratio.",
-    )
-    parser.add_argument(
-        "--mchmc-l-proposal-factor",
-        type=float,
-        default=DEFAULT_MCHMC_L_PROPOSAL_FACTOR,
-        help="Adjusted dynamic MCHMC proposal refresh factor; use inf for the BlackJAX recommended default.",
-    )
-    parser.add_argument(
-        "--mchmc-divergence-threshold",
-        type=float,
-        default=DEFAULT_MCHMC_DIVERGENCE_THRESHOLD,
-        help="Energy-error threshold for adjusted dynamic MCHMC divergence diagnostics.",
-    )
-    parser.add_argument(
-        "--mchmc-num-windows",
-        type=int,
-        default=DEFAULT_MCHMC_NUM_WINDOWS,
-        help="Number of BlackJAX adjusted MCHMC adaptation windows.",
-    )
-    parser.add_argument(
-        "--mchmc-tuning-factor",
-        type=float,
-        default=DEFAULT_MCHMC_TUNING_FACTOR,
-        help="Multiplicative L tuning factor for adjusted dynamic MCHMC adaptation.",
-    )
-    parser.add_argument(
-        "--mchmc-l-estimator",
-        choices=MCHMC_L_ESTIMATORS,
-        default=DEFAULT_MCHMC_L_ESTIMATOR,
-        help="Eigenvalue estimator used by BlackJAX adjusted MCHMC L adaptation.",
-    )
-    parser.add_argument(
-        "--caustic-plot-grid-scale-arcsec",
-        type=_positive_float_arg,
-        default=CAUSTIC_PLOT_GRID_SCALE_ARCSEC,
-        help=(
-            "Arcsec grid spacing for caustic overlay and absolute magnification plots. "
-            f"Defaults to {CAUSTIC_PLOT_GRID_SCALE_ARCSEC:g} arcsec."
-        ),
-    )
-    parser.add_argument(
-        "--caustic-source-redshift",
-        type=float,
-        default=9.0,
-        help="Source redshift used for critical-line and caustic overlay diagnostics.",
-    )
-    parser.add_argument(
-        "--truth",
-        default=None,
-        help=(
-            "Optional path to a truth.json file. When provided, mock-truth recovery PDFs are written "
-            "under each completed stage's validation/ directory."
-        ),
-    )
-    return parser.parse_args()
 
 
 def _format_count_map(values: dict[str, int] | Counter) -> str:
@@ -2552,7 +1152,7 @@ def _log_runtime_summary(args: argparse.Namespace) -> None:
     _log(
         args,
         (
-            f"[runtime] par_path={args.par_path} fit_mode={args.fit_mode} fit_method={args.fit_method} "
+            f"[runtime] model_source=config fit_mode={args.fit_mode} fit_method={args.fit_method} "
             f"sampling_engine={args.sampling_engine} sample_likelihood_mode={sample_likelihood_mode} "
             f"source_plane_covariance_mode={source_plane_covariance_mode} "
             f"{local_jacobian_metric_item}"
@@ -9178,7 +7778,7 @@ def _microcanonical_posterior_is_usable(posterior: PosteriorResults) -> tuple[bo
 class _MicrocanonicalProgressReporter:
     def __init__(
         self,
-        progress: Progress,
+        progress: Any,
         *,
         overall_task: int,
         chain_task: int,
@@ -9610,16 +8210,13 @@ def _run_blackjax_microcanonical_sampler(
             f"warmup={warmup} samples={samples_requested} device={_jax_device_label(default_device)}"
         ),
     )
-    progress_cm = (
-        Progress(
-            TextColumn("{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            transient=True,
-        )
-        if not bool(getattr(args, "quiet", False))
-        else nullcontext(None)
+    progress_cm = _progress_context(
+        args,
+        TextColumn("{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        transient=True,
     )
     with ThreadPoolExecutor(max_workers=chains_requested) as executor, progress_cm as progress:
         if progress is not None:
@@ -13435,9 +12032,8 @@ def _extract_ns_diagnostics(results: Any) -> dict[str, np.ndarray] | None:
 
 
 def _run_ns_phase_with_progress(args: argparse.Namespace, fn):
-    if bool(getattr(args, "quiet", False)):
-        return _run_logged_phase(args, "ns.run", fn)
-    with Progress(
+    with _progress_context(
+        args,
         SpinnerColumn(),
         TextColumn("{task.description}"),
         TimeElapsedColumn(),
@@ -13622,9 +12218,9 @@ def _parse_refresh_every_value(value: Any) -> int | None:
     try:
         cadence = int(value)
     except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError("--refresh-every values must be positive integers, 0, or None.") from exc
+        raise ValueError("refresh_every values must be positive integers, 0, or None.") from exc
     if cadence < 0:
-        raise argparse.ArgumentTypeError("--refresh-every values must be positive integers, 0, or None.")
+        raise ValueError("refresh_every values must be positive integers, 0, or None.")
     return None if cadence == 0 else cadence
 
 
@@ -25955,6 +24551,8 @@ def _validation_complete_message(validation_elapsed: float, best_eval: Evaluatio
 
 
 def _to_jsonable(payload: Any) -> Any:
+    if is_dataclass(payload) and not isinstance(payload, type):
+        return {field.name: _to_jsonable(getattr(payload, field.name)) for field in fields(payload)}
     if isinstance(payload, Path):
         return {"__path__": str(payload)}
     if isinstance(payload, pd.DataFrame):
@@ -25995,6 +24593,33 @@ def _read_h5_json(group: h5py.Group, name: str, default: Any = None) -> Any:
     return _from_jsonable(json.loads(raw))
 
 
+def _args_payload(args: Any) -> dict[str, Any]:
+    values = getattr(args, "values", None)
+    if isinstance(values, dict):
+        return dict(values)
+    raise TypeError("Solver runtime must be a config-native SolverRuntime with a flat values payload.")
+
+
+def _require_config_native_artifact(handle: h5py.File, path: Path) -> dict[str, Any]:
+    if "cli_args_json" in handle or "runtime_args_json" not in handle or "model_config_json" not in handle:
+        raise ValueError(
+            f"{path} is an old unsupported artifact bundle. "
+            "Rerun with the config-native runner; par/CLI artifacts cannot be resumed or rerendered."
+        )
+    runtime_args = _read_h5_json(handle, "runtime_args_json", default=None)
+    if not isinstance(runtime_args, dict) or not runtime_args:
+        raise ValueError(f"{path} is missing config-native runtime_args_json metadata.")
+    if "values" in runtime_args:
+        raise ValueError(
+            f"{path} contains nested legacy runtime metadata. "
+            "Rerun with the config-native runner to regenerate artifacts."
+        )
+    model_config = _read_h5_json(handle, "model_config_json", default=None)
+    if model_config is None:
+        raise ValueError(f"{path} is missing model_config_json metadata.")
+    return runtime_args
+
+
 def _slim_potfiles_for_artifact(potfiles: list[dict[str, Any]]) -> list[dict[str, Any]]:
     slim: list[dict[str, Any]] = []
     for potfile in potfiles:
@@ -26019,8 +24644,12 @@ def _save_plot_bundle_h5(
     best_fit: np.ndarray,
     results: PosteriorResults,
 ) -> None:
+    runtime_args = _args_payload(args)
+    model_config = runtime_args.get("model_config")
+    if model_config is None:
+        raise ValueError("Cannot save config-native artifacts without model_config in the solver runtime.")
     with h5py.File(path, "w") as handle:
-        handle.attrs["schema_version"] = 1
+        handle.attrs["schema_version"] = 2
 
         posterior_group = handle.create_group("posterior")
         posterior_group.create_dataset("samples", data=np.asarray(results.samples, dtype=float))
@@ -26077,7 +24706,8 @@ def _save_plot_bundle_h5(
                 if array.dtype.kind in {"b", "i", "u", "f", "c"}:
                     ns_group.create_dataset(str(key), data=array)
 
-        _write_h5_json(handle, "cli_args_json", vars(args))
+        _write_h5_json(handle, "runtime_args_json", runtime_args)
+        _write_h5_json(handle, "model_config_json", model_config)
         _write_h5_json(handle, "init_diagnostics_json", diagnostics)
 
         state_group = handle.create_group("state")
@@ -26086,7 +24716,7 @@ def _save_plot_bundle_h5(
             "build_state_meta_json",
             {
                 "run_name": state.run_name,
-                "par_path": state.par_path,
+                "model_source": "config",
                 "cosmo_config": state.cosmo_config,
                 "z_lens": state.z_lens,
                 "sigma_arcsec": state.sigma_arcsec,
@@ -26258,6 +24888,7 @@ def _save_plot_bundle_h5(
 
 def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict[str, np.ndarray], dict[str, Any]]:
     with h5py.File(path, "r") as handle:
+        runtime_args = _require_config_native_artifact(handle, path)
         meta = _read_h5_json(handle["state"], "build_state_meta_json", default={})
         if "source_position_parameterization" not in meta:
             raise ValueError(
@@ -26284,7 +24915,7 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
         _validate_supported_lens_model_list(lens_model_list, str(path))
         state = BuildState(
             run_name=str(meta["run_name"]),
-            par_path=str(meta["par_path"]),
+            par_path="<config>",
             cosmo_config=dict(meta["cosmo_config"]),
             z_lens=float(meta["z_lens"]),
             sigma_arcsec=float(meta["sigma_arcsec"]),
@@ -26433,7 +25064,6 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
                 else str(meta.get("active_scaling_frozen_source_path"))
             ),
         )
-        cli_args = _read_h5_json(handle, "cli_args_json", default={})
         init_diagnostics = _read_h5_json(handle, "init_diagnostics_json", default={})
         posterior_group = handle["posterior"]
         arrays = {name: np.asarray(posterior_group[name]) for name in posterior_group.keys()}
@@ -26442,14 +25072,14 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
                 name: np.asarray(handle["ns_diagnostics"][name])
                 for name in handle["ns_diagnostics"].keys()
             }
-    return state, cli_args, arrays, init_diagnostics
+    return state, runtime_args, arrays, init_diagnostics
 
 
 def _load_artifacts(artifacts_dir: Path) -> tuple[BuildState, dict[str, Any], dict[str, np.ndarray], dict[str, Any]]:
     h5_path = artifacts_dir / "plot_bundle.h5"
     if not h5_path.exists():
         raise FileNotFoundError(f"Missing current-format artifact bundle: {h5_path}")
-    state, cli_args, arrays, init_diagnostics = _rebuild_state_from_h5(h5_path)
+    state, runtime_args, arrays, init_diagnostics = _rebuild_state_from_h5(h5_path)
     if state.geometry_cache is None:
         cosmo_config = dict(state.cosmo_config) if state.cosmo_config else _build_cosmology(state.parsed)
         state.cosmo_config = dict(cosmo_config)
@@ -26459,7 +25089,7 @@ def _load_artifacts(artifacts_dir: Path) -> tuple[BuildState, dict[str, Any], di
             state.family_data,
             state.bin_data,
         )
-    return state, cli_args, arrays, init_diagnostics
+    return state, runtime_args, arrays, init_diagnostics
 
 
 def _stage1_summary_from_results(parameter_specs: list[ParameterSpec], samples: np.ndarray, best_fit: np.ndarray) -> Stage1PriorSummary:
@@ -26546,21 +25176,11 @@ _LIKELIHOOD_STABILIZER_SAVED_ARG_DEFAULTS: dict[str, Any] = {
 }
 
 
-def _saved_likelihood_stabilizer_arg(saved_args: dict[str, Any], key: str, default: Any) -> Any:
-    legacy_key = key.replace("likelihood_stabilizer", "linearized_image_plane")
-    return saved_args.get(key, saved_args.get(legacy_key, default))
-
-
 def _normalized_saved_likelihood_stabilizer_args(saved_args: dict[str, Any]) -> dict[str, Any]:
     return {
-        key: _saved_likelihood_stabilizer_arg(saved_args, key, default)
+        key: saved_args.get(key, default)
         for key, default in _LIKELIHOOD_STABILIZER_SAVED_ARG_DEFAULTS.items()
     }
-
-
-def _drop_legacy_likelihood_stabilizer_args(args: dict[str, Any]) -> None:
-    for key in _LIKELIHOOD_STABILIZER_SAVED_ARG_DEFAULTS:
-        args.pop(key.replace("likelihood_stabilizer", "linearized_image_plane"), None)
 
 
 def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[str, tuple[float, float]]:
@@ -26581,6 +25201,7 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
     )
     cab_likelihood_weight = _effective_cab_likelihood_weight(saved_args.get("cab_likelihood_weight"), state)
     match_tolerance_arcsec = float(saved_args.get("match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE))
+    plot_saved_args = saved_args
     evaluator = ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=match_tolerance_arcsec,
@@ -26624,106 +25245,109 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
             saved_args.get("source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
         ),
         sample_likelihood_mode=sample_likelihood_mode,
-        image_plane_newton_steps=int(saved_args.get("image_plane_newton_steps", 0)),
+        image_plane_newton_steps=int(plot_saved_args.get("image_plane_newton_steps", 0)),
         anchored_image_plane_solve_steps=int(
-            saved_args.get("anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)
+            plot_saved_args.get("anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)
         ),
         anchored_image_plane_trust_radius_arcsec=float(
-            saved_args.get(
+            plot_saved_args.get(
                 "anchored_image_plane_trust_radius_arcsec",
                 DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC,
             )
         ),
         anchored_image_plane_lm_damping_relative=float(
-            saved_args.get(
+            plot_saved_args.get(
                 "anchored_image_plane_lm_damping_relative",
                 DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE,
             )
         ),
         anchored_image_plane_lm_damping_absolute=float(
-            saved_args.get(
+            plot_saved_args.get(
                 "anchored_image_plane_lm_damping_absolute",
                 DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_ABSOLUTE,
             )
         ),
         critical_arc_critical_direction_sigma_arcsec=float(
-            saved_args.get("critical_arc_critical_direction_sigma_arcsec", DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)
+            plot_saved_args.get(
+                "critical_arc_critical_direction_sigma_arcsec",
+                DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+            )
         ),
         critical_arc_base_prob=float(
-            saved_args.get("critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)
+            plot_saved_args.get("critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)
         ),
         critical_arc_max_prob=float(
-            saved_args.get("critical_arc_max_prob", DEFAULT_CRITICAL_ARC_MAX_PROB)
+            plot_saved_args.get("critical_arc_max_prob", DEFAULT_CRITICAL_ARC_MAX_PROB)
         ),
         critical_arc_singular_threshold=float(
-            saved_args.get("critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)
+            plot_saved_args.get("critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)
         ),
         critical_arc_singular_softness=float(
-            saved_args.get("critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
+            plot_saved_args.get("critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
         ),
         critical_arc_lm_damping_relative=float(
-            saved_args.get("critical_arc_lm_damping_relative", DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE)
+            plot_saved_args.get("critical_arc_lm_damping_relative", DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE)
         ),
         critical_arc_lm_damping_absolute=float(
-            saved_args.get("critical_arc_lm_damping_absolute", DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE)
+            plot_saved_args.get("critical_arc_lm_damping_absolute", DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE)
         ),
         critical_arc_lm_trust_radius_arcsec=float(
-            saved_args.get("critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
+            plot_saved_args.get("critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
         ),
         arc_recovery_p_arc_threshold=float(
-            saved_args.get("arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
+            plot_saved_args.get("arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
         ),
         arc_aware_max_arclength_arcsec=float(
-            saved_args.get("arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
+            plot_saved_args.get("arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
         ),
         arc_aware_curve_step_arcsec=float(
-            saved_args.get("arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)
+            plot_saved_args.get("arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)
         ),
         fold_curvature_arcsec_inv=float(
-            saved_args.get("fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
+            plot_saved_args.get("fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
         ),
-        catastrophe_likelihood=str(saved_args.get("catastrophe_likelihood", DEFAULT_CATASTROPHE_LIKELIHOOD)),
-        catastrophe_lambda_on=float(saved_args.get("catastrophe_lambda_on", DEFAULT_CATASTROPHE_LAMBDA_ON)),
-        catastrophe_lambda_off=float(saved_args.get("catastrophe_lambda_off", DEFAULT_CATASTROPHE_LAMBDA_OFF)),
-        catastrophe_gap_on=float(saved_args.get("catastrophe_gap_on", DEFAULT_CATASTROPHE_GAP_ON)),
-        catastrophe_gap_off=float(saved_args.get("catastrophe_gap_off", DEFAULT_CATASTROPHE_GAP_OFF)),
+        catastrophe_likelihood=str(plot_saved_args.get("catastrophe_likelihood", DEFAULT_CATASTROPHE_LIKELIHOOD)),
+        catastrophe_lambda_on=float(plot_saved_args.get("catastrophe_lambda_on", DEFAULT_CATASTROPHE_LAMBDA_ON)),
+        catastrophe_lambda_off=float(plot_saved_args.get("catastrophe_lambda_off", DEFAULT_CATASTROPHE_LAMBDA_OFF)),
+        catastrophe_gap_on=float(plot_saved_args.get("catastrophe_gap_on", DEFAULT_CATASTROPHE_GAP_ON)),
+        catastrophe_gap_off=float(plot_saved_args.get("catastrophe_gap_off", DEFAULT_CATASTROPHE_GAP_OFF)),
         catastrophe_tangential_variance_min=float(
-            saved_args.get(
+            plot_saved_args.get(
                 "catastrophe_tangential_variance_min",
                 DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
             )
         ),
         cab_likelihood_weight=cab_likelihood_weight,
         cab_finite_difference_step_arcsec=float(
-            saved_args.get("cab_finite_difference_step_arcsec", DEFAULT_CAB_FINITE_DIFFERENCE_STEP_ARCSEC)
+            plot_saved_args.get("cab_finite_difference_step_arcsec", DEFAULT_CAB_FINITE_DIFFERENCE_STEP_ARCSEC)
         ),
         cab_tangent_sigma_floor_rad=float(
-            saved_args.get("cab_tangent_sigma_floor_rad", DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD)
+            plot_saved_args.get("cab_tangent_sigma_floor_rad", DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD)
         ),
         cab_curvature_sigma_floor_arcsec_inv=float(
-            saved_args.get("cab_curvature_sigma_floor_arcsec_inv", DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV)
+            plot_saved_args.get("cab_curvature_sigma_floor_arcsec_inv", DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV)
         ),
         image_plane_scatter_floor_arcsec=float(
-            saved_args.get("image_plane_scatter_floor_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC)
+            plot_saved_args.get("image_plane_scatter_floor_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC)
         ),
-        fixed_image_sigma_int_arcsec=saved_args.get("fix_image_sigma_int_arcsec"),
+        fixed_image_sigma_int_arcsec=plot_saved_args.get("fix_image_sigma_int_arcsec"),
         image_presence_penalty_weight=image_presence_penalty_weight,
         image_presence_match_radius_arcsec=float(
-            saved_args.get("image_presence_match_radius_arcsec", DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC)
+            plot_saved_args.get("image_presence_match_radius_arcsec", DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC)
         ),
         image_presence_temperature_arcsec=float(
-            saved_args.get("image_presence_temperature_arcsec", DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC)
+            plot_saved_args.get("image_presence_temperature_arcsec", DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC)
         ),
         image_presence_count_softness=float(
-            saved_args.get("image_presence_count_softness", DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS)
+            plot_saved_args.get("image_presence_count_softness", DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS)
         ),
         image_presence_count_margin=float(
-            saved_args.get("image_presence_count_margin", DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN)
+            plot_saved_args.get("image_presence_count_margin", DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN)
         ),
-        **_normalized_saved_likelihood_stabilizer_args(saved_args),
-        evidence_source_prior_sigma_arcsec=saved_args.get("evidence_source_prior_sigma_arcsec"),
-        evidence_source_prior_mean_x_arcsec=float(saved_args.get("evidence_source_prior_mean_x_arcsec", 0.0)),
-        evidence_source_prior_mean_y_arcsec=float(saved_args.get("evidence_source_prior_mean_y_arcsec", 0.0)),
+        **_normalized_saved_likelihood_stabilizer_args(plot_saved_args),
+        evidence_source_prior_sigma_arcsec=plot_saved_args.get("evidence_source_prior_sigma_arcsec"),
+        evidence_source_prior_mean_x_arcsec=float(plot_saved_args.get("evidence_source_prior_mean_x_arcsec", 0.0)),
+        evidence_source_prior_mean_y_arcsec=float(plot_saved_args.get("evidence_source_prior_mean_y_arcsec", 0.0)),
     )
     best_fit_latent = evaluator.reported_physical_to_latent_parameter_vector(best_fit_physical)
     summaries = evaluator._family_source_summary(best_fit_latent)
@@ -26946,14 +25570,10 @@ def _run_stage3_critical_det_diagnostic(
             min_abs_detA=float("nan"),
             total_images=0,
         )
-    state, saved_args, arrays, init_diagnostics = _load_artifacts(artifacts_dir)
+    state, _saved_args, arrays, init_diagnostics = _load_artifacts(artifacts_dir)
     arrays, _converted = _maybe_convert_loaded_posterior_arrays_to_physical(arrays, state.parameter_specs, init_diagnostics)
     best_fit_physical = np.asarray(arrays["best_fit"], dtype=float)
-    diagnostic_saved_args = dict(saved_args)
-    diagnostic_saved_args.update(_normalized_saved_likelihood_stabilizer_args(saved_args))
-    _drop_legacy_likelihood_stabilizer_args(diagnostic_saved_args)
-    diagnostic_saved_args["quick_diagnostics"] = False
-    diagnostic_args = _clone_args(args, **diagnostic_saved_args)
+    diagnostic_args = _clone_args(args, quick_diagnostics=False)
     evaluator = _build_cluster_evaluator_from_args(
         diagnostic_args,
         state,
@@ -27058,6 +25678,317 @@ def _apply_cosmology_init_overrides(
     return merged
 
 
+def _prior_config_to_limit_entry(prior: PriorConfig | None, *, default_fixed_value: float | None = None) -> list[float]:
+    if prior is None or str(prior.kind) == "fixed":
+        return [0] if default_fixed_value is None else [0, float(default_fixed_value)]
+    kind = str(prior.kind).replace("-", "_")
+    if kind == "uniform":
+        if prior.lower is None or prior.upper is None:
+            raise ValueError("Uniform priors require lower and upper.")
+        step = float(prior.step) if prior.step is not None else 0.1 * (float(prior.upper) - float(prior.lower))
+        return [1, float(prior.lower), float(prior.upper), step]
+    if kind == "normal":
+        if prior.mean is None or prior.std is None:
+            raise ValueError("Normal priors require mean and std.")
+        return [3, float(prior.mean), float(prior.std)]
+    if kind == "truncated_normal":
+        if prior.mean is None or prior.std is None or prior.lower is None or prior.upper is None:
+            raise ValueError("Truncated normal priors require mean, std, lower, and upper.")
+        return [9, float(prior.mean), float(prior.std), float(prior.lower), float(prior.upper)]
+    raise ValueError(f"Unsupported prior kind {prior.kind!r}.")
+
+
+def _cosmology_config_from_model_config(model_config: LensModelConfig) -> dict[str, float | str]:
+    cosmo = model_config.cosmology
+    om0 = float(cosmo.Om0)
+    ode0 = float(1.0 - om0 if cosmo.Ode0 is None else cosmo.Ode0)
+    return {
+        "class": str(cosmo.class_name),
+        "H0": float(cosmo.H0),
+        "Om0": om0,
+        "Ode0": ode0,
+        "w0": float(cosmo.w0),
+    }
+
+
+def _filter_declared_member_catalog_exclusions(
+    catalog_df: pd.DataFrame,
+    population: MemberPopulationConfig,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    exclude_ids = tuple(str(value).strip() for value in getattr(population, "exclude_catalog_ids", ()) or ())
+    if not exclude_ids:
+        return catalog_df, {
+            "exclude_catalog_ids": [],
+            "excluded_catalog_ids_found": [],
+            "excluded_catalog_id_count": 0,
+        }
+    if "id" not in catalog_df.columns:
+        raise ValueError(
+            f"member population {population.id!r} cannot apply exclude_catalog_ids because "
+            f"{population.catalog_path} has no 'id' column."
+        )
+    catalog_ids = catalog_df["id"].astype(str)
+    exclude_set = set(exclude_ids)
+    found_set = set(catalog_ids[catalog_ids.isin(exclude_set)].tolist())
+    missing_ids = [catalog_id for catalog_id in exclude_ids if catalog_id not in found_set]
+    if missing_ids:
+        raise ValueError(
+            f"member population {population.id!r} exclude_catalog_ids not found in "
+            f"{population.catalog_path}: {', '.join(missing_ids)}"
+        )
+    keep_mask = ~catalog_ids.isin(exclude_set)
+    filtered_df = catalog_df.loc[keep_mask].copy().reset_index(drop=True)
+    if filtered_df.empty:
+        raise ValueError(
+            f"member population {population.id!r} has no catalog rows after applying exclude_catalog_ids."
+        )
+    found_ids = [catalog_id for catalog_id in exclude_ids if catalog_id in found_set]
+    return filtered_df, {
+        "exclude_catalog_ids": list(exclude_ids),
+        "excluded_catalog_ids_found": found_ids,
+        "excluded_catalog_id_count": int(len(catalog_df) - len(filtered_df)),
+    }
+
+
+def _declared_independent_member_halos_by_population(
+    model_config: LensModelConfig,
+) -> dict[str, list[IndependentMemberHaloConfig]]:
+    grouped: dict[str, list[IndependentMemberHaloConfig]] = {}
+    for item in getattr(model_config, "independent_member_halos", ()) or ():
+        grouped.setdefault(str(item.population_id), []).append(item)
+    return grouped
+
+
+def _independent_member_default_positive_std(mean: float, *, dex_sigma: float = 0.5) -> float:
+    safe_mean = max(float(mean), 1.0e-12)
+    log_sigma = float(np.log(10.0) * dex_sigma)
+    return float(safe_mean * np.sqrt(np.expm1(log_sigma * log_sigma)))
+
+
+def _independent_member_default_priors(
+    *,
+    x_centre: float,
+    y_centre: float,
+    ellipticite: float,
+    angle_pos: float,
+    population: MemberPopulationConfig,
+) -> dict[str, PriorConfig]:
+    core_mean = float(population.corekpc)
+    cut_mean = float(population.cutkpc)
+    sigma_mean = float(population.sigma)
+    return {
+        "x_centre": PriorConfig(
+            "truncated_normal",
+            mean=float(x_centre),
+            std=1.0,
+            lower=float(x_centre) - 5.0,
+            upper=float(x_centre) + 5.0,
+        ),
+        "y_centre": PriorConfig(
+            "truncated_normal",
+            mean=float(y_centre),
+            std=1.0,
+            lower=float(y_centre) - 5.0,
+            upper=float(y_centre) + 5.0,
+        ),
+        "ellipticite": PriorConfig("uniform", lower=0.0, upper=0.8),
+        "angle_pos": PriorConfig("uniform", lower=-180.0, upper=180.0),
+        "core_radius_kpc": PriorConfig(
+            "truncated_normal",
+            mean=core_mean,
+            std=_independent_member_default_positive_std(core_mean),
+            lower=0.01,
+            upper=50.0,
+        ),
+        "cut_radius_kpc": PriorConfig(
+            "truncated_normal",
+            mean=cut_mean,
+            std=_independent_member_default_positive_std(cut_mean),
+            lower=1.0,
+            upper=1000.0,
+        ),
+        "v_disp": PriorConfig(
+            "truncated_normal",
+            mean=sigma_mean,
+            std=max(0.5 * sigma_mean, 1.0e-6),
+            lower=30.0,
+            upper=1000.0,
+        ),
+    }
+
+
+def _independent_member_halo_potential_from_catalog_row(
+    *,
+    independent: IndependentMemberHaloConfig,
+    population: MemberPopulationConfig,
+    catalog_row: pd.Series,
+    reference: tuple[int, float, float],
+    cosmo_config: dict[str, float | str],
+) -> dict[str, Any]:
+    _, ra0_deg, dec0_deg = reference
+    x_offsets, y_offsets = _radec_to_offsets_arcsec(
+        np.asarray([float(catalog_row["ra"])], dtype=float),
+        np.asarray([float(catalog_row["dec"])], dtype=float),
+        ra0_deg,
+        dec0_deg,
+    )
+    x_centre = float(x_offsets[0])
+    y_centre = float(y_offsets[0])
+    if {"catalog_a", "catalog_b", "catalog_theta"}.issubset(catalog_row.index):
+        ellipticite, angle_pos = _catalog_shape_to_ellipticity(
+            float(catalog_row["catalog_a"]),
+            float(catalog_row["catalog_b"]),
+            float(catalog_row["catalog_theta"]),
+        )
+    else:
+        ellipticite, angle_pos = 0.0, 0.0
+    catalog_id = str(independent.catalog_id)
+    potential_id = str(independent.id or f"independent_member_{population.id}_{catalog_id}")
+    potential = {
+        "id": potential_id,
+        "profil": int(population.profile_type),
+        "x_centre": x_centre,
+        "y_centre": y_centre,
+        "ellipticite": float(ellipticite),
+        "angle_pos": float(angle_pos),
+        "core_radius_kpc": float(population.corekpc),
+        "cut_radius_kpc": float(population.cutkpc),
+        "v_disp": float(population.sigma),
+        "z_lens": float(population.z_lens),
+    }
+    default_priors = _independent_member_default_priors(
+        x_centre=x_centre,
+        y_centre=y_centre,
+        ellipticite=float(ellipticite),
+        angle_pos=float(angle_pos),
+        population=population,
+    )
+    merged_priors = {**default_priors, **(independent.priors or {})}
+    prior_entries = {
+        field_name: _prior_config_to_limit_entry(prior, default_fixed_value=float(potential.get(field_name, 0.0)))
+        for field_name, prior in merged_priors.items()
+    }
+    normalized, normalized_priors = _normalize_declared_potential_definition(
+        potential,
+        prior_entries,
+        cosmo_config,
+    )
+    normalized["priors"] = normalized_priors
+    normalized["independent_member_population_id"] = str(population.id)
+    normalized["independent_member_catalog_id"] = catalog_id
+    return normalized
+
+
+def _declared_model_inputs(
+    model_config: LensModelConfig,
+) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, list[dict[str, Any]]]:
+    reference = (
+        int(model_config.reference.reference),
+        float(model_config.reference.ra0_deg),
+        float(model_config.reference.dec0_deg),
+    )
+    cosmo_config = _cosmology_config_from_model_config(model_config)
+    parsed: dict[str, Any] = {
+        "runmode": {"reference": [reference[0], reference[1], reference[2]]},
+        "image": {},
+        "potentials": [],
+        "potfiles": [],
+        "cosmologie": {
+            "H0": cosmo_config["H0"],
+            "omega": cosmo_config["Om0"],
+            "lambda": cosmo_config["Ode0"],
+        },
+    }
+    if model_config.image_constraints is not None:
+        parsed["image"]["sigposArcsec"] = float(model_config.image_constraints.sigma_arcsec)
+        parsed["image"]["multfile"] = str(model_config.image_constraints.catalog_path)
+        images_df = _load_declared_multiple_images_catalog(model_config.image_constraints.catalog_path, reference)
+    else:
+        images_df = pd.DataFrame()
+    arc_frames: list[pd.DataFrame] = []
+    for arc_config in model_config.arc_constraints:
+        arc_frames.append(_load_declared_arc_constraints_catalog(arc_config.catalog_path, reference))
+    arcs_df = pd.concat(arc_frames, ignore_index=True) if arc_frames else pd.DataFrame()
+
+    potentials_with_priors: list[dict[str, Any]] = []
+    for halo in model_config.large_halos:
+        potential = {
+            "id": str(halo.id),
+            "profil": int(halo.profile_type),
+            "x_centre": float(halo.x_centre),
+            "y_centre": float(halo.y_centre),
+            "ellipticite": float(halo.ellipticite),
+            "angle_pos": float(halo.angle_pos),
+            "core_radius_kpc": float(halo.core_radius_kpc),
+            "cut_radius_kpc": float(halo.cut_radius_kpc),
+            "v_disp": float(halo.v_disp),
+            "z_lens": float(halo.z_lens),
+        }
+        priors = {
+            field_name: _prior_config_to_limit_entry(prior, default_fixed_value=float(potential.get(field_name, 0.0)))
+            for field_name, prior in (halo.priors or {}).items()
+        }
+        normalized, normalized_priors = _normalize_declared_potential_definition(
+            potential,
+            priors,
+            cosmo_config,
+        )
+        normalized["priors"] = normalized_priors
+        parsed["potentials"].append(normalized)
+        potentials_with_priors.append(normalized)
+
+    independent_by_population = _declared_independent_member_halos_by_population(model_config)
+    potfiles: list[dict[str, Any]] = []
+    for population in model_config.member_populations:
+        catalog_df = _load_declared_dat_catalog(
+            population.catalog_path,
+            reference,
+            catalog_kind="potfile_galaxies",
+        )
+        independent_items = independent_by_population.get(str(population.id), [])
+        independent_catalog_ids = {str(item.catalog_id) for item in independent_items}
+        if independent_items:
+            catalog_ids = catalog_df["id"].astype(str)
+            for independent in independent_items:
+                match = catalog_df.loc[catalog_ids == str(independent.catalog_id)]
+                if match.empty:
+                    raise ValueError(
+                        f"independent member halo population_id={population.id!r} "
+                        f"catalog_id={independent.catalog_id!r} was not found in {population.catalog_path}."
+                    )
+                potential = _independent_member_halo_potential_from_catalog_row(
+                    independent=independent,
+                    population=population,
+                    catalog_row=match.iloc[0],
+                    reference=reference,
+                    cosmo_config=cosmo_config,
+                )
+                parsed["potentials"].append(potential)
+                potentials_with_priors.append(potential)
+            catalog_df = catalog_df.loc[~catalog_ids.isin(independent_catalog_ids)].copy().reset_index(drop=True)
+        catalog_df, exclusion_metadata = _filter_declared_member_catalog_exclusions(catalog_df, population)
+        potfile = {
+            "id": str(population.id),
+            "type": int(population.profile_type),
+            "catalog_path": str(population.catalog_path),
+            "filein": str(population.catalog_path),
+            "catalog_df": catalog_df,
+            "mag0": float(population.mag0),
+            "corekpc": float(population.corekpc),
+            "core_arcsec": None,
+            "zlens": float(population.z_lens),
+            "sigma": _prior_config_to_limit_entry(population.sigma_prior, default_fixed_value=float(population.sigma)),
+            "sigma_nominal": float(population.sigma),
+            "cutkpc": _prior_config_to_limit_entry(population.cutkpc_prior, default_fixed_value=float(population.cutkpc)),
+            "cutkpc_nominal": float(population.cutkpc),
+            "cut_arcsec_nominal": None,
+            **exclusion_metadata,
+        }
+        potfiles.append(potfile)
+    parsed["potfiles"] = potfiles
+    return parsed, images_df, arcs_df, potentials_with_priors
+
+
 def _build_state_from_inputs(
     args: argparse.Namespace,
     fit_mode_override: str | None = None,
@@ -27074,7 +26005,10 @@ def _build_state_from_inputs(
     fit_mode = fit_mode_override or args.fit_mode
     model_fit_mode = FIT_MODE_JOINT if fit_mode == FIT_MODE_EVIDENCE_NS else fit_mode
     fit_cosmology_flat_wcdm = bool(getattr(args, "fit_cosmology_flat_wcdm", False))
-    parsed, _potentials_df, images_df, arcs_df, potentials_with_priors = load_best_par(args.par_path)
+    model_config = getattr(args, "model_config", None)
+    if model_config is None:
+        raise ValueError("LensModelConfig is required; Lenstool par-file runtime support has been removed.")
+    parsed, images_df, arcs_df, potentials_with_priors = _declared_model_inputs(model_config)
     if images_df.empty and arcs_df.empty:
         raise ValueError("No multiple-image or CAB arc constraints found in the parsed catalogs.")
     reference = _extract_reference(parsed)
@@ -27614,8 +26548,8 @@ def _build_state_from_inputs(
         )
     )
     return BuildState(
-        run_name=args.run_name or _make_run_name(args.par_path),
-        par_path=str(Path(args.par_path).resolve()),
+        run_name=args.run_name or "cluster_solver",
+        par_path="<config>",
         cosmo_config=cosmo_config,
         z_lens=z_lens,
         sigma_arcsec=sigma_arcsec,
@@ -28912,7 +27846,7 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
     start = time.time()
     perturbation_stage0 = bool(getattr(args, "perturbation_discovery_stage0", False))
     _configure_debug_log(args, state.run_name, run_dir)
-    _log(args, f"[load] run={state.run_name} par={state.par_path}")
+    _log(args, f"[load] run={state.run_name} model_source=config")
     _log(
         args,
         (
@@ -29171,9 +28105,11 @@ def _run_inference(args: argparse.Namespace, state: BuildState, run_dir: Path) -
                             f"rows={len(final_union_detail_df)} path={discovery_table_path}"
                         ),
                 )
-                final_args = argparse.Namespace(**vars(args))
-                final_args.sampling_engine = SAMPLING_ENGINE_FULL_FLAT
-                final_args.perturbation_discovery_stage0 = True
+                final_args = _clone_args(
+                    args,
+                    sampling_engine=SAMPLING_ENGINE_FULL_FLAT,
+                    perturbation_discovery_stage0=True,
+                )
                 _log(
                     args,
                     _perturbation_discovery_svi_final_log_message(
@@ -29484,6 +28420,7 @@ def _rerender_plots(
         "plots_only.load_artifacts",
         lambda: _load_artifacts(run_dir / "artifacts"),
     )
+    current_runtime_args = _args_payload(args)
     if not getattr(state, "previous_stage_best_values", None):
         inferred_previous_values = _infer_previous_stage_best_values_for_plots(args, run_dir)
         if inferred_previous_values:
@@ -29498,16 +28435,11 @@ def _rerender_plots(
     )
     quick_diagnostics = bool(
         getattr(args, "quick_diagnostics", False)
-        or (saved_args.get("quick_diagnostics", False) and not exact_stage_diagnostics)
         or force_quick_diagnostics
     )
-    if force_quick_diagnostics and not bool(saved_args.get("quick_diagnostics", False)):
+    if force_quick_diagnostics:
         _log(args, "[plots-only] quick diagnostics forced for pre-stage4 sequential stage")
-    if exact_stage_diagnostics and bool(saved_args.get("quick_diagnostics", False)):
-        _log(args, "[plots-only] exact stage image diagnostics requested; ignoring saved quick_diagnostics=True")
-    plot_saved_args = dict(saved_args)
-    plot_saved_args.update(_normalized_saved_likelihood_stabilizer_args(saved_args))
-    _drop_legacy_likelihood_stabilizer_args(plot_saved_args)
+    plot_saved_args = dict(current_runtime_args)
     plot_saved_args["quick_diagnostics"] = quick_diagnostics
     plot_saved_args["exact_image_diagnostics_stage2"] = bool(getattr(args, "exact_image_diagnostics_stage2", False))
     plot_saved_args["exact_image_diagnostics_stage3"] = bool(getattr(args, "exact_image_diagnostics_stage3", False))
@@ -29563,11 +28495,9 @@ def _rerender_plots(
         if current_cutout_bands is not None:
             plot_saved_args["image_catalog_family_cutout_bands"] = list(current_cutout_bands)
     current_cutout_mode = str(getattr(args, "image_catalog_family_cutout_mode", "full"))
-    if "image_catalog_family_cutout_mode" not in saved_args or current_cutout_mode != "full":
-        plot_saved_args["image_catalog_family_cutout_mode"] = current_cutout_mode
+    plot_saved_args["image_catalog_family_cutout_mode"] = current_cutout_mode
     current_cutout_critical_lines = str(getattr(args, "image_catalog_family_cutout_critical_lines", "auto"))
-    if "image_catalog_family_cutout_critical_lines" not in saved_args or current_cutout_critical_lines != "auto":
-        plot_saved_args["image_catalog_family_cutout_critical_lines"] = current_cutout_critical_lines
+    plot_saved_args["image_catalog_family_cutout_critical_lines"] = current_cutout_critical_lines
     current_cutout_dpi = getattr(args, "image_catalog_family_cutout_dpi", None)
     if current_cutout_dpi is not None:
         plot_saved_args["image_catalog_family_cutout_dpi"] = int(current_cutout_dpi)
@@ -29649,111 +28579,114 @@ def _rerender_plots(
             plot_saved_args.get("source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
         ),
         sample_likelihood_mode=sample_likelihood_mode,
-        image_plane_newton_steps=int(saved_args.get("image_plane_newton_steps", 0)),
+        image_plane_newton_steps=int(plot_saved_args.get("image_plane_newton_steps", 0)),
         anchored_image_plane_solve_steps=int(
-            saved_args.get("anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)
+            plot_saved_args.get("anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)
         ),
         anchored_image_plane_trust_radius_arcsec=float(
-            saved_args.get(
+            plot_saved_args.get(
                 "anchored_image_plane_trust_radius_arcsec",
                 DEFAULT_ANCHORED_IMAGE_PLANE_TRUST_RADIUS_ARCSEC,
             )
         ),
         anchored_image_plane_lm_damping_relative=float(
-            saved_args.get(
+            plot_saved_args.get(
                 "anchored_image_plane_lm_damping_relative",
                 DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE,
             )
         ),
         anchored_image_plane_lm_damping_absolute=float(
-            saved_args.get(
+            plot_saved_args.get(
                 "anchored_image_plane_lm_damping_absolute",
                 DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_ABSOLUTE,
             )
         ),
         critical_arc_critical_direction_sigma_arcsec=float(
-            saved_args.get("critical_arc_critical_direction_sigma_arcsec", DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)
+            plot_saved_args.get(
+                "critical_arc_critical_direction_sigma_arcsec",
+                DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+            )
         ),
         critical_arc_base_prob=float(
-            saved_args.get("critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)
+            plot_saved_args.get("critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)
         ),
         critical_arc_max_prob=float(
-            saved_args.get("critical_arc_max_prob", DEFAULT_CRITICAL_ARC_MAX_PROB)
+            plot_saved_args.get("critical_arc_max_prob", DEFAULT_CRITICAL_ARC_MAX_PROB)
         ),
         critical_arc_singular_threshold=float(
-            saved_args.get("critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)
+            plot_saved_args.get("critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)
         ),
         critical_arc_singular_softness=float(
-            saved_args.get("critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
+            plot_saved_args.get("critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
         ),
         critical_arc_lm_damping_relative=float(
-            saved_args.get("critical_arc_lm_damping_relative", DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE)
+            plot_saved_args.get("critical_arc_lm_damping_relative", DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE)
         ),
         critical_arc_lm_damping_absolute=float(
-            saved_args.get("critical_arc_lm_damping_absolute", DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE)
+            plot_saved_args.get("critical_arc_lm_damping_absolute", DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE)
         ),
         critical_arc_lm_trust_radius_arcsec=float(
-            saved_args.get("critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
+            plot_saved_args.get("critical_arc_lm_trust_radius_arcsec", DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC)
         ),
         arc_recovery_p_arc_threshold=float(
-            saved_args.get("arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
+            plot_saved_args.get("arc_recovery_p_arc_threshold", DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)
         ),
         arc_aware_max_arclength_arcsec=float(
-            saved_args.get("arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
+            plot_saved_args.get("arc_aware_max_arclength_arcsec", DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)
         ),
         arc_aware_curve_step_arcsec=float(
-            saved_args.get("arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)
+            plot_saved_args.get("arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)
         ),
         fold_curvature_arcsec_inv=float(
-            saved_args.get("fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
+            plot_saved_args.get("fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
         ),
-        catastrophe_likelihood=str(saved_args.get("catastrophe_likelihood", DEFAULT_CATASTROPHE_LIKELIHOOD)),
-        catastrophe_lambda_on=float(saved_args.get("catastrophe_lambda_on", DEFAULT_CATASTROPHE_LAMBDA_ON)),
-        catastrophe_lambda_off=float(saved_args.get("catastrophe_lambda_off", DEFAULT_CATASTROPHE_LAMBDA_OFF)),
-        catastrophe_gap_on=float(saved_args.get("catastrophe_gap_on", DEFAULT_CATASTROPHE_GAP_ON)),
-        catastrophe_gap_off=float(saved_args.get("catastrophe_gap_off", DEFAULT_CATASTROPHE_GAP_OFF)),
+        catastrophe_likelihood=str(plot_saved_args.get("catastrophe_likelihood", DEFAULT_CATASTROPHE_LIKELIHOOD)),
+        catastrophe_lambda_on=float(plot_saved_args.get("catastrophe_lambda_on", DEFAULT_CATASTROPHE_LAMBDA_ON)),
+        catastrophe_lambda_off=float(plot_saved_args.get("catastrophe_lambda_off", DEFAULT_CATASTROPHE_LAMBDA_OFF)),
+        catastrophe_gap_on=float(plot_saved_args.get("catastrophe_gap_on", DEFAULT_CATASTROPHE_GAP_ON)),
+        catastrophe_gap_off=float(plot_saved_args.get("catastrophe_gap_off", DEFAULT_CATASTROPHE_GAP_OFF)),
         catastrophe_tangential_variance_min=float(
-            saved_args.get(
+            plot_saved_args.get(
                 "catastrophe_tangential_variance_min",
                 DEFAULT_CATASTROPHE_TANGENTIAL_VARIANCE_MIN,
             )
         ),
         cab_likelihood_weight=cab_likelihood_weight,
         cab_finite_difference_step_arcsec=float(
-            saved_args.get("cab_finite_difference_step_arcsec", DEFAULT_CAB_FINITE_DIFFERENCE_STEP_ARCSEC)
+            plot_saved_args.get("cab_finite_difference_step_arcsec", DEFAULT_CAB_FINITE_DIFFERENCE_STEP_ARCSEC)
         ),
         cab_tangent_sigma_floor_rad=float(
-            saved_args.get("cab_tangent_sigma_floor_rad", DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD)
+            plot_saved_args.get("cab_tangent_sigma_floor_rad", DEFAULT_CAB_TANGENT_SIGMA_FLOOR_RAD)
         ),
         cab_curvature_sigma_floor_arcsec_inv=float(
-            saved_args.get("cab_curvature_sigma_floor_arcsec_inv", DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV)
+            plot_saved_args.get("cab_curvature_sigma_floor_arcsec_inv", DEFAULT_CAB_CURVATURE_SIGMA_FLOOR_ARCSEC_INV)
         ),
         image_plane_scatter_floor_arcsec=float(
-            saved_args.get("image_plane_scatter_floor_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC)
+            plot_saved_args.get("image_plane_scatter_floor_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC)
         ),
-        fixed_image_sigma_int_arcsec=saved_args.get("fix_image_sigma_int_arcsec"),
+        fixed_image_sigma_int_arcsec=plot_saved_args.get("fix_image_sigma_int_arcsec"),
         image_presence_penalty_weight=image_presence_penalty_weight,
         image_presence_match_radius_arcsec=float(
-            saved_args.get("image_presence_match_radius_arcsec", DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC)
+            plot_saved_args.get("image_presence_match_radius_arcsec", DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC)
         ),
         image_presence_temperature_arcsec=float(
-            saved_args.get("image_presence_temperature_arcsec", DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC)
+            plot_saved_args.get("image_presence_temperature_arcsec", DEFAULT_IMAGE_PRESENCE_TEMPERATURE_ARCSEC)
         ),
         image_presence_count_softness=float(
-            saved_args.get("image_presence_count_softness", DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS)
+            plot_saved_args.get("image_presence_count_softness", DEFAULT_IMAGE_PRESENCE_COUNT_SOFTNESS)
         ),
         image_presence_count_margin=float(
-            saved_args.get("image_presence_count_margin", DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN)
+            plot_saved_args.get("image_presence_count_margin", DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN)
         ),
-        **_normalized_saved_likelihood_stabilizer_args(saved_args),
-        evidence_source_prior_sigma_arcsec=saved_args.get("evidence_source_prior_sigma_arcsec"),
-        evidence_source_prior_mean_x_arcsec=float(saved_args.get("evidence_source_prior_mean_x_arcsec", 0.0)),
-        evidence_source_prior_mean_y_arcsec=float(saved_args.get("evidence_source_prior_mean_y_arcsec", 0.0)),
+        **_normalized_saved_likelihood_stabilizer_args(plot_saved_args),
+        evidence_source_prior_sigma_arcsec=plot_saved_args.get("evidence_source_prior_sigma_arcsec"),
+        evidence_source_prior_mean_x_arcsec=float(plot_saved_args.get("evidence_source_prior_mean_x_arcsec", 0.0)),
+        evidence_source_prior_mean_y_arcsec=float(plot_saved_args.get("evidence_source_prior_mean_y_arcsec", 0.0)),
         quick_diagnostics=quick_diagnostics,
     )
     _log_active_approximation_table(args, evaluator)
     best_fit = np.asarray(arrays["best_fit"], dtype=float)
-    saved_best_value = str(init_diagnostics.get("best_value_selected", saved_args.get("best_value", "saved_best_fit")))
+    saved_best_value = str(init_diagnostics.get("best_value_selected", plot_saved_args.get("best_value", "saved_best_fit")))
     _log(args, f"[plots-only] using saved best_fit convention best_value={saved_best_value}")
     best_fit_latent = _run_logged_phase(
         args,
@@ -29791,13 +28724,13 @@ def _rerender_plots(
         accept_prob=np.asarray(arrays["accept_prob"], dtype=float),
         diverging=np.asarray(arrays["diverging"], dtype=bool),
         num_steps=np.asarray(arrays["num_steps"], dtype=float),
-        warmup_steps=int(saved_args.get("warmup", 0)),
-        sample_steps=int(saved_args.get("samples", 0)),
-        num_chains=int(saved_args.get("chains", 1)),
+        warmup_steps=int(plot_saved_args.get("warmup", 0)),
+        sample_steps=int(plot_saved_args.get("samples", 0)),
+        num_chains=int(plot_saved_args.get("chains", 1)),
         init_diagnostics=init_diagnostics,
         grouped_samples=np.asarray(arrays["grouped_samples"], dtype=float) if "grouped_samples" in arrays else None,
         grouped_log_prob=np.asarray(arrays["grouped_log_prob"], dtype=float) if "grouped_log_prob" in arrays else None,
-        sampler=str(saved_args.get("sampler", DEFAULT_SAMPLER)),
+        sampler=str(plot_saved_args.get("sampler", DEFAULT_SAMPLER)),
         sample_weights=np.asarray(arrays["sample_weights"], dtype=float) if "sample_weights" in arrays else None,
         temperature_schedule=np.asarray(arrays["temperature_schedule"], dtype=float) if "temperature_schedule" in arrays else None,
         ess_history=np.asarray(arrays["ess_history"], dtype=float) if "ess_history" in arrays else None,
@@ -29839,7 +28772,7 @@ def _rerender_plots(
             args,
             run_dir,
             state,
-            saved_args,
+            plot_saved_args,
             init_diagnostics,
         ),
     )
@@ -29849,9 +28782,17 @@ def _rerender_plots(
 
 
 def _clone_args(args: argparse.Namespace, **updates: Any) -> argparse.Namespace:
-    payload = vars(args).copy()
+    payload = _args_payload(args)
+    model_config = payload.get("model_config")
+    updates = dict(updates)
+    if model_config is not None:
+        updates.pop("model_config", None)
     payload.update(updates)
-    return argparse.Namespace(**payload)
+    if model_config is not None:
+        payload["model_config"] = model_config
+    if payload.get("model_config") is None:
+        raise ValueError("SolverRuntime clone lost model_config; config-native runtime is required.")
+    return args.__class__(payload)
 
 
 INPUT_ARCHIVE_VERSION = 1
@@ -29891,10 +28832,9 @@ def _input_archive_iter_blocks(parsed: dict[str, Any], key: str) -> Iterable[dic
 
 
 def _discover_input_archive_files(state: BuildState) -> list[tuple[str, Path]]:
-    par_path = Path(state.par_path).expanduser().resolve(strict=False)
-    base_dir = par_path.parent
-    discovered: list[tuple[str, Path]] = [("par", par_path)]
-    seen: set[Path] = {par_path}
+    base_dir = Path.cwd()
+    discovered: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
 
     def add(kind: str, path: Path | None) -> None:
         if path is None or path in seen:
@@ -30086,7 +29026,7 @@ def _run_single_stage(
         ),
     )
     load_start = time.time()
-    _log(stage_args, f"[load] parsing input from {stage_args.par_path}")
+    _log(stage_args, "[load] building state from LensModelConfig")
     state = _run_logged_phase(
         stage_args,
         "state.build",
@@ -30411,7 +29351,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
     stage0_controls = stage_fit_controls.get("stage0", default_controls)
     stage1_controls = stage_fit_controls.get("stage1", default_controls)
     stage2_controls = stage_fit_controls.get("stage2", stage1_controls)
-    root_run_name = args.run_name or _make_run_name(args.par_path)
+    root_run_name = args.run_name or "cluster_solver"
     resume_mode = _resume_mode(args)
     resume = resume_mode is not None
     fast_resume = resume_mode == RESUME_MODE_FAST
@@ -30638,7 +29578,7 @@ def _run_sequential(args: argparse.Namespace) -> None:
             updates["cosmology_config_override"] = _sequential_fiducial_cosmology_config()
         return updates
 
-    root_run_name = args.run_name or _make_run_name(args.par_path)
+    root_run_name = args.run_name or "cluster_solver"
     resume_mode = _resume_mode(args)
     fast_resume = resume_mode == RESUME_MODE_FAST
     _log_stage_banner(
@@ -31154,7 +30094,7 @@ def _run_sequential(args: argparse.Namespace) -> None:
 def _run_evidence_ns(args: argparse.Namespace) -> None:
     stage_fit_controls = _normalize_stage_fit_controls(args)
     controls = stage_fit_controls["stage2"]
-    run_name = args.run_name or _make_run_name(args.par_path)
+    run_name = args.run_name or "cluster_solver"
     run_dir = Path(args.output_dir) / run_name
     evidence_likelihood_mode = str(
         getattr(args, "evidence_likelihood_mode", DEFAULT_EVIDENCE_LIKELIHOOD_MODE)
@@ -31210,11 +30150,9 @@ def _resolve_run_artifacts_dir(run_dir: str | Path) -> Path:
     return candidate if candidate.name == "artifacts" else candidate / "artifacts"
 
 
-def _main_dispatch(args: argparse.Namespace, stage_fit_controls: dict[str, StageFitControls]) -> None:
-    if not args.par_path and not args.plots_only:
-        _fail("--par-path is required unless --plots-only is used.")
+def _run_typed_plan_dispatch(args: argparse.Namespace, stage_fit_controls: dict[str, StageFitControls]) -> None:
     if args.plots_only:
-        root_run_name = args.run_name or _make_run_name(args.par_path)
+        root_run_name = args.run_name or "cluster_solver"
         root_dir = Path(args.output_dir) / root_run_name
         stage_dirs = [
             root_dir / STAGE1_BACKPROJECTED_CENTROID_FIT_DIR,
@@ -31227,7 +30165,7 @@ def _main_dispatch(args: argparse.Namespace, stage_fit_controls: dict[str, Stage
                     _configure_debug_log(args, stage_dir.name, stage_dir)
                     _rerender_plots(args, stage_dir, exact_diagnostics_stage=exact_diagnostics_stage)
             return
-        run_dir = Path(args.output_dir) / (args.run_name or _make_run_name(args.par_path))
+        run_dir = Path(args.output_dir) / (args.run_name or "cluster_solver")
         _configure_debug_log(args, run_dir.name, run_dir)
         if not _has_plot_artifacts(run_dir / "artifacts"):
             _fail(f"Missing saved artifacts for plots-only mode: {run_dir / 'artifacts'}")
@@ -31238,7 +30176,7 @@ def _main_dispatch(args: argparse.Namespace, stage_fit_controls: dict[str, Stage
     elif args.fit_mode == FIT_MODE_EVIDENCE_NS:
         _run_evidence_ns(args)
     else:
-        run_name = args.run_name or _make_run_name(args.par_path)
+        run_name = args.run_name or "cluster_solver"
         run_dir = Path(args.output_dir) / run_name
         if bool(getattr(args, "resume", False)):
             if _stage_run_complete(run_dir):
@@ -31262,29 +30200,11 @@ def _main_dispatch(args: argparse.Namespace, stage_fit_controls: dict[str, Stage
 
 
 def main() -> None:
-    try:
-        args = _parse_args()
-        stage_fit_controls = {} if bool(getattr(args, "plots_only", False)) else _normalize_stage_fit_controls(args)
-        if args.seed is not None:
-            np.random.seed(args.seed)
-        inferred_run_name = args.run_name
-        if inferred_run_name is None and args.par_path:
-            inferred_run_name = _make_run_name(args.par_path)
-        else:
-            inferred_run_name = inferred_run_name or "cluster_solver"
-        _configure_debug_log(args, inferred_run_name, None)
-        _log(args, "[main] startup")
-        _log_runtime_summary(args)
-        default_device = _resolve_jax_device_for_args(args, "jax_default_device", flag_name="--jax-default-device")
-        smc_device = _resolve_jax_device_for_args(args, "smc_device", flag_name="--smc-device")
-        _log_jax_device_policy(args, default_device, smc_device)
-        with _jax_device_context(default_device):
-            _main_dispatch(args, stage_fit_controls)
-    except BaseException as exc:
-        _log_exception("main", exc)
-        raise
-    finally:
-        _close_debug_log()
+    raise SystemExit(
+        "lenscluster.cluster_solver no longer accepts command-line arguments. "
+        "Build a LensClusterSolverConfig, compile it with lenscluster.planning.compile_run_plan, "
+        "and execute it with lenscluster.runner.LensClusterRunner."
+    )
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import sys
+import warnings
 from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 
 import lenscluster.plotting as plotting
+import lenscluster.utils as lc_utils
 from lenscluster.plotting import plot_path
 from lenscluster.model import PosteriorResults, ParameterSpec
 
@@ -729,7 +731,7 @@ def test_run_plot_tasks_with_progress_tracks_plot_names(monkeypatch: Any) -> Non
             return None
 
     monkeypatch.setattr(plotting, "_run_logged_phase", fake_logged_phase)
-    monkeypatch.setattr(plotting, "Progress", FakeProgress)
+    monkeypatch.setattr(plotting, "_progress_context", lambda _args, *columns, **kwargs: FakeProgress(*columns, **kwargs))
 
     tasks: list[plotting.PlotTask] = [
         ("corner", "plots.corner", lambda: calls.append("corner")),
@@ -750,6 +752,66 @@ def test_run_plot_tasks_with_progress_tracks_plot_names(monkeypatch: Any) -> Non
     ]
 
 
+def test_progress_context_uses_rich_in_terminal(monkeypatch: Any) -> None:
+    instances: list[Any] = []
+
+    class FakeRichProgress:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+            instances.append(self)
+
+        def __enter__(self) -> "FakeRichProgress":
+            return self
+
+        def __exit__(self, *exc: Any) -> bool:
+            return False
+
+    monkeypatch.setattr(lc_utils, "is_notebook_environment", lambda: False)
+    monkeypatch.setattr(lc_utils, "_RichProgress", FakeRichProgress)
+
+    with lc_utils.progress_context(argparse.Namespace(quiet=False), "column", transient=True) as progress:
+        assert progress is instances[0]
+
+    assert instances[0].args == ("column",)
+    assert instances[0].kwargs == {"transient": True}
+
+
+def test_progress_context_uses_tqdm_in_notebook(monkeypatch: Any) -> None:
+    instances: list[Any] = []
+
+    class FakeNotebookProgress:
+        def __init__(self) -> None:
+            instances.append(self)
+
+        def __enter__(self) -> "FakeNotebookProgress":
+            return self
+
+        def __exit__(self, *exc: Any) -> bool:
+            return False
+
+    def fail_rich(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("notebook progress should not instantiate Rich Progress")
+
+    monkeypatch.setattr(lc_utils, "is_notebook_environment", lambda: True)
+    monkeypatch.setattr(lc_utils, "_NotebookTqdmProgress", FakeNotebookProgress)
+    monkeypatch.setattr(lc_utils, "_RichProgress", fail_rich)
+
+    with lc_utils.progress_context(argparse.Namespace(quiet=False), "column", transient=True) as progress:
+        assert progress is instances[0]
+
+
+def test_progress_context_quiet_is_noop(monkeypatch: Any) -> None:
+    def fail_progress(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("quiet progress should not instantiate a backend")
+
+    monkeypatch.setattr(lc_utils, "_RichProgress", fail_progress)
+    monkeypatch.setattr(lc_utils, "_NotebookTqdmProgress", fail_progress)
+
+    with lc_utils.progress_context(argparse.Namespace(quiet=True), "column") as progress:
+        assert progress is None
+
+
 def test_run_plot_tasks_with_progress_quiet_skips_progress(monkeypatch: Any) -> None:
     calls: list[str] = []
     phases: list[str] = []
@@ -762,7 +824,7 @@ def test_run_plot_tasks_with_progress_quiet_skips_progress(monkeypatch: Any) -> 
         raise AssertionError("quiet plot execution should not create a progress bar")
 
     monkeypatch.setattr(plotting, "_run_logged_phase", fake_logged_phase)
-    monkeypatch.setattr(plotting, "Progress", fail_progress)
+    monkeypatch.setattr(plotting, "_progress_context", fail_progress)
 
     tasks: list[plotting.PlotTask] = [
         ("corner", "plots.corner", lambda: calls.append("corner")),
@@ -779,6 +841,7 @@ def test_run_plot_stages_with_progress_tracks_stage_and_subtask_names(monkeypatc
     calls: list[str] = []
     phases: list[str] = []
     progress_instances: list[Any] = []
+    received_progress: list[Any] = []
 
     def fake_logged_phase(args: argparse.Namespace, phase_name: str, fn: Any) -> Any:
         phases.append(phase_name)
@@ -809,7 +872,7 @@ def test_run_plot_stages_with_progress_tracks_stage_and_subtask_names(monkeypatc
             return None
 
     monkeypatch.setattr(plotting, "_run_logged_phase", fake_logged_phase)
-    monkeypatch.setattr(plotting, "Progress", FakeProgress)
+    monkeypatch.setattr(plotting, "_progress_context", lambda _args, *columns, **kwargs: FakeProgress(*columns, **kwargs))
 
     stages: list[plotting.PlotStage] = [
         (
@@ -822,7 +885,14 @@ def test_run_plot_stages_with_progress_tracks_stage_and_subtask_names(monkeypatc
         (
             "image_recovery",
             [
-                ("fit_quality_tables", "plots.image_recovery.fit_quality_tables", lambda: calls.append("fit_quality_tables")),
+                (
+                    "fit_quality_tables",
+                    "plots.image_recovery.fit_quality_tables",
+                    lambda progress=None: (
+                        received_progress.append(progress),
+                        calls.append("fit_quality_tables"),
+                    ),
+                ),
             ],
         ),
         ("empty_stage", []),
@@ -831,6 +901,7 @@ def test_run_plot_stages_with_progress_tracks_stage_and_subtask_names(monkeypatc
     plotting._run_plot_stages_with_progress(argparse.Namespace(quiet=False), stages)
 
     assert calls == ["corner", "chain_health", "fit_quality_tables"]
+    assert received_progress == [progress_instances[0]]
     assert phases == [
         "plots.run_diagnostics",
         "plots.corner",
@@ -867,7 +938,7 @@ def test_run_plot_stages_with_progress_quiet_skips_progress(monkeypatch: Any) ->
         raise AssertionError("quiet staged plot execution should not create a progress bar")
 
     monkeypatch.setattr(plotting, "_run_logged_phase", fake_logged_phase)
-    monkeypatch.setattr(plotting, "Progress", fail_progress)
+    monkeypatch.setattr(plotting, "_progress_context", fail_progress)
 
     plotting._run_plot_stages_with_progress(
         argparse.Namespace(quiet=True),
@@ -2337,12 +2408,14 @@ def test_posterior_fit_quality_predictions_parallelizes_per_sample_family(monkey
             self.totals: dict[int, int] = {}
             self.transient = kwargs.get("transient")
             self._next_task_id = 0
+            self.exited = False
             progress_instances.append(self)
 
         def __enter__(self) -> "FakeProgress":
             return self
 
         def __exit__(self, *exc: Any) -> bool:
+            self.exited = True
             return False
 
         def add_task(self, description: str, *, total: int) -> int:
@@ -2365,7 +2438,7 @@ def test_posterior_fit_quality_predictions_parallelizes_per_sample_family(monkey
     monkeypatch.setattr(plotting, "_clone_fit_quality_evaluator", lambda *_args, **_kwargs: evaluator)
     monkeypatch.setattr(plotting, "ThreadPoolExecutor", InlineExecutor)
     monkeypatch.setattr(plotting, "as_completed", lambda futures: list(futures))
-    monkeypatch.setattr(plotting, "Progress", FakeProgress)
+    monkeypatch.setattr(plotting, "_progress_context", lambda _args, *columns, **kwargs: FakeProgress(*columns, **kwargs))
     monkeypatch.setattr(plotting, "jax_cpu_worker_count", lambda: 4)
     monkeypatch.setattr(plotting, "_log", lambda _args, message: log_messages.append(str(message)))
 
@@ -2460,12 +2533,14 @@ def test_posterior_fit_quality_predictions_tracks_serial_progress(monkeypatch: A
             self.totals: dict[int, int] = {}
             self.transient = kwargs.get("transient")
             self._next_task_id = 0
+            self.exited = False
             progress_instances.append(self)
 
         def __enter__(self) -> "FakeProgress":
             return self
 
         def __exit__(self, *exc: Any) -> bool:
+            self.exited = True
             return False
 
         def add_task(self, description: str, *, total: int) -> int:
@@ -2483,7 +2558,7 @@ def test_posterior_fit_quality_predictions_tracks_serial_progress(monkeypatch: A
         def advance(self, task_id: int) -> None:
             self.advances[task_id] += 1
 
-    monkeypatch.setattr(plotting, "Progress", FakeProgress)
+    monkeypatch.setattr(plotting, "_progress_context", lambda _args, *columns, **kwargs: FakeProgress(*columns, **kwargs))
     monkeypatch.setattr(plotting, "jax_cpu_worker_count", lambda: 1)
     log_messages: list[str] = []
     monkeypatch.setattr(plotting, "_log", lambda _args, message: log_messages.append(str(message)))
@@ -2499,6 +2574,7 @@ def test_posterior_fit_quality_predictions_tracks_serial_progress(monkeypatch: A
     assert len(progress_instances) == 1
     progress = progress_instances[0]
     assert progress.transient is False
+    assert progress.exited is True
     assert progress.totals == {1: 2, 2: 2}
     assert progress.advances == {1: 2, 2: 2}
     assert progress.descriptions == [
@@ -2562,7 +2638,7 @@ def test_posterior_fit_quality_predictions_quiet_skips_progress(monkeypatch: Any
     def fail_progress(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("quiet fit-quality diagnostics should not create a progress bar")
 
-    monkeypatch.setattr(plotting, "Progress", fail_progress)
+    monkeypatch.setattr(plotting, "_progress_context", fail_progress)
     monkeypatch.setattr(plotting, "jax_cpu_worker_count", lambda: 1)
 
     predictions = plotting._posterior_fit_quality_predictions(
@@ -2573,6 +2649,91 @@ def test_posterior_fit_quality_predictions_quiet_skips_progress(monkeypatch: Any
     )
 
     assert len(predictions) == 1
+
+
+def test_posterior_fit_quality_predictions_reuses_existing_progress(monkeypatch: Any) -> None:
+    family = SimpleNamespace(
+        family_id="1",
+        z_source=2.0,
+        sigma_arcsec=1.0,
+        search_window=10.0,
+        n_images=1,
+        image_labels=["1.1"],
+        x_obs=np.asarray([0.0], dtype=float),
+        y_obs=np.asarray([0.0], dtype=float),
+    )
+    state = SimpleNamespace(family_data=[family])
+
+    class FakeModel:
+        def magnification(self, x: Any, y: Any, kwargs_lens: list[dict[str, float]]) -> np.ndarray:
+            del x, y
+            return np.asarray([float(kwargs_lens[0]["offset"])], dtype=float)
+
+    class FakeEvaluator:
+        def __init__(self) -> None:
+            self.source_plane_covariance_floor = 0.0
+
+        def _image_sigma_int_numpy(self, _sample_latent: np.ndarray) -> float:
+            return 0.0
+
+        def _exact_family_prediction(self, sample_latent: np.ndarray, family_data: Any) -> tuple[np.ndarray, np.ndarray, float]:
+            offset = float(np.asarray(sample_latent, dtype=float)[0])
+            return family_data.x_obs + offset, family_data.y_obs, offset
+
+        def _get_exact_model_solver(self, _z_source: float) -> tuple[FakeModel, None]:
+            return FakeModel(), None
+
+        def _build_packed_lens_state(self, sample_latent: np.ndarray, _z_source: float) -> dict[str, float]:
+            return {"offset": float(np.asarray(sample_latent, dtype=float)[0])}
+
+        def _packed_to_kwargs_lens(self, packed_state: dict[str, float]) -> list[dict[str, float]]:
+            return [packed_state]
+
+    class ExistingProgress:
+        def __init__(self) -> None:
+            self.descriptions: list[tuple[int, str]] = []
+            self.advances: dict[int, int] = {}
+            self.totals: dict[int, int] = {}
+            self._next_task_id = 0
+
+        def add_task(self, description: str, *, total: int) -> int:
+            self._next_task_id += 1
+            task_id = self._next_task_id
+            self.descriptions.append((task_id, description))
+            self.totals[task_id] = total
+            self.advances[task_id] = 0
+            return task_id
+
+        def update(self, task_id: int, **kwargs: Any) -> None:
+            if "description" in kwargs:
+                self.descriptions.append((task_id, kwargs["description"]))
+
+        def advance(self, task_id: int) -> None:
+            self.advances[task_id] += 1
+
+    def fail_progress(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("existing fit-quality progress should be reused")
+
+    existing_progress = ExistingProgress()
+    monkeypatch.setattr(plotting, "_progress_context", fail_progress)
+    monkeypatch.setattr(plotting, "jax_cpu_worker_count", lambda: 1)
+    monkeypatch.setattr(plotting, "_log", lambda _args, _message: None)
+
+    predictions = plotting._posterior_fit_quality_predictions(
+        FakeEvaluator(),
+        state,
+        [np.asarray([1.0], dtype=float), np.asarray([2.0], dtype=float)],
+        argparse.Namespace(),
+        progress=existing_progress,
+    )
+
+    assert len(predictions) == 2
+    assert existing_progress.totals == {1: 2, 2: 2}
+    assert existing_progress.advances == {1: 2, 2: 2}
+    assert existing_progress.descriptions[0:2] == [
+        (1, "fit quality exact: 0/2 family diagnostics"),
+        (2, "draw progress: 0/2 complete"),
+    ]
 
 
 def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, monkeypatch: Any) -> None:
@@ -4495,6 +4656,47 @@ def test_plot_absolute_magnification_uses_configured_grid_redshift_and_capped_ab
     assert colorbar.labels == [r"$|\mu|$"]
 
 
+def test_load_kappa_true_fits_suppresses_only_radecsys_warning(tmp_path: Path) -> None:
+    true_path = tmp_path / "radecsys_kappa.fits"
+    header = fits.Header()
+    header["CTYPE1"] = "RA---TAN"
+    header["CTYPE2"] = "DEC--TAN"
+    header["CRVAL1"] = 10.0
+    header["CRVAL2"] = -20.0
+    header["CRPIX1"] = 1.0
+    header["CRPIX2"] = 1.0
+    header["CDELT1"] = -1.0 / 3600.0
+    header["CDELT2"] = 1.0 / 3600.0
+    header["RADECSYS"] = "FK5"
+    fits.PrimaryHDU(np.ones((2, 2), dtype=np.float32), header=header).writeto(true_path)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        image, wcs = plotting._load_kappa_true_fits(true_path)
+        warnings.warn("sentinel unrelated warning", UserWarning)
+
+    assert image.shape == (2, 2)
+    assert wcs.has_celestial
+    messages = [str(item.message) for item in caught]
+    assert not any("RADECSYS" in message for message in messages)
+    assert any("sentinel unrelated warning" in message for message in messages)
+
+
+def test_install_astropy_wcs_warning_filters_suppresses_radecsys_only() -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        lc_utils.install_astropy_wcs_warning_filters()
+        warnings.warn(
+            "RADECSYS= 'FK5 '\nthe RADECSYS keyword is deprecated, use RADESYSa.",
+            plotting.FITSFixedWarning,
+        )
+        warnings.warn("unrelated WCS warning", plotting.FITSFixedWarning)
+
+    messages = [str(item.message) for item in caught]
+    assert not any("RADECSYS" in message for message in messages)
+    assert any("unrelated WCS warning" in message for message in messages)
+
+
 def test_plot_kappa_true_comparison_uses_fits_grid_redshift_and_fixed_limits(
     monkeypatch: Any,
     tmp_path: Path,
@@ -4554,18 +4756,28 @@ def test_plot_kappa_true_comparison_uses_fits_grid_redshift_and_fixed_limits(
 
     class FakeAxis:
         def __init__(self) -> None:
-            self.imshow_calls: list[tuple[np.ndarray, dict[str, Any]]] = []
+            self.pcolormesh_calls: list[tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]] = []
             self.inverted = False
             self.xlabel: str | None = None
             self.ylabel: str | None = None
             self.title: str | None = None
 
-        def imshow(self, data: Any, **kwargs: Any) -> str:
-            self.imshow_calls.append((np.ma.asarray(data).filled(np.nan), dict(kwargs)))
-            return f"image-{len(self.imshow_calls)}"
+        def pcolormesh(self, x: Any, y: Any, data: Any, **kwargs: Any) -> str:
+            self.pcolormesh_calls.append(
+                (
+                    np.asarray(x, dtype=float),
+                    np.asarray(y, dtype=float),
+                    np.ma.asarray(data).filled(np.nan),
+                    dict(kwargs),
+                )
+            )
+            return f"mesh-{len(self.pcolormesh_calls)}"
 
         def invert_xaxis(self) -> None:
             self.inverted = True
+
+        def set_aspect(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
 
         def set_xlabel(self, label: str) -> None:
             self.xlabel = label
@@ -4582,7 +4794,7 @@ def test_plot_kappa_true_comparison_uses_fits_grid_redshift_and_fixed_limits(
             self.saved_paths: list[Path] = []
 
         def colorbar(self, image: Any, ax: FakeAxis, **kwargs: Any) -> FakeColorbar:
-            assert image.startswith("image-")
+            assert image.startswith("mesh-")
             assert isinstance(ax, FakeAxis)
             assert kwargs["fraction"] == pytest.approx(0.046)
             assert kwargs["pad"] == pytest.approx(0.04)
@@ -4632,10 +4844,19 @@ def test_plot_kappa_true_comparison_uses_fits_grid_redshift_and_fixed_limits(
     _x_input, _y_input, kwargs_lens = evaluator.model.inputs[0]
     assert kwargs_lens == [{"latent": 5.0}]
 
-    model_data, model_kwargs = axes[0].imshow_calls[0]
-    residual_data, residual_kwargs = axes[1].imshow_calls[0]
+    model_x, model_y, model_data, model_kwargs = axes[0].pcolormesh_calls[0]
+    residual_x, residual_y, residual_data, residual_kwargs = axes[1].pcolormesh_calls[0]
     np.testing.assert_allclose(model_data, [[2.0, 2.0], [2.0, 5.0]])
     np.testing.assert_allclose(residual_data, [[1.0, np.nan], [np.nan, 1.5]], equal_nan=True)
+    np.testing.assert_allclose(model_x, residual_x)
+    np.testing.assert_allclose(model_y, residual_y)
+    assert model_kwargs["shading"] == "nearest"
+    assert residual_kwargs["shading"] == "nearest"
+    for kwargs in (model_kwargs, residual_kwargs):
+        assert kwargs["edgecolors"] == "none"
+        assert kwargs["linewidth"] == pytest.approx(0.0)
+        assert kwargs["antialiased"] is False
+        assert kwargs["rasterized"] is True
     assert model_kwargs["vmin"] == pytest.approx(0.0)
     assert model_kwargs["vmax"] == pytest.approx(3.0)
     assert "vmin" not in residual_kwargs
@@ -4665,10 +4886,19 @@ def test_kappa_fractional_residual_overlays_members_and_images(monkeypatch: Any,
             self.scatter_calls: list[tuple[np.ndarray, np.ndarray, dict[str, Any]]] = []
             self.text_calls: list[tuple[float, float, str, dict[str, Any]]] = []
             self.legend_calls: list[dict[str, Any]] = []
+            self.pcolormesh_calls: list[tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]] = []
             self.inverted = False
 
-        def imshow(self, *_args: Any, **_kwargs: Any) -> str:
-            return "image"
+        def pcolormesh(self, x: Any, y: Any, data: Any, **kwargs: Any) -> str:
+            self.pcolormesh_calls.append(
+                (
+                    np.asarray(x, dtype=float),
+                    np.asarray(y, dtype=float),
+                    np.ma.asarray(data).filled(np.nan),
+                    dict(kwargs),
+                )
+            )
+            return "mesh"
 
         def scatter(self, x: Any, y: Any, **kwargs: Any) -> None:
             self.scatter_calls.append((np.asarray(x, dtype=float), np.asarray(y, dtype=float), dict(kwargs)))
@@ -4685,6 +4915,9 @@ def test_kappa_fractional_residual_overlays_members_and_images(monkeypatch: Any,
 
         def invert_xaxis(self) -> None:
             self.inverted = True
+
+        def set_aspect(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
 
         def set_xlabel(self, _label: str) -> None:
             return None
@@ -4725,8 +4958,8 @@ def test_kappa_fractional_residual_overlays_members_and_images(monkeypatch: Any,
     plotting._plot_kappa_true_comparison_from_grid(
         tmp_path,
         np.ones((2, 2), dtype=float),
-        np.full((2, 2), 1.2, dtype=float),
-        np.asarray([[0.0, 1.0], [0.0, 1.0]], dtype=float),
+        np.asarray([[2.2, 1.2], [1.2, 1.2]], dtype=float),
+        np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=float),
         np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=float),
         9.0,
         member_overlays=member_overlays,
@@ -4737,12 +4970,16 @@ def test_kappa_fractional_residual_overlays_members_and_images(monkeypatch: Any,
     assert model_axis.scatter_calls == []
     assert model_axis.text_calls == []
     assert [call[2]["marker"] for call in residual_axis.scatter_calls] == ["x", "s", "D"]
+    np.testing.assert_allclose(residual_axis.pcolormesh_calls[0][0], [[1.0, 0.0], [1.0, 0.0]])
+    np.testing.assert_allclose(residual_axis.pcolormesh_calls[0][2], [[1.2, 0.2], [0.2, 0.2]])
     np.testing.assert_allclose(residual_axis.scatter_calls[0][0], [-0.5])
     np.testing.assert_allclose(residual_axis.scatter_calls[0][1], [0.25])
     assert residual_axis.scatter_calls[0][2]["label"] == "observed images"
     assert residual_axis.scatter_calls[1][2]["label"] == "not free"
     assert residual_axis.scatter_calls[2][2]["label"] == "free"
     assert [call[2] for call in residual_axis.text_calls] == ["inactive", "free"]
+    assert residual_axis.text_calls[1][0] == pytest.approx(1.0)
+    assert residual_axis.text_calls[1][1] == pytest.approx(1.5)
     assert residual_axis.legend_calls
     assert model_axis.inverted is False
     assert residual_axis.inverted is False
@@ -5913,18 +6150,25 @@ def test_absolute_mu_comparison_labels_are_not_capped(monkeypatch: Any, tmp_path
 
     class FakeAxis:
         def __init__(self) -> None:
-            self.imshow_data: list[np.ndarray] = []
-            self.imshow_kwargs: list[dict[str, Any]] = []
+            self.pcolormesh_data: list[np.ndarray] = []
+            self.pcolormesh_x: list[np.ndarray] = []
+            self.pcolormesh_y: list[np.ndarray] = []
+            self.pcolormesh_kwargs: list[dict[str, Any]] = []
             self.title: str | None = None
             self.inverted = False
 
-        def imshow(self, data: Any, **kwargs: Any) -> str:
-            self.imshow_data.append(np.ma.asarray(data).filled(np.nan))
-            self.imshow_kwargs.append(dict(kwargs))
-            return f"image-{len(self.imshow_kwargs)}"
+        def pcolormesh(self, x: Any, y: Any, data: Any, **kwargs: Any) -> str:
+            self.pcolormesh_x.append(np.asarray(x, dtype=float))
+            self.pcolormesh_y.append(np.asarray(y, dtype=float))
+            self.pcolormesh_data.append(np.ma.asarray(data).filled(np.nan))
+            self.pcolormesh_kwargs.append(dict(kwargs))
+            return f"mesh-{len(self.pcolormesh_kwargs)}"
 
         def invert_xaxis(self) -> None:
             self.inverted = True
+
+        def set_aspect(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
 
         def set_xlabel(self, label: str) -> None:
             return None
@@ -5989,10 +6233,18 @@ def test_absolute_mu_comparison_labels_are_not_capped(monkeypatch: Any, tmp_path
     assert axes[1].title is None
     assert axes[0].inverted is False
     assert axes[1].inverted is False
-    np.testing.assert_allclose(axes[0].imshow_data[0], [[2.0, 25.0], [5.0, 60.0]])
-    np.testing.assert_allclose(axes[1].imshow_data[0], [[1.0, -0.5], [np.nan, np.nan]], equal_nan=True)
-    assert axes[0].imshow_kwargs[0]["vmax"] == pytest.approx(plotting.ABSOLUTE_MAGNIFICATION_PLOT_CAP)
-    residual_norm = axes[1].imshow_kwargs[0]["norm"]
+    np.testing.assert_allclose(axes[0].pcolormesh_data[0], [[2.0, 25.0], [5.0, 60.0]])
+    np.testing.assert_allclose(axes[1].pcolormesh_data[0], [[1.0, -0.5], [np.nan, np.nan]], equal_nan=True)
+    np.testing.assert_allclose(axes[0].pcolormesh_x[0], [[0.0, 1.0], [0.0, 1.0]])
+    np.testing.assert_allclose(axes[1].pcolormesh_y[0], [[0.0, 0.0], [1.0, 1.0]])
+    assert axes[0].pcolormesh_kwargs[0]["shading"] == "nearest"
+    for kwargs in (axes[0].pcolormesh_kwargs[0], axes[1].pcolormesh_kwargs[0]):
+        assert kwargs["edgecolors"] == "none"
+        assert kwargs["linewidth"] == pytest.approx(0.0)
+        assert kwargs["antialiased"] is False
+        assert kwargs["rasterized"] is True
+    assert axes[0].pcolormesh_kwargs[0]["vmax"] == pytest.approx(plotting.ABSOLUTE_MAGNIFICATION_PLOT_CAP)
+    residual_norm = axes[1].pcolormesh_kwargs[0]["norm"]
     assert isinstance(residual_norm, plotting.TwoSlopeNorm)
     assert residual_norm.vmin == pytest.approx(-1.0)
     assert residual_norm.vcenter == pytest.approx(0.0)

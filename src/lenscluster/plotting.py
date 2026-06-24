@@ -9,6 +9,7 @@ import math
 import re
 import sys
 import threading
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Sequence
@@ -20,7 +21,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
-from astropy.wcs import WCS
+from astropy.wcs import FITSFixedWarning, WCS
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import LogNorm, Normalize, TwoSlopeNorm, to_rgba
@@ -28,7 +29,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Circle
 import numpy as np
 import pandas as pd
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
+from rich.progress import BarColumn, MofNCompleteColumn, TextColumn, TimeElapsedColumn
 from scipy.ndimage import map_coordinates
 from scipy.stats import norm
 from skimage.measure import find_contours
@@ -52,7 +53,6 @@ from .image_diagnostics import (
 )
 from .jax_cosmology import critical_surface_density_angle_from_config
 from .jax_cosmology import kpc_per_arcsec_from_config as _kpc_per_arcsec_from_config
-from .lenstool_parser import load_best_par
 from .model import BuildState, EvaluationResult, ParameterSpec, PosteriorResults
 from .model import convert_theta_to_latent as _convert_theta_to_latent
 from .model import display_lower as _display_lower
@@ -60,6 +60,7 @@ from .model import display_upper as _display_upper
 from .utils import Table as _RichTable
 from .utils import jax_cpu_worker_count
 from .utils import log_message as _log
+from .utils import progress_context as _progress_context
 from .utils import run_logged_phase as _run_logged_phase
 
 DEFAULT_NUTS_INIT_BOUNDARY_FRAC = 0.02
@@ -82,7 +83,6 @@ CORNER_PLOT_DPI = 300
 CORNER_BEST_FIT_COLOR = "#d4a017"
 CORNER_MAP_COLOR = "#d4a017"
 CORNER_MAXIMUM_LIKELIHOOD_COLOR = "tab:orange"
-CORNER_BEST_PAR_COLOR = "tab:red"
 CORNER_PREVIOUS_STAGE_COLOR = "tab:green"
 CORNER_BAYES_OVERLAY_COLOR = "tab:red"
 SMC_CORNER_MAX_PARAMS = 8
@@ -505,7 +505,8 @@ def _run_plot_tasks_with_progress(args: argparse.Namespace, plot_tasks: list[Plo
         for _display_name, phase_name, task in plot_tasks:
             _run_logged_phase(args, phase_name, task)
         return
-    with Progress(
+    with _progress_context(
+        args,
         TextColumn("{task.description}"),
         BarColumn(),
         MofNCompleteColumn(),
@@ -548,7 +549,8 @@ def _run_plot_stages_with_progress(args: argparse.Namespace, stages: list[PlotSt
         for stage_name, tasks in active_stages:
             _run_logged_phase(args, f"plots.{stage_name}", lambda stage_name=stage_name, tasks=tasks: run_stage(stage_name, tasks))
         return
-    with Progress(
+    with _progress_context(
+        args,
         TextColumn("{task.description}"),
         BarColumn(),
         MofNCompleteColumn(),
@@ -4457,7 +4459,6 @@ def _plot_corner(
     maximum_likelihood_values: dict[str, float] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
     bayes_corner_overlay: BayesCornerOverlay | None = None,
-    best_par_marker_values: dict[str, float] | None = None,
     *,
     output_name: str = "corner.pdf",
     plot_datapoints: bool = False,
@@ -4492,7 +4493,6 @@ def _plot_corner(
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
     _overplot_corner_map(fig, subset_specs, map_values)
     _overplot_corner_maximum_likelihood(fig, subset_specs, maximum_likelihood_values)
-    _overplot_corner_best_par_marker(fig, subset_specs, best_par_marker_values, output_name)
     fig.savefig(_plot_path(plot_dir, output_name), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -4856,18 +4856,7 @@ def _finite_median(values: list[float]) -> float | None:
 
 
 def _state_potfiles_with_catalogs(state: BuildState) -> list[dict[str, Any]]:
-    potfiles = [dict(item) for item in list(getattr(state, "potfiles", []) or [])]
-    if any(isinstance(potfile.get("catalog_df"), pd.DataFrame) for potfile in potfiles):
-        return potfiles
-    par_path = getattr(state, "par_path", None)
-    if not par_path:
-        return potfiles
-    try:
-        parsed, _potentials_df, _images_df, _arcs_df, _potentials_with_priors = load_best_par(par_path)
-    except Exception as exc:
-        _log(None, f"[plot:corner] best.par potfile catalog fallback unavailable from {par_path}: {exc}")
-        return potfiles
-    return [dict(item) for item in list(parsed.get("potfiles", []) or [])]
+    return [dict(item) for item in list(getattr(state, "potfiles", []) or [])]
 
 
 def _best_par_large_component_values(potentials_df: pd.DataFrame) -> dict[str, float]:
@@ -4947,50 +4936,6 @@ def _best_par_potfile_values(
         if slope is not None:
             values[f"{potfile_id}.slope"] = slope
     return values
-
-
-def _load_best_par_marker_values(path: str | Path | None, state: BuildState) -> dict[str, float] | None:
-    if path is None:
-        return None
-    best_par_path = Path(path)
-    if not best_par_path.exists():
-        _log(None, f"[plot:corner] best.par marker skipped; missing file: {best_par_path}")
-        return None
-    try:
-        _parsed, potentials_df, _images_df, _arcs_df, _potentials_with_priors = load_best_par(best_par_path)
-    except Exception as exc:
-        _log(None, f"[plot:corner] best.par marker skipped; failed to read {best_par_path}: {exc}")
-        return None
-    values = _best_par_large_component_values(potentials_df)
-    values.update(_best_par_potfile_values(potentials_df, state))
-    if not values:
-        _log(None, f"[plot:corner] best.par marker skipped; no recognized parameter values in {best_par_path}")
-        return None
-    _log(None, f"[plot:corner] best.par marker loaded path={best_par_path} values={len(values)}")
-    return values
-
-
-def _overplot_corner_best_par_marker(
-    fig: Any,
-    parameter_specs: list[ParameterSpec],
-    marker_values: dict[str, float] | None,
-    plot_name: str,
-) -> None:
-    if corner is None or not marker_values:
-        return
-    xs = _corner_values_for_specs(parameter_specs, marker_values)
-    if not xs or not any(np.isfinite(xs)):
-        _log(None, f"[plot:corner] {plot_name}: best.par marker skipped; no matching finite parameters")
-        return
-    point_xs = [[float(value) if np.isfinite(value) else np.nan for value in xs]]
-    corner.overplot_points(
-        fig,
-        point_xs,
-        marker="x",
-        color=CORNER_BEST_PAR_COLOR,
-        markersize=5,
-        markeredgewidth=1.2,
-    )
 
 
 def _overplot_corner_map(
@@ -5125,7 +5070,6 @@ def _plot_potfile_corner(
     maximum_likelihood_values: dict[str, float] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
     bayes_corner_overlay: BayesCornerOverlay | None = None,
-    best_par_marker_values: dict[str, float] | None = None,
 ) -> None:
     if corner is None or samples.size == 0 or not parameter_specs:
         return
@@ -5153,7 +5097,6 @@ def _plot_potfile_corner(
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
     _overplot_corner_map(fig, subset_specs, map_values)
     _overplot_corner_maximum_likelihood(fig, subset_specs, maximum_likelihood_values)
-    _overplot_corner_best_par_marker(fig, subset_specs, best_par_marker_values, "potfile_corner.pdf")
     fig.savefig(_plot_path(plot_dir, "potfile_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -5168,7 +5111,6 @@ def _plot_cosmology_corner(
     maximum_likelihood_values: dict[str, float] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
     bayes_corner_overlay: BayesCornerOverlay | None = None,
-    best_par_marker_values: dict[str, float] | None = None,
     *,
     plot_datapoints: bool = False,
 ) -> None:
@@ -5199,7 +5141,6 @@ def _plot_cosmology_corner(
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
     _overplot_corner_map(fig, subset_specs, map_values)
     _overplot_corner_maximum_likelihood(fig, subset_specs, maximum_likelihood_values)
-    _overplot_corner_best_par_marker(fig, subset_specs, best_par_marker_values, "cosmology_corner.pdf")
     fig.savefig(_plot_path(plot_dir, "cosmology_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -7103,6 +7044,7 @@ def _posterior_fit_quality_predictions(
     state: BuildState,
     sample_latents: list[np.ndarray],
     args: argparse.Namespace,
+    progress: Any | None = None,
 ) -> list[dict[str, list[dict[str, Any]]]]:
     if not sample_latents:
         return []
@@ -7179,7 +7121,7 @@ def _posterior_fit_quality_predictions(
         return f"draw progress: {completed_draws}/{len(sample_latents)} complete"
 
     def update_task_progress(
-        progress: Progress | None,
+        progress: Any | None,
         family_task_id: int | None,
         status: str,
         sample_index: int,
@@ -7194,7 +7136,7 @@ def _posterior_fit_quality_predictions(
             progress.advance(family_task_id)
 
     def mark_family_completed(
-        progress: Progress | None,
+        progress: Any | None,
         family_task_id: int | None,
         draw_task_id: int | None,
         sample_index: int,
@@ -7250,23 +7192,25 @@ def _posterior_fit_quality_predictions(
             f"largest_grid={largest_num_pix}x{largest_num_pix} total_grid_points={total_grid_points}"
         ),
     )
+    own_progress = progress is None
     progress_cm = (
-        Progress(
+        _progress_context(
+            args,
             TextColumn("{task.description}"),
             BarColumn(),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
             transient=False,
         )
-        if progress_enabled
+        if progress_enabled and own_progress
         else None
     )
-    progress: Progress | None = None
     family_task_id: int | None = None
     draw_task_id: int | None = None
     try:
         if progress_cm is not None:
             progress = progress_cm.__enter__()
+        if progress is not None and progress_enabled:
             family_task_id = progress.add_task(f"fit quality exact: 0/{n_tasks} family diagnostics", total=n_tasks)
             draw_task_id = progress.add_task(draw_progress_description(), total=len(sample_latents))
         if worker_count <= 1 or n_tasks <= 1:
@@ -7341,6 +7285,7 @@ def _fit_quality_tables(
     best_fit: np.ndarray,
     results: PosteriorResults,
     args: argparse.Namespace,
+    progress: Any | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     best_fit_latent = _reported_physical_to_latent_vector(evaluator, np.asarray(best_fit, dtype=float))
     quick_diagnostics = bool(getattr(args, "quick_diagnostics", getattr(evaluator, "quick_diagnostics", False)))
@@ -7352,7 +7297,13 @@ def _fit_quality_tables(
         _reported_physical_to_latent_vector(evaluator, np.asarray(sample, dtype=float))
         for sample in posterior_samples
     ]
-    all_predictions = _posterior_fit_quality_predictions(evaluator, state, [best_fit_latent, *sample_latents], args)
+    all_predictions = _posterior_fit_quality_predictions(
+        evaluator,
+        state,
+        [best_fit_latent, *sample_latents],
+        args,
+        progress=progress,
+    )
     best_prediction = (
         all_predictions[0]
         if all_predictions
@@ -8508,7 +8459,6 @@ def _plot_exact_vs_approx_prediction_error(family_df: pd.DataFrame, path: Path) 
 def _plot_per_potential_summary(
     plot_dir: Path,
     summary_df: pd.DataFrame,
-    best_par_marker_values: dict[str, float] | None = None,
     previous_stage_best_values: dict[str, float] | None = None,
     parameter_specs: list[ParameterSpec] | None = None,
 ) -> None:
@@ -8525,15 +8475,10 @@ def _plot_per_potential_summary(
     if nrows == 1:
         axes = [axes]
     for ax, row in zip(axes, summary_df.itertuples(index=False)):
-        best_par_value = None
-        if best_par_marker_values:
-            best_par_value = _finite_float_or_none(best_par_marker_values.get(str(row.label)))
         previous_stage_value = previous_stage_by_label.get(str(row.label))
         ax.hlines(1, row.p16, row.p84, linewidth=4, color="tab:blue")
         ax.scatter([row.median], [1], color="tab:blue", s=35, label="median")
         ax.scatter([row.map], [1], color=CORNER_BEST_FIT_COLOR, marker="x", s=30, label="best fit")
-        if best_par_value is not None:
-            ax.scatter([best_par_value], [1], color=CORNER_BEST_PAR_COLOR, marker="x", s=30, label="best.par")
         if previous_stage_value is not None:
             ax.scatter(
                 [previous_stage_value],
@@ -8550,7 +8495,7 @@ def _plot_per_potential_summary(
             width = max(float(row.std), 0.5 * abs(float(row.p84) - float(row.p16)), 1.0e-3)
             x_min = float(min(row.p16, row.median, row.map) - 2.0 * width)
             x_max = float(max(row.p84, row.median, row.map) + 2.0 * width)
-        for marker_value in (best_par_value, previous_stage_value):
+        for marker_value in (previous_stage_value,):
             if marker_value is None:
                 continue
             span = max(abs(x_max - x_min), 1.0e-3)
@@ -8788,7 +8733,13 @@ def _load_kappa_true_fits(path: str | Path) -> tuple[np.ndarray, WCS]:
             image = np.squeeze(np.asarray(data, dtype=float))
             if image.ndim != 2:
                 continue
-            wcs = WCS(hdu.header).celestial
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"(?s).*RADECSYS.*deprecated.*RADESYS.*",
+                    category=FITSFixedWarning,
+                )
+                wcs = WCS(hdu.header).celestial
             if not wcs.has_celestial:
                 continue
             return image, wcs
@@ -9222,7 +9173,7 @@ def _posterior_truth_grid_quantiles(
     aperture_center: dict[str, Any] | None = None,
     aperture_kappa_true: np.ndarray | None = None,
     aperture_n_radii: int = 40,
-    progress: Progress | None = None,
+    progress: Any | None = None,
     truth_grid_metadata: dict[str, Any] | None = None,
 ) -> tuple[dict[str, dict[str, np.ndarray]], np.ndarray, np.ndarray]:
     requested_quantities = tuple(dict.fromkeys(str(quantity) for quantity in quantities))
@@ -10050,6 +10001,42 @@ def _write_kappa_recovery_from_grid(
     )
 
 
+def _plot_truth_recovery_spatial_map(
+    ax: Any,
+    x_arcsec: np.ndarray,
+    y_arcsec: np.ndarray,
+    image_data: np.ndarray,
+    *,
+    cmap: str,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    norm: Normalize | None = None,
+) -> Any:
+    mesh_kwargs: dict[str, Any] = {
+        "cmap": cmap,
+        "shading": "nearest",
+        "edgecolors": "none",
+        "linewidth": 0.0,
+        "antialiased": False,
+        "rasterized": True,
+    }
+    if norm is None:
+        if vmin is not None:
+            mesh_kwargs["vmin"] = float(vmin)
+        if vmax is not None:
+            mesh_kwargs["vmax"] = float(vmax)
+    else:
+        mesh_kwargs["norm"] = norm
+    mesh = ax.pcolormesh(
+        np.asarray(x_arcsec, dtype=float),
+        np.asarray(y_arcsec, dtype=float),
+        np.ma.masked_invalid(image_data),
+        **mesh_kwargs,
+    )
+    ax.set_aspect("equal", adjustable="box")
+    return mesh
+
+
 def _plot_kappa_recovery(
     plot_dir: Path,
     evaluator: ClusterJAXEvaluator,
@@ -10176,20 +10163,16 @@ def _plot_kappa_true_comparison_from_grid(
         overlays: bool = False,
     ) -> None:
         fig, ax = plt.subplots(figsize=(6.0, 5.2))
-        imshow_kwargs: dict[str, Any] = {
-            "origin": "lower",
-            "extent": extent,
-            "cmap": cmap,
-            "aspect": "equal",
-        }
-        if norm is None:
-            if vmin is not None:
-                imshow_kwargs["vmin"] = float(vmin)
-            if vmax is not None:
-                imshow_kwargs["vmax"] = float(vmax)
-        else:
-            imshow_kwargs["norm"] = norm
-        image = ax.imshow(np.ma.masked_invalid(image_data), **imshow_kwargs)
+        image = _plot_truth_recovery_spatial_map(
+            ax,
+            x_arcsec,
+            y_arcsec,
+            image_data,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            norm=norm,
+        )
         colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
         colorbar.set_label(colorbar_label)
         if overlays:
@@ -10203,13 +10186,6 @@ def _plot_kappa_true_comparison_from_grid(
     valid_residual = np.isfinite(model_kappa) & np.isfinite(kappa_true) & (kappa_true > 0.0)
     fractional_residual = np.full(kappa_true.shape, np.nan, dtype=float)
     fractional_residual[valid_residual] = (model_kappa[valid_residual] - kappa_true[valid_residual]) / kappa_true[valid_residual]
-    extent = [
-        float(np.nanmin(x_arcsec)),
-        float(np.nanmax(x_arcsec)),
-        float(np.nanmin(y_arcsec)),
-        float(np.nanmax(y_arcsec)),
-    ]
-
     _plot_comparison_map(
         "truth_recovery_kappa_model.pdf",
         model_kappa,
@@ -10692,20 +10668,16 @@ def _plot_abs_mu_true_comparison_from_grid(
         norm: Normalize | None = None,
     ) -> None:
         fig, ax = plt.subplots(figsize=(6.0, 5.2))
-        imshow_kwargs: dict[str, Any] = {
-            "origin": "lower",
-            "extent": extent,
-            "cmap": cmap,
-            "aspect": "equal",
-        }
-        if norm is None:
-            if vmin is not None:
-                imshow_kwargs["vmin"] = float(vmin)
-            if vmax is not None:
-                imshow_kwargs["vmax"] = float(vmax)
-        else:
-            imshow_kwargs["norm"] = norm
-        image = ax.imshow(np.ma.masked_invalid(image_data), **imshow_kwargs)
+        image = _plot_truth_recovery_spatial_map(
+            ax,
+            x_arcsec,
+            y_arcsec,
+            image_data,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            norm=norm,
+        )
         colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
         colorbar.set_label(colorbar_label)
         ax.set_xlabel("x [arcsec]")
@@ -10719,13 +10691,6 @@ def _plot_abs_mu_true_comparison_from_grid(
     fractional_residual[valid_residual] = (
         (abs_mu_model[valid_residual] - abs_mu_true[valid_residual]) / abs_mu_true[valid_residual]
     )
-    extent = [
-        float(np.nanmin(x_arcsec)),
-        float(np.nanmax(x_arcsec)),
-        float(np.nanmin(y_arcsec)),
-        float(np.nanmax(y_arcsec)),
-    ]
-
     _plot_comparison_map(
         "truth_recovery_mu_model.pdf",
         abs_mu_model,
@@ -10925,7 +10890,7 @@ def _precompute_truth_recovery_grids(
     results: PosteriorResults,
     args: argparse.Namespace,
     truth_grid_cache: dict[tuple[Any, ...], dict[str, Any]],
-    progress: Progress | None = None,
+    progress: Any | None = None,
 ) -> bool:
     if bool(getattr(args, "skip_grid_diagnostics", False)):
         return False
@@ -13538,7 +13503,6 @@ def _generate_plots_and_tables(
         "cosmology_samples": np.empty((0, 0), dtype=float),
         "cosmology_best_fit": np.empty((0,), dtype=float),
         "bayes_corner_overlay": None,
-        "best_par_marker_values": {},
         "potfile_constraint_df": pd.DataFrame(),
         "scaling_results_df": pd.DataFrame(),
         "independent_scaling_df": pd.DataFrame(),
@@ -13683,14 +13647,6 @@ def _generate_plots_and_tables(
             lambda: context.__setitem__(
                 "bayes_corner_overlay",
                 _load_bayes_corner_overlay(getattr(args, "corner_overlay_bayes_dat", None), state),
-            ),
-        ),
-        (
-            "load_best_par_corner_marker",
-            "plots.run_diagnostics.load_best_par_corner_marker",
-            lambda: context.__setitem__(
-                "best_par_marker_values",
-                _load_best_par_marker_values(getattr(args, "corner_overlay_best_par", None), state),
             ),
         ),
         (
@@ -13911,7 +13867,6 @@ def _generate_plots_and_tables(
                 maximum_likelihood_values=maximum_likelihood_values,
                 previous_stage_best_values=previous_stage_best_values,
                 bayes_corner_overlay=context["bayes_corner_overlay"],
-                best_par_marker_values=context["best_par_marker_values"],
             ),
         ),
         (
@@ -13927,7 +13882,6 @@ def _generate_plots_and_tables(
                     maximum_likelihood_values=values[2],
                     previous_stage_best_values=previous_stage_best_values,
                     bayes_corner_overlay=context["bayes_corner_overlay"],
-                    best_par_marker_values=context["best_par_marker_values"],
                 )
             )(_cosmology_corner_values()),
         ),
@@ -13944,7 +13898,6 @@ def _generate_plots_and_tables(
                     maximum_likelihood_values=values[2],
                     previous_stage_best_values=previous_stage_best_values,
                     bayes_corner_overlay=context["bayes_corner_overlay"],
-                    best_par_marker_values=context["best_par_marker_values"],
                 )
             )(_scaling_corner_values()),
         ),
@@ -14014,7 +13967,6 @@ def _generate_plots_and_tables(
             lambda: _plot_per_potential_summary(
                 run_dir,
                 context["summary_df"],
-                best_par_marker_values=context["best_par_marker_values"],
                 previous_stage_best_values=previous_stage_best_values,
                 parameter_specs=state.parameter_specs,
             ),
@@ -14057,13 +14009,13 @@ def _generate_plots_and_tables(
         (
             "fit_quality_tables",
             "plots.image_recovery.fit_quality_tables",
-            lambda: (
+            lambda progress=None: (
                 lambda tables: (
                     context.__setitem__("image_fit_quality_df", tables[0]),
                     context.__setitem__("model_magnification_df", tables[1]),
                     context.__setitem__("image_recovery_extra_df", tables[2]),
                 )
-            )(_fit_quality_tables(state, evaluator, best_fit, results, args)),
+            )(_fit_quality_tables(state, evaluator, best_fit, results, args, progress=progress)),
         ),
         (
             "cab_arc_diagnostics_table",
