@@ -30844,6 +30844,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
         sampling_engine=SAMPLING_ENGINE_FULL_FLAT,
         critical_arc_source_position_policy=stage0_source_position_policy,
         perturbation_discovery_stage0=True,
+        use_magnitude_likelihood=False,
     )
     stage0_args = _force_quick_diagnostics_for_nonfinal_stage(
         stage0_args,
