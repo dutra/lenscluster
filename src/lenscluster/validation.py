@@ -799,9 +799,13 @@ def _recovered_model_tables(
         DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
         DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
         DEFAULT_MATCH_TOLERANCE,
+        DEFAULT_MAGNITUDE_MIN_RELIABILITY,
+        DEFAULT_MAGNITUDE_MU_FLOOR,
+        DEFAULT_MAGNITUDE_SIGMA_FLOOR,
         DEFAULT_REFRESH_EVERY,
         DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
         DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
+        DEFAULT_USE_MAGNITUDE_LIKELIHOOD,
         SAMPLE_LIKELIHOOD_SOURCE,
         SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
         ClusterJAXEvaluator,
@@ -971,6 +975,20 @@ def _recovered_model_tables(
         ),
         arc_aware_curve_step_arcsec=float(
             _artifact_arg(artifact_args, "arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)
+        ),
+        use_magnitude_likelihood=bool(
+            _artifact_arg(artifact_args, "use_magnitude_likelihood", DEFAULT_USE_MAGNITUDE_LIKELIHOOD)
+        ),
+        magnitude_sigma_floor=float(
+            _artifact_arg(
+                artifact_args,
+                "magnitude_sigma_floor",
+                _artifact_arg(artifact_args, "magnitude_sigma", DEFAULT_MAGNITUDE_SIGMA_FLOOR),
+            )
+        ),
+        magnitude_mu_floor=float(_artifact_arg(artifact_args, "magnitude_mu_floor", DEFAULT_MAGNITUDE_MU_FLOOR)),
+        magnitude_min_reliability=float(
+            _artifact_arg(artifact_args, "magnitude_min_reliability", DEFAULT_MAGNITUDE_MIN_RELIABILITY)
         ),
         fold_curvature_arcsec_inv=float(
             _artifact_arg(artifact_args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
@@ -1458,9 +1476,13 @@ def _posterior_prediction_uncertainty_tables(
         DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
         DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
         DEFAULT_MATCH_TOLERANCE,
+        DEFAULT_MAGNITUDE_MIN_RELIABILITY,
+        DEFAULT_MAGNITUDE_MU_FLOOR,
+        DEFAULT_MAGNITUDE_SIGMA_FLOOR,
         DEFAULT_REFRESH_EVERY,
         DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
         DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
+        DEFAULT_USE_MAGNITUDE_LIKELIHOOD,
         SAMPLE_LIKELIHOOD_SOURCE,
         SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
         ClusterJAXEvaluator,
@@ -1649,6 +1671,20 @@ def _posterior_prediction_uncertainty_tables(
             ),
             arc_aware_curve_step_arcsec=float(
                 _artifact_arg(artifact_args, "arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)
+            ),
+            use_magnitude_likelihood=bool(
+                _artifact_arg(artifact_args, "use_magnitude_likelihood", DEFAULT_USE_MAGNITUDE_LIKELIHOOD)
+            ),
+            magnitude_sigma_floor=float(
+                _artifact_arg(
+                    artifact_args,
+                    "magnitude_sigma_floor",
+                    _artifact_arg(artifact_args, "magnitude_sigma", DEFAULT_MAGNITUDE_SIGMA_FLOOR),
+                )
+            ),
+            magnitude_mu_floor=float(_artifact_arg(artifact_args, "magnitude_mu_floor", DEFAULT_MAGNITUDE_MU_FLOOR)),
+            magnitude_min_reliability=float(
+                _artifact_arg(artifact_args, "magnitude_min_reliability", DEFAULT_MAGNITUDE_MIN_RELIABILITY)
             ),
             fold_curvature_arcsec_inv=float(
                 _artifact_arg(artifact_args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
@@ -5110,6 +5146,12 @@ def _resume_mode_is_fast(args: argparse.Namespace) -> bool:
 
 
 def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[str, ValidationStageFitControls]:
+    from .cluster_solver import (
+        DEFAULT_MAGNITUDE_MIN_RELIABILITY,
+        DEFAULT_MAGNITUDE_MU_FLOOR,
+        DEFAULT_MAGNITUDE_SIGMA_FLOOR,
+    )
+
     solver_fit_mode = str(getattr(args, "solver_fit_mode", SOLVER_FIT_MODE_SEQUENTIAL))
     mode = str(getattr(args, "image_plane_mode", IMAGE_PLANE_MODE_NONE))
     for attr_name, flag_name in (
@@ -5278,6 +5320,16 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         not np.isfinite(float(fixed_image_sigma_int)) or float(fixed_image_sigma_int) < 0.0
     ):
         raise SystemExit("--fix-image-sigma-int-arcsec must be finite and nonnegative.")
+    for attr, option, default, allow_zero in (
+        ("magnitude_sigma_floor", "--magnitude-sigma-floor", DEFAULT_MAGNITUDE_SIGMA_FLOOR, False),
+        ("magnitude_mu_floor", "--magnitude-mu-floor", DEFAULT_MAGNITUDE_MU_FLOOR, True),
+    ):
+        value = float(getattr(args, attr, default))
+        if not np.isfinite(value) or value < 0.0 or (not allow_zero and value <= 0.0):
+            raise SystemExit(f"{option} must be finite and {'non-negative' if allow_zero else 'positive'}.")
+    magnitude_min_reliability = float(getattr(args, "magnitude_min_reliability", DEFAULT_MAGNITUDE_MIN_RELIABILITY))
+    if not np.isfinite(magnitude_min_reliability) or not (0.0 <= magnitude_min_reliability <= 1.0):
+        raise SystemExit("--magnitude-min-reliability must be finite and in [0, 1].")
     for attr, option in (
         ("independent_scaling_free_log_sigma_tau_prior_median", "--independent-scaling-free-log-sigma-tau-prior-median"),
         ("independent_scaling_free_log_mass_tau_prior_median", "--independent-scaling-free-log-mass-tau-prior-median"),
@@ -6283,6 +6335,12 @@ def _log_validation_runtime_summary(args: argparse.Namespace, controls: dict[str
 
 
 def _validate_validation_args(args: argparse.Namespace) -> None:
+    from .cluster_solver import (
+        DEFAULT_MAGNITUDE_MIN_RELIABILITY,
+        DEFAULT_MAGNITUDE_MU_FLOOR,
+        DEFAULT_MAGNITUDE_SIGMA_FLOOR,
+    )
+
     if int(getattr(args, "n_primary_families", 0)) < 0:
         raise SystemExit("--n-primary-families must be non-negative.")
     if int(getattr(args, "n_subhalo_families", 0)) < 0:
@@ -6401,6 +6459,16 @@ def _validate_validation_args(args: argparse.Namespace) -> None:
         not np.isfinite(float(fixed_image_sigma_int)) or float(fixed_image_sigma_int) < 0.0
     ):
         raise SystemExit("--fix-image-sigma-int-arcsec must be finite and nonnegative.")
+    for attr, option, default, allow_zero in (
+        ("magnitude_sigma_floor", "--magnitude-sigma-floor", DEFAULT_MAGNITUDE_SIGMA_FLOOR, False),
+        ("magnitude_mu_floor", "--magnitude-mu-floor", DEFAULT_MAGNITUDE_MU_FLOOR, True),
+    ):
+        value = float(getattr(args, attr, default))
+        if not np.isfinite(value) or value < 0.0 or (not allow_zero and value <= 0.0):
+            raise SystemExit(f"{option} must be finite and {'non-negative' if allow_zero else 'positive'}.")
+    magnitude_min_reliability = float(getattr(args, "magnitude_min_reliability", DEFAULT_MAGNITUDE_MIN_RELIABILITY))
+    if not np.isfinite(magnitude_min_reliability) or not (0.0 <= magnitude_min_reliability <= 1.0):
+        raise SystemExit("--magnitude-min-reliability must be finite and in [0, 1].")
     for attr, option in (
         ("independent_scaling_free_log_sigma_tau_prior_median", "--independent-scaling-free-log-sigma-tau-prior-median"),
         ("independent_scaling_free_log_mass_tau_prior_median", "--independent-scaling-free-log-mass-tau-prior-median"),
@@ -6422,6 +6490,9 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+        DEFAULT_MAGNITUDE_MIN_RELIABILITY,
+        DEFAULT_MAGNITUDE_MU_FLOOR,
+        DEFAULT_MAGNITUDE_SIGMA_FLOOR,
         DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER,
         DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN,
         DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_STD,
@@ -6433,6 +6504,7 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         DEFAULT_REFRESH_EVERY,
         DEFAULT_SOFTENING_LENGTH_KPC,
         DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA,
+        DEFAULT_USE_MAGNITUDE_LIKELIHOOD,
     )
 
     controls = _normalize_validation_stage_fit_controls(args)
@@ -6461,6 +6533,12 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
         str(getattr(args, "image_plane_scatter_prior_median_arcsec", DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_MEDIAN_ARCSEC)),
         "--image-plane-scatter-prior-log-sigma",
         str(getattr(args, "image_plane_scatter_prior_log_sigma", DEFAULT_IMAGE_PLANE_SCATTER_PRIOR_LOG_SIGMA)),
+        "--magnitude-sigma-floor",
+        str(getattr(args, "magnitude_sigma_floor", getattr(args, "magnitude_sigma", DEFAULT_MAGNITUDE_SIGMA_FLOOR))),
+        "--magnitude-mu-floor",
+        str(getattr(args, "magnitude_mu_floor", DEFAULT_MAGNITUDE_MU_FLOOR)),
+        "--magnitude-min-reliability",
+        str(getattr(args, "magnitude_min_reliability", DEFAULT_MAGNITUDE_MIN_RELIABILITY)),
         "--image-presence-match-radius-arcsec",
         str(getattr(args, "image_presence_match_radius_arcsec", DEFAULT_IMAGE_PRESENCE_MATCH_RADIUS_ARCSEC)),
         "--image-presence-temperature-arcsec",
@@ -6629,6 +6707,8 @@ def _run_cluster_solver(par_path: Path, output_dir: Path, run_name: str, args: a
     _append_stage_option(cmd, "--max-tree-depth", args.max_tree_depth)
     if getattr(args, "fix_image_sigma_int_arcsec", None) is not None:
         cmd.extend(["--fix-image-sigma-int-arcsec", str(float(args.fix_image_sigma_int_arcsec))])
+    if bool(getattr(args, "use_magnitude_likelihood", DEFAULT_USE_MAGNITUDE_LIKELIHOOD)):
+        cmd.append("--use-magnitude-likelihood")
     if getattr(args, "image_presence_penalty_weight", None) is not None:
         cmd.extend(["--image-presence-penalty-weight", str(args.image_presence_penalty_weight)])
     if solver_fit_mode == SOLVER_FIT_MODE_SEQUENTIAL:
@@ -7167,6 +7247,9 @@ def _build_parser() -> argparse.ArgumentParser:
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_MASS_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_SIGMA_TAU_PRIOR_MEDIAN,
         DEFAULT_INDEPENDENT_SCALING_FREE_LOG_TAU_PRIOR_SIGMA,
+        DEFAULT_MAGNITUDE_MIN_RELIABILITY,
+        DEFAULT_MAGNITUDE_MU_FLOOR,
+        DEFAULT_MAGNITUDE_SIGMA_FLOOR,
         DEFAULT_REFRESH_EVERY,
         DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_LOWER,
         DEFAULT_SOLVER_POTFILE_ALPHA_SIGMA_MEAN,
@@ -7178,6 +7261,7 @@ def _build_parser() -> argparse.ArgumentParser:
         DEFAULT_SOLVER_POTFILE_GAMMA_ML_UPPER,
         DEFAULT_SOFTENING_LENGTH_KPC,
         DEFAULT_SOFTENING_LENGTH_PRIOR_LOG_SIGMA,
+        DEFAULT_USE_MAGNITUDE_LIKELIHOOD,
     )
 
     parser = argparse.ArgumentParser(description="Mock-recovery validation suite for lenscluster.")
@@ -7578,6 +7662,25 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Use deterministic intrinsic image-plane scatter instead of sampling image.sigma_int.",
+    )
+    parser.add_argument(
+        "--use-magnitude-likelihood",
+        action="store_true",
+        default=DEFAULT_USE_MAGNITUDE_LIKELIHOOD,
+        help="Add a family-level magnification-corrected catalog magnitude likelihood.",
+    )
+    parser.add_argument(
+        "--magnitude-sigma-floor",
+        "--magnitude-sigma",
+        dest="magnitude_sigma_floor",
+        type=float,
+        default=DEFAULT_MAGNITUDE_SIGMA_FLOOR,
+    )
+    parser.add_argument("--magnitude-mu-floor", type=float, default=DEFAULT_MAGNITUDE_MU_FLOOR)
+    parser.add_argument(
+        "--magnitude-min-reliability",
+        type=float,
+        default=DEFAULT_MAGNITUDE_MIN_RELIABILITY,
     )
     parser.add_argument("--image-presence-penalty-weight", type=float, default=None)
     parser.add_argument(

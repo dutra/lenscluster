@@ -314,8 +314,8 @@ def _load_dat_catalog(
         if max_columns < len(base_columns):
             raise ValueError(f"Multiple-image catalog '{path}' has rows with fewer than {len(base_columns)} columns.")
         padded_rows = [row + [np.nan] * (max_columns - len(row)) for row in rows]
-        extra_columns = ["family_reliability"] + [
-            f"extra_{idx}" for idx in range(max(0, max_columns - len(base_columns) - 1))
+        extra_columns = ["family_reliability", "mag_err"] + [
+            f"extra_{idx}" for idx in range(max(0, max_columns - len(base_columns) - 2))
         ]
         df = pd.DataFrame(padded_rows, columns=base_columns + extra_columns[: max_columns - len(base_columns)])
         df["lum"] = np.nan
@@ -333,8 +333,9 @@ def _load_dat_catalog(
     else:
         raise ValueError(f"Unsupported catalog kind '{catalog_kind}' for '{path}'.")
     df["id"] = df["id"].astype(str)
-    for column in ["coord_1", "coord_2", "a", "b", "theta", "mag", "z", "lum"]:
+    for column in ["coord_1", "coord_2", "a", "b", "theta", "z", "lum"]:
         df[column] = pd.to_numeric(df[column], errors="raise")
+    df["mag"] = pd.to_numeric(df["mag"], errors="coerce")
     if "color" in df.columns:
         df["color"] = pd.to_numeric(df["color"], errors="coerce")
     else:
@@ -343,6 +344,10 @@ def _load_dat_catalog(
         df["family_reliability"] = pd.to_numeric(df["family_reliability"], errors="coerce").fillna(1.0).clip(0.0, 1.0)
     else:
         df["family_reliability"] = 1.0
+    if "mag_err" in df.columns:
+        df["mag_err"] = pd.to_numeric(df["mag_err"], errors="coerce")
+    else:
+        df["mag_err"] = np.nan
 
     if header_reference == 0:
         df["ra"] = df["coord_1"]
@@ -371,6 +376,7 @@ def _load_dat_catalog(
             "b": "catalog_b",
             "theta": "catalog_theta",
             "mag": "catalog_mag",
+            "mag_err": "catalog_mag_err",
             "z": "catalog_z",
             "lum": "catalog_lum",
             "color": "catalog_color",
@@ -387,6 +393,7 @@ def _load_dat_catalog(
         "catalog_b",
         "catalog_theta",
         "catalog_mag",
+        "catalog_mag_err",
         "catalog_z",
         "catalog_lum",
         "catalog_color",
@@ -510,11 +517,29 @@ def _load_multiple_images_catalog(
             "catalog_b": catalog_df["catalog_b"].to_numpy(),
             "catalog_theta": catalog_df["catalog_theta"].to_numpy(),
             "catalog_mag": catalog_df["catalog_mag"].to_numpy(),
+            "catalog_mag_err": catalog_df["catalog_mag_err"].to_numpy(),
             "catalog_z": catalog_df["catalog_z"].to_numpy(),
             "catalog_lum": catalog_df["catalog_lum"].to_numpy(),
             "family_reliability": catalog_df["family_reliability"].to_numpy(),
         }
     )
+    sidecar_path = Path(filepath).with_name(f"{Path(filepath).stem}_band_magnitudes.csv")
+    if sidecar_path.exists():
+        sidecar = pd.read_csv(sidecar_path)
+        if "image_label" in sidecar.columns:
+            sidecar["image_label"] = sidecar["image_label"].astype(str)
+            band_columns = [
+                column
+                for column in sidecar.columns
+                if column.startswith(("mag_", "mag_err_", "detected_", "use_for_catalog_"))
+            ]
+            if band_columns:
+                result = result.merge(
+                    sidecar.loc[:, ["image_label", *band_columns]],
+                    on="image_label",
+                    how="left",
+                    validate="one_to_one",
+                )
     result = result.reset_index(drop=True)
     _validate_image_family_redshifts(result, filepath)
     return result
@@ -1015,10 +1040,11 @@ def _enrich_potentials(
         "catalog_source",
         "catalog_a",
         "catalog_b",
-        "catalog_theta",
-        "catalog_mag",
-        "catalog_z",
-        "catalog_lum",
+            "catalog_theta",
+            "catalog_mag",
+            "catalog_mag_err",
+            "catalog_z",
+            "catalog_lum",
     ]:
         if column not in result.columns:
             result[column] = np.nan if column != "catalog_source" else None

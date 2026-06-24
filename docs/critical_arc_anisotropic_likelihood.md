@@ -361,6 +361,98 @@ The practical recommendation is:
 - keep the current critical-arc mode as a robust implementation of this same
   core idea, with extra mixture and stabilization terms.
 
+## Optional Magnitude Term
+
+The catalog magnitude can be used as an optional family-level consistency
+term. For image \(i\), the lens model predicts the signed inverse
+magnification through the Jacobian determinant:
+
+$$
+\mu_i = \frac{1}{\det A_i}.
+$$
+
+The observed magnitude is corrected back to an estimated source magnitude:
+
+$$
+\hat{m}_{s,i}
+=
+m_i + 2.5 \log_{10} \left(|\mu_i| + \mu_{\rm floor}\right).
+$$
+
+Images from the same source family should have the same intrinsic source
+magnitude after this correction. The implementation analytically estimates the
+best family source magnitude,
+
+$$
+\bar{m}_{s,f}
+=
+\frac{\sum_{i \in f} w_i \hat{m}_{s,i}}
+{\sum_{i \in f} w_i},
+$$
+
+with
+
+$$
+w_i =
+\frac{r_i}{\sigma_{m,i,\rm eff}^2}.
+$$
+
+Here \(r_i\) is the catalog reliability. The effective magnitude variance is:
+
+$$
+\sigma_{m,i,\rm eff}^2
+=
+\sigma_{m,\rm floor}^2
++ \sigma_{m,\rm int}^2
++ g(s_{\min,i}) \sigma_{m,\rm arc}^2.
+$$
+
+The user sets only the floor term, \(\sigma_{m,\rm floor}\). It is a minimum
+measurement uncertainty in magnitudes, useful when the catalog does not provide
+a trustworthy per-image magnitude error. The other two terms are inferred
+nuisance parameters with broad positive priors:
+
+- \(\sigma_{m,\rm int}\): ordinary family-level intrinsic or catalog scatter.
+- \(\sigma_{m,\rm arc}\): extra scatter for arc-like images.
+
+The final term adds extra scatter for arc-like images, where fluxes are often
+less reliable. It uses the same smooth gate as the critical-arc likelihood:
+
+$$
+g(s_{\min,i})
+=
+\operatorname{sigmoid}
+\left(
+\frac{s_{\rm th} - s_{\min,i}}{s_{\rm soft}}
+\right).
+$$
+
+The family contribution is then
+
+$$
+\log p(\{m_i\}_{i \in f} \mid \mathrm{lens})
+=
+-\frac{1}{2}
+\left[
+\sum_{i \in f}
+r_i
+\left(
+\frac{(\hat{m}_{s,i} - \bar{m}_{s,f})^2}
+{\sigma_{m,i,\rm eff}^2}
++
+\log(2\pi\sigma_{m,i,\rm eff}^2)
+\right)
++
+\log\sum_{i \in f}w_i
+\right].
+$$
+
+There is no separate magnitude likelihood weight. The strength of this term is
+controlled by inferred scatter terms. If the magnitude measurements are
+uncertain, especially for arcs, the posterior can broaden
+\(\sigma_{m,\rm int}\) or \(\sigma_{m,\rm arc}\) rather than requiring a
+hand-tuned global downweighting factor.
+
 ## Scientific Interpretation
 
 This likelihood should be described as a critical-arc-aware image-plane

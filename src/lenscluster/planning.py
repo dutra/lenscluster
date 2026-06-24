@@ -118,6 +118,9 @@ SOLVER_RUNTIME_DEFAULTS: dict[str, Any] = {
     "likelihood_stabilizer_max_residual_arcsec": 0.0,
     "likelihood_stabilizer_residual_loss": "gaussian",
     "likelihood_stabilizer_student_t_nu": 4.0,
+    "magnitude_min_reliability": 1.0e-3,
+    "magnitude_mu_floor": 1.0e-3,
+    "magnitude_sigma_floor": 0.05,
     "mchmc_divergence_threshold": 1000.0,
     "mchmc_l_estimator": "avg",
     "mchmc_l_proposal_factor": float("inf"),
@@ -150,6 +153,7 @@ SOLVER_RUNTIME_DEFAULTS: dict[str, Any] = {
     "stage1_run_dir": None,
     "thin": 1,
     "truth": None,
+    "use_magnitude_likelihood": False,
 }
 
 
@@ -422,6 +426,10 @@ def _runtime_payload(config: LensClusterSolverConfig) -> dict[str, Any]:
             "image_plane_scatter_floor_arcsec": config.likelihood.image_plane_scatter_floor_arcsec,
             "image_plane_scatter_upper_arcsec": config.likelihood.image_plane_scatter_upper_arcsec,
             "fix_image_sigma_int_arcsec": config.likelihood.fix_image_sigma_int_arcsec,
+            "use_magnitude_likelihood": config.likelihood.use_magnitude_likelihood,
+            "magnitude_sigma_floor": config.likelihood.magnitude_sigma_floor,
+            "magnitude_mu_floor": config.likelihood.magnitude_mu_floor,
+            "magnitude_min_reliability": config.likelihood.magnitude_min_reliability,
             "fit_quality_draws": config.image_diagnostics.fit_quality_draws,
             "exact_image_min_distance_arcsec": config.image_diagnostics.exact_image_min_distance_arcsec,
             "exact_image_precision_limit": config.image_diagnostics.exact_image_precision_limit,

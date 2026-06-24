@@ -6638,9 +6638,13 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
         DEFAULT_EXACT_IMAGE_PRECISION_LIMIT,
         DEFAULT_IMAGE_PLANE_SCATTER_FLOOR_ARCSEC,
         DEFAULT_MATCH_TOLERANCE,
+        DEFAULT_MAGNITUDE_MIN_RELIABILITY,
+        DEFAULT_MAGNITUDE_MU_FLOOR,
+        DEFAULT_MAGNITUDE_SIGMA_FLOOR,
         DEFAULT_REFRESH_EVERY,
         DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
         DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
+        DEFAULT_USE_MAGNITUDE_LIKELIHOOD,
         SAMPLE_LIKELIHOOD_SOURCE,
     )
 
@@ -6860,6 +6864,30 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
                 args,
                 "arc_aware_curve_step_arcsec",
                 getattr(evaluator, "arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC),
+            )
+        ),
+        use_magnitude_likelihood=bool(
+            getattr(
+                args,
+                "use_magnitude_likelihood",
+                getattr(evaluator, "use_magnitude_likelihood", DEFAULT_USE_MAGNITUDE_LIKELIHOOD),
+            )
+        ),
+        magnitude_sigma_floor=float(
+            getattr(
+                args,
+                "magnitude_sigma_floor",
+                getattr(args, "magnitude_sigma", getattr(evaluator, "magnitude_sigma_floor", DEFAULT_MAGNITUDE_SIGMA_FLOOR)),
+            )
+        ),
+        magnitude_mu_floor=float(
+            getattr(args, "magnitude_mu_floor", getattr(evaluator, "magnitude_mu_floor", DEFAULT_MAGNITUDE_MU_FLOOR))
+        ),
+        magnitude_min_reliability=float(
+            getattr(
+                args,
+                "magnitude_min_reliability",
+                getattr(evaluator, "magnitude_min_reliability", DEFAULT_MAGNITUDE_MIN_RELIABILITY),
             )
         ),
         image_plane_scatter_floor_arcsec=float(
