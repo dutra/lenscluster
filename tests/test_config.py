@@ -17,6 +17,7 @@ from lenscluster.config import (
     IndependentMemberHaloConfig,
     LensClusterSolverConfig,
     LensModelConfig,
+    PerturbationDiscoveryConfig,
     RGBDisplayConfig,
     MemberPopulationConfig,
     PriorConfig,
@@ -268,6 +269,26 @@ def test_config_validation_rejects_old_stage1_critical_arc_mixture_name() -> Non
         config.validate()
 
 
+def test_config_validation_accepts_perturbation_discovery_top_k() -> None:
+    _minimal_sequential_config().with_updates(
+        perturbation=PerturbationDiscoveryConfig(perturbation_discovery_top_k=None),
+    ).validate()
+    config = _minimal_sequential_config().with_updates(
+        perturbation=PerturbationDiscoveryConfig(perturbation_discovery_top_k=5),
+    )
+    config.validate()
+    plan = compile_run_plan(config)
+    assert plan.runtime_args.perturbation_discovery_top_k == 5
+
+
+def test_config_validation_rejects_nonpositive_perturbation_discovery_top_k() -> None:
+    for value in (0, -1, 1.5, True):
+        with pytest.raises(ValueError, match="perturbation_discovery_top_k"):
+            _minimal_sequential_config().with_updates(
+                perturbation=PerturbationDiscoveryConfig(perturbation_discovery_top_k=value),
+            ).validate()
+
+
 def test_critical_arc_source_position_specs_follow_stage_policy() -> None:
     plan = compile_run_plan(
         _minimal_sequential_config().with_updates(
@@ -443,6 +464,8 @@ def test_run_xsh_is_self_contained_ff_sims_runner() -> None:
     assert "2.3 / 0.72" in text
     assert "cores = 4" in text
     assert "chains=cores" in text
+    assert "perturbation_top_k = None" in text
+    assert "perturbation_discovery_top_k=perturbation_top_k" in text
     assert 'stage1_likelihood = "critical-arc"' in text
     assert "critical-arc-centroid" not in text
     assert "critical-arc-mixture" not in text
@@ -473,6 +496,8 @@ def test_ff_sims_notebook_is_self_contained_and_config_native() -> None:
     assert "os.environ[\"JAX_NUM_CPU_DEVICES\"] = str(cores)" in source
     assert "RuntimeConfig" in source
     assert "chains=cores" in source
+    assert "perturbation_top_k = None" in source
+    assert "perturbation_discovery_top_k=perturbation_top_k" in source
     assert 'stage1_likelihood = "critical-arc"' in source
     assert "critical-arc-centroid" not in source
     assert "critical-arc-mixture" not in source

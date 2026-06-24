@@ -19,6 +19,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
+from numbers import Integral
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Iterable, Mapping, NamedTuple
@@ -357,6 +358,7 @@ SOLVER_POTFILE_POSITIVE_PRIOR_COORDINATE = "log_positive_latent"
 DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC = 0.01
 DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL = 0.01
 DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_WEIGHT = 1.0
+DEFAULT_PERTURBATION_DISCOVERY_TOP_K = None
 DEFAULT_LINEARIZED_BETA_PRIOR_SIGMA_ARCSEC = 2.0
 DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC = 10.0
 DEFAULT_IMAGE_PRESENCE_STAGE4_PENALTY_WEIGHT = 2.0
@@ -8648,6 +8650,10 @@ PERTURBATION_DISCOVERY_DIAGNOSTIC_COLUMNS: tuple[str, ...] = (
     "jacobian_norm",
     "score",
     "threshold_score",
+    "selection_mode",
+    "top_k_requested",
+    "rank_score",
+    "rank_position",
     "selected_pair",
     "selected_galaxy",
 )
@@ -8681,6 +8687,40 @@ def _perturbation_discovery_image_metadata(
                     image_label = str(labels[label_index])
         metadata.append({"family_id": family_id, "image_label": image_label})
     return metadata
+
+
+def _perturbation_discovery_rank_scores(score: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    score = np.asarray(score, dtype=float)
+    if score.ndim != 2 or score.shape[0] == 0:
+        return np.asarray([], dtype=float), np.asarray([], dtype=int)
+    if score.shape[1] == 0:
+        return np.zeros(score.shape[0], dtype=float), np.arange(1, score.shape[0] + 1, dtype=int)
+    rank_score = np.nanmax(np.where(np.isfinite(score), score, -np.inf), axis=1)
+    rank_score = np.where(np.isfinite(rank_score), rank_score, 0.0)
+    order = np.lexsort((np.arange(rank_score.size, dtype=int), -rank_score))
+    rank_position = np.empty(rank_score.size, dtype=int)
+    rank_position[order] = np.arange(1, rank_score.size + 1, dtype=int)
+    return rank_score, rank_position
+
+
+def _perturbation_discovery_top_k_selected(score: np.ndarray, top_k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rank_score, rank_position = _perturbation_discovery_rank_scores(score)
+    selected = np.zeros(rank_score.size, dtype=bool)
+    if selected.size:
+        selected[rank_position <= min(int(top_k), selected.size)] = True
+    return selected, rank_score, rank_position
+
+
+def _perturbation_discovery_top_k_from_evaluator(evaluator: Any) -> int | None:
+    value = getattr(evaluator, "perturbation_discovery_top_k", DEFAULT_PERTURBATION_DISCOVERY_TOP_K)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError("perturbation_discovery_top_k must be a positive integer or None.")
+    top_k = int(value)
+    if top_k <= 0:
+        raise ValueError("perturbation_discovery_top_k must be a positive integer or None.")
+    return top_k
 
 
 def _perturbation_discovery_score_table(
@@ -8723,6 +8763,7 @@ def _perturbation_discovery_score_table(
     score = np.where(np.isfinite(score), np.maximum(score, 0.0), 0.0)
     selected_pair = score > float(threshold_score)
     selected_galaxy = np.any(selected_pair, axis=1)
+    rank_score, rank_position = _perturbation_discovery_rank_scores(score)
 
     component_to_record = {
         int(record.get("component_index", -1)): dict(record)
@@ -8757,6 +8798,10 @@ def _perturbation_discovery_score_table(
                     "jacobian_norm": float(jacobian_norm[candidate_position, image_index]),
                     "score": float(score[candidate_position, image_index]),
                     "threshold_score": float(threshold_score),
+                    "selection_mode": "threshold",
+                    "top_k_requested": np.nan,
+                    "rank_score": float(rank_score[candidate_position]),
+                    "rank_position": int(rank_position[candidate_position]),
                     "selected_pair": bool(selected_pair[candidate_position, image_index]),
                     "selected_galaxy": bool(selected_galaxy[candidate_position]),
                 }
@@ -8811,6 +8856,8 @@ def _perturbation_discovery_union_from_evaluator(
     reference_params: np.ndarray,
 ) -> tuple[list[set[int]], dict[str, Any], pd.DataFrame]:
     selected_by_potfile = _empty_selected_by_potfile(state)
+    top_k = _perturbation_discovery_top_k_from_evaluator(evaluator)
+    selection_mode = "top_k" if top_k is not None else "threshold"
     candidates, evaluation_candidates, free_evaluation_count = _perturbation_discovery_identity_and_evaluation_components(
         state,
         evaluator,
@@ -8830,6 +8877,8 @@ def _perturbation_discovery_union_from_evaluator(
             "alpha_tol_arcsec": float(getattr(evaluator, "perturbation_discovery_alpha_tol_arcsec", DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC)),
             "jacobian_tol": float(getattr(evaluator, "perturbation_discovery_jacobian_tol", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL)),
             "jacobian_weight": float(getattr(evaluator, "perturbation_discovery_jacobian_weight", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_WEIGHT)),
+            "selection_mode": selection_mode,
+            "top_k_requested": top_k,
             "max_selected_score": 0.0,
             "max_unselected_score": 0.0,
         }, _empty_perturbation_discovery_diagnostics_table()
@@ -8856,6 +8905,8 @@ def _perturbation_discovery_union_from_evaluator(
             "alpha_tol_arcsec": float(getattr(evaluator, "perturbation_discovery_alpha_tol_arcsec", DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC)),
             "jacobian_tol": float(getattr(evaluator, "perturbation_discovery_jacobian_tol", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL)),
             "jacobian_weight": float(getattr(evaluator, "perturbation_discovery_jacobian_weight", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_WEIGHT)),
+            "selection_mode": selection_mode,
+            "top_k_requested": top_k,
             "max_selected_score": 0.0,
             "max_unselected_score": 0.0,
         }, _empty_perturbation_discovery_diagnostics_table()
@@ -8880,6 +8931,8 @@ def _perturbation_discovery_union_from_evaluator(
             "alpha_tol_arcsec": float(getattr(evaluator, "perturbation_discovery_alpha_tol_arcsec", DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC)),
             "jacobian_tol": float(getattr(evaluator, "perturbation_discovery_jacobian_tol", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL)),
             "jacobian_weight": float(getattr(evaluator, "perturbation_discovery_jacobian_weight", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_WEIGHT)),
+            "selection_mode": selection_mode,
+            "top_k_requested": top_k,
             "max_selected_score": 0.0,
             "max_unselected_score": 0.0,
         }, _empty_perturbation_discovery_diagnostics_table()
@@ -8909,6 +8962,28 @@ def _perturbation_discovery_union_from_evaluator(
         jacobian_weight=jacobian_weight,
         threshold_score=1.0,
     )
+    if top_k is not None:
+        selected_per_candidate, rank_score, rank_position = _perturbation_discovery_top_k_selected(score, top_k)
+        if not detail_df.empty:
+            component_rank = {
+                int(component_index): (float(rank_score[index]), int(rank_position[index]))
+                for index, component_index in enumerate(candidates.tolist())
+            }
+            detail_df = detail_df.copy()
+            detail_df["selection_mode"] = "top_k"
+            detail_df["top_k_requested"] = int(top_k)
+            detail_df["selected_galaxy"] = detail_df["component_index"].map(
+                {
+                    int(component_index): bool(selected_per_candidate[index])
+                    for index, component_index in enumerate(candidates.tolist())
+                }
+            ).fillna(False)
+            detail_df["rank_score"] = detail_df["component_index"].map(
+                {component_index: values[0] for component_index, values in component_rank.items()}
+            )
+            detail_df["rank_position"] = detail_df["component_index"].map(
+                {component_index: values[1] for component_index, values in component_rank.items()}
+            )
     valid_components = {int(value) for value in candidates[selected_per_candidate].reshape(-1).tolist() if int(value) >= 0}
     component_to_record = {
         int(record.get("component_index", -1)): (
@@ -8942,6 +9017,8 @@ def _perturbation_discovery_union_from_evaluator(
         "alpha_tol_arcsec": float(alpha_tol),
         "jacobian_tol": float(jacobian_tol),
         "jacobian_weight": float(jacobian_weight),
+        "selection_mode": selection_mode,
+        "top_k_requested": top_k,
         "max_selected_score": float(np.max(selected_scores)) if selected_scores.size else 0.0,
         "max_unselected_score": float(np.max(unselected_scores)) if unselected_scores.size else 0.0,
         "threshold_score": 1.0,
@@ -8963,6 +9040,8 @@ def _perturbation_discovery_svi_final_log_message(
         f"alpha_tol_arcsec={float(final_union_diag.get('alpha_tol_arcsec', 0.0)):.4g} "
         f"jacobian_tol={float(final_union_diag.get('jacobian_tol', 0.0)):.4g} "
         f"jacobian_weight={float(final_union_diag.get('jacobian_weight', 0.0)):.4g} "
+        f"selection_mode={final_union_diag.get('selection_mode', 'threshold')} "
+        f"top_k_requested={final_union_diag.get('top_k_requested', None)} "
         f"max_selected_score={float(final_union_diag.get('max_selected_score', 0.0)):.4g} "
         f"max_unselected_score={float(final_union_diag.get('max_unselected_score', 0.0)):.4g} "
         f"score_fraction={float(final_union_diag.get('score_fraction', 0.0)):.4g} "
@@ -9044,6 +9123,10 @@ def _perturbation_discovery_svi_final_diagnostics(
         "perturbation_discovery_svi_final_alpha_tol_arcsec": float(final_union_diag.get("alpha_tol_arcsec", 0.0)),
         "perturbation_discovery_svi_final_jacobian_tol": float(final_union_diag.get("jacobian_tol", 0.0)),
         "perturbation_discovery_svi_final_jacobian_weight": float(final_union_diag.get("jacobian_weight", 0.0)),
+        "perturbation_discovery_svi_final_selection_mode": str(final_union_diag.get("selection_mode", "threshold")),
+        "perturbation_discovery_svi_final_top_k_requested": (
+            None if final_union_diag.get("top_k_requested", None) is None else int(final_union_diag["top_k_requested"])
+        ),
         "perturbation_discovery_svi_final_max_selected_score": float(final_union_diag.get("max_selected_score", 0.0)),
         "perturbation_discovery_svi_final_max_unselected_score": float(final_union_diag.get("max_unselected_score", 0.0)),
         "perturbation_discovery_svi_final_rebuild_engine": SAMPLING_ENGINE_FULL_FLAT,
@@ -16576,6 +16659,7 @@ class ClusterJAXEvaluator:
         perturbation_discovery_alpha_tol_arcsec: float = DEFAULT_PERTURBATION_DISCOVERY_ALPHA_TOL_ARCSEC,
         perturbation_discovery_jacobian_tol: float = DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_TOL,
         perturbation_discovery_jacobian_weight: float = DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_WEIGHT,
+        perturbation_discovery_top_k: int | None = DEFAULT_PERTURBATION_DISCOVERY_TOP_K,
         refresh_every: int | None = DEFAULT_REFRESH_EVERY,
         refresh_param_drift_frac: float = DEFAULT_REFRESH_PARAM_DRIFT_FRAC,
         source_plane_covariance_floor: float = 1.0e-6,
@@ -16688,6 +16772,14 @@ class ClusterJAXEvaluator:
         self.perturbation_discovery_jacobian_weight = float(perturbation_discovery_jacobian_weight)
         if not np.isfinite(self.perturbation_discovery_jacobian_weight) or self.perturbation_discovery_jacobian_weight < 0.0:
             raise ValueError("perturbation_discovery_jacobian_weight must be finite and non-negative.")
+        if perturbation_discovery_top_k is None:
+            self.perturbation_discovery_top_k = None
+        elif isinstance(perturbation_discovery_top_k, bool) or not isinstance(perturbation_discovery_top_k, Integral):
+            raise ValueError("perturbation_discovery_top_k must be a positive integer or None.")
+        else:
+            self.perturbation_discovery_top_k = int(perturbation_discovery_top_k)
+        if self.perturbation_discovery_top_k is not None and self.perturbation_discovery_top_k <= 0:
+            raise ValueError("perturbation_discovery_top_k must be a positive integer or None.")
         self.refresh_every = _parse_refresh_every_value(refresh_every)
         self.refresh_param_drift_frac = float(refresh_param_drift_frac)
         self.source_plane_covariance_floor = max(float(source_plane_covariance_floor), 0.0)
@@ -26953,6 +27045,7 @@ def _build_cluster_evaluator_from_args(
         perturbation_discovery_jacobian_weight=float(
             getattr(args, "perturbation_discovery_jacobian_weight", DEFAULT_PERTURBATION_DISCOVERY_JACOBIAN_WEIGHT)
         ),
+        perturbation_discovery_top_k=getattr(args, "perturbation_discovery_top_k", DEFAULT_PERTURBATION_DISCOVERY_TOP_K),
         refresh_every=args.refresh_every,
         refresh_param_drift_frac=args.refresh_param_drift_frac,
         source_plane_covariance_floor=args.source_plane_covariance_floor,

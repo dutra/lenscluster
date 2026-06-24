@@ -450,6 +450,58 @@ def test_perturbation_discovery_diagnostics_plot_writes_pdf(tmp_path: Path) -> N
     assert plotting._plot_path(tmp_path, "perturbation_discovery_diagnostics.pdf").is_file()
 
 
+def test_perturbation_discovery_diagnostics_plot_reports_top_k_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from matplotlib.axes import Axes
+
+    text_calls: list[str] = []
+    original_text = Axes.text
+
+    def capture_text(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if len(args) >= 3:
+            text_calls.append(str(args[2]))
+        return original_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "text", capture_text)
+    diagnostics_df = pd.DataFrame(
+        {
+            "potfile_id": ["members"] * 4,
+            "potfile_order": [0] * 4,
+            "catalog_id": ["g1", "g1", "g2", "g2"],
+            "catalog_row_index": [0, 0, 1, 1],
+            "component_index": [10, 10, 11, 11],
+            "image_index": [0, 1, 0, 1],
+            "family_id": ["1"] * 4,
+            "image_label": ["a", "b", "a", "b"],
+            "alpha_x_arcsec": [0.2, 0.0, 0.1, 0.0],
+            "alpha_y_arcsec": [0.0] * 4,
+            "alpha_arcsec": [0.2, 0.0, 0.1, 0.0],
+            "jacobian_frobenius": [0.0] * 4,
+            "alpha_tol_arcsec": [1.0] * 4,
+            "jacobian_tol": [1.0] * 4,
+            "jacobian_weight": [1.0] * 4,
+            "alpha_norm": [0.2, 0.0, 0.1, 0.0],
+            "jacobian_norm": [0.0] * 4,
+            "score": [0.2, 0.0, 0.1, 0.0],
+            "threshold_score": [1.0] * 4,
+            "selection_mode": ["top_k"] * 4,
+            "top_k_requested": [1] * 4,
+            "rank_score": [0.2, 0.2, 0.1, 0.1],
+            "rank_position": [1, 1, 2, 2],
+            "selected_pair": [False] * 4,
+            "selected_galaxy": [True, True, False, False],
+        }
+    )
+
+    plotting._plot_perturbation_discovery_diagnostics(tmp_path, diagnostics_df)
+
+    annotation_text = "\n".join(text_calls)
+    assert "selection_mode = top_k" in annotation_text
+    assert "top_k_requested = 1" in annotation_text
+
+
 def test_perturbation_discovery_diagnostics_plot_fraction_labels_and_heatmap(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

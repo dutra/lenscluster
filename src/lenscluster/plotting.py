@@ -5510,9 +5510,21 @@ def _plot_perturbation_discovery_diagnostics(plot_dir: Path, diagnostics_df: pd.
     df = df[np.isfinite(df["score"].to_numpy(dtype=float))]
     if df.empty:
         return
+    if "selection_mode" not in df:
+        df["selection_mode"] = "threshold"
+    if "top_k_requested" not in df:
+        df["top_k_requested"] = np.nan
+    if "rank_score" not in df:
+        df["rank_score"] = df["score"]
+    if "rank_position" not in df:
+        df["rank_position"] = np.nan
+    df["rank_score"] = pd.to_numeric(df["rank_score"], errors="coerce")
+    df["rank_position"] = pd.to_numeric(df["rank_position"], errors="coerce")
 
     max_idx = df.groupby("component_index", sort=False)["score"].idxmax()
     galaxy_df = df.loc[max_idx].copy().sort_values("score", ascending=False).reset_index(drop=True)
+    if galaxy_df["rank_position"].notna().any():
+        galaxy_df = galaxy_df.sort_values(["rank_position", "score"], ascending=[True, False]).reset_index(drop=True)
     image_df = (
         df.groupby(["image_index", "family_id", "image_label"], dropna=False)
         .agg(selected_pairs=("selected_pair", "sum"), max_score=("score", "max"))
@@ -5525,6 +5537,9 @@ def _plot_perturbation_discovery_diagnostics(plot_dir: Path, diagnostics_df: pd.
     alpha_tol = float(np.nanmedian(df["alpha_tol_arcsec"]))
     jacobian_tol = float(np.nanmedian(df["jacobian_tol"]))
     jacobian_weight = float(np.nanmedian(df["jacobian_weight"]))
+    selection_mode = str(df["selection_mode"].dropna().astype(str).iloc[0]) if "selection_mode" in df and df["selection_mode"].notna().any() else "threshold"
+    top_k_values = pd.to_numeric(df["top_k_requested"], errors="coerce").dropna()
+    top_k_requested = float(np.nanmedian(top_k_values)) if not top_k_values.empty else float("nan")
     selected_galaxies = int(galaxy_df["selected_galaxy"].sum())
     selected_pairs = int(df["selected_pair"].sum())
     total_candidates = int(galaxy_df["component_index"].nunique())
@@ -5562,10 +5577,12 @@ def _plot_perturbation_discovery_diagnostics(plot_dir: Path, diagnostics_df: pd.
     colors = np.where(galaxy_df["selected_galaxy"].to_numpy(dtype=bool), selected_color, unselected_color)
     axes_flat[0].scatter(x, galaxy_df["score"], c=colors, s=26, linewidth=0.0)
     axes_flat[0].axhline(threshold, color="black", linestyle="--", linewidth=1.0, label="score = 1")
+    if selection_mode == "top_k" and selected_galaxies > 0 and selected_galaxies < len(galaxy_df):
+        axes_flat[0].axvline(selected_galaxies - 0.5, color="black", linestyle=":", linewidth=1.0, label="top-k split")
     axes_flat[0].set_yscale("log")
     axes_flat[0].set_xlabel("galaxies sorted by max score")
     axes_flat[0].set_ylabel("max image-galaxy score")
-    axes_flat[0].set_title("selection threshold")
+    axes_flat[0].set_title("selection rank" if selection_mode == "top_k" else "selection threshold")
     axes_flat[0].legend(loc="best", fontsize=8)
 
     axes_flat[1].plot(x, galaxy_df["alpha_norm"], color="#4c78a8", linewidth=1.2, label="alpha fraction")
@@ -5652,6 +5669,8 @@ def _plot_perturbation_discovery_diagnostics(plot_dir: Path, diagnostics_df: pd.
         f"alpha_tol = {alpha_tol:.4g} arcsec\n"
         f"jacobian_tol = {jacobian_tol:.4g}\n"
         f"jacobian_weight = {jacobian_weight:.4g}\n"
+        f"selection_mode = {selection_mode}\n"
+        f"top_k_requested = {int(top_k_requested) if np.isfinite(top_k_requested) else 'none'}\n"
         f"candidates = {total_candidates}\n"
         f"selected galaxies = {selected_galaxies}\n"
         f"selected pairs = {selected_pairs}"

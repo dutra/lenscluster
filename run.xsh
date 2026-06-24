@@ -203,11 +203,13 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
 
     perturbation_alpha_tol = 0.4
     perturbation_jacobian_tol = 0.3
+    perturbation_top_k = None
     warmup = 5000
     samples = 1000
     max_tree_depth = 8
     mode = "none"
     stage1_likelihood = "critical-arc"
+    #stage1_likelihood = "source"
     output_dir = (
         f"{cluster_config['output_dir']}_PD{perturbation_alpha_tol:g}_"
         f"{perturbation_jacobian_tol:g}_T{max_tree_depth}W{warmup}S{samples}"
@@ -263,6 +265,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             perturbation_discovery_alpha_tol_arcsec=perturbation_alpha_tol,
             perturbation_discovery_jacobian_tol=perturbation_jacobian_tol,
             perturbation_discovery_jacobian_weight=1.0,
+            perturbation_discovery_top_k=perturbation_top_k,
         ),
         scaling=ScalingModelConfig(
             independent_scaling_free_log_sigma_tau_prior_median=0.45,

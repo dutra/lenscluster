@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -166,6 +167,7 @@ class PerturbationDiscoveryConfig:
     perturbation_discovery_alpha_tol_arcsec: float = 0.01
     perturbation_discovery_jacobian_tol: float = 0.01
     perturbation_discovery_jacobian_weight: float = 1.0
+    perturbation_discovery_top_k: int | None = None
 
 
 @dataclass(frozen=True)
@@ -322,6 +324,10 @@ def validate_config(config: LensClusterSolverConfig) -> None:
         raise ValueError("initial_step_size must be positive.")
     if schedule.svi_learning_rate <= 0.0:
         raise ValueError("svi_learning_rate must be positive.")
+    if config.perturbation.perturbation_discovery_top_k is not None:
+        top_k = config.perturbation.perturbation_discovery_top_k
+        if isinstance(top_k, bool) or not isinstance(top_k, Integral) or int(top_k) <= 0:
+            raise ValueError("perturbation_discovery_top_k must be a positive integer or None.")
     if config.scaling.softening_length_kpc < 0.0:
         raise ValueError("softening_length_kpc must be nonnegative.")
     if config.scaling.softening_length_prior_log_sigma <= 0.0:
