@@ -118,7 +118,6 @@ TRUTH_GRID_QUANTITY_OUTPUT_NAMES = {
     "abs_mu": "abs_mu",
 }
 CRITICAL_ARC_MIXTURE_IMAGE_PLANE_MODE = "critical-arc-mixture-image-plane"
-CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE_MODE = "critical-arc-mixture-centroid-image-plane"
 CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD = 0.5
 CRITICAL_ARC_BASE_PROB = 0.10
 CRITICAL_ARC_MAX_PROB = 0.80
@@ -312,7 +311,6 @@ def _active_sample_likelihood_mode(evaluator: Any, args: argparse.Namespace) -> 
 def _uses_arc_aware_diagnostics(sample_likelihood_mode: Any) -> bool:
     return str(sample_likelihood_mode or "").strip() in {
         CRITICAL_ARC_MIXTURE_IMAGE_PLANE_MODE,
-        CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE_MODE,
     }
 
 
@@ -380,7 +378,6 @@ def _numpyro_model_likelihood_label(sample_likelihood_mode: str) -> str:
         "source": "ln ℒ(η)\nsource-plane likelihood",
         "local-jacobian": "ln ℒ(η)\nlocal image-plane likelihood",
         "critical-arc-mixture-image-plane": "ln ℒ(η, {β_f})\ncritical-arc image-plane likelihood",
-        "critical-arc-mixture-centroid-image-plane": "ln ℒ(η)\ncritical-arc centroid image-plane likelihood",
     }
     return labels.get(str(sample_likelihood_mode), f"ln ℒ(η)\n{str(sample_likelihood_mode).replace('-', ' ')} likelihood")
 

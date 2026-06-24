@@ -492,9 +492,14 @@ SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE = "linearized-forward-beta
 SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE = "forward-metric-image-plane"
 SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE = "anchored-solved-forward-beta-image-plane"
 SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE = "critical-arc-mixture-image-plane"
-SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE = "critical-arc-mixture-centroid-image-plane"
 SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE = "fold-regularized-forward-beta-image-plane"
 SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE = "catastrophe-normal-form-image-plane"
+CRITICAL_ARC_SOURCE_POSITION_POLICY_CENTROID_FIXED = "centroid-fixed"
+CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED = "sampled"
+CRITICAL_ARC_SOURCE_POSITION_POLICIES = (
+    CRITICAL_ARC_SOURCE_POSITION_POLICY_CENTROID_FIXED,
+    CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED,
+)
 EVIDENCE_LIKELIHOOD_MODES = (
     SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
 )
@@ -540,11 +545,11 @@ STAGE1_BACKPROJECTED_CENTROID_FIT_DIR = "stage1_backprojected_centroid_fit"
 STAGE2_FREE_SOURCE_FORWARD_FIT_DIR = "stage2_free_source_forward_fit"
 STAGE1_LIKELIHOOD_SOURCE = "source"
 STAGE1_LIKELIHOOD_LOCAL_JACOBIAN = "local-jacobian"
-STAGE1_LIKELIHOOD_CRITICAL_ARC_CENTROID = "critical-arc-centroid"
+STAGE1_LIKELIHOOD_CRITICAL_ARC = "critical-arc"
 STAGE1_LIKELIHOODS = (
     STAGE1_LIKELIHOOD_SOURCE,
     STAGE1_LIKELIHOOD_LOCAL_JACOBIAN,
-    STAGE1_LIKELIHOOD_CRITICAL_ARC_CENTROID,
+    STAGE1_LIKELIHOOD_CRITICAL_ARC,
 )
 STAGE2_FORWARD_MODE_NONE = "none"
 STAGE2_FORWARD_MODE_LINEARIZED = "linearized"
@@ -1482,14 +1487,7 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
     elif sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE:
         items.append(
             "sample_likelihood=critical-arc-mixture-image-plane "
-            f"critical_direction_sigma_arcsec={float(getattr(evaluator, 'critical_arc_critical_direction_sigma_arcsec', DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)):.4g} "
-            f"arc_recovery_p_arc_threshold={float(getattr(evaluator, 'arc_recovery_p_arc_threshold', DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)):.4g} "
-            f"arc_max_arclength_arcsec={float(getattr(evaluator, 'arc_aware_max_arclength_arcsec', DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)):.4g}"
-        )
-    elif sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE:
-        items.append(
-            "sample_likelihood=critical-arc-mixture-centroid-image-plane "
-            "source_positions=current weighted centroids "
+            f"source_positions={getattr(evaluator, 'critical_arc_source_position_policy', CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED)} "
             f"critical_direction_sigma_arcsec={float(getattr(evaluator, 'critical_arc_critical_direction_sigma_arcsec', DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)):.4g} "
             f"arc_recovery_p_arc_threshold={float(getattr(evaluator, 'arc_recovery_p_arc_threshold', DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD)):.4g} "
             f"arc_max_arclength_arcsec={float(getattr(evaluator, 'arc_aware_max_arclength_arcsec', DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC)):.4g}"
@@ -6184,7 +6182,9 @@ def _critical_arc_debug_terms_for_state(
                 y_obs,
                 packed_state,
             )
-        if str(getattr(evaluator, "sample_likelihood_mode", "")) == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE:
+        if not _critical_arc_uses_sampled_source_positions(
+            getattr(evaluator, "critical_arc_source_position_policy", CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED)
+        ):
             beta_family_x, beta_family_y, has_source_positions, source_transport_correction = evaluator._centroid_source_position_vectors_for_bin(
                 bin_data,
                 beta_x,
@@ -12304,16 +12304,30 @@ def _sample_likelihood_uses_explicit_beta(sample_likelihood_mode: str) -> bool:
 
 
 def _sample_likelihood_uses_image_scatter(sample_likelihood_mode: str) -> bool:
-    return _sample_likelihood_uses_explicit_beta(sample_likelihood_mode) or str(
-        sample_likelihood_mode
-    ) == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE
+    return _sample_likelihood_uses_explicit_beta(sample_likelihood_mode)
 
 
 def _sample_likelihood_uses_critical_arc_terms(sample_likelihood_mode: str) -> bool:
     return str(sample_likelihood_mode) in {
         SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-        SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
     }
+
+
+def _critical_arc_source_position_policy_from_value(value: Any) -> str:
+    policy = str(value or CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED)
+    if policy not in CRITICAL_ARC_SOURCE_POSITION_POLICIES:
+        raise ValueError(
+            "critical_arc_source_position_policy must be one of "
+            f"{', '.join(CRITICAL_ARC_SOURCE_POSITION_POLICIES)}; got {policy!r}."
+        )
+    return policy
+
+
+def _critical_arc_uses_sampled_source_positions(source_position_policy: Any) -> bool:
+    return (
+        _critical_arc_source_position_policy_from_value(source_position_policy)
+        == CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED
+    )
 
 
 def _sample_likelihood_uses_image_plane_jacobian(sample_likelihood_mode: str) -> bool:
@@ -12322,7 +12336,6 @@ def _sample_likelihood_uses_image_plane_jacobian(sample_likelihood_mode: str) ->
         SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-        SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
     }
@@ -12355,7 +12368,6 @@ def _effective_image_presence_penalty_weight(
         SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-        SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
         SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
     }:
@@ -12474,7 +12486,7 @@ def _stage3_sample_likelihood_mode(args: argparse.Namespace) -> str | None:
     if mode == STAGE3_IMAGE_PLANE_MODE_LOCAL_JACOBIAN:
         return SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
     if mode == STAGE3_IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE:
-        return SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE
+        return SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
     return None
 
 
@@ -16554,6 +16566,7 @@ class ClusterJAXEvaluator:
         source_plane_covariance_mode: str = SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION,
         source_plane_outlier_sigma_arcsec: float = DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC,
         sample_likelihood_mode: str = SAMPLE_LIKELIHOOD_SOURCE,
+        critical_arc_source_position_policy: str = CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED,
         active_scaling_inference_likelihood: str | None = None,
         image_plane_newton_steps: int = 0,
         anchored_image_plane_solve_steps: int = DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS,
@@ -16671,6 +16684,9 @@ class ClusterJAXEvaluator:
             )
         self.source_plane_outlier_sigma_arcsec = max(float(source_plane_outlier_sigma_arcsec), 1.0e-6)
         self.sample_likelihood_mode = str(sample_likelihood_mode)
+        self.critical_arc_source_position_policy = _critical_arc_source_position_policy_from_value(
+            critical_arc_source_position_policy
+        )
         self.active_scaling_inference_likelihood = str(
             active_scaling_inference_likelihood
             if active_scaling_inference_likelihood is not None
@@ -16693,7 +16709,6 @@ class ClusterJAXEvaluator:
             SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
         }:
@@ -16702,18 +16717,15 @@ class ClusterJAXEvaluator:
             SAMPLE_LIKELIHOOD_SOURCE,
             SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
         }:
             raise ValueError(
                 f"sampling_engine={self.sampling_engine!r} currently only supports "
-                "source, local-jacobian, critical-arc-mixture-image-plane, and "
-                "critical-arc-mixture-centroid-image-plane."
+                "source, local-jacobian, and critical-arc-mixture-image-plane."
             )
         if self.sampling_engine == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT and self.sample_likelihood_mode not in {
             SAMPLE_LIKELIHOOD_SOURCE,
             SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
         }:
             raise ValueError(
                 "sampling_engine='refreshing_surrogate_flat' does not yet support "
@@ -18098,7 +18110,7 @@ class ClusterJAXEvaluator:
         image_sigma_int: jnp.ndarray,
         jacobian_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE:
+        if not _critical_arc_uses_sampled_source_positions(self.critical_arc_source_position_policy):
             return self._flat_centroid_source_position_vectors(flat_data, beta_x, beta_y, image_sigma_int)
         if self.source_position_conditional:
             return self._flat_conditional_source_position_transport(
@@ -22539,10 +22551,7 @@ class ClusterJAXEvaluator:
                 return self._flat_refreshing_surrogate_source_loglike_impl(params)
             if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
                 return self._flat_refreshing_surrogate_local_jacobian_source_loglike_impl(params)
-            if self.sample_likelihood_mode in {
-                SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-                SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
-            }:
+            if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE:
                 return self._flat_refreshing_surrogate_critical_arc_source_loglike_impl(params)
             return jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64)
         if (
@@ -22560,11 +22569,7 @@ class ClusterJAXEvaluator:
         if (
             str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
             in {SAMPLING_ENGINE_FULL_FLAT}
-            and self.sample_likelihood_mode
-            in {
-                SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-                SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
-            }
+            and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
         ):
             return self._flat_critical_arc_source_loglike_impl(params)
 
@@ -22593,7 +22598,6 @@ class ClusterJAXEvaluator:
         if self.sample_likelihood_mode in {
             SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
             SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
         }:
             fit_component_indices = None
         sampled_kpc_per_arcsec = None
@@ -22835,7 +22839,7 @@ class ClusterJAXEvaluator:
                         y_obs,
                         packed_state,
                     )
-                if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE:
+                if not _critical_arc_uses_sampled_source_positions(self.critical_arc_source_position_policy):
                     beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._centroid_source_position_vectors_for_bin(
                         bin_data,
                         observed_beta_x,
@@ -23427,7 +23431,12 @@ class ClusterJAXEvaluator:
                     self.source_plane_covariance_floor,
                 )
                 sampled_source = self._source_position_for_family_numpy(params, str(family_id))
-                if _sample_likelihood_uses_explicit_beta(self.sample_likelihood_mode) and sampled_source is not None:
+                uses_sampled_source = _sample_likelihood_uses_explicit_beta(self.sample_likelihood_mode)
+                if _sample_likelihood_uses_critical_arc_terms(self.sample_likelihood_mode):
+                    uses_sampled_source = _critical_arc_uses_sampled_source_positions(
+                        self.critical_arc_source_position_policy
+                    )
+                if uses_sampled_source and sampled_source is not None:
                     source_x, source_y = sampled_source
                 else:
                     source_x = float(np.average(beta_x[mask], weights=weights))
@@ -24298,7 +24307,12 @@ class ClusterJAXEvaluator:
             self.source_plane_covariance_floor,
         )
         sampled_source = self._source_position_for_family_numpy(params, family.family_id)
-        if _sample_likelihood_uses_explicit_beta(self.sample_likelihood_mode) and sampled_source is not None:
+        uses_sampled_source = _sample_likelihood_uses_explicit_beta(self.sample_likelihood_mode)
+        if _sample_likelihood_uses_critical_arc_terms(self.sample_likelihood_mode):
+            uses_sampled_source = _critical_arc_uses_sampled_source_positions(
+                self.critical_arc_source_position_policy
+            )
+        if uses_sampled_source and sampled_source is not None:
             source_x, source_y = sampled_source
         else:
             source_x = float(np.average(np.asarray(beta_x, dtype=float), weights=weights))
@@ -25245,6 +25259,12 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
             saved_args.get("source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
         ),
         sample_likelihood_mode=sample_likelihood_mode,
+        critical_arc_source_position_policy=str(
+            saved_args.get(
+                "critical_arc_source_position_policy",
+                CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED,
+            )
+        ),
         image_plane_newton_steps=int(plot_saved_args.get("image_plane_newton_steps", 0)),
         anchored_image_plane_solve_steps=int(
             plot_saved_args.get("anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)
@@ -26270,8 +26290,16 @@ def _build_state_from_inputs(
     bin_data = _build_bin_data(family_data)
     arc_data = _prepare_arc_constraint_data(arcs_df, reference)
     sample_likelihood_mode = str(getattr(args, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))
+    critical_arc_source_position_policy = _critical_arc_source_position_policy_from_value(
+        getattr(args, "critical_arc_source_position_policy", CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED)
+    )
+    uses_sampled_source_positions = _sample_likelihood_uses_explicit_beta(sample_likelihood_mode)
+    if _sample_likelihood_uses_critical_arc_terms(sample_likelihood_mode):
+        uses_sampled_source_positions = _critical_arc_uses_sampled_source_positions(
+            critical_arc_source_position_policy
+        )
     source_position_parameterization = SOURCE_POSITION_PARAMETERIZATION_DIRECT
-    if family_data and _sample_likelihood_uses_explicit_beta(sample_likelihood_mode):
+    if family_data and uses_sampled_source_positions:
         source_position_parameterization = str(
             getattr(
                 args,
@@ -26917,6 +26945,13 @@ def _build_cluster_evaluator_from_args(
         ),
         source_plane_outlier_sigma_arcsec=args.source_plane_outlier_sigma_arcsec,
         sample_likelihood_mode=sample_likelihood_mode,
+        critical_arc_source_position_policy=str(
+            getattr(
+                args,
+                "critical_arc_source_position_policy",
+                CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED,
+            )
+        ),
         active_scaling_inference_likelihood=str(
             getattr(
                 args,
@@ -28579,6 +28614,12 @@ def _rerender_plots(
             plot_saved_args.get("source_plane_outlier_sigma_arcsec", DEFAULT_SOURCE_PLANE_OUTLIER_SIGMA_ARCSEC)
         ),
         sample_likelihood_mode=sample_likelihood_mode,
+        critical_arc_source_position_policy=str(
+            plot_saved_args.get(
+                "critical_arc_source_position_policy",
+                CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED,
+            )
+        ),
         image_plane_newton_steps=int(plot_saved_args.get("image_plane_newton_steps", 0)),
         anchored_image_plane_solve_steps=int(
             plot_saved_args.get("anchored_image_plane_solve_steps", DEFAULT_ANCHORED_IMAGE_PLANE_SOLVE_STEPS)
@@ -29012,6 +29053,7 @@ def _run_single_stage(
         (
             f"run_name={run_name} fit_mode={fit_mode} fit_method={stage_args.fit_method} "
             f"sample_likelihood_mode={sample_likelihood_mode} "
+            f"critical_arc_source_position_policy={getattr(stage_args, 'critical_arc_source_position_policy', CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED)} "
             f"max_tree_depth={stage_args.max_tree_depth} "
             f"fit_cosmology_flat_wcdm={bool(getattr(stage_args, 'fit_cosmology_flat_wcdm', False))}"
         ),
@@ -29021,6 +29063,7 @@ def _run_single_stage(
         (
             f"[stage] start run_name={run_name} fit_mode={fit_mode} fit_method={stage_args.fit_method} "
             f"sample_likelihood_mode={sample_likelihood_mode} "
+            f"critical_arc_source_position_policy={getattr(stage_args, 'critical_arc_source_position_policy', CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED)} "
             f"max_tree_depth={stage_args.max_tree_depth} "
             f"fit_cosmology_flat_wcdm={bool(getattr(stage_args, 'fit_cosmology_flat_wcdm', False))}"
         ),
@@ -29317,9 +29360,23 @@ def _stage1_sample_likelihood_mode(args: argparse.Namespace) -> str:
         return SAMPLE_LIKELIHOOD_SOURCE
     if requested == STAGE1_LIKELIHOOD_LOCAL_JACOBIAN:
         return SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
-    if requested == STAGE1_LIKELIHOOD_CRITICAL_ARC_CENTROID:
-        return SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE
+    if requested == STAGE1_LIKELIHOOD_CRITICAL_ARC:
+        return SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
     raise ValueError(f"Unsupported stage1_likelihood={requested!r}.")
+
+
+def _stage1_source_position_policy(args: argparse.Namespace) -> str:
+    requested = str(getattr(args, "stage1_likelihood", STAGE1_LIKELIHOOD_LOCAL_JACOBIAN))
+    if requested == STAGE1_LIKELIHOOD_CRITICAL_ARC:
+        return CRITICAL_ARC_SOURCE_POSITION_POLICY_CENTROID_FIXED
+    return CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED
+
+
+def _stage2_source_position_policy(args: argparse.Namespace) -> str:
+    requested = str(getattr(args, "stage2_forward_mode", STAGE2_FORWARD_MODE_NONE))
+    if requested == STAGE2_FORWARD_MODE_CRITICAL_ARC:
+        return CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED
+    return CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED
 
 
 def _stage2_forward_enabled(args: argparse.Namespace) -> bool:
@@ -29358,6 +29415,8 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
     stage2_enabled = _stage2_forward_enabled(args)
     stage1_likelihood = _stage1_sample_likelihood_mode(args)
     stage2_likelihood = _stage2_sample_likelihood_mode(args)
+    stage1_source_position_policy = _stage1_source_position_policy(args)
+    stage2_source_position_policy = _stage2_source_position_policy(args)
     _log_stage_banner(
         args,
         "SEQUENTIAL WORKFLOW",
@@ -29410,6 +29469,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
         stage0_controls,
         fit_method=FIT_METHOD_SVI,
         sampling_engine=SAMPLING_ENGINE_FULL_FLAT,
+        critical_arc_source_position_policy=stage1_source_position_policy,
         perturbation_discovery_stage0=True,
     )
     stage0_args = _force_quick_diagnostics_for_nonfinal_stage(
@@ -29446,6 +29506,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
         args,
         stage1_controls,
         sampling_engine=stage1_sampling_engine,
+        critical_arc_source_position_policy=stage1_source_position_policy,
     )
     if stage2_enabled:
         stage1_args = _force_quick_diagnostics_for_nonfinal_stage(
@@ -29479,6 +29540,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
         "stage1_run_dir": str(stage1_run_dir),
         "stage1_likelihood": str(getattr(args, "stage1_likelihood", STAGE1_LIKELIHOOD_LOCAL_JACOBIAN)),
         "stage1_sample_likelihood_mode": str(stage1_likelihood),
+        "stage1_source_position_policy": str(stage1_source_position_policy),
         "stage2_forward_mode": str(getattr(args, "stage2_forward_mode", STAGE2_FORWARD_MODE_NONE)),
         "stage_fit_controls": {
             "stage0": stage0_controls.to_json(),
@@ -29501,6 +29563,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
             else requested_stage2_engine
         )
         stage2_updates["sampling_engine"] = effective_stage2_engine
+        stage2_updates["critical_arc_source_position_policy"] = stage2_source_position_policy
         stage2_args = _args_with_fit_controls(args, stage2_controls, **stage2_updates)
         stage2_init_artifacts = stage1_run_dir / "artifacts"
         stage2_init_values = _physical_best_fit_values_from_artifacts(stage2_init_artifacts)
@@ -29522,6 +29585,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
         )
         summary_payload["stage2_run_dir"] = str(stage2_run_dir)
         summary_payload["stage2_sample_likelihood_mode"] = str(stage2_likelihood)
+        summary_payload["stage2_source_position_policy"] = str(stage2_source_position_policy)
         summary_payload["stage2_sampling_engine_requested"] = requested_stage2_engine
         summary_payload["stage2_sampling_engine_effective"] = str(effective_stage2_engine)
         summary_payload["stage2_fresh_process"] = bool(stage2_runs_fresh)

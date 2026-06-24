@@ -201,13 +201,13 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         raise ValueError(f"cluster must be one of {', '.join(sorted(FF_SIMS_CLUSTERS))}; got {cluster!r}.")
     cluster_config = FF_SIMS_CLUSTERS[cluster]
 
-    perturbation_alpha_tol = 0.1
-    perturbation_jacobian_tol = 0.2
-    warmup = 500
-    samples = 250
+    perturbation_alpha_tol = 0.4
+    perturbation_jacobian_tol = 0.3
+    warmup = 5000
+    samples = 1000
     max_tree_depth = 8
     mode = "none"
-    stage1_likelihood = "local-jacobian"
+    stage1_likelihood = "critical-arc"
     output_dir = (
         f"{cluster_config['output_dir']}_PD{perturbation_alpha_tol:g}_"
         f"{perturbation_jacobian_tol:g}_T{max_tree_depth}W{warmup}S{samples}"
@@ -250,7 +250,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         schedule=StageScheduleConfig(
             fit_method=("svi+nuts",),
             refresh_every=(None, 1000),
-            svi_steps=(5000, 5000),
+            svi_steps=(10000, 5000),
             warmup=(warmup,),
             samples=(samples,),
             sampling_refresh_runs=(1,),

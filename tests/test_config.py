@@ -222,6 +222,84 @@ def test_compile_run_plan_resolves_runtime_stages_and_outputs() -> None:
     assert plan.run_metadata["paths"]["run_name"] == "hera_demo"
 
 
+def test_compile_run_plan_resolves_unified_critical_arc_stage_policies() -> None:
+    config = _minimal_sequential_config().with_updates(
+        workflow=WorkflowConfig(
+            fit_mode="sequential",
+            stage1_likelihood="critical-arc",
+            stage2_forward_mode="critical-arc",
+        ),
+        schedule=StageScheduleConfig(
+            fit_method=("svi+nuts", "svi+nuts"),
+            svi_steps=(10, 20, 30),
+            refresh_every=(None, 100, 100),
+            warmup=(1, 1),
+            samples=(2, 2),
+            sampling_refresh_runs=(1,),
+            max_tree_depth=(8, 8),
+        ),
+    )
+
+    plan = compile_run_plan(config)
+
+    assert [stage.sample_likelihood_mode for stage in plan.stages] == [
+        "critical-arc-mixture-image-plane",
+        "critical-arc-mixture-image-plane",
+        "critical-arc-mixture-image-plane",
+    ]
+    assert [stage.likelihood_family for stage in plan.stages] == [
+        "critical-arc",
+        "critical-arc",
+        "critical-arc",
+    ]
+    assert [stage.source_position_policy for stage in plan.stages] == [
+        "centroid-fixed",
+        "centroid-fixed",
+        "sampled",
+    ]
+
+
+def test_config_validation_rejects_old_stage1_critical_arc_mixture_name() -> None:
+    config = _minimal_sequential_config().with_updates(
+        workflow=WorkflowConfig(fit_mode="sequential", stage1_likelihood="critical-arc-mixture"),
+    )
+
+    with pytest.raises(ValueError, match="stage1_likelihood"):
+        config.validate()
+
+
+def test_critical_arc_source_position_specs_follow_stage_policy() -> None:
+    plan = compile_run_plan(
+        _minimal_sequential_config().with_updates(
+            workflow=WorkflowConfig(fit_mode="sequential", stage1_likelihood="critical-arc"),
+        )
+    )
+    stage1_args = cluster_solver._clone_args(
+        plan.runtime_args,
+        sample_likelihood_mode="critical-arc-mixture-image-plane",
+        critical_arc_source_position_policy="centroid-fixed",
+    )
+    stage2_args = cluster_solver._clone_args(
+        plan.runtime_args,
+        sample_likelihood_mode="critical-arc-mixture-image-plane",
+        critical_arc_source_position_policy="sampled",
+    )
+
+    stage1_state = cluster_solver._build_state_from_inputs(stage1_args, fit_mode_override="joint")
+    source_position_priors = {
+        str(family.family_id): (0.0, 0.0)
+        for family in stage1_state.family_data
+    }
+    stage2_state = cluster_solver._build_state_from_inputs(
+        stage2_args,
+        fit_mode_override="joint",
+        source_position_prior_values=source_position_priors,
+    )
+
+    assert not any(spec.component_family == "source_position" for spec in stage1_state.parameter_specs)
+    assert any(spec.component_family == "source_position" for spec in stage2_state.parameter_specs)
+
+
 def test_solver_runtime_payload_is_flat_and_clone_preserves_model_config() -> None:
     plan = compile_run_plan(_minimal_sequential_config())
 
@@ -365,6 +443,9 @@ def test_run_xsh_is_self_contained_ff_sims_runner() -> None:
     assert "2.3 / 0.72" in text
     assert "cores = 4" in text
     assert "chains=cores" in text
+    assert 'stage1_likelihood = "critical-arc"' in text
+    assert "critical-arc-centroid" not in text
+    assert "critical-arc-mixture" not in text
 
 
 def test_ff_sims_notebook_is_self_contained_and_config_native() -> None:
@@ -392,6 +473,9 @@ def test_ff_sims_notebook_is_self_contained_and_config_native() -> None:
     assert "os.environ[\"JAX_NUM_CPU_DEVICES\"] = str(cores)" in source
     assert "RuntimeConfig" in source
     assert "chains=cores" in source
+    assert 'stage1_likelihood = "critical-arc"' in source
+    assert "critical-arc-centroid" not in source
+    assert "critical-arc-mixture" not in source
     assert sum(len(cell.get("outputs", [])) for cell in notebook.cells if cell.cell_type == "code") == 0
     assert "available_cpu_cores" not in source
     assert "os.sched_getaffinity" not in source

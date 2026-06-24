@@ -48,7 +48,6 @@ from lenscluster.cluster_solver import (
     IMAGE_PLANE_MODE_NONE,
     SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
     SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
-    SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
     SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
     SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
     SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
@@ -4674,7 +4673,7 @@ def test_stage3_critical_arc_centroid_samples_image_scatter_without_source_posit
     )
     args = _parse_args()
     stage3_args = argparse.Namespace(**vars(args))
-    stage3_args.sample_likelihood_mode = SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE
+    stage3_args.sample_likelihood_mode = SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
 
     state = cluster_solver._build_state_from_inputs(stage3_args, fit_mode_override="joint")
 
@@ -8052,7 +8051,7 @@ def test_refreshing_surrogate_flat_matches_legacy_loglike_and_gradient(sample_li
             jnp.asarray([1.1, 0.05, -0.03], dtype=jnp.float64),
         ),
         (
-            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
+            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
             _minimal_stage4_surrogate_state(),
             jnp.asarray([1.1], dtype=jnp.float64),
         ),
@@ -12102,7 +12101,8 @@ def test_critical_arc_centroid_source_loglike_uses_current_weighted_centroid(
     class FakeEvaluator:
         surrogate_enabled = False
         surrogate_cache_by_z = {}
-        sample_likelihood_mode = SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE
+        sample_likelihood_mode = SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+        critical_arc_source_position_policy = "centroid-fixed"
         critical_arc_critical_direction_sigma_arcsec = 5.0
         critical_arc_base_prob = 0.10
         critical_arc_max_prob = 0.80
@@ -13533,7 +13533,7 @@ def test_microcanonical_transition_debug_table_flags_chain_health(tmp_path: Path
     "sample_likelihood_mode",
     [
         SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-        SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
     ],
 )
 def test_critical_arc_debug_terms_sum_to_bin_loglike_without_presence_penalty(
@@ -13625,7 +13625,7 @@ def test_critical_arc_debug_terms_sum_to_bin_loglike_without_presence_penalty(
     image_sigma_int = evaluator._image_sigma_int_from_physical(physical_params)
     beta_x, beta_y = evaluator._ray_shooting_for_components(None, bin_data.x_obs, bin_data.y_obs, {})
     jacobian_entries = evaluator._lensing_jacobian_for_components(None, bin_data.x_obs, bin_data.y_obs, {})
-    if sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE:
+    if sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE:
         beta_family_x, beta_family_y, _has_sources, transport = evaluator._centroid_source_position_vectors_for_bin(
             bin_data,
             beta_x,
@@ -29225,14 +29225,14 @@ def test_sequential_stage3_critical_arc_centroid_runs_without_stage4(
         "fit/stage2_joint",
         "fit/stage3_image_plane",
     ]
-    assert calls[2][1] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE
+    assert calls[2][1] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
     assert calls[2][2] == "svi"
     assert calls[2][3] == {"halo_v_disp": 1100.0}
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
     assert summary["stage3_run_dir"].endswith("stage3_image_plane")
     assert "stage4_run_dir" not in summary
     assert summary["stage3_image_plane_mode"] == IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
-    assert summary["stage3_sample_likelihood_mode"] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE
+    assert summary["stage3_sample_likelihood_mode"] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
     assert summary["image_sigma_int_sampled"] is True
 
 
@@ -29301,13 +29301,13 @@ def test_sequential_stage3_critical_arc_centroid_then_stage4_critical_arc(
         "fit/stage3_image_plane",
         "fit/stage4_critical_arc_mixture_image_plane",
     ]
-    assert calls[2][1] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE
+    assert calls[2][1] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
     assert calls[3][1] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
     assert calls[3][3] == {"halo_v_disp": 1200.0}
     assert calls[3][4] == {"1": (0.1, -0.2)}
     summary = json.loads((tmp_path / "fit" / "sequential_summary.json").read_text(encoding="utf-8"))
     assert summary["stage3_image_plane_mode"] == IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE
-    assert summary["stage3_sample_likelihood_mode"] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_CENTROID_IMAGE_PLANE
+    assert summary["stage3_sample_likelihood_mode"] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
     assert summary["stage4_run_dir"].endswith("stage4_critical_arc_mixture_image_plane")
 
 

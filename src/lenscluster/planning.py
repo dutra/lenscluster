@@ -41,6 +41,8 @@ class StagePlan:
     fit_method: str
     sampling_engine: str
     sample_likelihood_mode: str
+    likelihood_family: str
+    source_position_policy: str
     svi_steps: int
     refresh_every: int | None
     warmup: int
@@ -141,6 +143,7 @@ SOLVER_RUNTIME_DEFAULTS: dict[str, Any] = {
     "sample_critical_arc_singular_softness": False,
     "sample_critical_arc_singular_threshold": False,
     "sample_likelihood_mode": "source",
+    "critical_arc_source_position_policy": "sampled",
     "sampler": "numpyro_nuts",
     "skip_critical_det_diagnostic": False,
     "source_plane_outlier_sigma_arcsec": 10.0,
@@ -199,6 +202,8 @@ def _stage_plans(config: LensClusterSolverConfig, output: OutputPlan) -> tuple[S
                 fit_method=schedule.fit_method[0],
                 sampling_engine=workflow.sampling_engine,
                 sample_likelihood_mode="source",
+                likelihood_family="source",
+                source_position_policy="sampled",
                 svi_steps=schedule.svi_steps[0],
                 refresh_every=schedule.refresh_every[0],
                 warmup=schedule.warmup[0],
@@ -213,7 +218,9 @@ def _stage_plans(config: LensClusterSolverConfig, output: OutputPlan) -> tuple[S
             fit_mode="stage0_fast_initializer",
             fit_method=schedule.fit_method[0],
             sampling_engine="full_flat",
-            sample_likelihood_mode=workflow.stage1_likelihood,
+            sample_likelihood_mode=_stage1_sample_likelihood_mode(workflow.stage1_likelihood),
+            likelihood_family=_stage1_likelihood_family(workflow.stage1_likelihood),
+            source_position_policy=_stage1_source_position_policy(workflow.stage1_likelihood),
             svi_steps=schedule.svi_steps[0],
             refresh_every=schedule.refresh_every[0],
             warmup=schedule.warmup[0],
@@ -226,7 +233,9 @@ def _stage_plans(config: LensClusterSolverConfig, output: OutputPlan) -> tuple[S
             fit_mode="stage1_backprojected_centroid_fit",
             fit_method=schedule.fit_method[0],
             sampling_engine=workflow.stage1_sampling_engine,
-            sample_likelihood_mode=workflow.stage1_likelihood,
+            sample_likelihood_mode=_stage1_sample_likelihood_mode(workflow.stage1_likelihood),
+            likelihood_family=_stage1_likelihood_family(workflow.stage1_likelihood),
+            source_position_policy=_stage1_source_position_policy(workflow.stage1_likelihood),
             svi_steps=schedule.svi_steps[1],
             refresh_every=schedule.refresh_every[1],
             warmup=schedule.warmup[0],
@@ -242,7 +251,9 @@ def _stage_plans(config: LensClusterSolverConfig, output: OutputPlan) -> tuple[S
                 fit_mode="stage2_free_source_forward_fit",
                 fit_method=schedule.fit_method[-1],
                 sampling_engine=workflow.stage2_sampling_engine,
-                sample_likelihood_mode=workflow.stage2_forward_mode,
+                sample_likelihood_mode=_stage2_sample_likelihood_mode(workflow.stage2_forward_mode),
+                likelihood_family=_stage2_likelihood_family(workflow.stage2_forward_mode),
+                source_position_policy=_stage2_source_position_policy(workflow.stage2_forward_mode),
                 svi_steps=schedule.svi_steps[2],
                 refresh_every=schedule.refresh_every[2],
                 warmup=schedule.warmup[-1],
@@ -252,6 +263,47 @@ def _stage_plans(config: LensClusterSolverConfig, output: OutputPlan) -> tuple[S
             )
         )
     return tuple(stages)
+
+
+def _stage1_sample_likelihood_mode(stage1_likelihood: str) -> str:
+    if stage1_likelihood in {"source", "local-jacobian"}:
+        return stage1_likelihood
+    if stage1_likelihood == "critical-arc":
+        return "critical-arc-mixture-image-plane"
+    raise ValueError(f"Unsupported stage1_likelihood={stage1_likelihood!r}.")
+
+
+def _stage1_likelihood_family(stage1_likelihood: str) -> str:
+    if stage1_likelihood in {"source", "local-jacobian"}:
+        return stage1_likelihood
+    if stage1_likelihood == "critical-arc":
+        return "critical-arc"
+    raise ValueError(f"Unsupported stage1_likelihood={stage1_likelihood!r}.")
+
+
+def _stage1_source_position_policy(stage1_likelihood: str) -> str:
+    return "centroid-fixed" if stage1_likelihood == "critical-arc" else "sampled"
+
+
+def _stage2_sample_likelihood_mode(stage2_forward_mode: str) -> str:
+    if stage2_forward_mode == "linearized":
+        return "linearized-forward-beta-image-plane"
+    if stage2_forward_mode == "critical-arc":
+        return "critical-arc-mixture-image-plane"
+    raise ValueError(f"Unsupported stage2_forward_mode={stage2_forward_mode!r}.")
+
+
+def _stage2_likelihood_family(stage2_forward_mode: str) -> str:
+    if stage2_forward_mode == "linearized":
+        return "linearized"
+    if stage2_forward_mode == "critical-arc":
+        return "critical-arc"
+    raise ValueError(f"Unsupported stage2_forward_mode={stage2_forward_mode!r}.")
+
+
+def _stage2_source_position_policy(stage2_forward_mode: str) -> str:
+    del stage2_forward_mode
+    return "sampled"
 
 
 def _resolved_run_name(config: LensClusterSolverConfig) -> str:
