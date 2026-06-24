@@ -1,7 +1,10 @@
 import jax.numpy as jnp
+import numpy as np
 import pytest
+from astropy.wcs import WCS
 
 from lenscluster.cluster_solver import _family_magnitude_loglike
+from lenscluster.image_tools.truth_magnitudes import TruthMagnitudeConfig, _effective_abs_magnification
 
 
 def test_family_magnitude_loglike_prefers_magnification_corrected_consistency():
@@ -159,3 +162,35 @@ def test_family_magnitude_loglike_uses_arc_gated_scatter():
     )
 
     assert arc_broadened > base_only
+
+
+def test_truth_magnitude_uses_capped_aperture_average_for_near_critical_pixel():
+    wcs = WCS(naxis=2)
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    wcs.wcs.crpix = [3.0, 3.0]
+    wcs.wcs.crval = [0.0, 0.0]
+    wcs.wcs.cdelt = [1.0 / 3600.0, 1.0 / 3600.0]
+
+    kappa = np.full((5, 5), 0.2)
+    gamma_x = np.zeros((5, 5))
+    gamma_y = np.zeros((5, 5))
+    kappa[2, 2] = 0.999999
+
+    config = TruthMagnitudeConfig(
+        mu_floor=1.0e-3,
+        mu_max=50.0,
+        mu_aperture_radius_arcsec=1.0,
+    )
+    effective = _effective_abs_magnification(
+        kappa,
+        gamma_x,
+        gamma_y,
+        np.asarray([2.0]),
+        np.asarray([2.0]),
+        np.asarray([1.0]),
+        wcs=wcs,
+        config=config,
+    )
+
+    assert float(effective[0]) < 50.0
+    assert float(effective[0]) > 1.0

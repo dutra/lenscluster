@@ -8,6 +8,7 @@ import pandas as pd
 from astropy.cosmology import FlatLambdaCDM
 from astropy.io import fits
 from astropy.wcs import WCS
+from astropy.wcs.utils import proj_plane_pixel_scales
 
 from .photometry import read_lenstool_image_catalog, write_photometric_image_catalog
 
@@ -34,6 +35,8 @@ class TruthMagnitudeConfig:
     color_scatter_sigma: float = 0.15
     magnitude_error: float = 0.01
     mu_floor: float = 1.0e-3
+    mu_max: float = 50.0
+    mu_aperture_radius_arcsec: float = 0.5
     random_seed: int = 12_345
     band_colors_rel_f160w: dict[str, float] = field(default_factory=lambda: dict(HST_BAND_COLOR_REL_F160W))
 
@@ -65,6 +68,66 @@ def _bilinear_sample(data: np.ndarray, x_pix: np.ndarray, y_pix: np.ndarray) -> 
         + (1.0 - wx) * wy * data[y1, x0]
         + wx * wy * data[y1, x1]
     )
+
+
+def _safe_inverse_determinant(det_a: np.ndarray) -> np.ndarray:
+    det = np.asarray(det_a, dtype=float)
+    sign = np.where(det < 0.0, -1.0, 1.0)
+    safe_det = np.where(np.isfinite(det) & (np.abs(det) > 1.0e-12), det, sign * 1.0e-12)
+    return 1.0 / safe_det
+
+
+def _circular_offsets(radius_pixels: float) -> tuple[np.ndarray, np.ndarray]:
+    radius = float(radius_pixels)
+    if not np.isfinite(radius) or radius <= 0.0:
+        return np.asarray([0.0]), np.asarray([0.0])
+    max_offset = int(np.ceil(radius))
+    yy, xx = np.mgrid[-max_offset : max_offset + 1, -max_offset : max_offset + 1]
+    keep = np.square(xx) + np.square(yy) <= np.square(radius)
+    if not np.any(keep):
+        return np.asarray([0.0]), np.asarray([0.0])
+    return xx[keep].astype(float), yy[keep].astype(float)
+
+
+def _pixel_scale_arcsec(wcs: WCS) -> float:
+    scales = np.asarray(proj_plane_pixel_scales(wcs), dtype=float) * 3600.0
+    finite = scales[np.isfinite(scales) & (scales > 0.0)]
+    if finite.size == 0:
+        raise ValueError("Could not determine a finite positive pixel scale from the magnification-map WCS.")
+    return float(np.mean(finite))
+
+
+def _effective_abs_magnification(
+    kappa_ref_map: np.ndarray,
+    gamma_x_ref_map: np.ndarray,
+    gamma_y_ref_map: np.ndarray,
+    x_pix: np.ndarray,
+    y_pix: np.ndarray,
+    scale: np.ndarray,
+    *,
+    wcs: WCS,
+    config: TruthMagnitudeConfig,
+) -> np.ndarray:
+    radius_arcsec = max(float(config.mu_aperture_radius_arcsec), 0.0)
+    radius_pixels = radius_arcsec / _pixel_scale_arcsec(wcs)
+    dx, dy = _circular_offsets(radius_pixels)
+    sample_x = np.asarray(x_pix, dtype=float)[:, None] + dx[None, :]
+    sample_y = np.asarray(y_pix, dtype=float)[:, None] + dy[None, :]
+
+    kappa_ref = _bilinear_sample(kappa_ref_map, sample_x, sample_y)
+    gamma_x_ref = _bilinear_sample(gamma_x_ref_map, sample_x, sample_y)
+    gamma_y_ref = _bilinear_sample(gamma_y_ref_map, sample_x, sample_y)
+    scale_2d = np.asarray(scale, dtype=float)[:, None]
+    det_a = (
+        np.square(1.0 - scale_2d * kappa_ref)
+        - np.square(scale_2d * gamma_x_ref)
+        - np.square(scale_2d * gamma_y_ref)
+    )
+    abs_mu_samples = np.abs(_safe_inverse_determinant(det_a))
+    abs_mu_samples = np.maximum(abs_mu_samples, float(config.mu_floor))
+    if np.isfinite(float(config.mu_max)) and float(config.mu_max) > 0.0:
+        abs_mu_samples = np.minimum(abs_mu_samples, float(config.mu_max))
+    return np.mean(abs_mu_samples, axis=1)
 
 
 def _lensing_efficiency(cosmo: FlatLambdaCDM, z_lens: float, z_source: np.ndarray | float) -> np.ndarray:
@@ -129,8 +192,22 @@ def build_truth_magnitude_catalog(
     gamma_x = scale * gamma_x_ref
     gamma_y = scale * gamma_y_ref
     det_a = np.square(1.0 - kappa) - np.square(gamma_x) - np.square(gamma_y)
-    mu = 1.0 / np.where(np.isfinite(det_a) & (np.abs(det_a) > 1.0e-12), det_a, np.sign(det_a) * 1.0e-12)
-    abs_mu = np.maximum(np.abs(mu), float(config.mu_floor))
+    mu = _safe_inverse_determinant(det_a)
+    point_abs_mu = np.maximum(np.abs(mu), float(config.mu_floor))
+    if np.isfinite(float(config.mu_max)) and float(config.mu_max) > 0.0:
+        point_abs_mu_clipped = np.minimum(point_abs_mu, float(config.mu_max))
+    else:
+        point_abs_mu_clipped = point_abs_mu
+    abs_mu = _effective_abs_magnification(
+        kappa_z9,
+        gamma_x_z9,
+        gamma_y_z9,
+        x_pix,
+        y_pix,
+        scale,
+        wcs=wcs,
+        config=config,
+    )
 
     bands = sorted(config.band_colors_rel_f160w)
     source_magnitudes = _family_source_magnitudes(image_catalog, bands, config)
@@ -152,6 +229,10 @@ def build_truth_magnitude_catalog(
             else float(1.0),
             "truth_mu": float(mu[row_index]),
             "truth_abs_mu": float(abs_mu[row_index]),
+            "truth_point_abs_mu": float(point_abs_mu[row_index]),
+            "truth_point_abs_mu_clipped": float(point_abs_mu_clipped[row_index]),
+            "truth_mu_max": float(config.mu_max),
+            "truth_mu_aperture_radius_arcsec": float(config.mu_aperture_radius_arcsec),
         }
         band_mags: list[float] = []
         for band in bands:

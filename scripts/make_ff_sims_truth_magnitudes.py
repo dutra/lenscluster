@@ -42,6 +42,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--color-scatter-sigma", type=float, default=0.15)
     parser.add_argument("--magnitude-error", type=float, default=0.01)
     parser.add_argument("--mu-floor", type=float, default=1.0e-3)
+    parser.add_argument(
+        "--mu-max",
+        type=float,
+        default=50.0,
+        help="Maximum absolute magnification used when averaging finite-source truth magnitudes.",
+    )
+    parser.add_argument(
+        "--mu-aperture-radius-arcsec",
+        type=float,
+        default=0.5,
+        help="Image-plane aperture radius for averaging the true magnification map.",
+    )
     return parser
 
 
@@ -62,6 +74,8 @@ def _process_cluster(cluster: str, data_root: Path, args: argparse.Namespace) ->
         color_scatter_sigma=float(args.color_scatter_sigma),
         magnitude_error=float(args.magnitude_error),
         mu_floor=float(args.mu_floor),
+        mu_max=float(args.mu_max),
+        mu_aperture_radius_arcsec=float(args.mu_aperture_radius_arcsec),
     )
     catalog, band_table, _reference = build_truth_magnitude_catalog(
         image_catalog,
