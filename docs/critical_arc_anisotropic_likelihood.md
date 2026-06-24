@@ -259,6 +259,31 @@ The implemented version adds several practical layers:
 So the clean anisotropic likelihood is the conceptual core. The implementation
 adds robustness and sampler-stability details needed for real fitting.
 
+## Lenscluster Option
+
+`lenscluster` now exposes this cleaner anisotropic version as:
+
+```python
+stage1_likelihood = "critical-arc-anisotropic"
+```
+
+The same value can be used for `stage0_likelihood` and `stage2_forward_mode`
+when those stages should use the anisotropic critical-arc likelihood. Internally
+this maps to:
+
+```text
+critical-arc-anisotropic-image-plane
+```
+
+The existing option
+
+```python
+stage1_likelihood = "critical-arc"
+```
+
+continues to select the older robust mixture implementation,
+`critical-arc-mixture-image-plane`.
+
 ## Image-Plane Versus Source-Plane Use
 
 This unified likelihood is most natural in the image plane. The anisotropic

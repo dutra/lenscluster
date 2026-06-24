@@ -262,6 +262,44 @@ def test_compile_run_plan_resolves_unified_critical_arc_stage_policies() -> None
     ]
 
 
+def test_compile_run_plan_resolves_critical_arc_anisotropic_stage_policies() -> None:
+    config = _minimal_sequential_config().with_updates(
+        workflow=WorkflowConfig(
+            fit_mode="sequential",
+            stage0_likelihood="critical-arc-anisotropic",
+            stage1_likelihood="critical-arc-anisotropic",
+            stage2_forward_mode="critical-arc-anisotropic",
+        ),
+        schedule=StageScheduleConfig(
+            fit_method=("svi+nuts", "svi+nuts"),
+            svi_steps=(10, 20, 30),
+            refresh_every=(None, 100, 100),
+            warmup=(1, 1),
+            samples=(2, 2),
+            sampling_refresh_runs=(1,),
+            max_tree_depth=(8, 8),
+        ),
+    )
+
+    plan = compile_run_plan(config)
+
+    assert [stage.sample_likelihood_mode for stage in plan.stages] == [
+        "critical-arc-anisotropic-image-plane",
+        "critical-arc-anisotropic-image-plane",
+        "critical-arc-anisotropic-image-plane",
+    ]
+    assert [stage.likelihood_family for stage in plan.stages] == [
+        "critical-arc",
+        "critical-arc",
+        "critical-arc",
+    ]
+    assert [stage.source_position_policy for stage in plan.stages] == [
+        "centroid-fixed",
+        "centroid-fixed",
+        "sampled",
+    ]
+
+
 def test_config_validation_rejects_old_stage1_critical_arc_mixture_name() -> None:
     config = _minimal_sequential_config().with_updates(
         workflow=WorkflowConfig(
@@ -299,7 +337,7 @@ def test_workflow_config_defaults_stage0_likelihood_to_source() -> None:
 
 
 def test_config_validation_accepts_stage0_likelihood_values() -> None:
-    for value in ("source", "local-jacobian", "critical-arc"):
+    for value in ("source", "local-jacobian", "critical-arc", "critical-arc-anisotropic"):
         _minimal_sequential_config().with_updates(
             workflow=WorkflowConfig(fit_mode="sequential", stage0_likelihood=value),
         ).validate()
