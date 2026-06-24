@@ -406,10 +406,15 @@ DEFAULT_MAGNITUDE_BASE_SCATTER_PRIOR_LOG_SIGMA = 0.75
 DEFAULT_MAGNITUDE_ARC_SCATTER_UPPER = 5.0
 DEFAULT_MAGNITUDE_ARC_SCATTER_PRIOR_MEDIAN = 0.50
 DEFAULT_MAGNITUDE_ARC_SCATTER_PRIOR_LOG_SIGMA = 0.75
+DEFAULT_MAGNITUDE_ARC_BIAS_LOWER = -2.0
+DEFAULT_MAGNITUDE_ARC_BIAS_UPPER = 2.0
+DEFAULT_MAGNITUDE_ARC_BIAS_PRIOR_MEAN = 0.0
+DEFAULT_MAGNITUDE_ARC_BIAS_PRIOR_STD = 0.5
 DEFAULT_MAGNITUDE_MU_FLOOR = 1.0e-3
 DEFAULT_MAGNITUDE_MIN_RELIABILITY = 1.0e-3
 MAGNITUDE_BASE_SCATTER_SAMPLE_NAME = "magnitude_base_scatter"
 MAGNITUDE_ARC_SCATTER_SAMPLE_NAME = "magnitude_arc_scatter"
+MAGNITUDE_ARC_BIAS_SAMPLE_NAME = "magnitude_arc_bias"
 MAGNITUDE_SCATTER_COMPONENT_FAMILY = "magnitude_scatter"
 CRITICAL_ARC_EIGENGAP_RELATIVE_SOFTENING = 1.0e-3
 CRITICAL_ARC_EIGENGAP_VALUE_ABSOLUTE_SOFTENING = 1.0e-18
@@ -5830,6 +5835,7 @@ def _family_magnitude_loglike(
     magnitude_sigma_floor: float = DEFAULT_MAGNITUDE_SIGMA_FLOOR,
     magnitude_base_scatter: float | jnp.ndarray = 0.0,
     magnitude_arc_scatter: float | jnp.ndarray = 0.0,
+    magnitude_arc_bias: float | jnp.ndarray = 0.0,
     magnitude_mu_floor: float = DEFAULT_MAGNITUDE_MU_FLOOR,
     magnitude_min_reliability: float = DEFAULT_MAGNITUDE_MIN_RELIABILITY,
     singular_min_precomputed: jnp.ndarray | None = None,
@@ -5896,6 +5902,7 @@ def _family_magnitude_loglike(
         (jnp.asarray(singular_threshold, dtype=jnp.float64) - jax.lax.stop_gradient(singular_min))
         / jnp.asarray(singular_softness, dtype=jnp.float64)
     )
+    source_mag_estimate = source_mag_estimate - jnp.asarray(magnitude_arc_bias, dtype=jnp.float64) * arc_gate
     if measurement_error_input is None:
         measurement_sigma = jnp.full_like(magnitudes, float(magnitude_sigma_floor), dtype=jnp.float64)
     else:
@@ -16451,6 +16458,38 @@ def _build_magnitude_scatter_parameter_spec(
     )
 
 
+def _build_magnitude_arc_bias_parameter_spec() -> ParameterSpec:
+    lower = float(DEFAULT_MAGNITUDE_ARC_BIAS_LOWER)
+    upper = float(DEFAULT_MAGNITUDE_ARC_BIAS_UPPER)
+    mean = float(DEFAULT_MAGNITUDE_ARC_BIAS_PRIOR_MEAN)
+    std = float(DEFAULT_MAGNITUDE_ARC_BIAS_PRIOR_STD)
+    if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+        raise ValueError("magnitude arc-bias bounds must be finite and ordered.")
+    if not np.isfinite(mean) or not (lower < mean < upper):
+        raise ValueError("magnitude arc-bias prior mean must be between bounds.")
+    if not np.isfinite(std) or std <= 0.0:
+        raise ValueError("magnitude arc-bias prior std must be finite and positive.")
+    return ParameterSpec(
+        name="magnitude.arc_bias",
+        sample_name=MAGNITUDE_ARC_BIAS_SAMPLE_NAME,
+        potential_id="magnitude",
+        profile_type=0,
+        field="arc_bias",
+        prior_kind="truncated_normal",
+        lower=lower,
+        upper=upper,
+        step=0.05,
+        mean=mean,
+        std=std,
+        component_family=MAGNITUDE_SCATTER_COMPONENT_FAMILY,
+        transform_kind="identity",
+        physical_lower=lower,
+        physical_upper=upper,
+        physical_mean=mean,
+        physical_std=std,
+    )
+
+
 def _build_critical_arc_singular_threshold_parameter_spec(
     start_index: int,
     *,
@@ -18213,6 +18252,14 @@ class ClusterJAXEvaluator:
             ),
             -1,
         )
+        self.magnitude_arc_bias_param_index = next(
+            (
+                idx
+                for idx, spec in enumerate(self.state.parameter_specs)
+                if spec.sample_name == MAGNITUDE_ARC_BIAS_SAMPLE_NAME
+            ),
+            -1,
+        )
         self.log_softening_length_param_index = next(
             (
                 idx
@@ -19064,6 +19111,14 @@ class ClusterJAXEvaluator:
             jnp.asarray(self.magnitude_arc_scatter_param_index, dtype=jnp.int32),
         )
 
+    def _magnitude_arc_bias_from_physical(self, physical_params: jnp.ndarray) -> jnp.ndarray:
+        if self.magnitude_arc_bias_param_index < 0:
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        return jnp.take(
+            physical_params,
+            jnp.asarray(self.magnitude_arc_bias_param_index, dtype=jnp.int32),
+        )
+
     def _critical_arc_singular_threshold_from_physical(self, physical_params: jnp.ndarray) -> jnp.ndarray:
         param_index = int(getattr(self, "critical_arc_singular_threshold_param_index", -1))
         if param_index < 0:
@@ -19456,6 +19511,7 @@ class ClusterJAXEvaluator:
             magnitude_sigma_floor=self.magnitude_sigma_floor,
             magnitude_base_scatter=self._magnitude_base_scatter_from_physical(physical_params),
             magnitude_arc_scatter=self._magnitude_arc_scatter_from_physical(physical_params),
+            magnitude_arc_bias=self._magnitude_arc_bias_from_physical(physical_params),
             magnitude_mu_floor=self.magnitude_mu_floor,
             magnitude_min_reliability=self.magnitude_min_reliability,
             singular_min_precomputed=singular_min,
@@ -19495,6 +19551,7 @@ class ClusterJAXEvaluator:
             magnitude_sigma_floor=self.magnitude_sigma_floor,
             magnitude_base_scatter=self._magnitude_base_scatter_from_physical(physical_params),
             magnitude_arc_scatter=self._magnitude_arc_scatter_from_physical(physical_params),
+            magnitude_arc_bias=self._magnitude_arc_bias_from_physical(physical_params),
             magnitude_mu_floor=self.magnitude_mu_floor,
             magnitude_min_reliability=self.magnitude_min_reliability,
             singular_min_precomputed=singular_min,
@@ -27631,6 +27688,7 @@ def _build_state_from_inputs(
                 prior_log_sigma=DEFAULT_MAGNITUDE_ARC_SCATTER_PRIOR_LOG_SIGMA,
             )
         )
+        parameter_specs.append(_build_magnitude_arc_bias_parameter_spec())
     if (
         bool(getattr(args, "sample_critical_arc_singular_threshold", False))
         and _sample_likelihood_uses_critical_arc_terms(sample_likelihood_mode)

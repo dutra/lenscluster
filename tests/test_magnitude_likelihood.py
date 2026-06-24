@@ -164,6 +164,48 @@ def test_family_magnitude_loglike_uses_arc_gated_scatter():
     assert arc_broadened > base_only
 
 
+def test_family_magnitude_loglike_uses_arc_bias_to_repair_systematic_arc_offset():
+    family_idx = jnp.array([0, 0, 0], dtype=jnp.int32)
+    image_has_constraint = jnp.array([True, True, True])
+    reliability = jnp.ones(3)
+    magnitudes = jnp.array([24.0, 24.05, 24.50])
+    jacobian_entries = (jnp.ones(3), jnp.zeros(3), jnp.zeros(3), jnp.ones(3))
+    singular_min = jnp.array([1.0, 1.0, 0.01])
+
+    no_bias = _family_magnitude_loglike(
+        magnitudes,
+        None,
+        reliability,
+        image_has_constraint,
+        family_idx,
+        1,
+        *jacobian_entries,
+        magnitude_base_scatter=0.05,
+        magnitude_arc_scatter=0.10,
+        magnitude_arc_bias=0.0,
+        singular_min_precomputed=singular_min,
+        singular_threshold=0.05,
+        singular_softness=0.01,
+    )
+    repaired = _family_magnitude_loglike(
+        magnitudes,
+        None,
+        reliability,
+        image_has_constraint,
+        family_idx,
+        1,
+        *jacobian_entries,
+        magnitude_base_scatter=0.05,
+        magnitude_arc_scatter=0.10,
+        magnitude_arc_bias=0.50,
+        singular_min_precomputed=singular_min,
+        singular_threshold=0.05,
+        singular_softness=0.01,
+    )
+
+    assert repaired > no_bias
+
+
 def test_truth_magnitude_uses_capped_aperture_average_for_near_critical_pixel():
     wcs = WCS(naxis=2)
     wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
