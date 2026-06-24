@@ -136,7 +136,10 @@ from .model import (
     GeometryCache,
     ActiveInferenceFlatCache,
     NUTSInitialization,
+    PackedLensDetails,
     PackedLensSpec,
+    PackedLensState,
+    PackedLensValidity,
     ParameterSpec,
     PosteriorResults,
     Stage1PriorSummary,
@@ -6630,7 +6633,7 @@ def _critical_arc_debug_terms_for_state(
                     kpc_per_arcsec=bin_kpc_per_arcsec,
                     dpie_sigma0_factor=bin_dpie_sigma0_factor,
                 )
-            invalid = ~validity["is_valid"]
+            invalid = ~validity.is_valid
             beta_x, beta_y = jax.lax.cond(
                 invalid,
                 lambda _: (x_obs, y_obs),
@@ -9354,8 +9357,8 @@ def _perturbation_discovery_union_from_evaluator(
         flat_data,
         stop_gradient=False,
     )
-    if not bool(np.asarray(validity["is_valid"], dtype=bool)):
-        evaluator._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+    if not bool(np.asarray(validity.is_valid, dtype=bool)):
+        evaluator._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
         return selected_by_potfile, {
             "count": 0,
             "exact_unique": 0,
@@ -18863,7 +18866,7 @@ class ClusterJAXEvaluator:
                 stop_gradient=True,
             )
             beta_x, beta_y = jax.lax.cond(
-                validity["is_valid"],
+                validity.is_valid,
                 lambda current_state: self._ray_shooting_for_components(
                     bin_data.effective_z_source,
                     bin_data.x_obs,
@@ -19225,8 +19228,8 @@ class ClusterJAXEvaluator:
             y_obs = jnp.asarray(bin_data.y_obs, dtype=jnp.float64)
             packed_state = self._build_packed_lens_state(reference_jax, bin_data.effective_z_source)
             validity = self._packed_lens_validity_from_params(reference_jax, bin_data.effective_z_source, stop_gradient=False)
-            if not bool(np.asarray(validity["is_valid"], dtype=bool)):
-                self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+            if not bool(np.asarray(validity.is_valid, dtype=bool)):
+                self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
                 self.scaling_scatter_cache_by_z = {}
                 self._refresh_flat_critical_arc_scatter_arrays()
                 return
@@ -19297,8 +19300,8 @@ class ClusterJAXEvaluator:
             flat_data,
             stop_gradient=False,
         )
-        if not bool(np.asarray(validity["is_valid"], dtype=bool)):
-            self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+        if not bool(np.asarray(validity.is_valid, dtype=bool)):
+            self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
             self._refresh_flat_critical_arc_scatter_arrays()
             return
         beta_x, beta_y = self._flat_ray_shooting_for_components(
@@ -19321,8 +19324,8 @@ class ClusterJAXEvaluator:
                 core_log_offset=core_offset,
                 cut_log_offset=cut_offset,
             )
-            if not bool(np.asarray(plus_validity["is_valid"], dtype=bool)):
-                self._record_invalid_state_callback(np.asarray(plus_validity["reason_flags"], dtype=bool))
+            if not bool(np.asarray(plus_validity.is_valid, dtype=bool)):
+                self._record_invalid_state_callback(np.asarray(plus_validity.reason_flags, dtype=bool))
                 raise ValueError("invalid flat scaling-scatter offset state")
             beta_plus_x, beta_plus_y = self._flat_ray_shooting_for_components(
                 flat_data.x_obs,
@@ -19386,8 +19389,8 @@ class ClusterJAXEvaluator:
             flat_data,
             stop_gradient=False,
         )
-        if not bool(np.asarray(validity["is_valid"], dtype=bool)):
-            self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+        if not bool(np.asarray(validity.is_valid, dtype=bool)):
+            self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
             return
         jac_a00, jac_a01, jac_a10, jac_a11 = self._flat_lensing_jacobian_for_components(
             flat_data.x_obs,
@@ -19437,8 +19440,8 @@ class ClusterJAXEvaluator:
                 bin_data.effective_z_source,
                 stop_gradient=False,
             )
-            if not bool(np.asarray(validity["is_valid"], dtype=bool)):
-                self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+            if not bool(np.asarray(validity.is_valid, dtype=bool)):
+                self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
                 return
             jac_a00, jac_a01, jac_a10, jac_a11 = self._lensing_jacobian_for_components(
                 bin_data.effective_z_source,
@@ -19501,35 +19504,35 @@ class ClusterJAXEvaluator:
         jax.debug.callback(self._record_invalid_state_callback, reason_flags)
         return jnp.int32(0)
 
-    def _bulk_ray_shooting_kwargs(self, packed_state: dict[str, Any]) -> dict[str, Any]:
+    def _bulk_ray_shooting_kwargs(self, packed_state: PackedLensState) -> dict[str, Any]:
         return self._bulk_ray_shooting_kwargs_from_indices(packed_state)
 
     def _bulk_ray_shooting_kwargs_from_indices(
         self,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> dict[str, Any]:
         if component_indices is None:
             component_indices = np.arange(len(self.bulk_index_list), dtype=np.int32)
         component_indices_jax = jnp.asarray(component_indices, dtype=jnp.int32)
         all_kwargs = {
-            "sigma0": jnp.take(jnp.asarray(packed_state["sigma0"], dtype=jnp.float64), component_indices_jax),
-            "Ra": jnp.take(jnp.asarray(packed_state["Ra"], dtype=jnp.float64), component_indices_jax),
-            "Rs": jnp.take(jnp.asarray(packed_state["Rs"], dtype=jnp.float64), component_indices_jax),
-            "e1": jnp.take(jnp.asarray(packed_state["e1"], dtype=jnp.float64), component_indices_jax),
-            "e2": jnp.take(jnp.asarray(packed_state["e2"], dtype=jnp.float64), component_indices_jax),
-            "center_x": jnp.take(jnp.asarray(packed_state["center_x"], dtype=jnp.float64), component_indices_jax),
-            "center_y": jnp.take(jnp.asarray(packed_state["center_y"], dtype=jnp.float64), component_indices_jax),
-            "gamma1": jnp.take(jnp.asarray(packed_state["gamma1"], dtype=jnp.float64), component_indices_jax),
-            "gamma2": jnp.take(jnp.asarray(packed_state["gamma2"], dtype=jnp.float64), component_indices_jax),
-            "ra_0": jnp.zeros_like(jnp.take(jnp.asarray(packed_state["gamma1"], dtype=jnp.float64), component_indices_jax)),
-            "dec_0": jnp.zeros_like(jnp.take(jnp.asarray(packed_state["gamma2"], dtype=jnp.float64), component_indices_jax)),
+            "sigma0": jnp.take(jnp.asarray(packed_state.sigma0, dtype=jnp.float64), component_indices_jax),
+            "Ra": jnp.take(jnp.asarray(packed_state.Ra, dtype=jnp.float64), component_indices_jax),
+            "Rs": jnp.take(jnp.asarray(packed_state.Rs, dtype=jnp.float64), component_indices_jax),
+            "e1": jnp.take(jnp.asarray(packed_state.e1, dtype=jnp.float64), component_indices_jax),
+            "e2": jnp.take(jnp.asarray(packed_state.e2, dtype=jnp.float64), component_indices_jax),
+            "center_x": jnp.take(jnp.asarray(packed_state.center_x, dtype=jnp.float64), component_indices_jax),
+            "center_y": jnp.take(jnp.asarray(packed_state.center_y, dtype=jnp.float64), component_indices_jax),
+            "gamma1": jnp.take(jnp.asarray(packed_state.gamma1, dtype=jnp.float64), component_indices_jax),
+            "gamma2": jnp.take(jnp.asarray(packed_state.gamma2, dtype=jnp.float64), component_indices_jax),
+            "ra_0": jnp.zeros_like(jnp.take(jnp.asarray(packed_state.gamma1, dtype=jnp.float64), component_indices_jax)),
+            "dec_0": jnp.zeros_like(jnp.take(jnp.asarray(packed_state.gamma2, dtype=jnp.float64), component_indices_jax)),
         }
         return {"all_kwargs": all_kwargs, "index_list": jnp.asarray(self.bulk_index_list[component_indices], dtype=jnp.int32)}
 
     def _flat_bulk_ray_shooting_kwargs_from_indices(
         self,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> dict[str, Any]:
         if component_indices is None:
@@ -19540,23 +19543,23 @@ class ClusterJAXEvaluator:
             return jnp.take(jnp.asarray(value, dtype=dtype), component_indices_jax, axis=0)
 
         all_kwargs = {
-            "sigma0": take_components(packed_state["sigma0"]),
-            "Ra": take_components(packed_state["Ra"]),
-            "Rs": take_components(packed_state["Rs"]),
-            "e1": take_components(packed_state["e1"]),
-            "e2": take_components(packed_state["e2"]),
-            "center_x": take_components(packed_state["center_x"]),
-            "center_y": take_components(packed_state["center_y"]),
-            "gamma1": take_components(packed_state["gamma1"]),
-            "gamma2": take_components(packed_state["gamma2"]),
-            "ra_0": jnp.zeros_like(take_components(packed_state["gamma1"])),
-            "dec_0": jnp.zeros_like(take_components(packed_state["gamma2"])),
+            "sigma0": take_components(packed_state.sigma0),
+            "Ra": take_components(packed_state.Ra),
+            "Rs": take_components(packed_state.Rs),
+            "e1": take_components(packed_state.e1),
+            "e2": take_components(packed_state.e2),
+            "center_x": take_components(packed_state.center_x),
+            "center_y": take_components(packed_state.center_y),
+            "gamma1": take_components(packed_state.gamma1),
+            "gamma2": take_components(packed_state.gamma2),
+            "ra_0": jnp.zeros_like(take_components(packed_state.gamma1)),
+            "dec_0": jnp.zeros_like(take_components(packed_state.gamma2)),
         }
         return {"all_kwargs": all_kwargs, "index_list": jnp.asarray(self.bulk_index_list[component_indices], dtype=jnp.int32)}
 
     def _packed_state_to_kwargs_lens_jax(
         self,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> list[dict[str, jnp.ndarray]]:
         profile_type = np.asarray(self.state.packed_lens_spec.profile_type, dtype=int)
@@ -19572,20 +19575,20 @@ class ClusterJAXEvaluator:
             if profile == DP_IE_PROFILE:
                 kwargs_lens.append(
                     {
-                        "sigma0": packed_state["sigma0"][idx],
-                        "Ra": packed_state["Ra"][idx],
-                        "Rs": packed_state["Rs"][idx],
-                        "e1": packed_state["e1"][idx],
-                        "e2": packed_state["e2"][idx],
-                        "center_x": packed_state["center_x"][idx],
-                        "center_y": packed_state["center_y"][idx],
+                        "sigma0": packed_state.sigma0[idx],
+                        "Ra": packed_state.Ra[idx],
+                        "Rs": packed_state.Rs[idx],
+                        "e1": packed_state.e1[idx],
+                        "e2": packed_state.e2[idx],
+                        "center_x": packed_state.center_x[idx],
+                        "center_y": packed_state.center_y[idx],
                     }
                 )
             elif profile == SHEAR_PROFILE:
                 kwargs_lens.append(
                     {
-                        "gamma1": packed_state["gamma1"][idx],
-                        "gamma2": packed_state["gamma2"][idx],
+                        "gamma1": packed_state.gamma1[idx],
+                        "gamma2": packed_state.gamma2[idx],
                     }
                 )
             else:  # pragma: no cover
@@ -19705,7 +19708,7 @@ class ClusterJAXEvaluator:
             dpie_sigma0_factors=sampled_dpie_sigma0_factors,
         )
         self._maybe_record_invalid_state(validity)
-        invalid = ~validity["is_valid"]
+        invalid = ~validity.is_valid
         beta_active_x, beta_active_y = jax.lax.cond(
             invalid,
             lambda _: (flat_data.x_obs, flat_data.y_obs),
@@ -19728,7 +19731,7 @@ class ClusterJAXEvaluator:
         self,
         params: jnp.ndarray,
         flat_data: FlatCriticalArcData,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         invalid: jnp.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         active_jacobian_entries = jax.lax.cond(
@@ -20001,8 +20004,8 @@ class ClusterJAXEvaluator:
             flat_data,
             stop_gradient=False,
         )
-        if not bool(np.asarray(validity["is_valid"], dtype=bool)):
-            self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+        if not bool(np.asarray(validity.is_valid, dtype=bool)):
+            self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
             return
         alpha_x_rows: list[np.ndarray] = []
         alpha_y_rows: list[np.ndarray] = []
@@ -20165,7 +20168,7 @@ class ClusterJAXEvaluator:
             dpie_sigma0_factors=sampled_dpie_sigma0_factors,
         )
         self._maybe_record_invalid_state(validity)
-        invalid = ~validity["is_valid"]
+        invalid = ~validity.is_valid
         beta_x, beta_y, jac_a00, jac_a01, jac_a10, jac_a11 = jax.lax.cond(
             invalid,
             lambda _: (
@@ -20357,7 +20360,7 @@ class ClusterJAXEvaluator:
                 stop_gradient=True,
             )
             self._maybe_record_invalid_state(cab_validity)
-            cab_invalid = ~cab_validity["is_valid"]
+            cab_invalid = ~cab_validity.is_valid
             cab_loglike = self._cab_morphology_loglike_for_arcs(
                 arc_data,
                 cab_packed_state,
@@ -20391,7 +20394,7 @@ class ClusterJAXEvaluator:
             dpie_sigma0_factors=sampled_dpie_sigma0_factors,
         )
         self._maybe_record_invalid_state(validity)
-        invalid = ~validity["is_valid"]
+        invalid = ~validity.is_valid
         beta_x, beta_y, jac_a00, jac_a01, jac_a10, jac_a11 = jax.lax.cond(
             invalid,
             lambda _: (
@@ -20488,7 +20491,7 @@ class ClusterJAXEvaluator:
             dpie_sigma0_factors=sampled_dpie_sigma0_factors,
         )
         self._maybe_record_invalid_state(validity)
-        invalid = ~validity["is_valid"]
+        invalid = ~validity.is_valid
         beta_x, beta_y, jac_a00, jac_a01, jac_a10, jac_a11 = jax.lax.cond(
             invalid,
             lambda _: (
@@ -20610,7 +20613,7 @@ class ClusterJAXEvaluator:
                 stop_gradient=True,
             )
             self._maybe_record_invalid_state(cab_validity)
-            cab_invalid = ~cab_validity["is_valid"]
+            cab_invalid = ~cab_validity.is_valid
             cab_loglike = self._cab_morphology_loglike_for_arcs(
                 arc_data,
                 cab_packed_state,
@@ -20859,7 +20862,7 @@ class ClusterJAXEvaluator:
         self,
         params: jnp.ndarray,
         z_source: float,
-    ) -> tuple[dict[str, Any], dict[str, jnp.ndarray]]:
+    ) -> tuple[PackedLensState, PackedLensDetails]:
         transform_kind_log_positive_mask = getattr(self, "transform_kind_log_positive_mask", None)
         if transform_kind_log_positive_mask is None:
             transform_kind_array = np.asarray(
@@ -20902,7 +20905,7 @@ class ClusterJAXEvaluator:
         *,
         kpc_per_arcsec: jnp.ndarray | None = None,
         dpie_sigma0_factor: jnp.ndarray | None = None,
-    ) -> tuple[dict[str, Any], dict[str, jnp.ndarray]]:
+    ) -> tuple[PackedLensState, PackedLensDetails]:
         spec_jax = self.packed_spec_jax
         x_center = self._apply_param_updates(spec_jax["x_center_base"], spec_jax["x_center_param_index"], physical_params)
         y_center = self._apply_param_updates(spec_jax["y_center_base"], spec_jax["y_center_param_index"], physical_params)
@@ -21003,85 +21006,84 @@ class ClusterJAXEvaluator:
         )
         sigma0 = branch_weight * (v_disp**2) * safe_factor / ra
 
-        packed_state = {
-            "__packed__": True,
-            "profile_type": profile_type,
-            "sigma0": jnp.where(is_dpie, sigma0, 0.0),
-            "Ra": jnp.where(is_dpie, ra, 0.0),
-            "Rs": jnp.where(is_dpie, rs, 0.0),
-            "e1": jnp.where(is_dpie, e1, 0.0),
-            "e2": jnp.where(is_dpie, e2, 0.0),
-            "center_x": x_center,
-            "center_y": y_center,
-            "gamma1": jnp.where(is_shear, gamma1, 0.0),
-            "gamma2": jnp.where(is_shear, gamma2, 0.0),
-        }
-        details = {
-            "is_dpie": is_dpie,
-            "is_shear": is_shear,
-            "is_scaling": is_scaling,
-            "sigma0": sigma0,
-            "ra_raw": ra_raw,
-            "rs_raw": rs_raw,
-            "core_radius_kpc": core_radius_kpc,
-            "core_radius_effective_kpc": core_radius_effective_kpc,
-            "softening_length_kpc": softening_length_kpc,
-            "log_softening_length_kpc": log_softening_length_kpc,
-            "v_disp": v_disp,
-            "alpha_sigma": alpha_sigma,
-            "beta_radius": beta_radius,
-            "gamma_ml": gamma_ml,
-            "x_center": x_center,
-            "y_center": y_center,
-            "gamma1": gamma1,
-            "gamma2": gamma2,
-            "e1": e1,
-            "e2": e2,
-            "factor_array": factor_array,
-            "independent_branch_weight": branch_weight,
-        }
+        packed_state = PackedLensState(
+            profile_type=profile_type,
+            sigma0=jnp.where(is_dpie, sigma0, 0.0),
+            Ra=jnp.where(is_dpie, ra, 0.0),
+            Rs=jnp.where(is_dpie, rs, 0.0),
+            e1=jnp.where(is_dpie, e1, 0.0),
+            e2=jnp.where(is_dpie, e2, 0.0),
+            center_x=x_center,
+            center_y=y_center,
+            gamma1=jnp.where(is_shear, gamma1, 0.0),
+            gamma2=jnp.where(is_shear, gamma2, 0.0),
+        )
+        details = PackedLensDetails(
+            is_dpie=is_dpie,
+            is_shear=is_shear,
+            is_scaling=is_scaling,
+            sigma0=sigma0,
+            ra_raw=ra_raw,
+            rs_raw=rs_raw,
+            core_radius_kpc=core_radius_kpc,
+            core_radius_effective_kpc=core_radius_effective_kpc,
+            softening_length_kpc=softening_length_kpc,
+            log_softening_length_kpc=log_softening_length_kpc,
+            v_disp=v_disp,
+            alpha_sigma=alpha_sigma,
+            beta_radius=beta_radius,
+            gamma_ml=gamma_ml,
+            x_center=x_center,
+            y_center=y_center,
+            gamma1=gamma1,
+            gamma2=gamma2,
+            e1=e1,
+            e2=e2,
+            factor_array=factor_array,
+            independent_branch_weight=branch_weight,
+        )
         return packed_state, details
 
     def _packed_lens_validity(
         self,
-        details: dict[str, jnp.ndarray],
-    ) -> dict[str, jnp.ndarray]:
+        details: PackedLensDetails,
+    ) -> PackedLensValidity:
         reason_flags = jnp.stack(
             [
-                jnp.any(details["is_dpie"] & ~jnp.isfinite(details["sigma0"])),
-                jnp.any(details["is_dpie"] & (details["ra_raw"] <= 0.0)),
-                jnp.any(details["is_dpie"] & (details["rs_raw"] <= details["ra_raw"])),
-                jnp.any(details["is_dpie"] & ~jnp.isfinite(details["rs_raw"])),
-                jnp.any(details["is_dpie"] & ~jnp.isfinite(details["v_disp"])),
+                jnp.any(details.is_dpie & ~jnp.isfinite(details.sigma0)),
+                jnp.any(details.is_dpie & (details.ra_raw <= 0.0)),
+                jnp.any(details.is_dpie & (details.rs_raw <= details.ra_raw)),
+                jnp.any(details.is_dpie & ~jnp.isfinite(details.rs_raw)),
+                jnp.any(details.is_dpie & ~jnp.isfinite(details.v_disp)),
                 jnp.any(
-                    details["is_scaling"]
+                    details.is_scaling
                     & (
-                        ~jnp.isfinite(details["alpha_sigma"])
-                        | ~jnp.isfinite(details["beta_radius"])
+                        ~jnp.isfinite(details.alpha_sigma)
+                        | ~jnp.isfinite(details.beta_radius)
                     )
                 ),
-                jnp.any(~jnp.isfinite(details["x_center"]) | ~jnp.isfinite(details["y_center"])),
-                jnp.any(details["is_shear"] & (~jnp.isfinite(details["gamma1"]) | ~jnp.isfinite(details["gamma2"]))),
+                jnp.any(~jnp.isfinite(details.x_center) | ~jnp.isfinite(details.y_center)),
+                jnp.any(details.is_shear & (~jnp.isfinite(details.gamma1) | ~jnp.isfinite(details.gamma2))),
                 jnp.any(
-                    details["is_dpie"]
+                    details.is_dpie
                     & (
-                        ~jnp.isfinite(details["e1"])
-                        | ~jnp.isfinite(details["e2"])
-                        | ((jnp.square(details["e1"]) + jnp.square(details["e2"])) >= 1.0)
+                        ~jnp.isfinite(details.e1)
+                        | ~jnp.isfinite(details.e2)
+                        | ((jnp.square(details.e1) + jnp.square(details.e2)) >= 1.0)
                     )
                 ),
-                ~jnp.isfinite(details["factor_array"]),
+                ~jnp.isfinite(details.factor_array),
             ],
             axis=0,
         )
-        return {"is_valid": ~jnp.any(reason_flags), "reason_flags": reason_flags}
+        return PackedLensValidity(is_valid=~jnp.any(reason_flags), reason_flags=reason_flags)
 
     def _stopped_packed_lens_validity(
         self,
-        details: dict[str, jnp.ndarray],
-    ) -> dict[str, jnp.ndarray]:
+        details: PackedLensDetails,
+    ) -> PackedLensValidity:
         return self._packed_lens_validity(
-            {key: jax.lax.stop_gradient(value) for key, value in details.items()}
+            PackedLensDetails(*(jax.lax.stop_gradient(value) for value in details))
         )
 
     def _packed_lens_validity_from_params(
@@ -21090,7 +21092,7 @@ class ClusterJAXEvaluator:
         z_source: float,
         *,
         stop_gradient: bool,
-    ) -> dict[str, jnp.ndarray]:
+    ) -> PackedLensValidity:
         validity_params = jax.lax.stop_gradient(params) if stop_gradient else params
         _packed_state, details = self._build_packed_lens_state_details(validity_params, z_source)
         return self._packed_lens_validity(details)
@@ -21153,7 +21155,7 @@ class ClusterJAXEvaluator:
         self,
         params: jnp.ndarray,
         z_source: float,
-    ) -> tuple[dict[str, Any], dict[str, jnp.ndarray]]:
+    ) -> tuple[PackedLensState, PackedLensValidity]:
         packed_state, details = self._build_packed_lens_state_details(params, z_source)
         return packed_state, self._packed_lens_validity(details)
 
@@ -21165,7 +21167,7 @@ class ClusterJAXEvaluator:
         stop_gradient: bool,
         kpc_per_arcsec: jnp.ndarray | None = None,
         dpie_sigma0_factor: jnp.ndarray | None = None,
-    ) -> tuple[dict[str, Any], dict[str, jnp.ndarray]]:
+    ) -> tuple[PackedLensState, PackedLensValidity]:
         packed_state, details = self._build_packed_lens_state_details_from_physical(
             physical_params,
             z_source,
@@ -21179,7 +21181,7 @@ class ClusterJAXEvaluator:
         self,
         params: jnp.ndarray,
         z_source: float,
-    ) -> dict[str, Any]:
+    ) -> PackedLensState:
         packed_state, _details = self._build_packed_lens_state_details(params, z_source)
         return packed_state
 
@@ -21191,7 +21193,7 @@ class ClusterJAXEvaluator:
         sigma_log_offset: float | jnp.ndarray = 0.0,
         core_log_offset: float | jnp.ndarray = 0.0,
         cut_log_offset: float | jnp.ndarray = 0.0,
-    ) -> dict[str, Any]:
+    ) -> PackedLensState:
         pack_start = time.perf_counter()
         spec = self.state.packed_lens_spec
         spec_jax = self.packed_spec_jax
@@ -21293,19 +21295,18 @@ class ClusterJAXEvaluator:
         branch_weight = self._independent_branch_weight_from_physical(physical_params)
         sigma0 = branch_weight * (v_disp**2) * safe_factor / ra
 
-        packed_state = {
-            "__packed__": True,
-            "profile_type": profile_type,
-            "sigma0": jnp.where(is_dpie, sigma0, 0.0),
-            "Ra": jnp.where(is_dpie, ra, 0.0),
-            "Rs": jnp.where(is_dpie, rs, 0.0),
-            "e1": jnp.where(is_dpie, e1, 0.0),
-            "e2": jnp.where(is_dpie, e2, 0.0),
-            "center_x": x_center,
-            "center_y": y_center,
-            "gamma1": jnp.where(is_shear, gamma1, 0.0),
-            "gamma2": jnp.where(is_shear, gamma2, 0.0),
-        }
+        packed_state = PackedLensState(
+            profile_type=profile_type,
+            sigma0=jnp.where(is_dpie, sigma0, 0.0),
+            Ra=jnp.where(is_dpie, ra, 0.0),
+            Rs=jnp.where(is_dpie, rs, 0.0),
+            e1=jnp.where(is_dpie, e1, 0.0),
+            e2=jnp.where(is_dpie, e2, 0.0),
+            center_x=x_center,
+            center_y=y_center,
+            gamma1=jnp.where(is_shear, gamma1, 0.0),
+            gamma2=jnp.where(is_shear, gamma2, 0.0),
+        )
         self.timing_totals["packed_parameter_update"] += time.perf_counter() - pack_start
         return packed_state
 
@@ -21320,7 +21321,7 @@ class ClusterJAXEvaluator:
         sigma_log_offset: float | jnp.ndarray = 0.0,
         core_log_offset: float | jnp.ndarray = 0.0,
         cut_log_offset: float | jnp.ndarray = 0.0,
-    ) -> tuple[dict[str, Any], dict[str, jnp.ndarray]]:
+    ) -> tuple[PackedLensState, PackedLensValidity]:
         spec_jax = self.packed_spec_jax
         x_center = self._apply_param_updates(spec_jax["x_center_base"], spec_jax["x_center_param_index"], physical_params)
         y_center = self._apply_param_updates(spec_jax["y_center_base"], spec_jax["y_center_param_index"], physical_params)
@@ -21402,19 +21403,18 @@ class ClusterJAXEvaluator:
         )
         sigma0 = branch_weight[:, None] * (v_disp[:, None] ** 2) * safe_factor[None, :] / ra[:, None]
 
-        packed_state = {
-            "__packed__": True,
-            "profile_type": profile_type,
-            "sigma0": jnp.where(is_dpie[:, None], sigma0, 0.0),
-            "Ra": jnp.where(is_dpie, ra, 0.0),
-            "Rs": jnp.where(is_dpie, rs, 0.0),
-            "e1": jnp.where(is_dpie, e1, 0.0),
-            "e2": jnp.where(is_dpie, e2, 0.0),
-            "center_x": x_center,
-            "center_y": y_center,
-            "gamma1": jnp.where(is_shear, gamma1, 0.0),
-            "gamma2": jnp.where(is_shear, gamma2, 0.0),
-        }
+        packed_state = PackedLensState(
+            profile_type=profile_type,
+            sigma0=jnp.where(is_dpie[:, None], sigma0, 0.0),
+            Ra=jnp.where(is_dpie, ra, 0.0),
+            Rs=jnp.where(is_dpie, rs, 0.0),
+            e1=jnp.where(is_dpie, e1, 0.0),
+            e2=jnp.where(is_dpie, e2, 0.0),
+            center_x=x_center,
+            center_y=y_center,
+            gamma1=jnp.where(is_shear, gamma1, 0.0),
+            gamma2=jnp.where(is_shear, gamma2, 0.0),
+        )
         reason_flags = jnp.stack(
             [
                 jnp.any(is_dpie[:, None] & ~jnp.isfinite(sigma0)),
@@ -21445,10 +21445,10 @@ class ClusterJAXEvaluator:
         )
         if stop_gradient:
             reason_flags = jax.lax.stop_gradient(reason_flags)
-        return packed_state, {"is_valid": ~jnp.any(reason_flags), "reason_flags": reason_flags}
+        return packed_state, PackedLensValidity(is_valid=~jnp.any(reason_flags), reason_flags=reason_flags)
 
-    def _maybe_record_invalid_state(self, validity: dict[str, jnp.ndarray]) -> None:
-        reason_flags = validity["reason_flags"]
+    def _maybe_record_invalid_state(self, validity: PackedLensValidity) -> None:
+        reason_flags = validity.reason_flags
         _ = jax.lax.cond(
             jnp.any(reason_flags),
             self._emit_invalid_state_callback,
@@ -21479,43 +21479,42 @@ class ClusterJAXEvaluator:
 
     def _take_packed_components(
         self,
-        packed_state: dict[str, Any],
-        field: str,
+        value: jnp.ndarray,
         component_indices: np.ndarray,
     ) -> jnp.ndarray:
         return jnp.take(
-            jnp.asarray(packed_state[field], dtype=jnp.float64),
+            jnp.asarray(value, dtype=jnp.float64),
             jnp.asarray(component_indices, dtype=jnp.int32),
             axis=0,
         )
 
     def _grouped_dpie_params(
         self,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         return (
-            self._take_packed_components(packed_state, "sigma0", component_indices),
-            self._take_packed_components(packed_state, "Ra", component_indices),
-            self._take_packed_components(packed_state, "Rs", component_indices),
-            self._take_packed_components(packed_state, "e1", component_indices),
-            self._take_packed_components(packed_state, "e2", component_indices),
-            self._take_packed_components(packed_state, "center_x", component_indices),
-            self._take_packed_components(packed_state, "center_y", component_indices),
+            self._take_packed_components(packed_state.sigma0, component_indices),
+            self._take_packed_components(packed_state.Ra, component_indices),
+            self._take_packed_components(packed_state.Rs, component_indices),
+            self._take_packed_components(packed_state.e1, component_indices),
+            self._take_packed_components(packed_state.e2, component_indices),
+            self._take_packed_components(packed_state.center_x, component_indices),
+            self._take_packed_components(packed_state.center_y, component_indices),
         )
 
     def _grouped_shear_alpha_and_hessian(
         self,
         x: jnp.ndarray,
         y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         if component_indices.size == 0:
             zeros = jnp.zeros_like(x, dtype=jnp.float64)
             return zeros, zeros, zeros, zeros, zeros, zeros
-        gamma1 = self._take_packed_components(packed_state, "gamma1", component_indices)
-        gamma2 = self._take_packed_components(packed_state, "gamma2", component_indices)
+        gamma1 = self._take_packed_components(packed_state.gamma1, component_indices)
+        gamma2 = self._take_packed_components(packed_state.gamma2, component_indices)
         gamma1_sum = jnp.sum(gamma1)
         gamma2_sum = jnp.sum(gamma2)
         alpha_x = gamma1_sum * x + gamma2_sum * y
@@ -21531,7 +21530,7 @@ class ClusterJAXEvaluator:
         self,
         x: jnp.ndarray,
         y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         dpie_indices, shear_indices = self._split_grouped_component_indices(component_indices)
@@ -21568,7 +21567,7 @@ class ClusterJAXEvaluator:
         self,
         x: jnp.ndarray,
         y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         indices = self._component_indices_np(component_indices)
@@ -21596,8 +21595,8 @@ class ClusterJAXEvaluator:
         shear_mask_np = selected_profiles == SHEAR_PROFILE
         if np.any(shear_mask_np):
             shear_indices = indices[shear_mask_np].astype(np.int32)
-            gamma1 = self._take_packed_components(packed_state, "gamma1", shear_indices)[:, jnp.newaxis]
-            gamma2 = self._take_packed_components(packed_state, "gamma2", shear_indices)[:, jnp.newaxis]
+            gamma1 = self._take_packed_components(packed_state.gamma1, shear_indices)[:, jnp.newaxis]
+            gamma2 = self._take_packed_components(packed_state.gamma2, shear_indices)[:, jnp.newaxis]
             x_row = x[jnp.newaxis, :]
             y_row = y[jnp.newaxis, :]
             ones = jnp.ones_like(x_row, dtype=jnp.float64)
@@ -21618,7 +21617,7 @@ class ClusterJAXEvaluator:
         z_source: float,
         x: jnp.ndarray,
         y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         del z_source
@@ -21629,7 +21628,7 @@ class ClusterJAXEvaluator:
         self,
         x: jnp.ndarray,
         y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         alpha_x, alpha_y, *_ = self._grouped_alpha_and_hessian_for_components(x, y, packed_state, component_indices)
@@ -21640,7 +21639,7 @@ class ClusterJAXEvaluator:
         z_source: float,
         x: jnp.ndarray,
         y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         del z_source
@@ -21656,7 +21655,7 @@ class ClusterJAXEvaluator:
         self,
         x: jnp.ndarray,
         y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         _, _, h_xx, h_xy, h_yx, h_yy = self._grouped_alpha_and_hessian_for_components(
@@ -21671,7 +21670,7 @@ class ClusterJAXEvaluator:
         self,
         x: jnp.ndarray,
         y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray,
         image_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -21709,8 +21708,8 @@ class ClusterJAXEvaluator:
         shear_mask_np = selected_profiles == SHEAR_PROFILE
         if np.any(shear_mask_np):
             shear_indices = component_indices_np[shear_mask_np].astype(np.int32)
-            gamma1 = self._take_packed_components(packed_state, "gamma1", shear_indices)
-            gamma2 = self._take_packed_components(packed_state, "gamma2", shear_indices)
+            gamma1 = self._take_packed_components(packed_state.gamma1, shear_indices)
+            gamma2 = self._take_packed_components(packed_state.gamma2, shear_indices)
             shear_positions = jnp.asarray(np.where(shear_mask_np)[0], dtype=jnp.int32)
             x_shear = x[shear_positions]
             y_shear = y[shear_positions]
@@ -21729,7 +21728,7 @@ class ClusterJAXEvaluator:
         self,
         x: jnp.ndarray,
         y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         return self._grouped_component_rows_for_components(x, y, packed_state, component_indices)
@@ -21738,7 +21737,7 @@ class ClusterJAXEvaluator:
         self,
         x: jnp.ndarray,
         y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         alpha_x, alpha_y, *_ = self._grouped_component_rows_for_components(x, y, packed_state, component_indices)
@@ -21748,7 +21747,7 @@ class ClusterJAXEvaluator:
         self,
         x: jnp.ndarray,
         y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         alpha_x, alpha_y, h_xx, h_xy, h_yx, h_yy = self._grouped_alpha_and_hessian_for_components(
@@ -21764,7 +21763,7 @@ class ClusterJAXEvaluator:
         z_source: float,
         anchor_x: jnp.ndarray,
         anchor_y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> _CabMorphologyPrediction:
         base_entries = self._lensing_jacobian_for_components(
@@ -21850,7 +21849,7 @@ class ClusterJAXEvaluator:
         physical_params: jnp.ndarray,
         *,
         stop_gradient: bool,
-    ) -> tuple[dict[str, Any], dict[str, jnp.ndarray]]:
+    ) -> tuple[PackedLensState, PackedLensValidity]:
         return self._build_packed_lens_state_with_validity_from_physical(
             physical_params,
             float(CAB_MORPHOLOGY_MODEL_KEY),
@@ -21862,7 +21861,7 @@ class ClusterJAXEvaluator:
     def _cab_morphology_loglike_for_arcs(
         self,
         arc_data: TracedArcConstraintData,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         component_indices: np.ndarray | None = None,
     ) -> jnp.ndarray:
         if float(self.cab_likelihood_weight) <= 0.0 or int(getattr(arc_data, "n_arcs", 0)) <= 0:
@@ -21897,7 +21896,7 @@ class ClusterJAXEvaluator:
         z_source: float,
         x_obs: jnp.ndarray,
         y_obs: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         observed_jacobian_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
         component_indices: np.ndarray | None = None,
         fold_frame: tuple[jnp.ndarray, ...] | None = None,
@@ -21977,7 +21976,7 @@ class ClusterJAXEvaluator:
         z_source: float,
         x_obs: jnp.ndarray,
         y_obs: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         observed_jacobian_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -22019,7 +22018,7 @@ class ClusterJAXEvaluator:
         y_obs: jnp.ndarray,
         beta_family_x: jnp.ndarray,
         beta_family_y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         initial_jacobian_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray] | None = None,
         component_indices: np.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -22083,7 +22082,7 @@ class ClusterJAXEvaluator:
         y_obs: jnp.ndarray,
         beta_family_x: jnp.ndarray,
         beta_family_y: jnp.ndarray,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         current_x = x_obs
         current_y = y_obs
@@ -22154,7 +22153,7 @@ class ClusterJAXEvaluator:
             getattr(self, "inactive_scaling_component_indices", np.asarray([], dtype=np.int32)),
         )
         beta_x, beta_y = jax.lax.cond(
-            validity["is_valid"],
+            validity.is_valid,
             lambda current_state: self._ray_shooting_for_components(
                 z_source,
                 x_obs,
@@ -22170,7 +22169,7 @@ class ClusterJAXEvaluator:
         pieces = [alpha_x, alpha_y]
         if include_jacobian:
             inactive_jacobian = jax.lax.cond(
-                validity["is_valid"],
+                validity.is_valid,
                 lambda current_state: self._lensing_jacobian_for_components(
                     z_source,
                     x_obs,
@@ -22227,7 +22226,7 @@ class ClusterJAXEvaluator:
             getattr(self, "inactive_scaling_component_indices", np.asarray([], dtype=np.int32)),
         )
         beta_x, beta_y = jax.lax.cond(
-            validity["is_valid"],
+            validity.is_valid,
             lambda current_state: self._flat_ray_shooting_for_components(
                 flat_data.x_obs,
                 flat_data.y_obs,
@@ -22242,7 +22241,7 @@ class ClusterJAXEvaluator:
         pieces = [alpha_x, alpha_y]
         if include_jacobian:
             inactive_jacobian = jax.lax.cond(
-                validity["is_valid"],
+                validity.is_valid,
                 lambda current_state: self._flat_lensing_jacobian_for_components(
                     flat_data.x_obs,
                     flat_data.y_obs,
@@ -22313,8 +22312,8 @@ class ClusterJAXEvaluator:
                     self.flat_critical_arc_data,
                     stop_gradient=False,
                 )
-                if not bool(np.asarray(plus_validity["is_valid"], dtype=bool)):
-                    self._record_invalid_state_callback(np.asarray(plus_validity["reason_flags"], dtype=bool))
+                if not bool(np.asarray(plus_validity.is_valid, dtype=bool)):
+                    self._record_invalid_state_callback(np.asarray(plus_validity.reason_flags, dtype=bool))
                     return None
                 plus_eval = np.asarray(
                     self._flat_inactive_surrogate_concat(
@@ -22336,8 +22335,8 @@ class ClusterJAXEvaluator:
                     self.flat_critical_arc_data,
                     stop_gradient=False,
                 )
-                if not bool(np.asarray(minus_validity["is_valid"], dtype=bool)):
-                    self._record_invalid_state_callback(np.asarray(minus_validity["reason_flags"], dtype=bool))
+                if not bool(np.asarray(minus_validity.is_valid, dtype=bool)):
+                    self._record_invalid_state_callback(np.asarray(minus_validity.reason_flags, dtype=bool))
                     return None
                 minus_eval = np.asarray(
                     self._flat_inactive_surrogate_concat(
@@ -22453,8 +22452,8 @@ class ClusterJAXEvaluator:
                     effective_z_source,
                     stop_gradient=False,
                 )
-                if not bool(np.asarray(plus_validity["is_valid"], dtype=bool)):
-                    self._record_invalid_state_callback(np.asarray(plus_validity["reason_flags"], dtype=bool))
+                if not bool(np.asarray(plus_validity.is_valid, dtype=bool)):
+                    self._record_invalid_state_callback(np.asarray(plus_validity.reason_flags, dtype=bool))
                     return None
                 plus_eval = np.asarray(
                     self._inactive_surrogate_concat(
@@ -22478,8 +22477,8 @@ class ClusterJAXEvaluator:
                     effective_z_source,
                     stop_gradient=False,
                 )
-                if not bool(np.asarray(minus_validity["is_valid"], dtype=bool)):
-                    self._record_invalid_state_callback(np.asarray(minus_validity["reason_flags"], dtype=bool))
+                if not bool(np.asarray(minus_validity.is_valid, dtype=bool)):
+                    self._record_invalid_state_callback(np.asarray(minus_validity.reason_flags, dtype=bool))
                     return None
                 minus_eval = np.asarray(
                     self._inactive_surrogate_concat(
@@ -22557,8 +22556,8 @@ class ClusterJAXEvaluator:
             self.flat_critical_arc_data,
             stop_gradient=False,
         )
-        if not bool(np.asarray(validity["is_valid"], dtype=bool)):
-            self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+        if not bool(np.asarray(validity.is_valid, dtype=bool)):
+            self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
             self.surrogate_reference_params = None
             self.surrogate_reference_param_values = np.zeros(len(self.surrogate_param_indices), dtype=float)
             return
@@ -22640,8 +22639,8 @@ class ClusterJAXEvaluator:
             y_obs = jnp.asarray(bin_data.y_obs, dtype=jnp.float64)
             packed_state = self._build_packed_lens_state(reference_jax, bin_data.effective_z_source)
             validity = self._packed_lens_validity_from_params(reference_jax, bin_data.effective_z_source, stop_gradient=False)
-            if not bool(np.asarray(validity["is_valid"], dtype=bool)):
-                self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+            if not bool(np.asarray(validity.is_valid, dtype=bool)):
+                self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
                 self.surrogate_cache_by_z = {}
                 self.flat_surrogate_cache = None
                 self.surrogate_reference_params = None
@@ -22872,7 +22871,7 @@ class ClusterJAXEvaluator:
         self,
         params: jnp.ndarray,
         bin_data: TracedBinData,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         invalid: jnp.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         x_obs = bin_data.x_obs
@@ -22963,7 +22962,7 @@ class ClusterJAXEvaluator:
         self._maybe_record_invalid_state(validity)
         x_obs = bin_data.x_obs
         y_obs = bin_data.y_obs
-        invalid = ~validity["is_valid"]
+        invalid = ~validity.is_valid
         beta_active_x, beta_active_y = jax.lax.cond(
             invalid,
             lambda _: (x_obs, y_obs),
@@ -22984,28 +22983,28 @@ class ClusterJAXEvaluator:
         beta_y = y_obs - active_alpha_y - inactive_alpha_y
         return beta_x, beta_y, invalid, packed_state
 
-    def _packed_to_kwargs_lens(self, packed_state: dict[str, Any]) -> list[dict[str, float]]:
+    def _packed_to_kwargs_lens(self, packed_state: PackedLensState) -> list[dict[str, float]]:
         convert_start = time.perf_counter()
         kwargs_lens: list[dict[str, float]] = []
-        profile_type = np.asarray(packed_state["profile_type"], dtype=int)
+        profile_type = np.asarray(packed_state.profile_type, dtype=int)
         for idx, profile in enumerate(profile_type.tolist()):
             if profile == DP_IE_PROFILE:
                 kwargs_lens.append(
                     {
-                        "sigma0": float(np.asarray(packed_state["sigma0"][idx])),
-                        "Ra": float(np.asarray(packed_state["Ra"][idx])),
-                        "Rs": float(np.asarray(packed_state["Rs"][idx])),
-                        "e1": float(np.asarray(packed_state["e1"][idx])),
-                        "e2": float(np.asarray(packed_state["e2"][idx])),
-                        "center_x": float(np.asarray(packed_state["center_x"][idx])),
-                        "center_y": float(np.asarray(packed_state["center_y"][idx])),
+                        "sigma0": float(np.asarray(packed_state.sigma0[idx])),
+                        "Ra": float(np.asarray(packed_state.Ra[idx])),
+                        "Rs": float(np.asarray(packed_state.Rs[idx])),
+                        "e1": float(np.asarray(packed_state.e1[idx])),
+                        "e2": float(np.asarray(packed_state.e2[idx])),
+                        "center_x": float(np.asarray(packed_state.center_x[idx])),
+                        "center_y": float(np.asarray(packed_state.center_y[idx])),
                     }
                 )
             elif profile == SHEAR_PROFILE:
                 kwargs_lens.append(
                     {
-                        "gamma1": float(np.asarray(packed_state["gamma1"][idx])),
-                        "gamma2": float(np.asarray(packed_state["gamma2"][idx])),
+                        "gamma1": float(np.asarray(packed_state.gamma1[idx])),
+                        "gamma2": float(np.asarray(packed_state.gamma2[idx])),
                     }
                 )
             else:  # pragma: no cover
@@ -23118,7 +23117,7 @@ class ClusterJAXEvaluator:
                         dpie_sigma0_factor=bin_dpie_sigma0_factor,
                     )
                 self._maybe_record_invalid_state(validity)
-                invalid = ~validity["is_valid"]
+                invalid = ~validity.is_valid
                 if fit_component_indices is None:
                     beta_x, beta_y = jax.lax.cond(
                         invalid,
@@ -23820,7 +23819,7 @@ class ClusterJAXEvaluator:
                 stop_gradient=True,
             )
             self._maybe_record_invalid_state(cab_validity)
-            cab_invalid = ~cab_validity["is_valid"]
+            cab_invalid = ~cab_validity.is_valid
             cab_loglike = self._cab_morphology_loglike_for_arcs(
                 arc_data,
                 cab_packed_state,
@@ -23878,8 +23877,8 @@ class ClusterJAXEvaluator:
             else:
                 packed_state = self._build_packed_lens_state(params_jax, bin_data.effective_z_source)
                 validity = self._packed_lens_validity_from_params(params_jax, bin_data.effective_z_source, stop_gradient=False)
-                if not bool(np.asarray(validity["is_valid"], dtype=bool)):
-                    self._record_invalid_state_callback(np.asarray(validity["reason_flags"], dtype=bool))
+                if not bool(np.asarray(validity.is_valid, dtype=bool)):
+                    self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
                     for family_id in bin_data.family_ids:
                         summaries[str(family_id)] = failed_prediction(str(family_id))
                     continue
@@ -23959,7 +23958,7 @@ class ClusterJAXEvaluator:
     def _exact_source_ray_shooting(
         self,
         family: FamilyData,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
     ) -> tuple[np.ndarray, np.ndarray]:
         model, _solver = self._get_exact_model_solver(family.z_source)
         kwargs_lens = self._packed_to_kwargs_lens(packed_state)
@@ -23973,7 +23972,7 @@ class ClusterJAXEvaluator:
     def _solve_exact_images_lenstronomy(
         self,
         family: FamilyData,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         source_x: float,
         source_y: float,
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -24003,7 +24002,7 @@ class ClusterJAXEvaluator:
     def _exact_ray_shooting_and_jacobian_numpy(
         self,
         family: FamilyData,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         x: np.ndarray,
         y: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -24028,7 +24027,7 @@ class ClusterJAXEvaluator:
     def _refine_exact_images_local_lm(
         self,
         family: FamilyData,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         source_x: float,
         source_y: float,
         start_x: np.ndarray,
@@ -24129,7 +24128,7 @@ class ClusterJAXEvaluator:
     def _solve_exact_images_local_lm(
         self,
         family: FamilyData,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         source_x: float,
         source_y: float,
         *,
@@ -24206,7 +24205,7 @@ class ClusterJAXEvaluator:
     def _solve_exact_images(
         self,
         family: FamilyData,
-        packed_state: dict[str, Any],
+        packed_state: PackedLensState,
         source_x: float,
         source_y: float,
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -24485,7 +24484,7 @@ class ClusterJAXEvaluator:
                 physical_params,
                 stop_gradient=False,
             )
-            if not bool(np.asarray(validity["is_valid"], dtype=bool)):
+            if not bool(np.asarray(validity.is_valid, dtype=bool)):
                 return base
             traced = self._prepare_traced_arc_constraint_data(arc_data)
             prediction = self._cab_morphology_predictions_for_anchors(

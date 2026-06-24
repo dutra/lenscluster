@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import jax.numpy as jnp
 import numpy as np
@@ -87,6 +87,49 @@ class PackedLensSpec:
     active_gate_mag_slope_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     active_gate_logit_offset_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     active_magnitude_feature: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+
+
+class PackedLensState(NamedTuple):
+    profile_type: jnp.ndarray
+    sigma0: jnp.ndarray
+    Ra: jnp.ndarray
+    Rs: jnp.ndarray
+    e1: jnp.ndarray
+    e2: jnp.ndarray
+    center_x: jnp.ndarray
+    center_y: jnp.ndarray
+    gamma1: jnp.ndarray
+    gamma2: jnp.ndarray
+
+
+class PackedLensDetails(NamedTuple):
+    is_dpie: jnp.ndarray
+    is_shear: jnp.ndarray
+    is_scaling: jnp.ndarray
+    sigma0: jnp.ndarray
+    ra_raw: jnp.ndarray
+    rs_raw: jnp.ndarray
+    core_radius_kpc: jnp.ndarray
+    core_radius_effective_kpc: jnp.ndarray
+    softening_length_kpc: jnp.ndarray
+    log_softening_length_kpc: jnp.ndarray
+    v_disp: jnp.ndarray
+    alpha_sigma: jnp.ndarray
+    beta_radius: jnp.ndarray
+    gamma_ml: jnp.ndarray
+    x_center: jnp.ndarray
+    y_center: jnp.ndarray
+    gamma1: jnp.ndarray
+    gamma2: jnp.ndarray
+    e1: jnp.ndarray
+    e2: jnp.ndarray
+    factor_array: jnp.ndarray
+    independent_branch_weight: jnp.ndarray
+
+
+class PackedLensValidity(NamedTuple):
+    is_valid: jnp.ndarray
+    reason_flags: jnp.ndarray
 
 
 @dataclass

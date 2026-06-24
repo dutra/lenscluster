@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -90,7 +91,9 @@ from lenscluster.model import (
     EvaluationResult,
     FamilyData,
     FamilyValidationCache,
+    PackedLensDetails,
     PackedLensSpec,
+    PackedLensState,
     ParameterSpec,
     NUTSInitialization,
     PosteriorResults,
@@ -6685,12 +6688,12 @@ def test_packed_lens_state_independent_candidates_are_deterministically_free() -
         dpie_sigma0_factor=jnp.asarray(1.0),
     )
 
-    assert tuple(low_state["sigma0"].shape) == (2,)
-    assert tuple(high_state["sigma0"].shape) == (2,)
-    np.testing.assert_allclose(np.asarray(low_details["independent_branch_weight"]), [0.0, 1.0], atol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(high_details["independent_branch_weight"]), [0.0, 1.0], atol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(mid_details["independent_branch_weight"]), [0.0, 1.0], atol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(mid_state["sigma0"]), [0.0, 200.0**2 / 2.0], rtol=1.0e-10)
+    assert tuple(low_state.sigma0.shape) == (2,)
+    assert tuple(high_state.sigma0.shape) == (2,)
+    np.testing.assert_allclose(np.asarray(low_details.independent_branch_weight), [0.0, 1.0], atol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(high_details.independent_branch_weight), [0.0, 1.0], atol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(mid_details.independent_branch_weight), [0.0, 1.0], atol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(mid_state.sigma0), [0.0, 200.0**2 / 2.0], rtol=1.0e-10)
 
 
 def test_packed_lens_state_scales_core_radius_with_beta_radius() -> None:
@@ -6706,10 +6709,10 @@ def test_packed_lens_state_scales_core_radius_with_beta_radius() -> None:
         dpie_sigma0_factor=jnp.asarray(1.0),
     )
 
-    np.testing.assert_allclose(np.asarray(details["ra_raw"])[0], 2.0, rtol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(details["rs_raw"])[0], 40.0, rtol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(packed_state["Ra"])[0], 2.0, rtol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(packed_state["Rs"])[0], 40.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details.ra_raw)[0], 2.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details.rs_raw)[0], 40.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(packed_state.Ra)[0], 2.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(packed_state.Rs)[0], 40.0, rtol=1.0e-12)
 
 
 def test_packed_lens_state_applies_sampled_log_softening_length_in_quadrature() -> None:
@@ -6724,11 +6727,11 @@ def test_packed_lens_state_applies_sampled_log_softening_length_in_quadrature() 
         dpie_sigma0_factor=jnp.asarray(1.0),
     )
 
-    np.testing.assert_allclose(np.asarray(details["core_radius_kpc"])[1], 3.0, rtol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(details["softening_length_kpc"]), 4.0, rtol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(details["log_softening_length_kpc"]), np.log(4.0), rtol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(details["core_radius_effective_kpc"])[1], 5.0, rtol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(packed_state["Ra"])[1], 5.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details.core_radius_kpc)[1], 3.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details.softening_length_kpc), 4.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details.log_softening_length_kpc), np.log(4.0), rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details.core_radius_effective_kpc)[1], 5.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(packed_state.Ra)[1], 5.0, rtol=1.0e-12)
 
 
 def test_packed_lens_state_gamma_ml_controls_size_exponent() -> None:
@@ -6751,11 +6754,11 @@ def test_packed_lens_state_gamma_ml_controls_size_exponent() -> None:
 
     expected_beta = 0.7
     expected_size = float(4.0**expected_beta)
-    np.testing.assert_allclose(np.asarray(details["alpha_sigma"])[0], 0.25, rtol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(details["beta_radius"])[0], expected_beta, rtol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(details["gamma_ml"])[0], 2.0 * 0.25 + expected_beta - 1.0, rtol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(packed_state["Ra"])[0], expected_size, rtol=1.0e-12)
-    np.testing.assert_allclose(np.asarray(packed_state["Rs"])[0], 20.0 * expected_size, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details.alpha_sigma)[0], 0.25, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details.beta_radius)[0], expected_beta, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details.gamma_ml)[0], 2.0 * 0.25 + expected_beta - 1.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(packed_state.Ra)[0], expected_size, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(packed_state.Rs)[0], 20.0 * expected_size, rtol=1.0e-12)
 
 
 def test_independent_scaling_parameter_specs_log_displacement_replaces_direct_free_parameters() -> None:
@@ -7109,7 +7112,7 @@ def _exact_per_bin_local_jacobian_loglike(
             bin_data.effective_z_source,
             stop_gradient=True,
         )
-        invalid = ~validity["is_valid"]
+        invalid = ~validity.is_valid
         beta_x, beta_y = jax.lax.cond(
             invalid,
             lambda _: (bin_data.x_obs, bin_data.y_obs),
@@ -7609,7 +7612,7 @@ def test_refreshing_surrogate_flat_keeps_independent_scaling_exact() -> None:
         flat_data,
         stop_gradient=False,
     )
-    assert bool(np.asarray(validity["is_valid"], dtype=bool))
+    assert bool(np.asarray(validity.is_valid, dtype=bool))
     inactive_beta_x, inactive_beta_y = evaluator._flat_ray_shooting_for_components(
         flat_data.x_obs,
         flat_data.y_obs,
@@ -8366,7 +8369,7 @@ def test_full_flat_combined_exact_helper_matches_separate_bulk_calls() -> None:
         stop_gradient=False,
     )
 
-    assert bool(np.asarray(validity["is_valid"], dtype=bool))
+    assert bool(np.asarray(validity.is_valid, dtype=bool))
     beta_x, beta_y = flat._flat_ray_shooting_for_components(
         flat.flat_critical_arc_data.x_obs,
         flat.flat_critical_arc_data.y_obs,
@@ -8411,7 +8414,7 @@ def test_full_flat_sparse_pair_alpha_jacobian_matches_rectangular_rows() -> None
         flat.flat_critical_arc_data,
         stop_gradient=False,
     )
-    assert bool(np.asarray(validity["is_valid"], dtype=bool))
+    assert bool(np.asarray(validity.is_valid, dtype=bool))
 
     pair_image_indices = np.asarray([0, 1, 0, 1], dtype=np.int32)
     pair_component_indices = np.asarray([0, 0, 1, 1], dtype=np.int32)
@@ -8469,7 +8472,7 @@ def test_full_flat_alpha_only_component_rows_match_alpha_jacobian_rows() -> None
     )
     component_indices = np.asarray([0, 1], dtype=np.int32)
 
-    assert bool(np.asarray(validity["is_valid"], dtype=bool))
+    assert bool(np.asarray(validity.is_valid, dtype=bool))
     alpha_x, alpha_y = flat._flat_component_alpha_rows_for_components(
         flat.flat_critical_arc_data.x_obs,
         flat.flat_critical_arc_data.y_obs,
@@ -9052,12 +9055,12 @@ def test_packed_lens_state_uses_direct_e1e2_and_lenstool_sigma0() -> None:
         dpie_sigma0_factor=jnp.asarray(1.0, dtype=jnp.float64),
     )
 
-    np.testing.assert_allclose(np.asarray(details["sigma0"]), [900.0**2 / 0.5, 120.0**2 / 0.1])
-    np.testing.assert_allclose(np.asarray(packed_state["sigma0"]), [900.0**2 / 0.5, 120.0**2 / 0.1])
-    np.testing.assert_allclose(np.asarray(details["e1"]), [0.11, 0.04])
-    np.testing.assert_allclose(np.asarray(details["e2"]), [-0.07, 0.03])
-    np.testing.assert_allclose(np.asarray(packed_state["e1"]), [0.11, 0.04])
-    np.testing.assert_allclose(np.asarray(packed_state["e2"]), [-0.07, 0.03])
+    np.testing.assert_allclose(np.asarray(details.sigma0), [900.0**2 / 0.5, 120.0**2 / 0.1])
+    np.testing.assert_allclose(np.asarray(packed_state.sigma0), [900.0**2 / 0.5, 120.0**2 / 0.1])
+    np.testing.assert_allclose(np.asarray(details.e1), [0.11, 0.04])
+    np.testing.assert_allclose(np.asarray(details.e2), [-0.07, 0.03])
+    np.testing.assert_allclose(np.asarray(packed_state.e1), [0.11, 0.04])
+    np.testing.assert_allclose(np.asarray(packed_state.e2), [-0.07, 0.03])
 
 
 def test_packed_lens_state_uses_direct_gamma1gamma2_for_shear() -> None:
@@ -9083,10 +9086,10 @@ def test_packed_lens_state_uses_direct_gamma1gamma2_for_shear() -> None:
         dpie_sigma0_factor=jnp.asarray(1.0, dtype=jnp.float64),
     )
 
-    np.testing.assert_allclose(np.asarray(details["gamma1"]), [0.0, 0.12])
-    np.testing.assert_allclose(np.asarray(details["gamma2"]), [0.0, -0.08])
-    np.testing.assert_allclose(np.asarray(packed_state["gamma1"]), [0.0, 0.12])
-    np.testing.assert_allclose(np.asarray(packed_state["gamma2"]), [0.0, -0.08])
+    np.testing.assert_allclose(np.asarray(details.gamma1), [0.0, 0.12])
+    np.testing.assert_allclose(np.asarray(details.gamma2), [0.0, -0.08])
+    np.testing.assert_allclose(np.asarray(packed_state.gamma1), [0.0, 0.12])
+    np.testing.assert_allclose(np.asarray(packed_state.gamma2), [0.0, -0.08])
 
 
 def test_sampled_cosmology_geometry_vectorizes_effective_redshift_factors() -> None:
@@ -13412,45 +13415,53 @@ def test_truncated_vdisp_default_theta_and_init_are_clipped_to_support() -> None
 
 def test_packed_lens_validity_allows_negative_finite_vdisp_and_rejects_nonfinite() -> None:
     evaluator = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
-    details = {
-        "is_dpie": jnp.asarray([True, True]),
-        "is_shear": jnp.asarray([False, False]),
-        "is_scaling": jnp.asarray([False, False]),
-        "sigma0": jnp.asarray([1.0, 1.0]),
-        "ra_raw": jnp.asarray([1.0, 1.0]),
-        "rs_raw": jnp.asarray([10.0, 10.0]),
-        "v_disp": jnp.asarray([500.0, -10.0]),
-        "alpha_sigma": jnp.asarray([0.25, 0.25]),
-        "beta_radius": jnp.asarray([0.5, 0.5]),
-        "x_center": jnp.asarray([0.0, 0.0]),
-        "y_center": jnp.asarray([0.0, 0.0]),
-        "gamma1": jnp.asarray([0.0, 0.0]),
-        "gamma2": jnp.asarray([0.0, 0.0]),
-        "e1": jnp.asarray([0.0, 0.0]),
-        "e2": jnp.asarray([0.0, 0.0]),
-        "factor_array": jnp.asarray(1.0),
-    }
+    details = PackedLensDetails(
+        is_dpie=jnp.asarray([True, True]),
+        is_shear=jnp.asarray([False, False]),
+        is_scaling=jnp.asarray([False, False]),
+        sigma0=jnp.asarray([1.0, 1.0]),
+        ra_raw=jnp.asarray([1.0, 1.0]),
+        rs_raw=jnp.asarray([10.0, 10.0]),
+        core_radius_kpc=jnp.asarray([1.0, 1.0]),
+        core_radius_effective_kpc=jnp.asarray([1.0, 1.0]),
+        softening_length_kpc=jnp.asarray(0.0),
+        log_softening_length_kpc=jnp.asarray(float("-inf")),
+        v_disp=jnp.asarray([500.0, -10.0]),
+        alpha_sigma=jnp.asarray([0.25, 0.25]),
+        beta_radius=jnp.asarray([0.5, 0.5]),
+        gamma_ml=jnp.asarray([0.0, 0.0]),
+        x_center=jnp.asarray([0.0, 0.0]),
+        y_center=jnp.asarray([0.0, 0.0]),
+        gamma1=jnp.asarray([0.0, 0.0]),
+        gamma2=jnp.asarray([0.0, 0.0]),
+        e1=jnp.asarray([0.0, 0.0]),
+        e2=jnp.asarray([0.0, 0.0]),
+        factor_array=jnp.asarray(1.0),
+        independent_branch_weight=jnp.asarray([1.0, 1.0]),
+    )
 
     validity = cluster_solver.ClusterJAXEvaluator._packed_lens_validity(evaluator, details)
     reason_index = cluster_solver.INVALID_STATE_REASON_NAMES.index("nonpositive_vdisp")
 
-    assert bool(validity["is_valid"]) is True
-    assert bool(np.asarray(validity["reason_flags"])[reason_index]) is False
+    assert bool(validity.is_valid) is True
+    assert bool(np.asarray(validity.reason_flags)[reason_index]) is False
 
-    details["v_disp"] = jnp.asarray([500.0, jnp.nan])
+    details = details._replace(v_disp=jnp.asarray([500.0, jnp.nan]))
     validity = cluster_solver.ClusterJAXEvaluator._packed_lens_validity(evaluator, details)
 
-    assert bool(validity["is_valid"]) is False
-    assert bool(np.asarray(validity["reason_flags"])[reason_index]) is True
+    assert bool(validity.is_valid) is False
+    assert bool(np.asarray(validity.reason_flags)[reason_index]) is True
 
-    details["v_disp"] = jnp.asarray([500.0, -10.0])
-    details["e1"] = jnp.asarray([0.8, 0.0])
-    details["e2"] = jnp.asarray([0.7, 0.0])
+    details = details._replace(
+        v_disp=jnp.asarray([500.0, -10.0]),
+        e1=jnp.asarray([0.8, 0.0]),
+        e2=jnp.asarray([0.7, 0.0]),
+    )
     validity = cluster_solver.ClusterJAXEvaluator._packed_lens_validity(evaluator, details)
     shape_reason_index = cluster_solver.INVALID_STATE_REASON_NAMES.index("nonfinite_shape")
 
-    assert bool(validity["is_valid"]) is False
-    assert bool(np.asarray(validity["reason_flags"])[shape_reason_index]) is True
+    assert bool(validity.is_valid) is False
+    assert bool(np.asarray(validity.reason_flags)[shape_reason_index]) is True
 
 
 def test_nuts_quality_diagnostics_flag_stuck_tree_depth_and_rhat() -> None:
@@ -15056,17 +15067,18 @@ def test_bulk_lensing_jacobian_matches_manual_dpie_finite_difference() -> None:
         fake,
         type(fake),
     )
-    packed_state = {
-        "sigma0": jnp.asarray([1.2], dtype=jnp.float64),
-        "Ra": jnp.asarray([0.15], dtype=jnp.float64),
-        "Rs": jnp.asarray([3.0], dtype=jnp.float64),
-        "e1": jnp.asarray([0.05], dtype=jnp.float64),
-        "e2": jnp.asarray([-0.02], dtype=jnp.float64),
-        "center_x": jnp.asarray([0.1], dtype=jnp.float64),
-        "center_y": jnp.asarray([-0.1], dtype=jnp.float64),
-        "gamma1": jnp.asarray([0.0], dtype=jnp.float64),
-        "gamma2": jnp.asarray([0.0], dtype=jnp.float64),
-    }
+    packed_state = PackedLensState(
+        profile_type=jnp.asarray([cluster_solver.DP_IE_PROFILE], dtype=jnp.int32),
+        sigma0=jnp.asarray([1.2], dtype=jnp.float64),
+        Ra=jnp.asarray([0.15], dtype=jnp.float64),
+        Rs=jnp.asarray([3.0], dtype=jnp.float64),
+        e1=jnp.asarray([0.05], dtype=jnp.float64),
+        e2=jnp.asarray([-0.02], dtype=jnp.float64),
+        center_x=jnp.asarray([0.1], dtype=jnp.float64),
+        center_y=jnp.asarray([-0.1], dtype=jnp.float64),
+        gamma1=jnp.asarray([0.0], dtype=jnp.float64),
+        gamma2=jnp.asarray([0.0], dtype=jnp.float64),
+    )
     x = jnp.asarray([0.2, 1.0, 3.0], dtype=jnp.float64)
     y = jnp.asarray([0.4, 2.0, -1.0], dtype=jnp.float64)
     eps = jnp.asarray(1.0e-5, dtype=jnp.float64)
@@ -15129,19 +15141,97 @@ def test_grouped_lensing_backend_rejects_unsupported_profile_code() -> None:
         cluster_solver.ClusterJAXEvaluator._split_grouped_component_indices(fake)
 
 
+def test_packed_lens_state_is_array_only_pytree_for_grouped_lensing() -> None:
+    packed_state = PackedLensState(
+        profile_type=jnp.asarray([cluster_solver.DP_IE_PROFILE], dtype=jnp.int32),
+        sigma0=jnp.asarray([1.2], dtype=jnp.float64),
+        Ra=jnp.asarray([0.15], dtype=jnp.float64),
+        Rs=jnp.asarray([3.0], dtype=jnp.float64),
+        e1=jnp.asarray([0.05], dtype=jnp.float64),
+        e2=jnp.asarray([-0.02], dtype=jnp.float64),
+        center_x=jnp.asarray([0.1], dtype=jnp.float64),
+        center_y=jnp.asarray([-0.1], dtype=jnp.float64),
+        gamma1=jnp.asarray([0.0], dtype=jnp.float64),
+        gamma2=jnp.asarray([0.0], dtype=jnp.float64),
+    )
+    leaves, _treedef = jax.tree_util.tree_flatten(packed_state)
+    assert leaves
+    assert all(isinstance(leaf, jax.Array) for leaf in leaves)
+
+    fake = SimpleNamespace(
+        state=SimpleNamespace(
+            lens_model_list=["DPIE_NIE"],
+            packed_lens_spec=SimpleNamespace(
+                profile_type=np.asarray([cluster_solver.DP_IE_PROFILE], dtype=np.int32)
+            ),
+        ),
+    )
+    for name in (
+        "_component_indices_np",
+        "_split_grouped_component_indices",
+        "_take_packed_components",
+        "_grouped_dpie_params",
+        "_grouped_shear_alpha_and_hessian",
+        "_grouped_alpha_and_hessian_for_components",
+    ):
+        setattr(fake, name, getattr(cluster_solver.ClusterJAXEvaluator, name).__get__(fake, type(fake)))
+
+    x = jnp.asarray([0.2, 1.0], dtype=jnp.float64)
+    y = jnp.asarray([0.4, -1.0], dtype=jnp.float64)
+
+    @jax.jit
+    def evaluate(current_state: PackedLensState) -> tuple[jnp.ndarray, ...]:
+        beta_x, beta_y = cluster_solver.ClusterJAXEvaluator._ray_shooting_for_components(
+            fake,
+            2.0,
+            x,
+            y,
+            current_state,
+        )
+        jacobian = cluster_solver.ClusterJAXEvaluator._lensing_jacobian_for_components(
+            fake,
+            2.0,
+            x,
+            y,
+            current_state,
+        )
+        return beta_x, beta_y, *jacobian
+
+    outputs = evaluate(packed_state)
+    assert len(outputs) == 6
+    assert all(np.asarray(value).shape == (2,) for value in outputs)
+
+
+def test_grouped_lensing_hot_paths_do_not_string_index_packed_state() -> None:
+    for method in (
+        cluster_solver.ClusterJAXEvaluator._grouped_dpie_params,
+        cluster_solver.ClusterJAXEvaluator._grouped_shear_alpha_and_hessian,
+        cluster_solver.ClusterJAXEvaluator._grouped_alpha_and_hessian_for_components,
+        cluster_solver.ClusterJAXEvaluator._grouped_component_rows_for_components,
+        cluster_solver.ClusterJAXEvaluator._ray_shooting_for_components,
+        cluster_solver.ClusterJAXEvaluator._lensing_jacobian_for_components,
+        cluster_solver.ClusterJAXEvaluator._flat_ray_shooting_and_lensing_jacobian_for_components,
+    ):
+        assert "packed_state[" not in inspect.getsource(method)
+
+
 def test_grouped_dpie_shear_backend_matches_lensmodelbulk_reference() -> None:
     lens_model_list = ["DPIE_NIE", "DPIE_NIE", "SHEAR"]
-    packed_state = {
-        "sigma0": jnp.asarray([1.2, 0.7, 0.0], dtype=jnp.float64),
-        "Ra": jnp.asarray([0.15, 0.08, 0.0], dtype=jnp.float64),
-        "Rs": jnp.asarray([3.0, 1.8, 0.0], dtype=jnp.float64),
-        "e1": jnp.asarray([0.05, -0.04, 0.0], dtype=jnp.float64),
-        "e2": jnp.asarray([-0.02, 0.03, 0.0], dtype=jnp.float64),
-        "center_x": jnp.asarray([0.1, -0.3, 0.0], dtype=jnp.float64),
-        "center_y": jnp.asarray([-0.1, 0.2, 0.0], dtype=jnp.float64),
-        "gamma1": jnp.asarray([0.0, 0.0, 0.04], dtype=jnp.float64),
-        "gamma2": jnp.asarray([0.0, 0.0, -0.015], dtype=jnp.float64),
-    }
+    packed_state = PackedLensState(
+        profile_type=jnp.asarray(
+            [cluster_solver.DP_IE_PROFILE, cluster_solver.DP_IE_PROFILE, cluster_solver.SHEAR_PROFILE],
+            dtype=jnp.int32,
+        ),
+        sigma0=jnp.asarray([1.2, 0.7, 0.0], dtype=jnp.float64),
+        Ra=jnp.asarray([0.15, 0.08, 0.0], dtype=jnp.float64),
+        Rs=jnp.asarray([3.0, 1.8, 0.0], dtype=jnp.float64),
+        e1=jnp.asarray([0.05, -0.04, 0.0], dtype=jnp.float64),
+        e2=jnp.asarray([-0.02, 0.03, 0.0], dtype=jnp.float64),
+        center_x=jnp.asarray([0.1, -0.3, 0.0], dtype=jnp.float64),
+        center_y=jnp.asarray([-0.1, 0.2, 0.0], dtype=jnp.float64),
+        gamma1=jnp.asarray([0.0, 0.0, 0.04], dtype=jnp.float64),
+        gamma2=jnp.asarray([0.0, 0.0, -0.015], dtype=jnp.float64),
+    )
     fake = SimpleNamespace(
         state=SimpleNamespace(
             lens_model_list=lens_model_list,
