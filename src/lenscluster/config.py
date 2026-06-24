@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field, replace
 from numbers import Integral
 from pathlib import Path
@@ -204,6 +205,10 @@ class LikelihoodConfig:
     image_plane_scatter_floor_arcsec: float = 1.0e-3
     image_plane_scatter_upper_arcsec: float = 2.0
     fix_image_sigma_int_arcsec: float | None = None
+    use_magnitude_likelihood: bool = False
+    magnitude_sigma_floor: float = 0.05
+    magnitude_mu_floor: float = 1.0e-3
+    magnitude_min_reliability: float = 1.0e-3
 
 
 @dataclass(frozen=True)
@@ -371,6 +376,19 @@ def validate_config(config: LensClusterSolverConfig) -> None:
         raise ValueError("truth_grid_draws must be a positive integer or None.")
     if config.truth.truth_grid_size < 0:
         raise ValueError("truth_grid_size must be nonnegative.")
+    likelihood = config.likelihood
+    for value, name, allow_zero in (
+        (likelihood.magnitude_sigma_floor, "magnitude_sigma_floor", False),
+        (likelihood.magnitude_mu_floor, "magnitude_mu_floor", True),
+    ):
+        if not math.isfinite(float(value)) or value < 0.0 or (not allow_zero and value <= 0.0):
+            raise ValueError(f"{name} must be {'nonnegative' if allow_zero else 'positive'}.")
+    if (
+        not math.isfinite(float(likelihood.magnitude_min_reliability))
+        or likelihood.magnitude_min_reliability < 0.0
+        or likelihood.magnitude_min_reliability > 1.0
+    ):
+        raise ValueError("magnitude_min_reliability must be in [0, 1].")
 
 
 def _validate_model_config(model: LensModelConfig | None) -> None:

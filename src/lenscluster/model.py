@@ -180,6 +180,8 @@ class FamilyData:
     x_obs: np.ndarray
     y_obs: np.ndarray
     reliability: np.ndarray
+    catalog_mag: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    catalog_mag_err: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
 
     @property
     def n_images(self) -> int:
@@ -213,6 +215,8 @@ class BinData:
     y_obs: np.ndarray
     sigma_per_image: np.ndarray
     reliability_per_image: np.ndarray
+    magnitude_per_image: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    magnitude_error_per_image: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
 
 
 @dataclass

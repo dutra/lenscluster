@@ -397,6 +397,20 @@ DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE = 1.0e-3
 DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE = 1.0e-6
 DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC = 20.0
 DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD = 0.5
+DEFAULT_USE_MAGNITUDE_LIKELIHOOD = False
+DEFAULT_MAGNITUDE_SIGMA_FLOOR = 0.05
+DEFAULT_MAGNITUDE_SCATTER_LOWER = 1.0e-3
+DEFAULT_MAGNITUDE_BASE_SCATTER_UPPER = 2.0
+DEFAULT_MAGNITUDE_BASE_SCATTER_PRIOR_MEDIAN = 0.10
+DEFAULT_MAGNITUDE_BASE_SCATTER_PRIOR_LOG_SIGMA = 0.75
+DEFAULT_MAGNITUDE_ARC_SCATTER_UPPER = 5.0
+DEFAULT_MAGNITUDE_ARC_SCATTER_PRIOR_MEDIAN = 0.50
+DEFAULT_MAGNITUDE_ARC_SCATTER_PRIOR_LOG_SIGMA = 0.75
+DEFAULT_MAGNITUDE_MU_FLOOR = 1.0e-3
+DEFAULT_MAGNITUDE_MIN_RELIABILITY = 1.0e-3
+MAGNITUDE_BASE_SCATTER_SAMPLE_NAME = "magnitude_base_scatter"
+MAGNITUDE_ARC_SCATTER_SAMPLE_NAME = "magnitude_arc_scatter"
+MAGNITUDE_SCATTER_COMPONENT_FAMILY = "magnitude_scatter"
 CRITICAL_ARC_EIGENGAP_RELATIVE_SOFTENING = 1.0e-3
 CRITICAL_ARC_EIGENGAP_VALUE_ABSOLUTE_SOFTENING = 1.0e-18
 # Always-on magnification-fold of the base covariance along the critical direction:
@@ -681,6 +695,8 @@ class TracedBinData:
     image_has_constraint: jnp.ndarray
     effective_z_index: int = -1
     constrained_image_indices: jnp.ndarray | None = None
+    magnitude_per_image: jnp.ndarray | None = None
+    magnitude_error_per_image: jnp.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -705,6 +721,8 @@ class FlatCriticalArcData:
     sigma_scatter_y: jnp.ndarray
     mass_scatter_x: jnp.ndarray
     mass_scatter_y: jnp.ndarray
+    magnitude_per_image: jnp.ndarray | None = None
+    magnitude_error_per_image: jnp.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -5795,6 +5813,132 @@ def _critical_arc_branch_probability(
     )
     prob = base + (high - base) * transition
     return jnp.clip(prob, 1.0e-6, 1.0 - 1.0e-6)
+
+
+def _family_magnitude_loglike(
+    magnitude_per_image: jnp.ndarray,
+    magnitude_error_per_image: jnp.ndarray | None,
+    reliability_per_image: jnp.ndarray,
+    image_has_constraint: jnp.ndarray,
+    family_idx: jnp.ndarray,
+    n_families: int,
+    jac_a00: jnp.ndarray,
+    jac_a01: jnp.ndarray,
+    jac_a10: jnp.ndarray,
+    jac_a11: jnp.ndarray,
+    *,
+    magnitude_sigma_floor: float = DEFAULT_MAGNITUDE_SIGMA_FLOOR,
+    magnitude_base_scatter: float | jnp.ndarray = 0.0,
+    magnitude_arc_scatter: float | jnp.ndarray = 0.0,
+    magnitude_mu_floor: float = DEFAULT_MAGNITUDE_MU_FLOOR,
+    magnitude_min_reliability: float = DEFAULT_MAGNITUDE_MIN_RELIABILITY,
+    singular_min_precomputed: jnp.ndarray | None = None,
+    singular_threshold: float | jnp.ndarray = DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+    singular_softness: float | jnp.ndarray = DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
+) -> jnp.ndarray:
+    """Family-level magnitude consistency with the source magnitude marginalized analytically."""
+    raw_magnitudes = jnp.asarray(magnitude_per_image, dtype=jnp.float64)
+    raw_errors = None if magnitude_error_per_image is None else jnp.asarray(magnitude_error_per_image, dtype=jnp.float64)
+    family_idx_base = jnp.asarray(family_idx, dtype=jnp.int32)
+    if raw_magnitudes.ndim == 2:
+        n_bands = int(raw_magnitudes.shape[1])
+        band_likelihood_normalization = jnp.asarray(1.0 / max(n_bands, 1), dtype=jnp.float64)
+        band_idx = jnp.tile(jnp.arange(n_bands, dtype=jnp.int32), raw_magnitudes.shape[0])
+        magnitudes = jnp.ravel(raw_magnitudes)
+        measurement_error_input = None if raw_errors is None else jnp.ravel(raw_errors)
+        reliability_input = jnp.repeat(jnp.asarray(reliability_per_image, dtype=jnp.float64), n_bands)
+        image_has_constraint_input = jnp.repeat(jnp.asarray(image_has_constraint, dtype=bool), n_bands)
+        family_idx_input = jnp.repeat(family_idx_base, n_bands) * n_bands + band_idx
+        n_groups = int(n_families) * n_bands
+        jac_a00_input = jnp.repeat(jnp.asarray(jac_a00, dtype=jnp.float64), n_bands)
+        jac_a01_input = jnp.repeat(jnp.asarray(jac_a01, dtype=jnp.float64), n_bands)
+        jac_a10_input = jnp.repeat(jnp.asarray(jac_a10, dtype=jnp.float64), n_bands)
+        jac_a11_input = jnp.repeat(jnp.asarray(jac_a11, dtype=jnp.float64), n_bands)
+        if singular_min_precomputed is None:
+            singular_min_input = None
+        else:
+            singular_min_input = jnp.repeat(jnp.asarray(singular_min_precomputed, dtype=jnp.float64), n_bands)
+    else:
+        band_likelihood_normalization = jnp.asarray(1.0, dtype=jnp.float64)
+        magnitudes = raw_magnitudes
+        measurement_error_input = raw_errors
+        reliability_input = jnp.asarray(reliability_per_image, dtype=jnp.float64)
+        image_has_constraint_input = jnp.asarray(image_has_constraint, dtype=bool)
+        family_idx_input = family_idx_base
+        n_groups = int(n_families)
+        jac_a00_input = jnp.asarray(jac_a00, dtype=jnp.float64)
+        jac_a01_input = jnp.asarray(jac_a01, dtype=jnp.float64)
+        jac_a10_input = jnp.asarray(jac_a10, dtype=jnp.float64)
+        jac_a11_input = jnp.asarray(jac_a11, dtype=jnp.float64)
+        singular_min_input = singular_min_precomputed
+    reliability = jnp.clip(
+        reliability_input,
+        jnp.asarray(float(magnitude_min_reliability), dtype=jnp.float64),
+        jnp.asarray(1.0, dtype=jnp.float64),
+    )
+    det_a = jac_a00_input * jac_a11_input - jac_a01_input * jac_a10_input
+    abs_mu = 1.0 / jnp.maximum(jnp.abs(det_a), jnp.asarray(1.0e-12, dtype=jnp.float64))
+    source_mag_estimate = magnitudes + 2.5 * jnp.log10(
+        abs_mu + jnp.asarray(float(magnitude_mu_floor), dtype=jnp.float64)
+    )
+
+    if singular_min_input is None:
+        singular_min, _singular_max, _p00, _p01, _p11, singular_finite = _critical_arc_geometry_from_jacobian(
+            jac_a00_input,
+            jac_a01_input,
+            jac_a10_input,
+            jac_a11_input,
+        )
+    else:
+        singular_min = jnp.asarray(singular_min_input, dtype=jnp.float64)
+        singular_finite = jnp.isfinite(singular_min)
+    arc_gate = jax.nn.sigmoid(
+        (jnp.asarray(singular_threshold, dtype=jnp.float64) - jax.lax.stop_gradient(singular_min))
+        / jnp.asarray(singular_softness, dtype=jnp.float64)
+    )
+    if measurement_error_input is None:
+        measurement_sigma = jnp.full_like(magnitudes, float(magnitude_sigma_floor), dtype=jnp.float64)
+    else:
+        measurement_error = jnp.asarray(measurement_error_input, dtype=jnp.float64)
+        measurement_sigma = jnp.where(
+            jnp.isfinite(measurement_error) & (measurement_error > 0.0),
+            jnp.maximum(measurement_error, jnp.asarray(float(magnitude_sigma_floor), dtype=jnp.float64)),
+            jnp.asarray(float(magnitude_sigma_floor), dtype=jnp.float64),
+        )
+    base_scatter = jnp.maximum(
+        jnp.asarray(magnitude_base_scatter, dtype=jnp.float64),
+        jnp.asarray(0.0, dtype=jnp.float64),
+    )
+    arc_scatter = jnp.maximum(
+        jnp.asarray(magnitude_arc_scatter, dtype=jnp.float64),
+        base_scatter,
+    )
+    model_scatter = base_scatter + arc_gate * (arc_scatter - base_scatter)
+    sigma2 = jnp.square(measurement_sigma) + jnp.square(model_scatter)
+    valid = (
+        image_has_constraint_input
+        & jnp.isfinite(magnitudes)
+        & jnp.isfinite(source_mag_estimate)
+        & jnp.isfinite(sigma2)
+        & singular_finite
+        & (sigma2 > 0.0)
+    )
+    precision = jnp.where(valid, reliability / sigma2, jnp.asarray(0.0, dtype=jnp.float64))
+    zeros = jnp.zeros(int(n_groups), dtype=jnp.float64)
+    sum_w = zeros.at[family_idx_input].add(precision)
+    sum_wy = zeros.at[family_idx_input].add(precision * source_mag_estimate)
+    valid_count = jnp.zeros(int(n_groups), dtype=jnp.int32).at[family_idx_input].add(valid.astype(jnp.int32))
+    family_valid = (valid_count >= 2) & (sum_w > 0.0)
+    mean_source_mag = sum_wy / jnp.maximum(sum_w, jnp.asarray(1.0e-18, dtype=jnp.float64))
+    residual = source_mag_estimate - mean_source_mag[family_idx_input]
+    per_image_terms = reliability * (
+        jnp.square(residual) / sigma2 + jnp.log(2.0 * jnp.pi * sigma2)
+    )
+    per_family_terms = zeros.at[family_idx_input].add(jnp.where(valid, per_image_terms, 0.0))
+    marginal_penalty = jnp.log(jnp.maximum(sum_w, jnp.asarray(1.0e-18, dtype=jnp.float64)))
+    loglike = -0.5 * jnp.sum(jnp.where(family_valid, per_family_terms + marginal_penalty, 0.0))
+    loglike = loglike * band_likelihood_normalization
+    return jnp.nan_to_num(loglike, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 class _CriticalArcMixtureTerms(NamedTuple):
@@ -13767,6 +13911,18 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         not np.isfinite(float(fixed_image_sigma_int)) or float(fixed_image_sigma_int) < 0.0
     ):
         _fail("--fix-image-sigma-int-arcsec must be finite and nonnegative.")
+    for attr, option, default, allow_zero in (
+        ("magnitude_sigma_floor", "--magnitude-sigma-floor", DEFAULT_MAGNITUDE_SIGMA_FLOOR, False),
+        ("magnitude_mu_floor", "--magnitude-mu-floor", DEFAULT_MAGNITUDE_MU_FLOOR, True),
+    ):
+        value = float(getattr(args, attr, default))
+        if not np.isfinite(value) or value < 0.0 or (not allow_zero and value <= 0.0):
+            _fail(f"{option} must be finite and {'non-negative' if allow_zero else 'positive'}.")
+    magnitude_min_reliability = float(
+        getattr(args, "magnitude_min_reliability", DEFAULT_MAGNITUDE_MIN_RELIABILITY)
+    )
+    if not np.isfinite(magnitude_min_reliability) or not (0.0 <= magnitude_min_reliability <= 1.0):
+        _fail("--magnitude-min-reliability must be finite and in [0, 1].")
     image_presence_penalty_weight = getattr(args, "image_presence_penalty_weight", None)
     if image_presence_penalty_weight is not None and (
         not np.isfinite(float(image_presence_penalty_weight)) or float(image_presence_penalty_weight) < 0.0
@@ -16254,6 +16410,47 @@ def _build_image_scatter_parameter_spec(
     )
 
 
+def _build_magnitude_scatter_parameter_spec(
+    *,
+    sample_name: str,
+    field: str,
+    upper_mag: float,
+    prior_median_mag: float,
+    prior_log_sigma: float,
+) -> ParameterSpec:
+    lower = float(DEFAULT_MAGNITUDE_SCATTER_LOWER)
+    upper = float(upper_mag)
+    median = float(prior_median_mag)
+    log_sigma = float(prior_log_sigma)
+    if not np.isfinite(lower) or lower <= 0.0:
+        raise ValueError("magnitude scatter lower bound must be finite and positive.")
+    if not np.isfinite(upper) or upper <= lower:
+        raise ValueError("magnitude scatter upper bound must be greater than the lower bound.")
+    if not np.isfinite(median) or not (lower < median < upper):
+        raise ValueError("magnitude scatter prior median must be between lower and upper bounds.")
+    if not np.isfinite(log_sigma) or log_sigma <= 0.0:
+        raise ValueError("magnitude scatter prior log sigma must be positive.")
+    return ParameterSpec(
+        name=f"magnitude.{field}",
+        sample_name=sample_name,
+        potential_id="magnitude",
+        profile_type=0,
+        field=field,
+        prior_kind="truncated_normal",
+        lower=float(np.log(lower)),
+        upper=float(np.log(upper)),
+        step=0.05,
+        mean=float(np.log(median)),
+        std=log_sigma,
+        component_family=MAGNITUDE_SCATTER_COMPONENT_FAMILY,
+        transform_kind="log_positive",
+        physical_lower=lower,
+        physical_upper=upper,
+        physical_mean=median,
+        physical_std=None,
+    )
+
+
 def _build_critical_arc_singular_threshold_parameter_spec(
     start_index: int,
     *,
@@ -17257,6 +17454,7 @@ def _prepare_family_data(
             ra0_deg,
             dec0_deg,
         )
+        catalog_mag, catalog_mag_err = _family_magnitude_arrays(family_df, len(family_df))
         families.append(
             FamilyData(
                 family_id=family_id,
@@ -17266,6 +17464,8 @@ def _prepare_family_data(
                 image_labels=family_df["image_label"].astype(str).tolist(),
                 x_obs=np.asarray(x_obs, dtype=float),
                 y_obs=np.asarray(y_obs, dtype=float),
+                catalog_mag=catalog_mag,
+                catalog_mag_err=catalog_mag_err,
                 reliability=np.asarray(
                     pd.to_numeric(family_df.get("family_reliability", 1.0), errors="coerce")
                     .fillna(1.0)
@@ -17312,6 +17512,63 @@ def _filter_non_positive_redshift_families(images_df: pd.DataFrame) -> tuple[pd.
     )
 
 
+def _image_catalog_band_magnitude_columns(images_df: pd.DataFrame) -> list[tuple[str, str]]:
+    """Return matched per-band magnitude/error columns from a photometry sidecar merge."""
+    pairs: list[tuple[str, str]] = []
+    for column in sorted(str(item) for item in images_df.columns):
+        if not column.startswith("mag_") or column.startswith("mag_err_"):
+            continue
+        suffix = column.removeprefix("mag_")
+        err_column = f"mag_err_{suffix}"
+        use_column = f"use_for_catalog_{suffix}"
+        if err_column in images_df.columns:
+            if use_column in images_df.columns:
+                use_values = pd.Series(images_df[use_column]).astype("boolean").fillna(False)
+                if not bool(use_values.any()):
+                    continue
+            pairs.append((column, err_column))
+    return pairs
+
+
+def _family_magnitude_arrays(family_df: pd.DataFrame, n_images: int) -> tuple[np.ndarray, np.ndarray]:
+    """Build image-by-band magnitude arrays, falling back to the combined catalog magnitude."""
+    band_pairs = _image_catalog_band_magnitude_columns(family_df)
+    if band_pairs:
+        mag_columns = [item[0] for item in band_pairs]
+        err_columns = [item[1] for item in band_pairs]
+        return (
+            family_df.loc[:, mag_columns].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float),
+            family_df.loc[:, err_columns].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float),
+        )
+    catalog_mag = np.asarray(
+        pd.to_numeric(
+            (
+                family_df["catalog_mag"]
+                if "catalog_mag" in family_df.columns
+                else pd.Series(np.nan, index=family_df.index)
+            ),
+            errors="coerce",
+        ).to_numpy(dtype=float),
+        dtype=float,
+    )
+    catalog_mag_err = np.asarray(
+        pd.to_numeric(
+            (
+                family_df["catalog_mag_err"]
+                if "catalog_mag_err" in family_df.columns
+                else pd.Series(np.nan, index=family_df.index)
+            ),
+            errors="coerce",
+        ).to_numpy(dtype=float),
+        dtype=float,
+    )
+    if catalog_mag.shape != (n_images,):
+        catalog_mag = np.full(n_images, np.nan, dtype=float)
+    if catalog_mag_err.shape != (n_images,):
+        catalog_mag_err = np.full(n_images, np.nan, dtype=float)
+    return catalog_mag, catalog_mag_err
+
+
 def _build_bin_data(families: list[FamilyData]) -> list[BinData]:
     bins: dict[float, list[FamilyData]] = {}
     for family in families:
@@ -17324,6 +17581,22 @@ def _build_bin_data(families: list[FamilyData]) -> list[BinData]:
         sigma_per_image = np.concatenate(
             [np.full(family.n_images, family.sigma_arcsec, dtype=float) for family in family_list]
         )
+        magnitude_per_image = np.concatenate(
+            [
+                np.asarray(family.catalog_mag, dtype=float)
+                if np.asarray(family.catalog_mag, dtype=float).shape[:1] == (family.n_images,)
+                else np.full(family.n_images, np.nan, dtype=float)
+                for family in family_list
+            ]
+        )
+        magnitude_error_per_image = np.concatenate(
+            [
+                np.asarray(family.catalog_mag_err, dtype=float)
+                if np.asarray(family.catalog_mag_err, dtype=float).shape[:1] == (family.n_images,)
+                else np.full(family.n_images, np.nan, dtype=float)
+                for family in family_list
+            ]
+        )
         reliability_per_image = np.concatenate([family.reliability for family in family_list])
         family_index_per_image = np.concatenate(
             [np.full(family.n_images, idx, dtype=int) for idx, family in enumerate(family_list)]
@@ -17335,6 +17608,8 @@ def _build_bin_data(families: list[FamilyData]) -> list[BinData]:
                 family_index_per_image=family_index_per_image,
                 x_obs=x_obs,
                 y_obs=y_obs,
+                magnitude_per_image=magnitude_per_image,
+                magnitude_error_per_image=magnitude_error_per_image,
                 sigma_per_image=sigma_per_image,
                 reliability_per_image=reliability_per_image,
             )
@@ -17404,6 +17679,10 @@ class ClusterJAXEvaluator:
         arc_recovery_p_arc_threshold: float = DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD,
         arc_aware_max_arclength_arcsec: float = DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC,
         arc_aware_curve_step_arcsec: float = DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC,
+        use_magnitude_likelihood: bool = DEFAULT_USE_MAGNITUDE_LIKELIHOOD,
+        magnitude_sigma_floor: float = DEFAULT_MAGNITUDE_SIGMA_FLOOR,
+        magnitude_mu_floor: float = DEFAULT_MAGNITUDE_MU_FLOOR,
+        magnitude_min_reliability: float = DEFAULT_MAGNITUDE_MIN_RELIABILITY,
         fold_curvature_arcsec_inv: float = DEFAULT_FOLD_CURVATURE_ARCSEC_INV,
         catastrophe_likelihood: str = DEFAULT_CATASTROPHE_LIKELIHOOD,
         catastrophe_lambda_on: float = DEFAULT_CATASTROPHE_LAMBDA_ON,
@@ -17633,6 +17912,10 @@ class ClusterJAXEvaluator:
         self.arc_recovery_p_arc_threshold = float(arc_recovery_p_arc_threshold)
         self.arc_aware_max_arclength_arcsec = float(arc_aware_max_arclength_arcsec)
         self.arc_aware_curve_step_arcsec = float(arc_aware_curve_step_arcsec)
+        self.use_magnitude_likelihood = bool(use_magnitude_likelihood)
+        self.magnitude_sigma_floor = float(magnitude_sigma_floor)
+        self.magnitude_mu_floor = float(magnitude_mu_floor)
+        self.magnitude_min_reliability = float(magnitude_min_reliability)
         self.fold_curvature_arcsec_inv = float(fold_curvature_arcsec_inv)
         self.catastrophe_likelihood = str(catastrophe_likelihood)
         self.catastrophe_lambda_on = float(catastrophe_lambda_on)
@@ -17692,6 +17975,18 @@ class ClusterJAXEvaluator:
             raise ValueError("arc_aware_max_arclength_arcsec must be finite and positive.")
         if not np.isfinite(self.arc_aware_curve_step_arcsec) or self.arc_aware_curve_step_arcsec <= 0.0:
             raise ValueError("arc_aware_curve_step_arcsec must be finite and positive.")
+        for value, name, allow_zero in (
+            (self.magnitude_sigma_floor, "magnitude_sigma_floor", False),
+            (self.magnitude_mu_floor, "magnitude_mu_floor", True),
+        ):
+            if not np.isfinite(value) or value < 0.0 or (not allow_zero and value <= 0.0):
+                raise ValueError(f"{name} must be finite and {'non-negative' if allow_zero else 'positive'}.")
+        if (
+            not np.isfinite(self.magnitude_min_reliability)
+            or self.magnitude_min_reliability < 0.0
+            or self.magnitude_min_reliability > 1.0
+        ):
+            raise ValueError("magnitude_min_reliability must be finite and in [0, 1].")
         if (
             not np.isfinite(self.fold_curvature_arcsec_inv)
             or self.fold_curvature_arcsec_inv <= 0.0
@@ -17902,6 +18197,22 @@ class ClusterJAXEvaluator:
         ]
         self.image_sigma_int_param_index = int(image_scatter_indices[0]) if image_scatter_indices else -1
         self.image_sigma_int_sampled = self.fixed_image_sigma_int_arcsec is None and self.image_sigma_int_param_index >= 0
+        self.magnitude_base_scatter_param_index = next(
+            (
+                idx
+                for idx, spec in enumerate(self.state.parameter_specs)
+                if spec.sample_name == MAGNITUDE_BASE_SCATTER_SAMPLE_NAME
+            ),
+            -1,
+        )
+        self.magnitude_arc_scatter_param_index = next(
+            (
+                idx
+                for idx, spec in enumerate(self.state.parameter_specs)
+                if spec.sample_name == MAGNITUDE_ARC_SCATTER_SAMPLE_NAME
+            ),
+            -1,
+        )
         self.log_softening_length_param_index = next(
             (
                 idx
@@ -18276,6 +18587,8 @@ class ClusterJAXEvaluator:
             x_obs=jnp.asarray(bin_data.x_obs, dtype=jnp.float64),
             y_obs=jnp.asarray(bin_data.y_obs, dtype=jnp.float64),
             sigma_per_image=jnp.asarray(bin_data.sigma_per_image, dtype=jnp.float64),
+            magnitude_per_image=jnp.asarray(bin_data.magnitude_per_image, dtype=jnp.float64),
+            magnitude_error_per_image=jnp.asarray(bin_data.magnitude_error_per_image, dtype=jnp.float64),
             reliability_per_image=jnp.asarray(bin_data.reliability_per_image, dtype=jnp.float64),
             image_has_constraint=jnp.asarray(image_has_constraint, dtype=bool),
             effective_z_index=int(self.cosmology_effective_z_to_index.get(float(bin_data.effective_z_source), -1)),
@@ -18286,6 +18599,8 @@ class ClusterJAXEvaluator:
         x_obs: list[np.ndarray] = []
         y_obs: list[np.ndarray] = []
         sigma_per_image: list[np.ndarray] = []
+        magnitude_per_image: list[np.ndarray] = []
+        magnitude_error_per_image: list[np.ndarray] = []
         reliability_per_image: list[np.ndarray] = []
         image_has_constraint: list[np.ndarray] = []
         effective_z_index_per_image: list[np.ndarray] = []
@@ -18306,6 +18621,8 @@ class ClusterJAXEvaluator:
             x_obs.append(np.asarray(bin_data.x_obs, dtype=float))
             y_obs.append(np.asarray(bin_data.y_obs, dtype=float))
             sigma_per_image.append(np.asarray(bin_data.sigma_per_image, dtype=float))
+            magnitude_per_image.append(np.asarray(bin_data.magnitude_per_image, dtype=float))
+            magnitude_error_per_image.append(np.asarray(bin_data.magnitude_error_per_image, dtype=float))
             reliability_per_image.append(np.asarray(bin_data.reliability_per_image, dtype=float))
             image_has_constraint.append(np.asarray(bin_data.image_has_constraint, dtype=bool))
             effective_z_index_per_image.append(
@@ -18341,6 +18658,8 @@ class ClusterJAXEvaluator:
             x_obs=concat_or_empty(x_obs, jnp.float64),
             y_obs=concat_or_empty(y_obs, jnp.float64),
             sigma_per_image=concat_or_empty(sigma_per_image, jnp.float64),
+            magnitude_per_image=concat_or_empty(magnitude_per_image, jnp.float64),
+            magnitude_error_per_image=concat_or_empty(magnitude_error_per_image, jnp.float64),
             reliability_per_image=concat_or_empty(reliability_per_image, jnp.float64),
             image_has_constraint=concat_or_empty(image_has_constraint, bool),
             effective_z_index_per_image=concat_or_empty(effective_z_index_per_image, jnp.int32),
@@ -18729,6 +19048,22 @@ class ClusterJAXEvaluator:
         physical_params = _convert_theta_to_physical(params_array, self.state.parameter_specs)
         return float(physical_params[self.image_sigma_int_param_index])
 
+    def _magnitude_base_scatter_from_physical(self, physical_params: jnp.ndarray) -> jnp.ndarray:
+        if self.magnitude_base_scatter_param_index < 0:
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        return jnp.take(
+            physical_params,
+            jnp.asarray(self.magnitude_base_scatter_param_index, dtype=jnp.int32),
+        )
+
+    def _magnitude_arc_scatter_from_physical(self, physical_params: jnp.ndarray) -> jnp.ndarray:
+        if self.magnitude_arc_scatter_param_index < 0:
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        return jnp.take(
+            physical_params,
+            jnp.asarray(self.magnitude_arc_scatter_param_index, dtype=jnp.int32),
+        )
+
     def _critical_arc_singular_threshold_from_physical(self, physical_params: jnp.ndarray) -> jnp.ndarray:
         param_index = int(getattr(self, "critical_arc_singular_threshold_param_index", -1))
         if param_index < 0:
@@ -19091,6 +19426,84 @@ class ClusterJAXEvaluator:
             source_y_by_family[family_idx],
             finite,
             jnp.where(finite, correction, jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64)),
+        )
+
+    def _magnitude_loglike_for_flat_data(
+        self,
+        flat_data: FlatCriticalArcData,
+        physical_params: jnp.ndarray,
+        jacobian_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+        *,
+        singular_min: jnp.ndarray | None = None,
+        singular_threshold: float | jnp.ndarray | None = None,
+        singular_softness: float | jnp.ndarray | None = None,
+    ) -> jnp.ndarray:
+        if not bool(getattr(self, "use_magnitude_likelihood", False)):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        if flat_data.magnitude_per_image is None:
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        return _family_magnitude_loglike(
+            magnitude_per_image=flat_data.magnitude_per_image,
+            magnitude_error_per_image=flat_data.magnitude_error_per_image,
+            reliability_per_image=flat_data.reliability_per_image,
+            image_has_constraint=flat_data.image_has_constraint,
+            family_idx=flat_data.global_family_index_per_image,
+            n_families=flat_data.n_families,
+            jac_a00=jacobian_entries[0],
+            jac_a01=jacobian_entries[1],
+            jac_a10=jacobian_entries[2],
+            jac_a11=jacobian_entries[3],
+            magnitude_sigma_floor=self.magnitude_sigma_floor,
+            magnitude_base_scatter=self._magnitude_base_scatter_from_physical(physical_params),
+            magnitude_arc_scatter=self._magnitude_arc_scatter_from_physical(physical_params),
+            magnitude_mu_floor=self.magnitude_mu_floor,
+            magnitude_min_reliability=self.magnitude_min_reliability,
+            singular_min_precomputed=singular_min,
+            singular_threshold=(
+                self.critical_arc_singular_threshold if singular_threshold is None else singular_threshold
+            ),
+            singular_softness=(
+                self.critical_arc_singular_softness if singular_softness is None else singular_softness
+            ),
+        )
+
+    def _magnitude_loglike_for_bin(
+        self,
+        bin_data: TracedBinData,
+        physical_params: jnp.ndarray,
+        jacobian_entries: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+        *,
+        singular_min: jnp.ndarray | None = None,
+        singular_threshold: float | jnp.ndarray | None = None,
+        singular_softness: float | jnp.ndarray | None = None,
+    ) -> jnp.ndarray:
+        if not bool(getattr(self, "use_magnitude_likelihood", False)):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        if bin_data.magnitude_per_image is None:
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        return _family_magnitude_loglike(
+            magnitude_per_image=bin_data.magnitude_per_image,
+            magnitude_error_per_image=bin_data.magnitude_error_per_image,
+            reliability_per_image=bin_data.reliability_per_image,
+            image_has_constraint=bin_data.image_has_constraint,
+            family_idx=bin_data.family_index_per_image,
+            n_families=bin_data.n_families,
+            jac_a00=jacobian_entries[0],
+            jac_a01=jacobian_entries[1],
+            jac_a10=jacobian_entries[2],
+            jac_a11=jacobian_entries[3],
+            magnitude_sigma_floor=self.magnitude_sigma_floor,
+            magnitude_base_scatter=self._magnitude_base_scatter_from_physical(physical_params),
+            magnitude_arc_scatter=self._magnitude_arc_scatter_from_physical(physical_params),
+            magnitude_mu_floor=self.magnitude_mu_floor,
+            magnitude_min_reliability=self.magnitude_min_reliability,
+            singular_min_precomputed=singular_min,
+            singular_threshold=(
+                self.critical_arc_singular_threshold if singular_threshold is None else singular_threshold
+            ),
+            singular_softness=(
+                self.critical_arc_singular_softness if singular_softness is None else singular_softness
+            ),
         )
 
     def _reported_physical_parameter_vector(self, params: jnp.ndarray) -> jnp.ndarray:
@@ -20319,6 +20732,11 @@ class ClusterJAXEvaluator:
             residual_loss=self.likelihood_stabilizer_residual_loss,
             student_t_nu=self.likelihood_stabilizer_student_t_nu,
         )
+        flat_loglike = flat_loglike + self._magnitude_loglike_for_flat_data(
+            flat_data,
+            physical_params,
+            (source_metric.jac_a00, source_metric.jac_a01, source_metric.jac_a10, source_metric.jac_a11),
+        )
         invalid = (
             invalid
             | (~jnp.all(jnp.isfinite(beta_x)))
@@ -20370,6 +20788,11 @@ class ClusterJAXEvaluator:
             max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
             residual_loss=self.likelihood_stabilizer_residual_loss,
             student_t_nu=self.likelihood_stabilizer_student_t_nu,
+        )
+        flat_loglike = flat_loglike + self._magnitude_loglike_for_flat_data(
+            flat_data,
+            physical_params,
+            (source_metric.jac_a00, source_metric.jac_a01, source_metric.jac_a10, source_metric.jac_a11),
         )
         invalid = (
             invalid
@@ -20447,6 +20870,11 @@ class ClusterJAXEvaluator:
             max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
             residual_loss=self.likelihood_stabilizer_residual_loss,
             student_t_nu=self.likelihood_stabilizer_student_t_nu,
+        )
+        flat_loglike = flat_loglike + self._magnitude_loglike_for_flat_data(
+            flat_data,
+            physical_params,
+            (jac_a00, jac_a01, jac_a10, jac_a11),
         )
         invalid = (
             invalid
@@ -20585,6 +21013,14 @@ class ClusterJAXEvaluator:
             scatter_cov01=scatter_cov01,
             scatter_cov11=scatter_cov11,
         )
+        flat_loglike = flat_loglike + self._magnitude_loglike_for_flat_data(
+            flat_data,
+            physical_params,
+            observed_jacobian_entries,
+            singular_min=singular_min,
+            singular_threshold=critical_arc_singular_threshold,
+            singular_softness=critical_arc_singular_softness,
+        )
         total_loglike = jnp.where(invalid, total_loglike, flat_loglike + source_transport_correction)
         invalid_seen = invalid
         arc_data = getattr(self, "traced_arc_data", None)
@@ -20670,6 +21106,11 @@ class ClusterJAXEvaluator:
             max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
             residual_loss=self.likelihood_stabilizer_residual_loss,
             student_t_nu=self.likelihood_stabilizer_student_t_nu,
+        )
+        flat_loglike = flat_loglike + self._magnitude_loglike_for_flat_data(
+            flat_data,
+            physical_params,
+            (jac_a00, jac_a01, jac_a10, jac_a11),
         )
         invalid = (
             invalid
@@ -20834,6 +21275,13 @@ class ClusterJAXEvaluator:
             scatter_cov00=scatter_cov00,
             scatter_cov01=scatter_cov01,
             scatter_cov11=scatter_cov11,
+        )
+        flat_loglike = flat_loglike + self._magnitude_loglike_for_flat_data(
+            flat_data,
+            observed_jacobian_entries,
+            singular_min=singular_min,
+            singular_threshold=critical_arc_singular_threshold,
+            singular_softness=critical_arc_singular_softness,
         )
         total_loglike = jnp.where(invalid, total_loglike, flat_loglike + source_transport_correction)
         invalid_seen = invalid
@@ -23478,6 +23926,11 @@ class ClusterJAXEvaluator:
                     residual_loss=self.likelihood_stabilizer_residual_loss,
                     student_t_nu=self.likelihood_stabilizer_student_t_nu,
                 )
+                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
+                    bin_data,
+                    physical_params,
+                    observed_jacobian_entries,
+                )
                 bin_loglike = bin_loglike + source_transport_correction
             elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE:
                 observed_beta_x = beta_x
@@ -23542,6 +23995,11 @@ class ClusterJAXEvaluator:
                     image_presence_count_margin=self.image_presence_count_margin,
                     residual_loss=self.likelihood_stabilizer_residual_loss,
                     student_t_nu=self.likelihood_stabilizer_student_t_nu,
+                )
+                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
+                    bin_data,
+                    physical_params,
+                    observed_jacobian_entries,
                 )
                 bin_loglike = bin_loglike + source_transport_correction
             elif _sample_likelihood_uses_critical_arc_terms(self.sample_likelihood_mode):
@@ -23661,6 +24119,14 @@ class ClusterJAXEvaluator:
                     scatter_cov00=scatter_cov00,
                     scatter_cov01=scatter_cov01,
                     scatter_cov11=scatter_cov11,
+                )
+                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
+                    bin_data,
+                    physical_params,
+                    observed_jacobian_entries,
+                    singular_min=singular_min,
+                    singular_threshold=critical_arc_singular_threshold,
+                    singular_softness=critical_arc_singular_softness,
                 )
                 bin_loglike = bin_loglike + source_transport_correction
             elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE:
@@ -23824,6 +24290,11 @@ class ClusterJAXEvaluator:
                         image_presence_count_softness=self.image_presence_count_softness,
                         image_presence_count_margin=self.image_presence_count_margin,
                     )
+                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
+                    bin_data,
+                    physical_params,
+                    observed_jacobian_entries,
+                )
                 bin_loglike = bin_loglike + source_transport_correction
             elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE:
                 observed_beta_x = beta_x
@@ -23948,6 +24419,11 @@ class ClusterJAXEvaluator:
                     image_presence_count_softness=self.image_presence_count_softness,
                     image_presence_count_margin=self.image_presence_count_margin,
                 )
+                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
+                    bin_data,
+                    physical_params,
+                    observed_jacobian_entries,
+                )
                 bin_loglike = bin_loglike + source_transport_correction
             elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE:
                 observed_beta_x = beta_x
@@ -24012,6 +24488,11 @@ class ClusterJAXEvaluator:
                     image_presence_count_softness=self.image_presence_count_softness,
                     image_presence_count_margin=self.image_presence_count_margin,
                 )
+                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
+                    bin_data,
+                    physical_params,
+                    observed_jacobian_entries,
+                )
                 bin_loglike = bin_loglike + source_transport_correction
             elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
                 jac_a00, jac_a01, jac_a10, jac_a11 = self._source_metric_jacobian_entries(bin_data)
@@ -24037,6 +24518,11 @@ class ClusterJAXEvaluator:
                     residual_loss=self.likelihood_stabilizer_residual_loss,
                     student_t_nu=self.likelihood_stabilizer_student_t_nu,
                 )
+                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
+                    bin_data,
+                    physical_params,
+                    (jac_a00, jac_a01, jac_a10, jac_a11),
+                )
             else:
                 bin_loglike = _source_plane_bin_loglike(
                     beta_x=beta_x,
@@ -24056,6 +24542,12 @@ class ClusterJAXEvaluator:
                     max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
                     residual_loss=self.likelihood_stabilizer_residual_loss,
                     student_t_nu=self.likelihood_stabilizer_student_t_nu,
+                )
+                source_jacobian_entries = self._source_metric_jacobian_entries(bin_data)
+                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
+                    bin_data,
+                    physical_params,
+                    source_jacobian_entries,
                 )
             total_loglike = jnp.where(invalid, total_loglike, total_loglike + bin_loglike)
             invalid_seen = jnp.logical_or(invalid_seen, invalid)
@@ -25578,6 +26070,8 @@ def _save_plot_bundle_h5(
                         "image_labels": family.image_labels,
                         "x_obs": family.x_obs,
                         "y_obs": family.y_obs,
+                        "catalog_mag": family.catalog_mag,
+                        "catalog_mag_err": family.catalog_mag_err,
                         "reliability": family.reliability,
                     }
                     for family in state.family_data
@@ -25589,6 +26083,8 @@ def _save_plot_bundle_h5(
                         "family_index_per_image": bin_item.family_index_per_image,
                         "x_obs": bin_item.x_obs,
                         "y_obs": bin_item.y_obs,
+                        "magnitude_per_image": bin_item.magnitude_per_image,
+                        "magnitude_error_per_image": bin_item.magnitude_error_per_image,
                         "sigma_per_image": bin_item.sigma_per_image,
                         "reliability_per_image": bin_item.reliability_per_image,
                     }
@@ -25662,6 +26158,14 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
                     image_labels=[str(label) for label in item["image_labels"]],
                     x_obs=np.asarray(item["x_obs"], dtype=float),
                     y_obs=np.asarray(item["y_obs"], dtype=float),
+                    catalog_mag=np.asarray(
+                        item.get("catalog_mag", np.full(len(item["image_labels"]), np.nan)),
+                        dtype=float,
+                    ),
+                    catalog_mag_err=np.asarray(
+                        item.get("catalog_mag_err", np.full(len(item["image_labels"]), np.nan)),
+                        dtype=float,
+                    ),
                     reliability=np.asarray(
                         item.get("reliability", np.ones(len(item["image_labels"]), dtype=float)),
                         dtype=float,
@@ -25676,6 +26180,14 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
                     family_index_per_image=np.asarray(item["family_index_per_image"], dtype=int),
                     x_obs=np.asarray(item["x_obs"], dtype=float),
                     y_obs=np.asarray(item["y_obs"], dtype=float),
+                    magnitude_per_image=np.asarray(
+                        item.get("magnitude_per_image", np.full(len(item["x_obs"]), np.nan)),
+                        dtype=float,
+                    ),
+                    magnitude_error_per_image=np.asarray(
+                        item.get("magnitude_error_per_image", np.full(len(item["x_obs"]), np.nan)),
+                        dtype=float,
+                    ),
                     sigma_per_image=np.asarray(item["sigma_per_image"], dtype=float),
                     reliability_per_image=np.asarray(
                         item.get("reliability_per_image", np.ones(len(item["x_obs"]), dtype=float)),
@@ -26038,6 +26550,19 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
         ),
         arc_aware_curve_step_arcsec=float(
             plot_saved_args.get("arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)
+        ),
+        use_magnitude_likelihood=bool(
+            plot_saved_args.get("use_magnitude_likelihood", DEFAULT_USE_MAGNITUDE_LIKELIHOOD)
+        ),
+        magnitude_sigma_floor=float(
+            plot_saved_args.get(
+                "magnitude_sigma_floor",
+                plot_saved_args.get("magnitude_sigma", DEFAULT_MAGNITUDE_SIGMA_FLOOR),
+            )
+        ),
+        magnitude_mu_floor=float(plot_saved_args.get("magnitude_mu_floor", DEFAULT_MAGNITUDE_MU_FLOOR)),
+        magnitude_min_reliability=float(
+            plot_saved_args.get("magnitude_min_reliability", DEFAULT_MAGNITUDE_MIN_RELIABILITY)
         ),
         fold_curvature_arcsec_inv=float(
             plot_saved_args.get("fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
@@ -27087,6 +27612,25 @@ def _build_state_from_inputs(
             )
     elif family_data:
         parameter_specs.append(_build_source_scatter_parameter_spec(start_index=len(parameter_specs)))
+    if bool(getattr(args, "use_magnitude_likelihood", DEFAULT_USE_MAGNITUDE_LIKELIHOOD)) and family_data:
+        parameter_specs.append(
+            _build_magnitude_scatter_parameter_spec(
+                sample_name=MAGNITUDE_BASE_SCATTER_SAMPLE_NAME,
+                field="base_scatter",
+                upper_mag=DEFAULT_MAGNITUDE_BASE_SCATTER_UPPER,
+                prior_median_mag=DEFAULT_MAGNITUDE_BASE_SCATTER_PRIOR_MEDIAN,
+                prior_log_sigma=DEFAULT_MAGNITUDE_BASE_SCATTER_PRIOR_LOG_SIGMA,
+            )
+        )
+        parameter_specs.append(
+            _build_magnitude_scatter_parameter_spec(
+                sample_name=MAGNITUDE_ARC_SCATTER_SAMPLE_NAME,
+                field="arc_scatter",
+                upper_mag=DEFAULT_MAGNITUDE_ARC_SCATTER_UPPER,
+                prior_median_mag=DEFAULT_MAGNITUDE_ARC_SCATTER_PRIOR_MEDIAN,
+                prior_log_sigma=DEFAULT_MAGNITUDE_ARC_SCATTER_PRIOR_LOG_SIGMA,
+            )
+        )
     if (
         bool(getattr(args, "sample_critical_arc_singular_threshold", False))
         and _sample_likelihood_uses_critical_arc_terms(sample_likelihood_mode)
@@ -27736,6 +28280,16 @@ def _build_cluster_evaluator_from_args(
         ),
         arc_aware_curve_step_arcsec=float(
             getattr(args, "arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)
+        ),
+        use_magnitude_likelihood=bool(
+            getattr(args, "use_magnitude_likelihood", DEFAULT_USE_MAGNITUDE_LIKELIHOOD)
+        ),
+        magnitude_sigma_floor=float(
+            getattr(args, "magnitude_sigma_floor", getattr(args, "magnitude_sigma", DEFAULT_MAGNITUDE_SIGMA_FLOOR))
+        ),
+        magnitude_mu_floor=float(getattr(args, "magnitude_mu_floor", DEFAULT_MAGNITUDE_MU_FLOOR)),
+        magnitude_min_reliability=float(
+            getattr(args, "magnitude_min_reliability", DEFAULT_MAGNITUDE_MIN_RELIABILITY)
         ),
         fold_curvature_arcsec_inv=float(
             getattr(args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
@@ -29398,6 +29952,19 @@ def _rerender_plots(
         arc_aware_curve_step_arcsec=float(
             plot_saved_args.get("arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)
         ),
+        use_magnitude_likelihood=bool(
+            plot_saved_args.get("use_magnitude_likelihood", DEFAULT_USE_MAGNITUDE_LIKELIHOOD)
+        ),
+        magnitude_sigma_floor=float(
+            plot_saved_args.get(
+                "magnitude_sigma_floor",
+                plot_saved_args.get("magnitude_sigma", DEFAULT_MAGNITUDE_SIGMA_FLOOR),
+            )
+        ),
+        magnitude_mu_floor=float(plot_saved_args.get("magnitude_mu_floor", DEFAULT_MAGNITUDE_MU_FLOOR)),
+        magnitude_min_reliability=float(
+            plot_saved_args.get("magnitude_min_reliability", DEFAULT_MAGNITUDE_MIN_RELIABILITY)
+        ),
         fold_curvature_arcsec_inv=float(
             plot_saved_args.get("fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
         ),
@@ -30681,6 +31248,16 @@ def _run_sequential(args: argparse.Namespace) -> None:
         ),
         "arc_aware_curve_step_arcsec": float(
             getattr(args, "arc_aware_curve_step_arcsec", DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC)
+        ),
+        "use_magnitude_likelihood": bool(
+            getattr(args, "use_magnitude_likelihood", DEFAULT_USE_MAGNITUDE_LIKELIHOOD)
+        ),
+        "magnitude_sigma_floor": float(
+            getattr(args, "magnitude_sigma_floor", getattr(args, "magnitude_sigma", DEFAULT_MAGNITUDE_SIGMA_FLOOR))
+        ),
+        "magnitude_mu_floor": float(getattr(args, "magnitude_mu_floor", DEFAULT_MAGNITUDE_MU_FLOOR)),
+        "magnitude_min_reliability": float(
+            getattr(args, "magnitude_min_reliability", DEFAULT_MAGNITUDE_MIN_RELIABILITY)
         ),
         "fold_curvature_arcsec_inv": float(
             getattr(args, "fold_curvature_arcsec_inv", DEFAULT_FOLD_CURVATURE_ARCSEC_INV)
