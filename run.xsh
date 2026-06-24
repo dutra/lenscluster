@@ -39,7 +39,7 @@ from lenscluster.config import (
 from lenscluster.planning import compile_run_plan
 from lenscluster.runner import LensClusterRunner
 
-OUTPUT_DIR_LABEL = "jun23b_newconfig_excludebgcs"
+OUTPUT_DIR_LABEL = "jun24d_flatpackedlenstate_vectorized_newconfig_anistropic"
 
 # Kept here for HFF display tuning reuse, but this runner intentionally has no
 # HFF/Bergamini model configurations.
@@ -201,18 +201,18 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         raise ValueError(f"cluster must be one of {', '.join(sorted(FF_SIMS_CLUSTERS))}; got {cluster!r}.")
     cluster_config = FF_SIMS_CLUSTERS[cluster]
 
-    perturbation_alpha_tol = 0.4
-    perturbation_jacobian_tol = 0.3
-    perturbation_top_k = None
-    warmup = 5000
-    samples = 1000
+    perturbation_alpha_tol = 0.1
+    perturbation_jacobian_tol = 0.1
+    perturbation_top_k = 20
+    warmup = 1000
+    samples = 500
     max_tree_depth = 8
     mode = "none"
     stage0_likelihood = "source"
-    stage1_likelihood = "critical-arc"
-    #stage1_likelihood = "source"
+    #stage1_likelihood = "critical-arc-anisotropic"
+    stage1_likelihood = "source"
     output_dir = (
-        f"{cluster_config['output_dir']}_PD{perturbation_alpha_tol:g}_"
+        f"{cluster_config['output_dir']}_PD{perturbation_alpha_tol:g}_TOPK_{perturbation_top_k}_"
         f"{perturbation_jacobian_tol:g}_T{max_tree_depth}W{warmup}S{samples}"
     )
     run_name = f"{cluster_config['cluster_key']}_S1{stage1_likelihood}_S2{mode}"
@@ -254,7 +254,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         schedule=StageScheduleConfig(
             fit_method=("svi+nuts",),
             refresh_every=(None, 1000),
-            svi_steps=(10000, 5000),
+            svi_steps=(10000, 10000),
             warmup=(warmup,),
             samples=(samples,),
             sampling_refresh_runs=(1,),
@@ -286,7 +286,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             softening_length_prior_log_sigma=float(cluster_config["softening_length_prior_log_sigma"]),
         ),
         likelihood=LikelihoodConfig(
-            pos_sigma_arcsec=0.01,
+            pos_sigma_arcsec=0.1,
             source_plane_covariance_mode="magnification",
             image_presence_penalty_weight=2.0,
             image_presence_match_radius_arcsec=1.0,

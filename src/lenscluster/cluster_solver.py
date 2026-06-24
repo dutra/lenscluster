@@ -1124,17 +1124,36 @@ def _evaluator_uses_conditional_source_transport(evaluator: Any | None) -> bool:
     )
 
 
+def _add_dynamic_cut_reference_offsets_to_reported_array(
+    array: np.ndarray,
+    parameter_specs: list[ParameterSpec],
+) -> np.ndarray:
+    reported = np.asarray(array, dtype=float).copy()
+    if reported.size == 0:
+        return reported
+    for index, spec in enumerate(parameter_specs):
+        if (
+            spec.field == "cut_radius_kpc"
+            and spec.transform_kind == "log_positive"
+            and float(getattr(spec, "transform_offset", 0.0)) > 0.0
+        ):
+            reported[..., index] = reported[..., index] + float(spec.transform_offset)
+    return reported
+
+
 def _convert_theta_to_reported_physical(
     theta: np.ndarray,
     parameter_specs: list[ParameterSpec],
     evaluator: Any | None = None,
 ) -> np.ndarray:
     if _evaluator_uses_conditional_source_transport(evaluator):
-        return np.asarray(
+        converted = np.asarray(
             evaluator.reported_physical_parameter_vector(jnp.asarray(theta, dtype=jnp.float64)),
             dtype=float,
         )
-    return _convert_theta_to_physical(theta, parameter_specs)
+    else:
+        converted = _convert_theta_to_physical(theta, parameter_specs)
+    return _add_dynamic_cut_reference_offsets_to_reported_array(converted, parameter_specs)
 
 
 def _convert_sample_matrix_to_reported_physical(
@@ -1148,14 +1167,20 @@ def _convert_sample_matrix_to_reported_physical(
     if array.size == 0:
         return array.copy()
     if not _evaluator_uses_conditional_source_transport(evaluator):
-        return _convert_sample_matrix_to_physical(array, parameter_specs)
+        return _add_dynamic_cut_reference_offsets_to_reported_array(
+            _convert_sample_matrix_to_physical(array, parameter_specs),
+            parameter_specs,
+        )
     original_shape = array.shape
     flat = array.reshape((-1, original_shape[-1]))
     converted = np.asarray(
         jax.vmap(evaluator._reported_physical_parameter_vector)(jnp.asarray(flat, dtype=jnp.float64)),
         dtype=float,
     )
-    return converted.reshape(original_shape)
+    return _add_dynamic_cut_reference_offsets_to_reported_array(
+        converted.reshape(original_shape),
+        parameter_specs,
+    )
 
 
 def _convert_ns_diagnostics_samples(
@@ -3848,7 +3873,17 @@ def _jitter_theta_in_support(
 
 
 def _initial_latent_value_from_physical(physical_value: float, spec: ParameterSpec) -> float:
-    latent_value = _physical_to_latent_numpy(float(physical_value), spec)
+    reported_physical_value = float(physical_value)
+    if (
+        spec.field == "cut_radius_kpc"
+        and spec.transform_kind == "log_positive"
+        and float(getattr(spec, "transform_offset", 0.0)) > 0.0
+    ):
+        reported_physical_value = max(
+            reported_physical_value - float(spec.transform_offset),
+            SAFE_RADIUS_MARGIN_KPC,
+        )
+    latent_value = _physical_to_latent_numpy(reported_physical_value, spec)
     if spec.prior_kind not in {"uniform", "truncated_normal"}:
         return latent_value
     return _clip_value_to_safe_bounds(
@@ -14960,6 +14995,9 @@ def _radius_transform_for_component_prior(
     potential: dict[str, Any],
     field_name: str,
     decoded_prior: dict[str, Any],
+    *,
+    softening_length_kpc: float = 0.0,
+    dynamic_cut_above_effective_core: bool = False,
 ) -> dict[str, Any]:
     prior_kind = str(decoded_prior["prior_kind"])
     lower = float(decoded_prior["lower"])
@@ -14990,8 +15028,19 @@ def _radius_transform_for_component_prior(
             step = float(max(step, SAFE_RADIUS_MARGIN_KPC))
     elif field_name == "cut_radius_kpc":
         core_radius = _coerce_numeric(potential.get("core_radius_kpc", SAFE_RADIUS_MARGIN_KPC), "core_radius_kpc")
-        transform_kind = "log_offset_positive"
-        transform_offset = max(float(core_radius), 0.0)
+        intrinsic_core_radius = max(float(core_radius), 0.0)
+        if dynamic_cut_above_effective_core:
+            softening = max(float(softening_length_kpc), 0.0)
+            transform_kind = "log_positive"
+            transform_offset = float(math.sqrt(intrinsic_core_radius * intrinsic_core_radius + softening * softening))
+            if np.isfinite(upper) and float(upper) <= transform_offset:
+                raise ValueError(
+                    f"{potential.get('id', 'potential')}.{field_name} upper bound {upper:g} kpc must exceed "
+                    f"reference effective core {transform_offset:g} kpc when softening-length hierarchy is enabled."
+                )
+        else:
+            transform_kind = "log_offset_positive"
+            transform_offset = intrinsic_core_radius
         context = f"{potential.get('id', 'potential')}.{field_name}"
         lower, upper, mean, std = _transform_offset_positive_prior_to_log_space(
             prior_kind,
@@ -15179,6 +15228,8 @@ def _append_shear_gamma1gamma2_specs(
 
 def _build_parameter_specs(
     potentials_with_priors: list[dict[str, Any]],
+    *,
+    softening_length_kpc: float = 0.0,
 ) -> tuple[list[ParameterSpec], list[list[tuple[str, int]]], list[str]]:
     specs: list[ParameterSpec] = []
     component_param_assignments: list[list[tuple[str, int]]] = []
@@ -15260,7 +15311,17 @@ def _build_parameter_specs(
             if decoded_prior is None:
                 continue
             if profile_type == DP_IE_PROFILE and normalized_field_name in {"core_radius_kpc", "cut_radius_kpc"}:
-                prior_spec = _radius_transform_for_component_prior(potential, normalized_field_name, decoded_prior)
+                dynamic_cut = (
+                    normalized_field_name == "cut_radius_kpc"
+                    and int(potential.get("component_family_code", COMPONENT_FAMILY_LARGE)) != COMPONENT_FAMILY_SCALING
+                )
+                prior_spec = _radius_transform_for_component_prior(
+                    potential,
+                    normalized_field_name,
+                    decoded_prior,
+                    softening_length_kpc=softening_length_kpc,
+                    dynamic_cut_above_effective_core=dynamic_cut,
+                )
             elif profile_type == DP_IE_PROFILE and normalized_field_name == "v_disp":
                 prior_spec = _vdisp_transform_for_component_prior(
                     decoded_prior,
@@ -16290,6 +16351,7 @@ def _build_packed_lens_spec(
     gamma1_param_index = np.full(n_components, -1, dtype=np.int32)
     gamma2_param_index = np.full(n_components, -1, dtype=np.int32)
     luminosity_ratio = np.ones(n_components, dtype=float)
+    cut_radius_excess_above_effective_core = np.zeros(n_components, dtype=bool)
     sigma_ref_base = np.zeros(n_components, dtype=float)
     cut_ref_base = np.zeros(n_components, dtype=float)
     core_ref_base = np.zeros(n_components, dtype=float)
@@ -16386,6 +16448,12 @@ def _build_packed_lens_spec(
         independent_free_log_sigma_tau_param_index[idx] = int(component.get("independent_free_log_sigma_tau_param_index", -1))
         independent_free_log_mass_tau_param_index[idx] = int(component.get("independent_free_log_mass_tau_param_index", -1))
 
+    cut_radius_excess_above_effective_core = (
+        (profile_type == DP_IE_PROFILE)
+        & (component_family != COMPONENT_FAMILY_SCALING)
+        & (cut_radius_param_index >= 0)
+    )
+
     return PackedLensSpec(
         profile_type=profile_type,
         component_family=component_family,
@@ -16420,6 +16488,7 @@ def _build_packed_lens_spec(
         gamma_ml_param_index=gamma_ml_param_index,
         sigma_log_scatter_param_index=sigma_log_scatter_param_index,
         mass_log_scatter_param_index=mass_log_scatter_param_index,
+        cut_radius_excess_above_effective_core=cut_radius_excess_above_effective_core,
         independent_branch_role=independent_branch_role,
         independent_magnitude_feature=independent_magnitude_feature,
         independent_free_log_sigma_delta_unit_param_index=independent_free_log_sigma_delta_unit_param_index,
@@ -18413,6 +18482,12 @@ class ClusterJAXEvaluator:
             "core_radius_param_index": jnp.asarray(spec.core_radius_param_index, dtype=jnp.int32),
             "cut_radius_kpc_base": jnp.asarray(spec.cut_radius_kpc_base, dtype=jnp.float64),
             "cut_radius_param_index": jnp.asarray(spec.cut_radius_param_index, dtype=jnp.int32),
+            "cut_radius_excess_above_effective_core": jnp.asarray(
+                np.asarray(spec.cut_radius_excess_above_effective_core, dtype=bool)
+                if np.asarray(spec.cut_radius_excess_above_effective_core).size == n_components
+                else np.zeros(n_components, dtype=bool),
+                dtype=bool,
+            ),
             "v_disp_base": jnp.asarray(spec.v_disp_base, dtype=jnp.float64),
             "v_disp_param_index": jnp.asarray(spec.v_disp_param_index, dtype=jnp.int32),
             "gamma1_base": jnp.asarray(spec.gamma1_base, dtype=jnp.float64),
@@ -20898,6 +20973,19 @@ class ClusterJAXEvaluator:
         )
         return self._build_packed_lens_state_details_from_physical(physical_params, z_source)
 
+    def _total_cut_radius_kpc_from_excess_modes(
+        self,
+        cut_radius_value_kpc: jnp.ndarray,
+        core_radius_effective_kpc: jnp.ndarray,
+        spec_arrays: dict[str, jnp.ndarray],
+    ) -> jnp.ndarray:
+        excess_mode = jnp.asarray(spec_arrays["cut_radius_excess_above_effective_core"], dtype=bool)
+        return jnp.where(
+            excess_mode,
+            core_radius_effective_kpc + jnp.maximum(cut_radius_value_kpc, SAFE_RADIUS_MARGIN_KPC),
+            cut_radius_value_kpc,
+        )
+
     def _build_packed_lens_state_details_from_physical(
         self,
         physical_params: jnp.ndarray,
@@ -20991,6 +21079,11 @@ class ClusterJAXEvaluator:
         kpc_per_arcsec = jnp.asarray(kpc_per_arcsec, dtype=jnp.float64)
         core_radius_effective_kpc, softening_length_kpc, log_softening_length_kpc = (
             self._effective_core_radius_kpc_from_physical(core_radius_kpc, physical_params)
+        )
+        cut_radius_kpc = self._total_cut_radius_kpc_from_excess_modes(
+            cut_radius_kpc,
+            core_radius_effective_kpc,
+            spec_jax,
         )
         ra_raw = core_radius_effective_kpc / kpc_per_arcsec
         rs_raw = cut_radius_kpc / kpc_per_arcsec
@@ -21286,6 +21379,11 @@ class ClusterJAXEvaluator:
         core_radius_effective_kpc, _softening_length_kpc, _log_softening_length_kpc = (
             self._effective_core_radius_kpc_from_physical(core_radius_kpc, physical_params)
         )
+        cut_radius_kpc = self._total_cut_radius_kpc_from_excess_modes(
+            cut_radius_kpc,
+            core_radius_effective_kpc,
+            spec_jax,
+        )
         ra_raw = core_radius_effective_kpc / kpc_per_arcsec
         rs_raw = cut_radius_kpc / kpc_per_arcsec
         ra = jnp.maximum(ra_raw, SAFE_RADIUS_MARGIN_ARCSEC)
@@ -21380,6 +21478,11 @@ class ClusterJAXEvaluator:
         kpc_per_arcsec = jnp.asarray(kpc_per_arcsec, dtype=jnp.float64)
         core_radius_effective_kpc, _softening_length_kpc, _log_softening_length_kpc = (
             self._effective_core_radius_kpc_from_physical(core_radius_kpc, physical_params)
+        )
+        cut_radius_kpc = self._total_cut_radius_kpc_from_excess_modes(
+            cut_radius_kpc,
+            core_radius_effective_kpc,
+            spec_jax,
         )
         ra_raw = core_radius_effective_kpc / kpc_per_arcsec
         rs_raw = cut_radius_kpc / kpc_per_arcsec
@@ -26558,7 +26661,10 @@ def _build_state_from_inputs(
             independent_importance_images_df, _n_singleton_skipped, _n_singleton_families_skipped = (
                 _filter_singleton_families(independent_importance_images_df)
             )
-    large_parameter_specs, large_component_param_assignments, large_lens_model_list = _build_parameter_specs(potentials_with_priors)
+    large_parameter_specs, large_component_param_assignments, large_lens_model_list = _build_parameter_specs(
+        potentials_with_priors,
+        softening_length_kpc=float(getattr(args, "softening_length_kpc", DEFAULT_SOFTENING_LENGTH_KPC)),
+    )
     if model_fit_mode == "small-only" and large_parameter_specs:
         if stage1_prior_summary is None:
             stage1_prior_summary = _load_stage1_summary(_infer_stage1_artifacts_dir(args))

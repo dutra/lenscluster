@@ -73,6 +73,7 @@ class PackedLensSpec:
     core_ref_param_index: np.ndarray
     sigma_log_scatter_param_index: np.ndarray
     mass_log_scatter_param_index: np.ndarray
+    cut_radius_excess_above_effective_core: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=bool))
     alpha_sigma_base: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
     gamma_ml_base: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
     alpha_sigma_param_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))

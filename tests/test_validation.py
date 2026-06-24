@@ -6734,6 +6734,29 @@ def test_packed_lens_state_applies_sampled_log_softening_length_in_quadrature() 
     np.testing.assert_allclose(np.asarray(packed_state.Ra)[1], 5.0, rtol=1.0e-12)
 
 
+def test_packed_lens_state_non_scaling_cut_is_excess_above_effective_core() -> None:
+    evaluator = _single_independent_branch_evaluator()
+    evaluator.state.packed_lens_spec.cut_radius_excess_above_effective_core = np.asarray(
+        [False, True],
+        dtype=bool,
+    )
+    evaluator.packed_spec_jax = cluster_solver.ClusterJAXEvaluator._prepare_packed_spec_arrays(evaluator)
+    evaluator.log_softening_length_param_index = 0
+
+    physical_params = jnp.asarray([np.log(4.0), 0.0, 200.0, 3.0, 7.0], dtype=jnp.float64)
+    packed_state, details = evaluator._build_packed_lens_state_details_from_physical(
+        physical_params,
+        2.0,
+        kpc_per_arcsec=jnp.asarray(1.0),
+        dpie_sigma0_factor=jnp.asarray(1.0),
+    )
+
+    np.testing.assert_allclose(np.asarray(details.core_radius_effective_kpc)[1], 5.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(details.rs_raw)[1], 12.0, rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(packed_state.Rs)[1], 12.0, rtol=1.0e-12)
+    assert np.asarray(details.rs_raw)[1] > np.asarray(details.ra_raw)[1]
+
+
 def test_packed_lens_state_gamma_ml_controls_size_exponent() -> None:
     evaluator = _single_independent_branch_evaluator()
     packed_spec = evaluator.state.packed_lens_spec
@@ -13049,6 +13072,79 @@ def test_shear_partial_or_nonuniform_polar_prior_raises() -> None:
                 },
             ],
         )
+
+
+def test_non_scaling_dpie_cut_prior_samples_excess_above_reference_effective_core() -> None:
+    specs, assignments, _lens_model_list = _build_parameter_specs(
+        [
+            {
+                "id": "halo",
+                "profil": cluster_solver.DP_IE_PROFILE,
+                "core_radius_kpc": 3.0,
+                "priors": {
+                    "cut_radius_kpc": [9, 20.0, 5.0, 1.0, 60.0],
+                },
+            },
+        ],
+        softening_length_kpc=4.0,
+    )
+
+    spec = specs[0]
+    expected_reference_core = 5.0
+    expected_mean, expected_std = cluster_solver._positive_lognormal_parameters(
+        15.0,
+        5.0,
+        floor=cluster_solver.SAFE_RADIUS_MARGIN_KPC,
+    )
+
+    assert assignments == [[("cut_radius_kpc", 0)]]
+    assert spec.transform_kind == "log_positive"
+    assert spec.transform_offset == pytest.approx(expected_reference_core)
+    assert spec.physical_mean == pytest.approx(20.0)
+    assert spec.physical_upper == pytest.approx(60.0)
+    assert spec.mean == pytest.approx(expected_mean)
+    assert spec.std == pytest.approx(expected_std)
+    assert spec.lower == pytest.approx(np.log(cluster_solver.SAFE_RADIUS_MARGIN_KPC))
+    assert spec.upper == pytest.approx(np.log(60.0 - expected_reference_core))
+
+
+def test_non_scaling_dpie_cut_prior_rejects_upper_below_reference_effective_core() -> None:
+    with pytest.raises(ValueError, match="upper bound .* must exceed reference effective core"):
+        _build_parameter_specs(
+            [
+                {
+                    "id": "halo",
+                    "profil": cluster_solver.DP_IE_PROFILE,
+                    "core_radius_kpc": 3.0,
+                    "priors": {
+                        "cut_radius_kpc": [9, 4.0, 1.0, 1.0, 4.5],
+                    },
+                },
+            ],
+            softening_length_kpc=4.0,
+        )
+
+
+def test_dynamic_cut_initialization_converts_reported_total_cut_to_excess() -> None:
+    spec = ParameterSpec(
+        name="halo.cut_radius_kpc",
+        sample_name="halo_cut_radius_kpc",
+        potential_id="halo",
+        profile_type=cluster_solver.DP_IE_PROFILE,
+        field="cut_radius_kpc",
+        prior_kind="truncated_normal",
+        lower=np.log(cluster_solver.SAFE_RADIUS_MARGIN_KPC),
+        upper=np.log(100.0),
+        step=1.0,
+        mean=np.log(10.0),
+        std=0.5,
+        transform_kind="log_positive",
+        transform_offset=5.0,
+    )
+
+    latent = cluster_solver._initial_latent_value_from_physical(17.0, spec)
+
+    assert latent == pytest.approx(np.log(12.0))
 
 
 def test_dpie_v_disp_normal_prior_uses_log_positive_transform() -> None:
