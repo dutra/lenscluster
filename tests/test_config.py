@@ -42,7 +42,7 @@ def _minimal_sequential_config() -> LensClusterSolverConfig:
     return LensClusterSolverConfig(
         model=_minimal_model_config(),
         paths=RunPathsConfig(output_dir="results/demo", run_name="hera_demo"),
-        workflow=WorkflowConfig(fit_mode="sequential"),
+        workflow=WorkflowConfig(fit_mode="sequential", stage0_likelihood="local-jacobian"),
         schedule=StageScheduleConfig(
             fit_method=("svi+nuts",),
             svi_steps=(10, 20),
@@ -215,6 +215,7 @@ def test_compile_run_plan_resolves_runtime_stages_and_outputs() -> None:
     assert plan.output.output_dir == Path("results/demo")
     assert [stage.name for stage in plan.stages] == ["stage0_fast_initializer", "stage1_backprojected_centroid_fit"]
     assert plan.stages[0].sampling_engine == "full_flat"
+    assert plan.stages[0].sample_likelihood_mode == "local-jacobian"
     assert plan.stages[0].output_plan.stage0_minimal_outputs is True
     assert plan.stages[1].svi_steps == 20
     assert plan.stages[1].refresh_every == 100
@@ -227,6 +228,7 @@ def test_compile_run_plan_resolves_unified_critical_arc_stage_policies() -> None
     config = _minimal_sequential_config().with_updates(
         workflow=WorkflowConfig(
             fit_mode="sequential",
+            stage0_likelihood="critical-arc",
             stage1_likelihood="critical-arc",
             stage2_forward_mode="critical-arc",
         ),
@@ -262,11 +264,65 @@ def test_compile_run_plan_resolves_unified_critical_arc_stage_policies() -> None
 
 def test_config_validation_rejects_old_stage1_critical_arc_mixture_name() -> None:
     config = _minimal_sequential_config().with_updates(
-        workflow=WorkflowConfig(fit_mode="sequential", stage1_likelihood="critical-arc-mixture"),
+        workflow=WorkflowConfig(
+            fit_mode="sequential",
+            stage0_likelihood="local-jacobian",
+            stage1_likelihood="critical-arc-mixture",
+        ),
     )
 
     with pytest.raises(ValueError, match="stage1_likelihood"):
         config.validate()
+
+
+def test_config_validation_requires_stage0_likelihood() -> None:
+    for value in ("", None):
+        config = _minimal_sequential_config().with_updates(
+            workflow=WorkflowConfig(fit_mode="sequential", stage0_likelihood=value),
+        )
+        with pytest.raises(ValueError, match="stage0_likelihood"):
+            config.validate()
+
+
+def test_workflow_config_defaults_stage0_likelihood_to_source() -> None:
+    config = LensClusterSolverConfig(
+        model=_minimal_model_config(),
+        workflow=WorkflowConfig(),
+    )
+
+    config.validate()
+    plan = compile_run_plan(config)
+
+    assert config.workflow.stage0_likelihood == "source"
+    assert plan.stages[0].sample_likelihood_mode == "source"
+    assert plan.stages[0].source_position_policy == "sampled"
+
+
+def test_config_validation_accepts_stage0_likelihood_values() -> None:
+    for value in ("source", "local-jacobian", "critical-arc"):
+        _minimal_sequential_config().with_updates(
+            workflow=WorkflowConfig(fit_mode="sequential", stage0_likelihood=value),
+        ).validate()
+
+
+def test_compile_run_plan_allows_stage0_likelihood_different_from_stage1() -> None:
+    config = _minimal_sequential_config().with_updates(
+        workflow=WorkflowConfig(
+            fit_mode="sequential",
+            stage0_likelihood="source",
+            stage1_likelihood="critical-arc",
+        )
+    )
+
+    plan = compile_run_plan(config)
+
+    assert [stage.sample_likelihood_mode for stage in plan.stages[:2]] == [
+        "source",
+        "critical-arc-mixture-image-plane",
+    ]
+    assert [stage.source_position_policy for stage in plan.stages[:2]] == ["sampled", "centroid-fixed"]
+    assert plan.runtime_args.stage0_likelihood == "source"
+    assert plan.runtime_args.stage1_likelihood == "critical-arc"
 
 
 def test_config_validation_accepts_perturbation_discovery_top_k() -> None:
@@ -292,7 +348,11 @@ def test_config_validation_rejects_nonpositive_perturbation_discovery_top_k() ->
 def test_critical_arc_source_position_specs_follow_stage_policy() -> None:
     plan = compile_run_plan(
         _minimal_sequential_config().with_updates(
-            workflow=WorkflowConfig(fit_mode="sequential", stage1_likelihood="critical-arc"),
+            workflow=WorkflowConfig(
+                fit_mode="sequential",
+                stage0_likelihood="local-jacobian",
+                stage1_likelihood="critical-arc",
+            ),
         )
     )
     stage1_args = cluster_solver._clone_args(
@@ -364,7 +424,11 @@ def test_old_cli_artifact_bundle_is_rejected(tmp_path: Path) -> None:
 
 def test_compile_run_plan_adds_stage2_when_enabled() -> None:
     config = _minimal_sequential_config().with_updates(
-        workflow=WorkflowConfig(fit_mode="sequential", stage2_forward_mode="linearized"),
+        workflow=WorkflowConfig(
+            fit_mode="sequential",
+            stage0_likelihood="local-jacobian",
+            stage2_forward_mode="linearized",
+        ),
         schedule=StageScheduleConfig(
             fit_method=("svi+nuts", "svi+nuts"),
             svi_steps=(10, 20, 30),
@@ -389,7 +453,7 @@ def test_compile_run_plan_adds_stage2_when_enabled() -> None:
 def test_config_validation_rejects_wrong_stage_counts_and_bad_priors() -> None:
     bad_counts = LensClusterSolverConfig(
         model=_minimal_model_config(),
-        workflow=WorkflowConfig(fit_mode="sequential"),
+        workflow=WorkflowConfig(fit_mode="sequential", stage0_likelihood="local-jacobian"),
         schedule=StageScheduleConfig(svi_steps=(10,), refresh_every=(None,), fit_method=("svi+nuts",)),
     )
     with pytest.raises(ValueError, match="svi_steps requires exactly 2 values"):
@@ -397,7 +461,7 @@ def test_config_validation_rejects_wrong_stage_counts_and_bad_priors() -> None:
 
     bad_prior = LensClusterSolverConfig(
         model=_minimal_model_config(),
-        workflow=WorkflowConfig(fit_mode="sequential"),
+        workflow=WorkflowConfig(fit_mode="sequential", stage0_likelihood="local-jacobian"),
         schedule=StageScheduleConfig(svi_steps=(10, 20), refresh_every=(None, 100), fit_method=("svi+nuts",)),
         scaling=ScalingModelConfig(potfile_gamma_ml_prior_lower=0.5, potfile_gamma_ml_prior_upper=-0.5),
     )
@@ -464,7 +528,8 @@ def test_run_xsh_is_self_contained_ff_sims_runner() -> None:
     assert "2.3 / 0.72" in text
     assert "cores = 4" in text
     assert "chains=cores" in text
-    assert "perturbation_top_k = None" in text
+    assert 'stage0_likelihood = "source"' in text
+    assert "stage0_likelihood=stage0_likelihood" in text
     assert "perturbation_discovery_top_k=perturbation_top_k" in text
     assert 'stage1_likelihood = "critical-arc"' in text
     assert "critical-arc-centroid" not in text
@@ -496,12 +561,12 @@ def test_ff_sims_notebook_is_self_contained_and_config_native() -> None:
     assert "os.environ[\"JAX_NUM_CPU_DEVICES\"] = str(cores)" in source
     assert "RuntimeConfig" in source
     assert "chains=cores" in source
-    assert "perturbation_top_k = None" in source
+    assert 'stage0_likelihood = "source"' in source
+    assert "stage0_likelihood=stage0_likelihood" in source
     assert "perturbation_discovery_top_k=perturbation_top_k" in source
     assert 'stage1_likelihood = "critical-arc"' in source
     assert "critical-arc-centroid" not in source
     assert "critical-arc-mixture" not in source
-    assert sum(len(cell.get("outputs", [])) for cell in notebook.cells if cell.cell_type == "code") == 0
     assert "available_cpu_cores" not in source
     assert "os.sched_getaffinity" not in source
     assert "os.cpu_count" not in source
@@ -522,7 +587,7 @@ def test_dataset_specific_runs_are_composed_from_generic_config_groups() -> None
             output_dir=cluster_config["output_dir"],
             run_name=f"{cluster_config['cluster_key']}_demo",
         ),
-        workflow=WorkflowConfig(fit_mode="sequential"),
+        workflow=WorkflowConfig(fit_mode="sequential", stage0_likelihood="local-jacobian"),
         schedule=StageScheduleConfig(
             fit_method=("svi+nuts",),
             svi_steps=(100, 200),

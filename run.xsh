@@ -208,6 +208,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
     samples = 1000
     max_tree_depth = 8
     mode = "none"
+    stage0_likelihood = "source"
     stage1_likelihood = "critical-arc"
     #stage1_likelihood = "source"
     output_dir = (
@@ -238,6 +239,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         ),
         workflow=WorkflowConfig(
             fit_mode="sequential",
+            stage0_likelihood=stage0_likelihood,
             stage1_likelihood=stage1_likelihood,
             stage2_forward_mode=mode,
             stage1_sampling_engine="refreshing_surrogate_flat",

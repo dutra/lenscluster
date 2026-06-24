@@ -218,9 +218,9 @@ def _stage_plans(config: LensClusterSolverConfig, output: OutputPlan) -> tuple[S
             fit_mode="stage0_fast_initializer",
             fit_method=schedule.fit_method[0],
             sampling_engine="full_flat",
-            sample_likelihood_mode=_stage1_sample_likelihood_mode(workflow.stage1_likelihood),
-            likelihood_family=_stage1_likelihood_family(workflow.stage1_likelihood),
-            source_position_policy=_stage1_source_position_policy(workflow.stage1_likelihood),
+            sample_likelihood_mode=_stage_likelihood_sample_mode(workflow.stage0_likelihood, field_name="stage0_likelihood"),
+            likelihood_family=_stage_likelihood_family(workflow.stage0_likelihood, field_name="stage0_likelihood"),
+            source_position_policy=_stage_likelihood_source_position_policy(workflow.stage0_likelihood),
             svi_steps=schedule.svi_steps[0],
             refresh_every=schedule.refresh_every[0],
             warmup=schedule.warmup[0],
@@ -265,24 +265,36 @@ def _stage_plans(config: LensClusterSolverConfig, output: OutputPlan) -> tuple[S
     return tuple(stages)
 
 
-def _stage1_sample_likelihood_mode(stage1_likelihood: str) -> str:
-    if stage1_likelihood in {"source", "local-jacobian"}:
-        return stage1_likelihood
-    if stage1_likelihood == "critical-arc":
+def _stage_likelihood_sample_mode(likelihood: str, *, field_name: str) -> str:
+    if likelihood in {"source", "local-jacobian"}:
+        return likelihood
+    if likelihood == "critical-arc":
         return "critical-arc-mixture-image-plane"
-    raise ValueError(f"Unsupported stage1_likelihood={stage1_likelihood!r}.")
+    raise ValueError(f"Unsupported {field_name}={likelihood!r}.")
+
+
+def _stage_likelihood_family(likelihood: str, *, field_name: str) -> str:
+    if likelihood in {"source", "local-jacobian"}:
+        return likelihood
+    if likelihood == "critical-arc":
+        return "critical-arc"
+    raise ValueError(f"Unsupported {field_name}={likelihood!r}.")
+
+
+def _stage_likelihood_source_position_policy(likelihood: str) -> str:
+    return "centroid-fixed" if likelihood == "critical-arc" else "sampled"
+
+
+def _stage1_sample_likelihood_mode(stage1_likelihood: str) -> str:
+    return _stage_likelihood_sample_mode(stage1_likelihood, field_name="stage1_likelihood")
 
 
 def _stage1_likelihood_family(stage1_likelihood: str) -> str:
-    if stage1_likelihood in {"source", "local-jacobian"}:
-        return stage1_likelihood
-    if stage1_likelihood == "critical-arc":
-        return "critical-arc"
-    raise ValueError(f"Unsupported stage1_likelihood={stage1_likelihood!r}.")
+    return _stage_likelihood_family(stage1_likelihood, field_name="stage1_likelihood")
 
 
 def _stage1_source_position_policy(stage1_likelihood: str) -> str:
-    return "centroid-fixed" if stage1_likelihood == "critical-arc" else "sampled"
+    return _stage_likelihood_source_position_policy(stage1_likelihood)
 
 
 def _stage2_sample_likelihood_mode(stage2_forward_mode: str) -> str:
@@ -340,6 +352,7 @@ def _runtime_payload(config: LensClusterSolverConfig) -> dict[str, Any]:
         "fit_mode": config.workflow.fit_mode,
         "sampling_engine": config.workflow.sampling_engine,
         "stage1_sampling_engine": config.workflow.stage1_sampling_engine,
+        "stage0_likelihood": config.workflow.stage0_likelihood,
         "stage1_likelihood": config.workflow.stage1_likelihood,
         "stage2_forward_mode": config.workflow.stage2_forward_mode,
         "stage2_sampling_engine": config.workflow.stage2_sampling_engine,

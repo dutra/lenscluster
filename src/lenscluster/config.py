@@ -125,6 +125,7 @@ class WorkflowConfig:
     fit_mode: str = "sequential"
     sampling_engine: str = "refreshing_surrogate"
     stage1_sampling_engine: str = "refreshing_surrogate_flat"
+    stage0_likelihood: str = "source"
     stage1_likelihood: str = "local-jacobian"
     stage2_forward_mode: str = "none"
     stage2_sampling_engine: str = "refreshing_surrogate_flat"
@@ -298,6 +299,8 @@ def _jsonable(value: Any) -> Any:
 def validate_config(config: LensClusterSolverConfig) -> None:
     _validate_model_config(config.model)
     workflow = config.workflow
+    if workflow.stage0_likelihood not in {"source", "local-jacobian", "critical-arc"}:
+        raise ValueError("stage0_likelihood must be 'source', 'local-jacobian', or 'critical-arc'.")
     if workflow.stage1_likelihood not in {"source", "local-jacobian", "critical-arc"}:
         raise ValueError("stage1_likelihood must be 'source', 'local-jacobian', or 'critical-arc'.")
     if workflow.stage2_forward_mode not in {"none", "linearized", "critical-arc"}:

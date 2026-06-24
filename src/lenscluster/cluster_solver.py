@@ -29463,22 +29463,43 @@ def _require_fast_resume_cosmology_compatibility(stage_args: argparse.Namespace,
     )
 
 
-def _stage1_sample_likelihood_mode(args: argparse.Namespace) -> str:
-    requested = str(getattr(args, "stage1_likelihood", STAGE1_LIKELIHOOD_LOCAL_JACOBIAN))
+def _stage_likelihood_sample_mode(requested: Any, *, field_name: str) -> str:
+    requested = str(requested)
     if requested == STAGE1_LIKELIHOOD_SOURCE:
         return SAMPLE_LIKELIHOOD_SOURCE
     if requested == STAGE1_LIKELIHOOD_LOCAL_JACOBIAN:
         return SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
     if requested == STAGE1_LIKELIHOOD_CRITICAL_ARC:
         return SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
-    raise ValueError(f"Unsupported stage1_likelihood={requested!r}.")
+    raise ValueError(f"Unsupported {field_name}={requested!r}.")
 
 
-def _stage1_source_position_policy(args: argparse.Namespace) -> str:
-    requested = str(getattr(args, "stage1_likelihood", STAGE1_LIKELIHOOD_LOCAL_JACOBIAN))
+def _stage_likelihood_source_position_policy(requested: Any) -> str:
+    requested = str(requested)
     if requested == STAGE1_LIKELIHOOD_CRITICAL_ARC:
         return CRITICAL_ARC_SOURCE_POSITION_POLICY_CENTROID_FIXED
     return CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED
+
+
+def _stage0_sample_likelihood_mode(args: argparse.Namespace) -> str:
+    return _stage_likelihood_sample_mode(getattr(args, "stage0_likelihood", ""), field_name="stage0_likelihood")
+
+
+def _stage0_source_position_policy(args: argparse.Namespace) -> str:
+    return _stage_likelihood_source_position_policy(getattr(args, "stage0_likelihood", ""))
+
+
+def _stage1_sample_likelihood_mode(args: argparse.Namespace) -> str:
+    return _stage_likelihood_sample_mode(
+        getattr(args, "stage1_likelihood", STAGE1_LIKELIHOOD_LOCAL_JACOBIAN),
+        field_name="stage1_likelihood",
+    )
+
+
+def _stage1_source_position_policy(args: argparse.Namespace) -> str:
+    return _stage_likelihood_source_position_policy(
+        getattr(args, "stage1_likelihood", STAGE1_LIKELIHOOD_LOCAL_JACOBIAN)
+    )
 
 
 def _stage2_source_position_policy(args: argparse.Namespace) -> str:
@@ -29522,8 +29543,10 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
     resume = resume_mode is not None
     fast_resume = resume_mode == RESUME_MODE_FAST
     stage2_enabled = _stage2_forward_enabled(args)
+    stage0_likelihood = _stage0_sample_likelihood_mode(args)
     stage1_likelihood = _stage1_sample_likelihood_mode(args)
     stage2_likelihood = _stage2_sample_likelihood_mode(args)
+    stage0_source_position_policy = _stage0_source_position_policy(args)
     stage1_source_position_policy = _stage1_source_position_policy(args)
     stage2_source_position_policy = _stage2_source_position_policy(args)
     _log_stage_banner(
@@ -29531,6 +29554,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
         "SEQUENTIAL WORKFLOW",
         (
             f"run_name={root_run_name} "
+            f"stage0={STAGE0_FAST_INITIALIZER_DIR} likelihood={getattr(args, 'stage0_likelihood', '')} "
             f"stage1={STAGE1_BACKPROJECTED_CENTROID_FIT_DIR} likelihood={getattr(args, 'stage1_likelihood', STAGE1_LIKELIHOOD_LOCAL_JACOBIAN)} "
             f"stage2={'enabled' if stage2_enabled else 'disabled'} mode={getattr(args, 'stage2_forward_mode', STAGE2_FORWARD_MODE_NONE)} "
             f"resume_mode={resume_mode or 'none'}"
@@ -29578,7 +29602,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
         stage0_controls,
         fit_method=FIT_METHOD_SVI,
         sampling_engine=SAMPLING_ENGINE_FULL_FLAT,
-        critical_arc_source_position_policy=stage1_source_position_policy,
+        critical_arc_source_position_policy=stage0_source_position_policy,
         perturbation_discovery_stage0=True,
     )
     stage0_args = _force_quick_diagnostics_for_nonfinal_stage(
@@ -29596,7 +29620,7 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
             stage0_args,
             FIT_MODE_JOINT,
             stage0_run_name,
-            sample_likelihood_mode=stage1_likelihood,
+            sample_likelihood_mode=stage0_likelihood,
         )
     stage0_artifacts_dir = stage0_run_dir / "artifacts"
     stage0_init_values = _physical_best_fit_values_from_artifacts(stage0_artifacts_dir)
@@ -29645,6 +29669,9 @@ def _run_sequential_v2(args: argparse.Namespace) -> None:
         "stage0_engine": SAMPLING_ENGINE_FULL_FLAT,
         "stage0_run_dir": str(stage0_run_dir),
         "stage0_selected_free_scaling": int(stage0_selected_count),
+        "stage0_likelihood": str(getattr(args, "stage0_likelihood", "")),
+        "stage0_sample_likelihood_mode": str(stage0_likelihood),
+        "stage0_source_position_policy": str(stage0_source_position_policy),
         "stage1_sampling_engine": stage1_sampling_engine,
         "stage1_run_dir": str(stage1_run_dir),
         "stage1_likelihood": str(getattr(args, "stage1_likelihood", STAGE1_LIKELIHOOD_LOCAL_JACOBIAN)),

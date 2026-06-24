@@ -25,6 +25,7 @@ import lenscluster.mock_cluster as mock_cluster
 import lenscluster.multi_cluster_solver as multi_cluster_solver
 import lenscluster.plotting as plotting
 import lenscluster.validation as validation
+from lenscluster.planning import SolverRuntime
 from lenscluster.jax_cosmology import (
     ARCSEC_TO_RAD,
     C_LIGHT_KM_S,
@@ -28818,6 +28819,7 @@ def test_sequential_stage2_linearized_runs_as_free_source_forward_fit(
     monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {"halo_v_disp": 1200.0})
     monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
+    monkeypatch.setattr(cluster_solver, "_member_shape_values_from_artifacts", lambda _artifacts_dir: {})
     monkeypatch.setattr(cluster_solver, "_selected_independent_by_potfile_from_artifacts", lambda _artifacts_dir: [{2, 5}])
     args = argparse.Namespace(
         run_name="fit",
@@ -28828,13 +28830,16 @@ def test_sequential_stage2_linearized_runs_as_free_source_forward_fit(
         refresh_every=[100, 50, 25],
         warmup=[2000, 1000, 10],
         samples=[250, 100, 20],
+        stage0_likelihood=cluster_solver.STAGE1_LIKELIHOOD_SOURCE,
         stage1_likelihood=cluster_solver.STAGE1_LIKELIHOOD_LOCAL_JACOBIAN,
         stage2_forward_mode=cluster_solver.STAGE2_FORWARD_MODE_LINEARIZED,
         stage2_sampling_engine=cluster_solver.STAGE2_SAMPLING_ENGINE_INHERIT,
         stage2_fresh_process=False,
         image_plane_mode=IMAGE_PLANE_MODE_NONE,
         fit_mode="sequential",
+        model_config=object(),
     )
+    args = SolverRuntime(vars(args))
 
     cluster_solver._run_sequential_v2(args)
 
@@ -28843,7 +28848,7 @@ def test_sequential_stage2_linearized_runs_as_free_source_forward_fit(
         "fit/stage1_backprojected_centroid_fit",
         "fit/stage2_free_source_forward_fit",
     ]
-    assert calls[0][2] == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
+    assert calls[0][2] == SAMPLE_LIKELIHOOD_SOURCE
     assert calls[1][2] == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
     assert calls[1][3] == {"halo_v_disp": 1200.0}
     assert calls[2][2] == SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
@@ -28854,6 +28859,10 @@ def test_sequential_stage2_linearized_runs_as_free_source_forward_fit(
     assert summary["stage1_run_dir"].endswith("stage1_backprojected_centroid_fit")
     assert summary["stage2_run_dir"].endswith("stage2_free_source_forward_fit")
     assert summary["stage0_selected_free_scaling"] == 2
+    assert summary["stage0_likelihood"] == cluster_solver.STAGE1_LIKELIHOOD_SOURCE
+    assert summary["stage0_sample_likelihood_mode"] == SAMPLE_LIKELIHOOD_SOURCE
+    assert summary["stage0_source_position_policy"] == cluster_solver.CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED
+    assert summary["stage1_sample_likelihood_mode"] == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
     assert summary["stage2_forward_mode"] == cluster_solver.STAGE2_FORWARD_MODE_LINEARIZED
 
 
@@ -29140,6 +29149,7 @@ def test_sequential_stage2_critical_arc_runs_as_free_source_forward_fit(
     monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cluster_solver, "_physical_best_fit_values_from_artifacts", lambda _artifacts_dir: {"halo_v_disp": 1200.0})
     monkeypatch.setattr(cluster_solver, "_source_position_prior_values_from_artifacts", lambda _artifacts_dir: {"1": (0.1, -0.2)})
+    monkeypatch.setattr(cluster_solver, "_member_shape_values_from_artifacts", lambda _artifacts_dir: {})
     monkeypatch.setattr(cluster_solver, "_selected_independent_by_potfile_from_artifacts", lambda _artifacts_dir: [{2, 5}])
     args = argparse.Namespace(
         run_name="fit",
@@ -29150,6 +29160,7 @@ def test_sequential_stage2_critical_arc_runs_as_free_source_forward_fit(
         refresh_every=[100, 50, 25],
         warmup=[2000, 1000, 10],
         samples=[250, 100, 20],
+        stage0_likelihood=cluster_solver.STAGE1_LIKELIHOOD_LOCAL_JACOBIAN,
         stage1_likelihood=cluster_solver.STAGE1_LIKELIHOOD_LOCAL_JACOBIAN,
         stage2_forward_mode=cluster_solver.STAGE2_FORWARD_MODE_CRITICAL_ARC,
         stage2_sampling_engine=cluster_solver.STAGE2_SAMPLING_ENGINE_INHERIT,
@@ -29168,7 +29179,9 @@ def test_sequential_stage2_critical_arc_runs_as_free_source_forward_fit(
         critical_arc_lm_damping_relative=0.002,
         critical_arc_lm_damping_absolute=1.0e-5,
         critical_arc_lm_trust_radius_arcsec=18.0,
+        model_config=object(),
     )
+    args = SolverRuntime(vars(args))
 
     cluster_solver._run_sequential_v2(args)
 
