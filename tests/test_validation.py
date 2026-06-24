@@ -5685,9 +5685,9 @@ def test_perturbation_discovery_scores_free_branch_but_selects_scaling_identity(
             stop_gradient,
         ):
             del stop_gradient
-            return SimpleNamespace(), {"is_valid": np.asarray(True), "reason_flags": np.asarray([], dtype=bool)}
+            return SimpleNamespace(), SimpleNamespace(is_valid=np.asarray(True), reason_flags=np.asarray([], dtype=bool))
 
-        def _record_invalid_state_callback(self, _reason_flags):
+        def _record_invalid_state_host(self, _reason_flags):
             raise AssertionError("state should be valid")
 
         def _flat_component_alpha_and_jacobian_delta_rows_for_components(
@@ -5776,9 +5776,9 @@ def test_perturbation_discovery_top_k_selects_ranked_candidates_below_threshold(
             stop_gradient,
         ):
             del stop_gradient
-            return SimpleNamespace(), {"is_valid": np.asarray(True), "reason_flags": np.asarray([], dtype=bool)}
+            return SimpleNamespace(), SimpleNamespace(is_valid=np.asarray(True), reason_flags=np.asarray([], dtype=bool))
 
-        def _record_invalid_state_callback(self, _reason_flags):
+        def _record_invalid_state_host(self, _reason_flags):
             raise AssertionError("state should be valid")
 
         def _flat_component_alpha_and_jacobian_delta_rows_for_components(
@@ -9894,9 +9894,6 @@ def test_active_subset_source_likelihood_passes_subset_to_ray_shooting() -> None
         def _build_packed_lens_state_with_validity_from_physical(self, *_args, **_kwargs):
             return {}, {"is_valid": jnp.asarray(True), "reason_flags": jnp.asarray([False])}
 
-        def _maybe_record_invalid_state(self, _validity):
-            return None
-
         def _ray_shooting_for_components(self, _z_source, x, y, _packed_state, component_indices=None):
             self.seen_component_indices.append(None if component_indices is None else np.asarray(component_indices))
             return x, y
@@ -9949,7 +9946,6 @@ def test_surrogate_beta_and_jacobian_composes_active_exact_and_inactive_cache() 
             inactive_jacobian_delta_da11_dparams=np.asarray([[0.3, -0.2]], dtype=float),
         )
     }
-    evaluator._maybe_record_invalid_state = lambda _validity: None
     evaluator._build_packed_lens_state_with_validity_from_physical = lambda *_args, **_kwargs: (
         {"tag": jnp.asarray(1, dtype=jnp.int32)},
         {"is_valid": jnp.asarray(True), "reason_flags": jnp.asarray([False])},
@@ -10038,7 +10034,6 @@ def test_surrogate_uses_cosmology_parameter_derivatives() -> None:
             ),
         )
     }
-    evaluator._maybe_record_invalid_state = lambda _validity: None
     evaluator._build_packed_lens_state_with_validity_from_physical = lambda *_args, **_kwargs: (
         {"tag": jnp.asarray(1, dtype=jnp.int32)},
         {"is_valid": jnp.asarray(True), "reason_flags": jnp.asarray([False])},
@@ -10102,7 +10097,6 @@ def test_source_plane_surrogate_beta_allows_cache_without_jacobian_fields() -> N
             inactive_alpha_dy_dparams=np.asarray([[-0.5, -0.25]], dtype=float),
         )
     }
-    evaluator._maybe_record_invalid_state = lambda _validity: None
     evaluator._build_packed_lens_state_with_validity_from_physical = lambda *_args, **_kwargs: (
         {},
         {"is_valid": jnp.asarray(True), "reason_flags": jnp.asarray([False])},
@@ -10194,9 +10188,6 @@ def test_explicit_beta_surrogate_branch_uses_returned_packed_state() -> None:
         def _scaling_scatter_extra_variance_from_physical(self, _physical_params, bin_data, _beta_x, _beta_y):
             return jnp.zeros_like(bin_data.x_obs), jnp.zeros_like(bin_data.y_obs)
 
-        def _maybe_record_invalid_state(self, _validity):
-            return None
-
         def _cab_morphology_loglike_for_arcs(self, *_args, **_kwargs):
             return jnp.asarray(0.0, dtype=jnp.float64)
 
@@ -10280,9 +10271,6 @@ def test_anchored_solved_source_loglike_branch_scores_local_image_residuals() ->
 
         def _scaling_scatter_extra_variance_from_physical(self, _physical_params, bin_data, _beta_x, _beta_y):
             return jnp.zeros_like(bin_data.x_obs), jnp.zeros_like(bin_data.y_obs)
-
-        def _maybe_record_invalid_state(self, _validity):
-            return None
 
         def _cab_morphology_loglike_for_arcs(self, *_args, **_kwargs):
             return jnp.asarray(0.0, dtype=jnp.float64)
@@ -10381,9 +10369,6 @@ def test_zero_step_anchored_source_loglike_uses_observed_anchor_lm_step(
 
         def _scaling_scatter_extra_variance_from_physical(self, _physical_params, bin_data, _beta_x, _beta_y):
             return jnp.zeros_like(bin_data.x_obs), jnp.zeros_like(bin_data.y_obs)
-
-        def _maybe_record_invalid_state(self, _validity):
-            return None
 
         def _cab_morphology_loglike_for_arcs(self, *_args, **_kwargs):
             return jnp.asarray(0.0, dtype=jnp.float64)
@@ -12148,9 +12133,6 @@ def test_critical_arc_source_loglike_branch_uses_anchor_lm_step(
             zeros = jnp.zeros_like(inv00)
             return zeros + 0.11, zeros - 0.03, zeros + 0.07, inverse_finite
 
-        def _maybe_record_invalid_state(self, _validity):
-            return None
-
         def _cab_morphology_loglike_for_arcs(self, *_args, **_kwargs):
             return jnp.asarray(0.0, dtype=jnp.float64)
 
@@ -12293,9 +12275,6 @@ def test_critical_arc_centroid_source_loglike_uses_current_weighted_centroid(
             zeros = jnp.zeros_like(inv00)
             return zeros, zeros, zeros, inverse_finite
 
-        def _maybe_record_invalid_state(self, _validity):
-            return None
-
     fake = FakeEvaluator()
     fake._centroid_source_position_vectors_for_bin = (
         cluster_solver.ClusterJAXEvaluator._centroid_source_position_vectors_for_bin.__get__(fake, FakeEvaluator)
@@ -12428,9 +12407,6 @@ def test_critical_arc_source_loglike_uses_full_exact_mixture(
         ):
             zeros = jnp.zeros_like(inv00)
             return zeros + 0.02, zeros + 0.005, zeros + 0.03, inverse_finite
-
-        def _maybe_record_invalid_state(self, _validity):
-            return None
 
         def _cab_morphology_loglike_for_arcs(self, *_args, **_kwargs):
             return jnp.asarray(0.0, dtype=jnp.float64)
@@ -13558,6 +13534,83 @@ def test_packed_lens_validity_allows_negative_finite_vdisp_and_rejects_nonfinite
 
     assert bool(validity.is_valid) is False
     assert bool(np.asarray(validity.reason_flags)[shape_reason_index]) is True
+
+
+def test_invalid_state_audit_draw_indices_are_deterministic_and_capped() -> None:
+    first = cluster_solver._invalid_state_audit_draw_indices(1000, max_draws=7)
+    second = cluster_solver._invalid_state_audit_draw_indices(1000, max_draws=7)
+
+    np.testing.assert_array_equal(first, second)
+    assert first.size == 7
+    assert first[0] == 0
+    assert first[-1] == 999
+
+
+def test_invalid_state_audit_counts_reason_flags_from_retained_draws() -> None:
+    reason_flags = np.zeros(len(cluster_solver.INVALID_STATE_REASON_NAMES), dtype=bool)
+    reason_flags[cluster_solver.INVALID_STATE_REASON_NAMES.index("rs_not_greater_than_ra")] = True
+
+    class FakeAuditEvaluator:
+        flat_critical_arc_data = object()
+        traced_arc_data = None
+        cab_likelihood_weight = 0.0
+
+        def _physical_parameter_vector(self, params):
+            return params
+
+        def _build_flat_packed_lens_state_with_validity_from_physical(self, physical_params, _flat_data, *, stop_gradient):
+            del stop_gradient
+            invalid = bool(np.asarray(physical_params)[0] > 0.5)
+            flags = reason_flags if invalid else np.zeros_like(reason_flags)
+            return SimpleNamespace(), SimpleNamespace(is_valid=jnp.asarray(not invalid), reason_flags=jnp.asarray(flags))
+
+    audit = cluster_solver._audit_invalid_state_draws(
+        FakeAuditEvaluator(),
+        np.asarray([[0.0], [1.0], [2.0]], dtype=float),
+    )
+
+    assert audit["invalid_state_audit_draw_count"] == 3
+    assert audit["invalid_state_audit_invalid_draw_count"] == 2
+    assert audit["invalid_state_audit_reason_counts"]["rs_not_greater_than_ra"] == 2
+
+
+def test_invalid_state_handling_does_not_use_jax_debug_callback() -> None:
+    assert not hasattr(cluster_solver.ClusterJAXEvaluator, "_maybe_record_invalid_state")
+    assert "_emit_invalid_state_callback" not in inspect.getsource(cluster_solver.ClusterJAXEvaluator)
+    assert "debug.callback(self._record_invalid_state" not in inspect.getsource(cluster_solver)
+
+
+def test_invalid_state_debug_callback_uses_are_only_progress_reporting() -> None:
+    source = inspect.getsource(cluster_solver)
+    callback_lines = [
+        line.strip()
+        for line in source.splitlines()
+        if "jax.debug.callback" in line or "debug.callback" in line
+    ]
+    assert callback_lines
+    assert all(
+        "report_warmup_transition" in line or "report_progress" in line
+        for line in callback_lines
+    )
+
+
+def test_invalid_state_audit_runs_when_debug_callback_raises(monkeypatch) -> None:
+    def fail_callback(*_args, **_kwargs):
+        raise AssertionError("invalid-state audit must not call jax.debug.callback")
+
+    monkeypatch.setattr(jax.debug, "callback", fail_callback)
+    audit = cluster_solver._audit_invalid_state_draws(
+        SimpleNamespace(
+            flat_critical_arc_data=None,
+            traced_arc_data=None,
+            cab_likelihood_weight=0.0,
+            traced_bin_data=(),
+            _physical_parameter_vector=lambda params: params,
+        ),
+        np.asarray([[0.0]], dtype=float),
+    )
+    assert audit["invalid_state_audit_draw_count"] == 1
+    assert audit["invalid_state_audit_invalid_draw_count"] == 0
 
 
 def test_nuts_quality_diagnostics_flag_stuck_tree_depth_and_rhat() -> None:
@@ -26696,7 +26749,7 @@ def test_family_source_summary_handles_zero_measurement_and_source_scatter() -> 
         "is_valid": jnp.asarray(True),
         "reason_flags": np.zeros(len(cluster_solver.INVALID_STATE_REASON_NAMES), dtype=bool),
     }
-    evaluator._record_invalid_state_callback = lambda _flags: None
+    evaluator._record_invalid_state_host = lambda _flags: None
     evaluator._ray_shooting_for_components = lambda _z_source, _x, _y, _packed_state: (
         jnp.asarray([0.0, 2.0], dtype=jnp.float64),
         jnp.asarray([0.0, 0.0], dtype=jnp.float64),

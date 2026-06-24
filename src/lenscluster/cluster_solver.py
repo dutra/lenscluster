@@ -1002,6 +1002,51 @@ INVALID_STATE_REASON_NAMES = (
     "nonfinite_shape",
     "nonfinite_cosmology_factor",
 )
+INVALID_STATE_AUDIT_MAX_DRAWS = 512
+
+
+def _zero_invalid_state_reason_counts() -> dict[str, int]:
+    return {name: 0 for name in INVALID_STATE_REASON_NAMES}
+
+
+def _invalid_state_audit_draw_indices(
+    draw_count: int,
+    max_draws: int = INVALID_STATE_AUDIT_MAX_DRAWS,
+) -> np.ndarray:
+    draw_count = int(draw_count)
+    max_draws = int(max_draws)
+    if draw_count <= 0 or max_draws <= 0:
+        return np.empty((0,), dtype=np.int64)
+    if draw_count <= max_draws:
+        return np.arange(draw_count, dtype=np.int64)
+    return np.unique(np.linspace(0, draw_count - 1, max_draws, dtype=np.int64))
+
+
+def _invalid_state_audit_result(
+    *,
+    draw_count_used: int,
+    invalid_draw_count: int,
+    reason_counts: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    counts = _zero_invalid_state_reason_counts()
+    if reason_counts:
+        counts.update({str(key): int(value) for key, value in reason_counts.items()})
+    return {
+        "invalid_state_audit_draw_count": int(draw_count_used),
+        "invalid_state_audit_invalid_draw_count": int(invalid_draw_count),
+        "invalid_state_audit_reason_counts": counts,
+    }
+
+
+def _merge_invalid_state_reason_flags(draw_flags: np.ndarray, reason_flags: Any) -> np.ndarray:
+    merged = np.asarray(draw_flags, dtype=bool).copy()
+    flags = np.asarray(reason_flags, dtype=bool).reshape(-1)
+    if flags.size == 0:
+        return merged
+    size = min(int(merged.size), int(flags.size))
+    merged[:size] |= flags[:size]
+    return merged
+
 
 def _state_with_run_name(state: BuildState, run_name: str) -> BuildState:
     if is_dataclass(state):
@@ -7679,6 +7724,82 @@ def _posterior_logprob_matrix(
     return np.concatenate(chunks, axis=0)
 
 
+def _audit_invalid_state_draws(
+    evaluator: Any,
+    samples: np.ndarray | None,
+    *,
+    max_draws: int = INVALID_STATE_AUDIT_MAX_DRAWS,
+) -> dict[str, Any]:
+    sample_array = np.asarray(samples, dtype=float) if samples is not None else np.empty((0, 0), dtype=float)
+    if sample_array.ndim != 2 or sample_array.shape[0] == 0:
+        return _invalid_state_audit_result(draw_count_used=0, invalid_draw_count=0)
+    indices = _invalid_state_audit_draw_indices(sample_array.shape[0], max_draws=max_draws)
+    reason_counts = _zero_invalid_state_reason_counts()
+    invalid_draw_count = 0
+    flat_data = getattr(evaluator, "flat_critical_arc_data", None)
+    traced_bins = tuple(getattr(evaluator, "traced_bin_data", ()) or ())
+    traced_arc_data = getattr(evaluator, "traced_arc_data", None)
+    use_cab = (
+        traced_arc_data is not None
+        and int(getattr(traced_arc_data, "n_arcs", 0)) > 0
+        and float(getattr(evaluator, "cab_likelihood_weight", 0.0)) > 0.0
+        and hasattr(evaluator, "_build_cab_packed_lens_state_with_validity_from_physical")
+    )
+
+    for draw_index in indices.tolist():
+        theta = np.asarray(sample_array[int(draw_index)], dtype=float)
+        draw_flags = np.zeros(len(INVALID_STATE_REASON_NAMES), dtype=bool)
+        if not np.all(np.isfinite(theta)):
+            invalid_draw_count += 1
+            continue
+        physical_params = evaluator._physical_parameter_vector(jnp.asarray(theta, dtype=jnp.float64))
+        if flat_data is not None and hasattr(evaluator, "_build_flat_packed_lens_state_with_validity_from_physical"):
+            _packed, validity = evaluator._build_flat_packed_lens_state_with_validity_from_physical(
+                physical_params,
+                flat_data,
+                stop_gradient=True,
+            )
+            draw_flags = _merge_invalid_state_reason_flags(draw_flags, validity.reason_flags)
+        else:
+            for bin_data in traced_bins:
+                _packed, validity = evaluator._build_packed_lens_state_with_validity_from_physical(
+                    physical_params,
+                    float(bin_data.effective_z_source),
+                    stop_gradient=True,
+                )
+                draw_flags = _merge_invalid_state_reason_flags(draw_flags, validity.reason_flags)
+        if use_cab:
+            _cab_packed, cab_validity = evaluator._build_cab_packed_lens_state_with_validity_from_physical(
+                physical_params,
+                stop_gradient=True,
+            )
+            draw_flags = _merge_invalid_state_reason_flags(draw_flags, cab_validity.reason_flags)
+        if draw_flags.any():
+            invalid_draw_count += 1
+            for name, flag in zip(INVALID_STATE_REASON_NAMES, draw_flags.tolist()):
+                if flag:
+                    reason_counts[name] = int(reason_counts.get(name, 0)) + 1
+    return _invalid_state_audit_result(
+        draw_count_used=int(indices.size),
+        invalid_draw_count=int(invalid_draw_count),
+        reason_counts=reason_counts,
+    )
+
+
+def _log_invalid_state_audit(args: Any, label: str, diagnostics: Mapping[str, Any]) -> None:
+    reason_counts = dict(diagnostics.get("invalid_state_audit_reason_counts", {}) or {})
+    positive_reasons = {key: int(value) for key, value in reason_counts.items() if int(value) > 0}
+    _log(
+        args,
+        (
+            f"[{label}] invalid-state audit "
+            f"draws={int(diagnostics.get('invalid_state_audit_draw_count', 0))} "
+            f"invalid={int(diagnostics.get('invalid_state_audit_invalid_draw_count', 0))} "
+            f"reasons={json.dumps(positive_reasons, sort_keys=True)}"
+        ),
+    )
+
+
 def _smc_standard_normal_log_prob(values: jnp.ndarray) -> jnp.ndarray:
     array = jnp.asarray(values, dtype=jnp.float64)
     return jnp.sum(-0.5 * jnp.square(array) - 0.5 * jnp.log(2.0 * jnp.pi))
@@ -8044,6 +8165,11 @@ def _run_blackjax_smc_sampler(
         weights = weights / weight_sum
     with _jax_device_context(default_device):
         log_prob = _posterior_logprob_matrix(parameter_specs, evaluator, samples)
+    invalid_state_audit = _run_logged_phase(
+        args,
+        "smc.invalid_state_audit",
+        lambda: _audit_invalid_state_draws(evaluator, samples),
+    )
     diagnostics = {
         "strategy_requested": FIT_METHOD_SMC,
         "strategy_used": FIT_METHOD_SMC,
@@ -8071,10 +8197,7 @@ def _run_blackjax_smc_sampler(
         "dropped_chain_indices": [],
         "chain_seed_labels": [],
         "distinct_chain_seeds": 0,
-        "invalid_state_rejection_count": int(getattr(evaluator, "invalid_state_rejection_count", 0)),
-        "invalid_state_reason_counts": {
-            key: int(value) for key, value in dict(getattr(evaluator, "invalid_state_reason_counts", {})).items()
-        },
+        **invalid_state_audit,
         "fixed_surrogate_drift": _smc_fixed_surrogate_drift_summary(evaluator, samples),
     }
     posterior = PosteriorResults(
@@ -8824,6 +8947,11 @@ def _run_blackjax_microcanonical_sampler(
         for diag in retained_chain_diag
     ]
     inverse_mass = np.concatenate(inverse_mass_values) if inverse_mass_values else np.empty((0,), dtype=float)
+    invalid_state_audit = _run_logged_phase(
+        args,
+        f"{method}.invalid_state_audit",
+        lambda: _audit_invalid_state_draws(evaluator, samples),
+    )
     diagnostics = {
         "strategy_requested": method,
         "strategy_used": method,
@@ -8866,10 +8994,7 @@ def _run_blackjax_microcanonical_sampler(
         "requested_chains": int(chains_requested),
         "chain_seed_labels": [seed.source_label for seed in chain_seeds],
         "distinct_chain_seeds": int(len({tuple(np.round(seed.values, 8)) for seed in chain_seeds})),
-        "invalid_state_rejection_count": int(getattr(evaluator, "invalid_state_rejection_count", 0)),
-        "invalid_state_reason_counts": {
-            key: int(value) for key, value in dict(getattr(evaluator, "invalid_state_reason_counts", {})).items()
-        },
+        **invalid_state_audit,
         "fixed_surrogate_drift": _smc_fixed_surrogate_drift_summary(evaluator, samples),
         **chain_quality_diag,
     }
@@ -9393,7 +9518,7 @@ def _perturbation_discovery_union_from_evaluator(
         stop_gradient=False,
     )
     if not bool(np.asarray(validity.is_valid, dtype=bool)):
-        evaluator._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
+        evaluator._record_invalid_state_host(np.asarray(validity.reason_flags, dtype=bool))
         return selected_by_potfile, {
             "count": 0,
             "exact_unique": 0,
@@ -11309,6 +11434,11 @@ def _run_svi_fit(
         "svi.posterior_logprob",
         lambda: _posterior_logprob_matrix(state.parameter_specs, evaluator, guide_samples),
     )
+    invalid_state_audit = _run_logged_phase(
+        args,
+        "svi.invalid_state_audit",
+        lambda: _audit_invalid_state_draws(evaluator, guide_samples),
+    )
     diagnostics = {
         "strategy_requested": "svi",
         "strategy_used": "svi",
@@ -11337,10 +11467,7 @@ def _run_svi_fit(
         "dropped_chain_indices": [],
         "chain_seed_labels": [],
         "distinct_chain_seeds": 0,
-        "invalid_state_rejection_count": int(getattr(evaluator, "invalid_state_rejection_count", 0)),
-        "invalid_state_reason_counts": {
-            key: int(value) for key, value in dict(getattr(evaluator, "invalid_state_reason_counts", {})).items()
-        },
+        **invalid_state_audit,
         "fixed_image_sigma_int_arcsec": (
             None
             if getattr(evaluator, "fixed_image_sigma_int_arcsec", None) is None
@@ -11371,6 +11498,7 @@ def _run_svi_fit(
         sampler="svi",
     )
     _log_posterior_summary(args, "svi_guide", posterior)
+    _log_invalid_state_audit(args, "svi", diagnostics)
     if bool(getattr(args, "debug_sampler_diagnostics", False)):
         _log(args, "[sampler-debug] skipped sampler=svi; diagnostics are only written for NUTS runs")
     del guide_samples_dict, svi_result, params
@@ -11526,10 +11654,6 @@ def _run_numpyro_nuts_sampler(
                 nuts_init.diagnostics["nuts_adapted_step_size_max"] = float(np.max(_finite_step))
     except Exception:
         pass
-    nuts_init.diagnostics["invalid_state_rejection_count"] = int(getattr(evaluator, "invalid_state_rejection_count", 0))
-    nuts_init.diagnostics["invalid_state_reason_counts"] = {
-        key: int(value) for key, value in dict(getattr(evaluator, "invalid_state_reason_counts", {})).items()
-    }
     samples = _run_logged_phase(
         args,
         "posterior.extract_samples",
@@ -11545,6 +11669,13 @@ def _run_numpyro_nuts_sampler(
     num_steps = np.asarray(extra["num_steps"], dtype=float).reshape(-1)[:: max(1, args.thin)]
     log_prob = -np.asarray(extra["potential_energy"], dtype=float).reshape(-1)[:: max(1, args.thin)]
     grouped_log_prob = -np.asarray(extra["potential_energy"], dtype=float)[:, :: max(1, args.thin)]
+    nuts_init.diagnostics.update(
+        _run_logged_phase(
+            args,
+            "posterior.invalid_state_audit",
+            lambda: _audit_invalid_state_draws(evaluator, samples),
+        )
+    )
     posterior = PosteriorResults(
         samples=samples,
         log_prob=log_prob,
@@ -11585,9 +11716,10 @@ def _run_numpyro_nuts_sampler(
     _log(
         args,
         (
-            "[nuts] invalid-state guards "
-            f"rejections={int(getattr(evaluator, 'invalid_state_rejection_count', 0))} "
-            f"reasons={json.dumps({key: int(value) for key, value in dict(getattr(evaluator, 'invalid_state_reason_counts', {})).items() if int(value) > 0}, sort_keys=True)}"
+            "[nuts] invalid-state audit "
+            f"draws={int(nuts_init.diagnostics.get('invalid_state_audit_draw_count', 0))} "
+            f"invalid={int(nuts_init.diagnostics.get('invalid_state_audit_invalid_draw_count', 0))} "
+            f"reasons={json.dumps({key: int(value) for key, value in dict(nuts_init.diagnostics.get('invalid_state_audit_reason_counts', {})).items() if int(value) > 0}, sort_keys=True)}"
         ),
     )
     _log(
@@ -12211,6 +12343,11 @@ def _run_blocked_numpyro_nuts_sampler(
         block_name: _summarize_blocked_nuts_metrics(values)
         for block_name, values in per_block_metrics.items()
     }
+    invalid_state_audit = _run_logged_phase(
+        args,
+        "blocked_nuts.invalid_state_audit",
+        lambda: _audit_invalid_state_draws(evaluator, samples),
+    )
     diagnostics = {
         **nuts_init.diagnostics,
         "sampler": "numpyro_blocked_nuts",
@@ -12231,10 +12368,7 @@ def _run_blocked_numpyro_nuts_sampler(
         "dropped_nonfinite_chains": int(len(dropped_indices)),
         "retained_chain_indices": retained_indices,
         "dropped_chain_indices": dropped_indices,
-        "invalid_state_rejection_count": int(getattr(evaluator, "invalid_state_rejection_count", 0)),
-        "invalid_state_reason_counts": {
-            key: int(value) for key, value in dict(getattr(evaluator, "invalid_state_reason_counts", {})).items()
-        },
+        **invalid_state_audit,
     }
     posterior = PosteriorResults(
         samples=samples,
@@ -12261,14 +12395,7 @@ def _run_blocked_numpyro_nuts_sampler(
             f"retained_samples={samples.shape[0]}"
         ),
     )
-    _log(
-        args,
-        (
-            "[blocked-nuts] invalid-state guards "
-            f"rejections={int(getattr(evaluator, 'invalid_state_rejection_count', 0))} "
-            f"reasons={json.dumps({key: int(value) for key, value in dict(getattr(evaluator, 'invalid_state_reason_counts', {})).items() if int(value) > 0}, sort_keys=True)}"
-        ),
-    )
+    _log_invalid_state_audit(args, "blocked-nuts", diagnostics)
     gc.collect()
     return posterior
 
@@ -12487,6 +12614,11 @@ def _run_active_blocked_numpyro_nuts_sampler(
         block_name: _summarize_blocked_nuts_metrics(values)
         for block_name, values in per_block_metrics.items()
     }
+    invalid_state_audit = _run_logged_phase(
+        args,
+        "active_blocked_nuts.invalid_state_audit",
+        lambda: _audit_invalid_state_draws(evaluator, samples),
+    )
     diagnostics = {
         **nuts_init.diagnostics,
         "sampler": "numpyro_active_blocked_nuts",
@@ -12514,10 +12646,7 @@ def _run_active_blocked_numpyro_nuts_sampler(
         "dropped_nonfinite_chains": int(len(dropped_indices)),
         "retained_chain_indices": retained_indices,
         "dropped_chain_indices": dropped_indices,
-        "invalid_state_rejection_count": int(getattr(evaluator, "invalid_state_rejection_count", 0)),
-        "invalid_state_reason_counts": {
-            key: int(value) for key, value in dict(getattr(evaluator, "invalid_state_reason_counts", {})).items()
-        },
+        **invalid_state_audit,
     }
     posterior = PosteriorResults(
         samples=samples,
@@ -12544,14 +12673,7 @@ def _run_active_blocked_numpyro_nuts_sampler(
             f"retained_samples={samples.shape[0]}"
         ),
     )
-    _log(
-        args,
-        (
-            "[active-blocked-nuts] invalid-state guards "
-            f"rejections={int(getattr(evaluator, 'invalid_state_rejection_count', 0))} "
-            f"reasons={json.dumps({key: int(value) for key, value in dict(getattr(evaluator, 'invalid_state_reason_counts', {})).items() if int(value) > 0}, sort_keys=True)}"
-        ),
-    )
+    _log_invalid_state_audit(args, "active-blocked-nuts", diagnostics)
     gc.collect()
     return posterior
 
@@ -12705,6 +12827,11 @@ def _run_numpyro_nested_sampler(
         "ns.posterior_logprob",
         lambda: _posterior_logprob_matrix(state.parameter_specs, evaluator, samples),
     )
+    invalid_state_audit = _run_logged_phase(
+        args,
+        "ns.invalid_state_audit",
+        lambda: _audit_invalid_state_draws(evaluator, samples),
+    )
     diagnostics = {
         "strategy_requested": FIT_METHOD_NS,
         "strategy_used": FIT_METHOD_NS,
@@ -12732,10 +12859,7 @@ def _run_numpyro_nested_sampler(
             integer=True,
         ),
         "ns_termination_reason": _result_scalar(ns_results, "termination_reason", integer=True),
-        "invalid_state_rejection_count": int(getattr(evaluator, "invalid_state_rejection_count", 0)),
-        "invalid_state_reason_counts": {
-            key: int(value) for key, value in dict(getattr(evaluator, "invalid_state_reason_counts", {})).items()
-        },
+        **invalid_state_audit,
     }
     posterior = PosteriorResults(
         samples=samples,
@@ -19304,7 +19428,7 @@ class ClusterJAXEvaluator:
             packed_state = self._build_packed_lens_state(reference_jax, bin_data.effective_z_source)
             validity = self._packed_lens_validity_from_params(reference_jax, bin_data.effective_z_source, stop_gradient=False)
             if not bool(np.asarray(validity.is_valid, dtype=bool)):
-                self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
+                self._record_invalid_state_host(np.asarray(validity.reason_flags, dtype=bool))
                 self.scaling_scatter_cache_by_z = {}
                 self._refresh_flat_critical_arc_scatter_arrays()
                 return
@@ -19376,7 +19500,7 @@ class ClusterJAXEvaluator:
             stop_gradient=False,
         )
         if not bool(np.asarray(validity.is_valid, dtype=bool)):
-            self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
+            self._record_invalid_state_host(np.asarray(validity.reason_flags, dtype=bool))
             self._refresh_flat_critical_arc_scatter_arrays()
             return
         beta_x, beta_y = self._flat_ray_shooting_for_components(
@@ -19400,7 +19524,7 @@ class ClusterJAXEvaluator:
                 cut_log_offset=cut_offset,
             )
             if not bool(np.asarray(plus_validity.is_valid, dtype=bool)):
-                self._record_invalid_state_callback(np.asarray(plus_validity.reason_flags, dtype=bool))
+                self._record_invalid_state_host(np.asarray(plus_validity.reason_flags, dtype=bool))
                 raise ValueError("invalid flat scaling-scatter offset state")
             beta_plus_x, beta_plus_y = self._flat_ray_shooting_for_components(
                 flat_data.x_obs,
@@ -19465,7 +19589,7 @@ class ClusterJAXEvaluator:
             stop_gradient=False,
         )
         if not bool(np.asarray(validity.is_valid, dtype=bool)):
-            self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
+            self._record_invalid_state_host(np.asarray(validity.reason_flags, dtype=bool))
             return
         jac_a00, jac_a01, jac_a10, jac_a11 = self._flat_lensing_jacobian_for_components(
             flat_data.x_obs,
@@ -19516,7 +19640,7 @@ class ClusterJAXEvaluator:
                 stop_gradient=False,
             )
             if not bool(np.asarray(validity.is_valid, dtype=bool)):
-                self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
+                self._record_invalid_state_host(np.asarray(validity.reason_flags, dtype=bool))
                 return
             jac_a00, jac_a01, jac_a10, jac_a11 = self._lensing_jacobian_for_components(
                 bin_data.effective_z_source,
@@ -19566,7 +19690,7 @@ class ClusterJAXEvaluator:
             jnp.asarray(cache["jac_a11"], dtype=jnp.float64),
         )
 
-    def _record_invalid_state_callback(self, reason_flags: Any) -> None:
+    def _record_invalid_state_host(self, reason_flags: Any) -> None:
         flags = np.asarray(reason_flags, dtype=bool).reshape(-1)
         if not flags.any():
             return
@@ -19574,10 +19698,6 @@ class ClusterJAXEvaluator:
         for name, flag in zip(INVALID_STATE_REASON_NAMES, flags.tolist()):
             if flag:
                 self.invalid_state_reason_counts[name] = int(self.invalid_state_reason_counts.get(name, 0)) + 1
-
-    def _emit_invalid_state_callback(self, reason_flags: jnp.ndarray) -> jnp.ndarray:
-        jax.debug.callback(self._record_invalid_state_callback, reason_flags)
-        return jnp.int32(0)
 
     def _bulk_ray_shooting_kwargs(self, packed_state: PackedLensState) -> dict[str, Any]:
         return self._bulk_ray_shooting_kwargs_from_indices(packed_state)
@@ -19782,7 +19902,6 @@ class ClusterJAXEvaluator:
             kpc_per_arcsec=sampled_kpc_per_arcsec,
             dpie_sigma0_factors=sampled_dpie_sigma0_factors,
         )
-        self._maybe_record_invalid_state(validity)
         invalid = ~validity.is_valid
         beta_active_x, beta_active_y = jax.lax.cond(
             invalid,
@@ -20080,7 +20199,7 @@ class ClusterJAXEvaluator:
             stop_gradient=False,
         )
         if not bool(np.asarray(validity.is_valid, dtype=bool)):
-            self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
+            self._record_invalid_state_host(np.asarray(validity.reason_flags, dtype=bool))
             return
         alpha_x_rows: list[np.ndarray] = []
         alpha_y_rows: list[np.ndarray] = []
@@ -20242,7 +20361,6 @@ class ClusterJAXEvaluator:
             kpc_per_arcsec=sampled_kpc_per_arcsec,
             dpie_sigma0_factors=sampled_dpie_sigma0_factors,
         )
-        self._maybe_record_invalid_state(validity)
         invalid = ~validity.is_valid
         beta_x, beta_y, jac_a00, jac_a01, jac_a10, jac_a11 = jax.lax.cond(
             invalid,
@@ -20434,7 +20552,6 @@ class ClusterJAXEvaluator:
                 physical_params,
                 stop_gradient=True,
             )
-            self._maybe_record_invalid_state(cab_validity)
             cab_invalid = ~cab_validity.is_valid
             cab_loglike = self._cab_morphology_loglike_for_arcs(
                 arc_data,
@@ -20468,7 +20585,6 @@ class ClusterJAXEvaluator:
             kpc_per_arcsec=sampled_kpc_per_arcsec,
             dpie_sigma0_factors=sampled_dpie_sigma0_factors,
         )
-        self._maybe_record_invalid_state(validity)
         invalid = ~validity.is_valid
         beta_x, beta_y, jac_a00, jac_a01, jac_a10, jac_a11 = jax.lax.cond(
             invalid,
@@ -20565,7 +20681,6 @@ class ClusterJAXEvaluator:
             kpc_per_arcsec=sampled_kpc_per_arcsec,
             dpie_sigma0_factors=sampled_dpie_sigma0_factors,
         )
-        self._maybe_record_invalid_state(validity)
         invalid = ~validity.is_valid
         beta_x, beta_y, jac_a00, jac_a01, jac_a10, jac_a11 = jax.lax.cond(
             invalid,
@@ -20687,7 +20802,6 @@ class ClusterJAXEvaluator:
                 physical_params,
                 stop_gradient=True,
             )
-            self._maybe_record_invalid_state(cab_validity)
             cab_invalid = ~cab_validity.is_valid
             cab_loglike = self._cab_morphology_loglike_for_arcs(
                 arc_data,
@@ -21550,15 +21664,6 @@ class ClusterJAXEvaluator:
             reason_flags = jax.lax.stop_gradient(reason_flags)
         return packed_state, PackedLensValidity(is_valid=~jnp.any(reason_flags), reason_flags=reason_flags)
 
-    def _maybe_record_invalid_state(self, validity: PackedLensValidity) -> None:
-        reason_flags = validity.reason_flags
-        _ = jax.lax.cond(
-            jnp.any(reason_flags),
-            self._emit_invalid_state_callback,
-            lambda flags: jnp.int32(0),
-            reason_flags,
-        )
-
     def _component_indices_np(self, component_indices: np.ndarray | None = None) -> np.ndarray:
         if component_indices is None:
             return np.arange(len(self.state.lens_model_list), dtype=np.int32)
@@ -22416,7 +22521,7 @@ class ClusterJAXEvaluator:
                     stop_gradient=False,
                 )
                 if not bool(np.asarray(plus_validity.is_valid, dtype=bool)):
-                    self._record_invalid_state_callback(np.asarray(plus_validity.reason_flags, dtype=bool))
+                    self._record_invalid_state_host(np.asarray(plus_validity.reason_flags, dtype=bool))
                     return None
                 plus_eval = np.asarray(
                     self._flat_inactive_surrogate_concat(
@@ -22439,7 +22544,7 @@ class ClusterJAXEvaluator:
                     stop_gradient=False,
                 )
                 if not bool(np.asarray(minus_validity.is_valid, dtype=bool)):
-                    self._record_invalid_state_callback(np.asarray(minus_validity.reason_flags, dtype=bool))
+                    self._record_invalid_state_host(np.asarray(minus_validity.reason_flags, dtype=bool))
                     return None
                 minus_eval = np.asarray(
                     self._flat_inactive_surrogate_concat(
@@ -22556,7 +22661,7 @@ class ClusterJAXEvaluator:
                     stop_gradient=False,
                 )
                 if not bool(np.asarray(plus_validity.is_valid, dtype=bool)):
-                    self._record_invalid_state_callback(np.asarray(plus_validity.reason_flags, dtype=bool))
+                    self._record_invalid_state_host(np.asarray(plus_validity.reason_flags, dtype=bool))
                     return None
                 plus_eval = np.asarray(
                     self._inactive_surrogate_concat(
@@ -22581,7 +22686,7 @@ class ClusterJAXEvaluator:
                     stop_gradient=False,
                 )
                 if not bool(np.asarray(minus_validity.is_valid, dtype=bool)):
-                    self._record_invalid_state_callback(np.asarray(minus_validity.reason_flags, dtype=bool))
+                    self._record_invalid_state_host(np.asarray(minus_validity.reason_flags, dtype=bool))
                     return None
                 minus_eval = np.asarray(
                     self._inactive_surrogate_concat(
@@ -22660,7 +22765,7 @@ class ClusterJAXEvaluator:
             stop_gradient=False,
         )
         if not bool(np.asarray(validity.is_valid, dtype=bool)):
-            self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
+            self._record_invalid_state_host(np.asarray(validity.reason_flags, dtype=bool))
             self.surrogate_reference_params = None
             self.surrogate_reference_param_values = np.zeros(len(self.surrogate_param_indices), dtype=float)
             return
@@ -22743,7 +22848,7 @@ class ClusterJAXEvaluator:
             packed_state = self._build_packed_lens_state(reference_jax, bin_data.effective_z_source)
             validity = self._packed_lens_validity_from_params(reference_jax, bin_data.effective_z_source, stop_gradient=False)
             if not bool(np.asarray(validity.is_valid, dtype=bool)):
-                self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
+                self._record_invalid_state_host(np.asarray(validity.reason_flags, dtype=bool))
                 self.surrogate_cache_by_z = {}
                 self.flat_surrogate_cache = None
                 self.surrogate_reference_params = None
@@ -23062,7 +23167,6 @@ class ClusterJAXEvaluator:
             kpc_per_arcsec=kpc_per_arcsec,
             dpie_sigma0_factor=dpie_sigma0_factor,
         )
-        self._maybe_record_invalid_state(validity)
         x_obs = bin_data.x_obs
         y_obs = bin_data.y_obs
         invalid = ~validity.is_valid
@@ -23219,7 +23323,6 @@ class ClusterJAXEvaluator:
                         kpc_per_arcsec=bin_kpc_per_arcsec,
                         dpie_sigma0_factor=bin_dpie_sigma0_factor,
                     )
-                self._maybe_record_invalid_state(validity)
                 invalid = ~validity.is_valid
                 if fit_component_indices is None:
                     beta_x, beta_y = jax.lax.cond(
@@ -23921,7 +24024,6 @@ class ClusterJAXEvaluator:
                 physical_params,
                 stop_gradient=True,
             )
-            self._maybe_record_invalid_state(cab_validity)
             cab_invalid = ~cab_validity.is_valid
             cab_loglike = self._cab_morphology_loglike_for_arcs(
                 arc_data,
@@ -23981,7 +24083,7 @@ class ClusterJAXEvaluator:
                 packed_state = self._build_packed_lens_state(params_jax, bin_data.effective_z_source)
                 validity = self._packed_lens_validity_from_params(params_jax, bin_data.effective_z_source, stop_gradient=False)
                 if not bool(np.asarray(validity.is_valid, dtype=bool)):
-                    self._record_invalid_state_callback(np.asarray(validity.reason_flags, dtype=bool))
+                    self._record_invalid_state_host(np.asarray(validity.reason_flags, dtype=bool))
                     for family_id in bin_data.family_ids:
                         summaries[str(family_id)] = failed_prediction(str(family_id))
                     continue
