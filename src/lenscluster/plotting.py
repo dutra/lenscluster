@@ -148,7 +148,7 @@ NUMPYRO_MODEL_ROLE_PRIORITY = (
     "large",
     "other",
 )
-_DISPLAY_PLOTS_IN_NOTEBOOK = False
+_SHOW_PLOTS = False
 
 
 def _stage_scalar(value: Any, default: Any) -> Any:
@@ -162,20 +162,22 @@ def _stage_scalar(value: Any, default: Any) -> Any:
     return value
 
 
-def _finish_figure(fig: Any, path: Path, *, dpi: int = 180, bbox_inches: str | None = "tight") -> None:
-    fig.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
-    if _DISPLAY_PLOTS_IN_NOTEBOOK:
-        from base64 import b64encode
-        from io import BytesIO
+def _maybe_show_figure(fig: Any) -> None:
+    if _SHOW_PLOTS:
+        plt.figure(fig.number)
+        plt.show()
 
-        from IPython.display import display
 
-        buffer = BytesIO()
-        fig.savefig(buffer, format="png", dpi=dpi, bbox_inches=bbox_inches)
-        display({"image/png": b64encode(buffer.getvalue()).decode("ascii")}, raw=True)
-        plt.close(fig)
-    else:
-        plt.close(fig)
+def _finish_figure(fig: Any, path: Path, *, dpi: int = 180, bbox_inches: str | None = "tight", **savefig_kwargs: Any) -> None:
+    fig.savefig(path, dpi=dpi, bbox_inches=bbox_inches, **savefig_kwargs)
+    _maybe_show_figure(fig)
+    plt.close(fig)
+
+
+def _finish_pdf_page(pdf: PdfPages, fig: Any, **savefig_kwargs: Any) -> None:
+    pdf.savefig(fig, **savefig_kwargs)
+    _maybe_show_figure(fig)
+    plt.close(fig)
 
 
 def _log10_dpie_mass_msun(v_disp: Any, cut_radius_kpc: Any) -> np.ndarray:
@@ -1812,8 +1814,7 @@ def _add_active_population_mixture_page2(pdf: PdfPages, df: pd.DataFrame, thresh
     ax_hist.legend(loc="best", fontsize=8)
 
     fig.suptitle("Population active mixture diagnostics", fontsize=13)
-    pdf.savefig(fig, bbox_inches="tight")
-    plt.close(fig)
+    _finish_pdf_page(pdf, fig, bbox_inches="tight")
 
 
 def _add_active_population_mixture_page3(pdf: PdfPages, df: pd.DataFrame, threshold: float) -> None:
@@ -1926,8 +1927,7 @@ def _add_active_population_mixture_page3(pdf: PdfPages, df: pd.DataFrame, thresh
     )
 
     fig.suptitle("Population active mixture uncertainty and decisions", fontsize=13)
-    pdf.savefig(fig, bbox_inches="tight")
-    plt.close(fig)
+    _finish_pdf_page(pdf, fig, bbox_inches="tight")
 
 
 def _plot_active_scaling_summary(
@@ -2106,8 +2106,7 @@ def _plot_active_scaling_summary(
     ax_counts.legend(loc="best", fontsize=8)
 
     with PdfPages(pdf_path) as pdf:
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
+        _finish_pdf_page(pdf, fig, bbox_inches="tight")
         if population_mode:
             _add_active_population_mixture_page2(pdf, df, threshold)
             _add_active_population_mixture_page3(pdf, df, threshold)
@@ -2968,8 +2967,7 @@ def _plot_potfile_prior_posterior(
     if handles:
         fig.legend(handles, labels, loc="upper right")
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "potfile_prior_posterior.png"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "potfile_prior_posterior.png"), dpi=180, bbox_inches="tight")
 
 
 def _plot_potfile_leverage_summary(plot_dir: Path, potfile_diag_df: pd.DataFrame) -> None:
@@ -3008,8 +3006,7 @@ def _plot_potfile_leverage_summary(plot_dir: Path, potfile_diag_df: pd.DataFrame
     for ax in axes.ravel():
         ax.tick_params(axis="x", rotation=0)
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "potfile_leverage_summary.png"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "potfile_leverage_summary.png"), dpi=180, bbox_inches="tight")
 
 
 def _family_diagnostics_table(evaluator: ClusterJAXEvaluator, best_eval: EvaluationResult) -> pd.DataFrame:
@@ -4522,8 +4519,7 @@ def _plot_corner(
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
     _overplot_corner_map(fig, subset_specs, map_values)
     _overplot_corner_maximum_likelihood(fig, subset_specs, maximum_likelihood_values)
-    fig.savefig(_plot_path(plot_dir, output_name), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, output_name), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
 
 
 def _best_fit_values_for_specs(
@@ -5126,8 +5122,7 @@ def _plot_potfile_corner(
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
     _overplot_corner_map(fig, subset_specs, map_values)
     _overplot_corner_maximum_likelihood(fig, subset_specs, maximum_likelihood_values)
-    fig.savefig(_plot_path(plot_dir, "potfile_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "potfile_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
 
 
 def _plot_cosmology_corner(
@@ -5170,8 +5165,7 @@ def _plot_cosmology_corner(
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
     _overplot_corner_map(fig, subset_specs, map_values)
     _overplot_corner_maximum_likelihood(fig, subset_specs, maximum_likelihood_values)
-    fig.savefig(_plot_path(plot_dir, "cosmology_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "cosmology_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
 
 
 def _plot_trace(
@@ -5215,8 +5209,7 @@ def _plot_trace(
     if handles:
         fig.legend(handles, labels, loc="upper right")
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
 
 
 def _ns_series(ns_diagnostics: dict[str, np.ndarray] | None, key: str) -> np.ndarray | None:
@@ -5311,8 +5304,7 @@ def _plot_ns_diagnostics(plot_dir: Path, ns_diagnostics: dict[str, np.ndarray] |
     axes[5].set_xlabel(r"$-\log X$")
 
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "ns_diagnostics.pdf"), dpi=220, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "ns_diagnostics.pdf"), dpi=220, bbox_inches="tight")
 
 
 def _ns_trace_parameter_subset(
@@ -5382,8 +5374,7 @@ def _plot_ns_trace(plot_dir: Path, ns_diagnostics: dict[str, np.ndarray] | None,
         fig.subplots_adjust(right=0.86, hspace=0.25)
     else:
         fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "ns_trace_plot.pdf"), dpi=220, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "ns_trace_plot.pdf"), dpi=220, bbox_inches="tight")
 
 
 def _plot_ns_weight_diagnostics(plot_dir: Path, ns_diagnostics: dict[str, np.ndarray] | None) -> None:
@@ -5410,8 +5401,7 @@ def _plot_ns_weight_diagnostics(plot_dir: Path, ns_diagnostics: dict[str, np.nda
     axes[1].set_ylim(-0.02, 1.02)
     axes[1].set_xscale("log")
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "ns_weight_diagnostics.pdf"), dpi=220, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "ns_weight_diagnostics.pdf"), dpi=220, bbox_inches="tight")
 
 
 def _logsafe_importance_values(values: pd.Series | np.ndarray | list[float]) -> tuple[np.ndarray, float]:
@@ -5467,8 +5457,7 @@ def _plot_scaling_rank_scatter(plot_dir: Path, scaling_rank_df: pd.DataFrame) ->
         ax.legend(loc="best", fontsize=8)
         _apply_log_importance_axis(ax, pot_df["importance"])
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "scaling_rank_scatter.png"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "scaling_rank_scatter.png"), dpi=180, bbox_inches="tight")
 
 
 def _load_perturbation_discovery_diagnostics_table(tables_dir: Path) -> pd.DataFrame:
@@ -5688,8 +5677,7 @@ def _plot_perturbation_discovery_diagnostics(plot_dir: Path, diagnostics_df: pd.
         bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "0.6", "alpha": 0.92},
     )
     fig.suptitle("Perturbation discovery diagnostics", fontsize=14)
-    fig.savefig(_plot_path(plot_dir, "perturbation_discovery_diagnostics.pdf"), dpi=200, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "perturbation_discovery_diagnostics.pdf"), dpi=200, bbox_inches="tight")
 
 
 def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) -> None:
@@ -5945,8 +5933,7 @@ def _plot_scaling_relation_summary(plot_dir: Path, relation_df: pd.DataFrame) ->
     mappable.set_array([])
     colorbar = fig.colorbar(mappable, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02)
     colorbar.set_label("catalog color (F606W - F814W)")
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, output_path, dpi=180, bbox_inches="tight")
 
 
 def _plot_unavailable_axis(ax: Any, label: str) -> None:
@@ -6058,8 +6045,7 @@ def _plot_chain_health(
     if handles:
         fig.legend(handles, labels, loc="upper right")
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "chain_health.pdf"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "chain_health.pdf"), dpi=180, bbox_inches="tight")
 
 
 def _finite_1d_array(value: np.ndarray | None) -> np.ndarray | None:
@@ -6173,8 +6159,7 @@ def _plot_smc_diagnostics(plot_dir: Path, results: PosteriorResults) -> None:
         axes[3].axis("off")
 
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "smc_diagnostics.pdf"), dpi=220, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "smc_diagnostics.pdf"), dpi=220, bbox_inches="tight")
 
 
 def _plot_smc_weight_diagnostics(plot_dir: Path, results: PosteriorResults) -> None:
@@ -6227,8 +6212,7 @@ def _plot_smc_weight_diagnostics(plot_dir: Path, results: PosteriorResults) -> N
         axes[1, 1].axis("off")
 
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "smc_weight_diagnostics.pdf"), dpi=220, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "smc_weight_diagnostics.pdf"), dpi=220, bbox_inches="tight")
 
 
 def _weighted_variance(samples: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -6310,8 +6294,7 @@ def _plot_smc_corner(
     _overplot_corner_previous_stage_best_fit(fig, subset_specs, previous_stage_best_values)
     _overplot_corner_map(fig, subset_specs, map_values)
     _overplot_corner_maximum_likelihood(fig, subset_specs, maximum_likelihood_values)
-    fig.savefig(_plot_path(plot_dir, "smc_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "smc_corner.pdf"), dpi=CORNER_PLOT_DPI, bbox_inches="tight")
 
 
 def _source_plane_residual_components(
@@ -6438,8 +6421,7 @@ def _plot_source_plane_residual_histogram(
     axes[2].set_title("Radial Residuals")
     axes[2].legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "source_plane_residual_histogram.png"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "source_plane_residual_histogram.png"), dpi=180, bbox_inches="tight")
 
 
 def _fit_quality_quantiles(values: list[float] | np.ndarray) -> tuple[float, float, float]:
@@ -7781,8 +7763,7 @@ def _write_placeholder_plot(path: Path, title: str, message: str) -> None:
     ax.text(0.5, 0.62, title, ha="center", va="center", fontsize=13, fontweight="bold")
     ax.text(0.5, 0.42, message, ha="center", va="center", fontsize=10, wrap=True)
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _plot_image_residual_histogram(
@@ -8208,8 +8189,7 @@ def _plot_critical_arc_support_histogram(
     tuning_ax.set_title("p_arc vs Support Distance")
 
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _plot_critical_arc_support_phase_space(
@@ -8325,8 +8305,7 @@ def _plot_critical_arc_support_phase_space(
     ax.set_ylim(-0.02, 1.02)
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _plot_critical_arc_recovery_by_family(image_count_df: pd.DataFrame, path: Path) -> None:
@@ -8389,8 +8368,7 @@ def _plot_critical_arc_recovery_by_family(image_count_df: pd.DataFrame, path: Pa
     ax.grid(axis="x", alpha=0.25)
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _plot_residual_vs_magnification(image_df: pd.DataFrame, magnification_df: pd.DataFrame, path: Path) -> None:
@@ -8496,8 +8474,7 @@ def _plot_exact_vs_approx_prediction_error(family_df: pd.DataFrame, path: Path) 
             ax.set_xticklabels(labels[order], rotation=90, fontsize=7)
             ax.set_xlabel("family")
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _plot_per_potential_summary(
@@ -8553,8 +8530,7 @@ def _plot_per_potential_summary(
     if handles:
         fig.legend(handles, labels, loc="upper right")
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "per_potential_summary.png"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "per_potential_summary.png"), dpi=180, bbox_inches="tight")
 
 
 def _plot_timing_profile(plot_dir: Path, evaluator: ClusterJAXEvaluator) -> None:
@@ -8566,8 +8542,7 @@ def _plot_timing_profile(plot_dir: Path, evaluator: ClusterJAXEvaluator) -> None
     ax.set_title("Timing Totals")
     ax.tick_params(axis="x", rotation=45)
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "timing_profile.png"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "timing_profile.png"), dpi=180, bbox_inches="tight")
 
 
 def _critical_curve_caustics(
@@ -8705,8 +8680,7 @@ def _plot_caustic_overlay(
     source_ax.set_ylabel(r"$\beta_y$ [arcsec]")
     source_ax.set_title("Caustics + Source Centroids")
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "caustic_overlay.png"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "caustic_overlay.png"), dpi=180, bbox_inches="tight")
 
 
 def _plot_absolute_magnification(
@@ -8763,8 +8737,7 @@ def _plot_absolute_magnification(
     ax.set_ylabel("y [arcsec]")
     ax.set_title(f"Absolute Magnification (z={z_source:g})")
     fig.tight_layout()
-    fig.savefig(_plot_path(plot_dir, "absolute_magnification.pdf"), dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, _plot_path(plot_dir, "absolute_magnification.pdf"), dpi=180, bbox_inches="tight")
 
 
 def _load_kappa_true_fits(path: str | Path) -> tuple[np.ndarray, WCS]:
@@ -10223,8 +10196,7 @@ def _plot_kappa_true_comparison_from_grid(
         ax.set_xlabel("x [arcsec]")
         ax.set_ylabel("y [arcsec]")
         fig.tight_layout()
-        fig.savefig(_plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
-        plt.close(fig)
+        _finish_figure(fig, _plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
 
     valid_residual = np.isfinite(model_kappa) & np.isfinite(kappa_true) & (kappa_true > 0.0)
     fractional_residual = np.full(kappa_true.shape, np.nan, dtype=float)
@@ -10428,8 +10400,7 @@ def _plot_truth_recovery_m2d_aperture_ratio(
     )
     ax.legend(loc="best", fontsize=8, frameon=True)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, output_path, dpi=220, bbox_inches="tight")
 
 
 def _write_truth_recovery_m2d_aperture_profile(
@@ -10726,8 +10697,7 @@ def _plot_abs_mu_true_comparison_from_grid(
         ax.set_xlabel("x [arcsec]")
         ax.set_ylabel("y [arcsec]")
         fig.tight_layout()
-        fig.savefig(_plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
-        plt.close(fig)
+        _finish_figure(fig, _plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
 
     valid_residual = np.isfinite(abs_mu_model) & np.isfinite(abs_mu_true) & (abs_mu_true > 0.0)
     fractional_residual = np.full(abs_mu_true.shape, np.nan, dtype=float)
@@ -10807,8 +10777,7 @@ def _plot_critical_line_recovery_from_grid(
     if legend_handles:
         ax.legend(handles=legend_handles, loc="best", fontsize=8, frameon=True)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, output_path, dpi=180, bbox_inches="tight")
 
 
 def _plot_abs_mu_truth_diagnostics(
@@ -11223,8 +11192,7 @@ def _plot_subhalo_mass_function(subhalo_df: pd.DataFrame, path: Path) -> None:
     ax.set_ylabel(r"$dN/d\log_{10}M$")
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _plot_subhalo_radial_distribution(subhalo_df: pd.DataFrame, path: Path) -> None:
@@ -11257,8 +11225,7 @@ def _plot_subhalo_radial_distribution(subhalo_df: pd.DataFrame, path: Path) -> N
     ax.set_xlabel("cluster-centric radius [arcsec]")
     ax.set_ylabel(r"$dN/dR$ [arcsec$^{-1}$]")
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _load_image_catalog_cutout_helpers() -> Any:
@@ -13397,6 +13364,7 @@ def _plot_image_catalog_family_cutouts(
     )
     fig.savefig(cluster_output, facecolor=fig.get_facecolor(), **savefig_kwargs)
     if not detail_cutouts_enabled:
+        _maybe_show_figure(fig)
         plt.close(fig)
         return
     blocks = _image_catalog_family_cutout_blocks(
@@ -13407,8 +13375,7 @@ def _plot_image_catalog_family_cutouts(
         default_cutout_size_arcsec=cutout_size_arcsec,
     )
     with PdfPages(output) as pdf:
-        pdf.savefig(fig, facecolor=fig.get_facecolor(), **savefig_kwargs)
-        plt.close(fig)
+        _finish_pdf_page(pdf, fig, facecolor=fig.get_facecolor(), **savefig_kwargs)
 
         for block in blocks:
             model_pair = (
@@ -13463,8 +13430,7 @@ def _plot_image_catalog_family_cutouts(
                     render_config=render_config,
                     include_critical_lines=draw_critical_lines,
                 )
-            pdf.savefig(fig, facecolor=fig.get_facecolor(), **savefig_kwargs)
-            plt.close(fig)
+            _finish_pdf_page(pdf, fig, facecolor=fig.get_facecolor(), **savefig_kwargs)
 
 
 def _is_stage0_minimal_output(state: BuildState, args: argparse.Namespace) -> bool:
@@ -13485,18 +13451,24 @@ def _generate_plots_and_tables(
 ) -> dict[str, Any]:
     tables_dir = run_dir / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
+    global _SHOW_PLOTS
     if _is_stage0_minimal_output(state, args):
-        return _generate_stage0_minimal_plots_and_tables(
-            run_dir=run_dir,
-            tables_dir=tables_dir,
-            state=state,
-            evaluator=evaluator,
-            best_fit=best_fit,
-            best_eval=best_eval,
-            results=results,
-            runtime_sec=runtime_sec,
-            args=args,
-        )
+        previous_show_setting = _SHOW_PLOTS
+        _SHOW_PLOTS = bool(getattr(args, "show_plots", False))
+        try:
+            return _generate_stage0_minimal_plots_and_tables(
+                run_dir=run_dir,
+                tables_dir=tables_dir,
+                state=state,
+                evaluator=evaluator,
+                best_fit=best_fit,
+                best_eval=best_eval,
+                results=results,
+                runtime_sec=runtime_sec,
+                args=args,
+            )
+        finally:
+            _SHOW_PLOTS = previous_show_setting
     sample_likelihood_mode = _active_sample_likelihood_mode(evaluator, args)
     use_arc_aware_diagnostics = _uses_arc_aware_diagnostics(sample_likelihood_mode)
     max_tree_depth = _first_int_value(getattr(args, "max_tree_depth", 10), 10)
@@ -14368,9 +14340,8 @@ def _generate_plots_and_tables(
                 ),
             )
         )
-    global _DISPLAY_PLOTS_IN_NOTEBOOK
-    previous_display_setting = _DISPLAY_PLOTS_IN_NOTEBOOK
-    _DISPLAY_PLOTS_IN_NOTEBOOK = bool(getattr(args, "display_plots_in_notebook", False))
+    previous_show_setting = _SHOW_PLOTS
+    _SHOW_PLOTS = bool(getattr(args, "show_plots", False))
     try:
         _run_plot_stages_with_progress(
             args,
@@ -14381,7 +14352,7 @@ def _generate_plots_and_tables(
             ],
         )
     finally:
-        _DISPLAY_PLOTS_IN_NOTEBOOK = previous_display_setting
+        _SHOW_PLOTS = previous_show_setting
     _log(args, "[done] run summary\n" + str(context["run_summary_text"]).rstrip())
     return context["run_summary"]
 

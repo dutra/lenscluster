@@ -61,9 +61,6 @@ from .jax_cosmology import (
     critical_surface_density_angle_from_config,
     flat_wcdm_config,
 )
-import matplotlib
-
-matplotlib.use("Agg")
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.path import Path as MplPath
 from matplotlib.ticker import AutoMinorLocator

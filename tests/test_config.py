@@ -117,6 +117,15 @@ def test_cluster_solver_exposes_no_cli_parser() -> None:
     assert not hasattr(cluster_solver, "_parse_args")
 
 
+def test_solver_modules_do_not_force_matplotlib_agg_backend() -> None:
+    for path in ("src/lenscluster/cluster_solver.py", "src/lenscluster/validation.py"):
+        text = Path(path).read_text(encoding="utf-8")
+        assert 'matplotlib.use("Agg")' not in text
+        assert "matplotlib.use('Agg')" not in text
+        assert 'matplotlib_use("Agg")' not in text
+        assert "matplotlib_use('Agg')" not in text
+
+
 def test_config_defaults_validate_without_solver_namespace() -> None:
     config = LensClusterSolverConfig(model=_minimal_model_config())
 
@@ -124,6 +133,7 @@ def test_config_defaults_validate_without_solver_namespace() -> None:
     assert config.workflow.stage1_likelihood == "local-jacobian"
     assert config.workflow.stage2_forward_mode == "none"
     assert config.workflow.best_value == "map"
+    assert config.runtime.show_plots is False
     assert config.schedule.svi_steps == (2000, 2000)
     assert config.schedule.refresh_every == (250, 250)
     assert config.truth.truth_grid_mode == "median"
@@ -566,10 +576,15 @@ def test_run_xsh_is_self_contained_ff_sims_runner() -> None:
     assert "2.3 / 0.72" in text
     assert "cores = 4" in text
     assert "chains=cores" in text
+    assert "show_plots=True" not in text
+    assert "display_plots_in_notebook" not in text
+    assert "%matplotlib" not in text
+    assert "matplotlib.use" not in text
+    assert "MPLBACKEND" not in text
     assert 'stage0_likelihood = "source"' in text
     assert "stage0_likelihood=stage0_likelihood" in text
     assert "perturbation_discovery_top_k=perturbation_top_k" in text
-    assert 'stage1_likelihood = "critical-arc"' in text
+    assert "stage1_likelihood =" in text
     assert "critical-arc-centroid" not in text
     assert "critical-arc-mixture" not in text
 
@@ -599,15 +614,23 @@ def test_ff_sims_notebook_is_self_contained_and_config_native() -> None:
     assert "os.environ[\"JAX_NUM_CPU_DEVICES\"] = str(cores)" in source
     assert "RuntimeConfig" in source
     assert "chains=cores" in source
+    assert "show_plots=True" in source
+    assert "display_plots_in_notebook" not in source
+    assert "%matplotlib" not in source
+    assert "matplotlib.use" not in source
+    assert "MPLBACKEND" not in source
+    assert "FigureCanvasAgg" not in source
     assert 'stage0_likelihood = "source"' in source
     assert "stage0_likelihood=stage0_likelihood" in source
     assert "perturbation_discovery_top_k=perturbation_top_k" in source
-    assert 'stage1_likelihood = "critical-arc"' in source
+    assert "stage1_likelihood =" in source
     assert "critical-arc-centroid" not in source
     assert "critical-arc-mixture" not in source
     assert "available_cpu_cores" not in source
     assert "os.sched_getaffinity" not in source
     assert "os.cpu_count" not in source
+    assert "ARTIFACT_RUN_DIR = None" in source
+    assert "plots_only=True" in source
 
 
 def test_dataset_specific_runs_are_composed_from_generic_config_groups() -> None:

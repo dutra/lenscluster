@@ -35,7 +35,6 @@ import pandas as pd
 import h5py
 from astropy.cosmology import FlatLambdaCDM, FlatwCDM, LambdaCDM, wCDM
 from jax import config as jax_config
-from matplotlib import use as matplotlib_use
 from numpyro.infer import MCMC, NUTS, SVI, Trace_ELBO
 from numpyro.infer.autoguide import AutoNormal
 from numpyro.infer.initialization import init_to_value
@@ -90,13 +89,12 @@ Path(os.environ["NUMBA_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
 from lenstronomy.LensModel.lens_model import LensModel as NPLensModel
 from lenstronomy.LensModel.Solver.lens_equation_solver import LensEquationSolver as NPLensEquationSolver
 
-# Configure matplotlib before pyplot import.
+# Configure a writable matplotlib config/cache directory without selecting a backend.
 _MPLCONFIGDIR = os.environ.get("MPLCONFIGDIR")
 if not _MPLCONFIGDIR:
     _MPLCONFIGDIR = f"/tmp/mpl_cluster_solver_{os.getpid()}"
     os.environ["MPLCONFIGDIR"] = _MPLCONFIGDIR
 Path(_MPLCONFIGDIR).mkdir(parents=True, exist_ok=True)
-matplotlib_use("Agg")
 
 jax_config.update("jax_enable_x64", True)
 

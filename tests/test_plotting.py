@@ -49,6 +49,58 @@ def test_plot_path_creates_directory(tmp_path: Path) -> None:
     assert output.parent.is_dir()
 
 
+def test_finish_figure_saves_and_closes_without_show(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    show_calls: list[bool] = []
+    monkeypatch.setattr(plotting, "_SHOW_PLOTS", False)
+    monkeypatch.setattr(plotting.plt, "show", lambda: show_calls.append(True))
+
+    fig, ax = plotting.plt.subplots()
+    fig_number = fig.number
+    ax.plot([0.0, 1.0], [0.0, 1.0])
+    output = tmp_path / "figure.pdf"
+
+    plotting._finish_figure(fig, output)
+
+    assert output.is_file()
+    assert show_calls == []
+    assert not plotting.plt.fignum_exists(fig_number)
+
+
+def test_finish_figure_shows_when_enabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    show_calls: list[bool] = []
+    monkeypatch.setattr(plotting, "_SHOW_PLOTS", True)
+    monkeypatch.setattr(plotting.plt, "show", lambda: show_calls.append(True))
+
+    fig, ax = plotting.plt.subplots()
+    fig_number = fig.number
+    ax.plot([0.0, 1.0], [1.0, 0.0])
+    output = tmp_path / "figure.pdf"
+
+    plotting._finish_figure(fig, output)
+
+    assert output.is_file()
+    assert show_calls == [True]
+    assert not plotting.plt.fignum_exists(fig_number)
+
+
+def test_finish_pdf_page_shows_when_enabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    show_calls: list[bool] = []
+    monkeypatch.setattr(plotting, "_SHOW_PLOTS", True)
+    monkeypatch.setattr(plotting.plt, "show", lambda: show_calls.append(True))
+
+    fig, ax = plotting.plt.subplots()
+    fig_number = fig.number
+    ax.text(0.5, 0.5, "page")
+    output = tmp_path / "pages.pdf"
+
+    with plotting.PdfPages(output) as pdf:
+        plotting._finish_pdf_page(pdf, fig, bbox_inches="tight")
+
+    assert output.is_file()
+    assert show_calls == [True]
+    assert not plotting.plt.fignum_exists(fig_number)
+
+
 def test_active_scaling_summary_plot_writes_pdf_only(tmp_path: Path) -> None:
     df = pd.DataFrame(
         {

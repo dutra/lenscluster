@@ -108,7 +108,7 @@ class RuntimeConfig:
     skip_validation: bool = False
     skip_plots: bool = False
     plot_numpyro_model: bool = False
-    display_plots_in_notebook: bool = False
+    show_plots: bool = False
     quick_diagnostics: bool = False
     quiet: bool = False
     debug_sampler_diagnostics: bool = False
