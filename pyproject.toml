@@ -13,6 +13,8 @@ dependencies = [
     "graphviz>=0.21",
     "jax-cosmo>=0.1.0",
     "jax>=0.4",
+    "jaxtronomy @ git+https://github.com/dutra/JAXtronomy.git@feat-pseudojaffe-compact-profiles",
+    "lenstronomy @ git+https://github.com/dutra/lenstronomy.git@feat-lenscluster-models",
     "matplotlib>=3.7",
     "photutils>=2.0",
     "PyYAML>=6",
