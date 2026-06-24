@@ -9281,6 +9281,7 @@ PERTURBATION_DISCOVERY_DIAGNOSTIC_COLUMNS: tuple[str, ...] = (
     "top_k_requested",
     "rank_score",
     "rank_position",
+    "image_rank_position",
     "selected_pair",
     "selected_galaxy",
 )
@@ -9330,12 +9331,38 @@ def _perturbation_discovery_rank_scores(score: np.ndarray) -> tuple[np.ndarray, 
     return rank_score, rank_position
 
 
-def _perturbation_discovery_top_k_selected(score: np.ndarray, top_k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _perturbation_discovery_image_rank_positions(score: np.ndarray) -> np.ndarray:
+    score = np.asarray(score, dtype=float)
+    if score.ndim != 2:
+        return np.zeros((0, 0), dtype=int)
+    n_candidates, n_images = score.shape
+    image_rank_position = np.zeros((n_candidates, n_images), dtype=int)
+    if n_candidates == 0 or n_images == 0:
+        return image_rank_position
+    candidate_order = np.arange(n_candidates, dtype=int)
+    for image_index in range(n_images):
+        image_score = np.where(np.isfinite(score[:, image_index]), score[:, image_index], -np.inf)
+        order = np.lexsort((candidate_order, -image_score))
+        image_rank_position[order, image_index] = np.arange(1, n_candidates + 1, dtype=int)
+    return image_rank_position
+
+
+def _perturbation_discovery_top_k_selected(
+    score: np.ndarray,
+    top_k: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    score = np.asarray(score, dtype=float)
     rank_score, rank_position = _perturbation_discovery_rank_scores(score)
-    selected = np.zeros(rank_score.size, dtype=bool)
-    if selected.size:
-        selected[rank_position <= min(int(top_k), selected.size)] = True
-    return selected, rank_score, rank_position
+    if score.ndim != 2:
+        empty_pair = np.zeros((0, 0), dtype=bool)
+        return np.zeros(0, dtype=bool), empty_pair, rank_score, rank_position, np.zeros((0, 0), dtype=int)
+    image_rank_position = _perturbation_discovery_image_rank_positions(score)
+    selected_pair = np.zeros(score.shape, dtype=bool)
+    if score.size:
+        finite = np.isfinite(score)
+        selected_pair = finite & (image_rank_position <= min(int(top_k), score.shape[0]))
+    selected = np.any(selected_pair, axis=1) if selected_pair.ndim == 2 else np.zeros(rank_score.size, dtype=bool)
+    return selected, selected_pair, rank_score, rank_position, image_rank_position
 
 
 def _perturbation_discovery_top_k_from_evaluator(evaluator: Any) -> int | None:
@@ -9429,6 +9456,7 @@ def _perturbation_discovery_score_table(
                     "top_k_requested": np.nan,
                     "rank_score": float(rank_score[candidate_position]),
                     "rank_position": int(rank_position[candidate_position]),
+                    "image_rank_position": np.nan,
                     "selected_pair": bool(selected_pair[candidate_position, image_index]),
                     "selected_galaxy": bool(selected_galaxy[candidate_position]),
                 }
@@ -9589,8 +9617,15 @@ def _perturbation_discovery_union_from_evaluator(
         jacobian_weight=jacobian_weight,
         threshold_score=1.0,
     )
+    selected_pair_for_summary = above_threshold
     if top_k is not None:
-        selected_per_candidate, rank_score, rank_position = _perturbation_discovery_top_k_selected(score, top_k)
+        (
+            selected_per_candidate,
+            selected_pair_for_summary,
+            rank_score,
+            rank_position,
+            image_rank_position,
+        ) = _perturbation_discovery_top_k_selected(score, top_k)
         if not detail_df.empty:
             component_rank = {
                 int(component_index): (float(rank_score[index]), int(rank_position[index]))
@@ -9599,6 +9634,7 @@ def _perturbation_discovery_union_from_evaluator(
             detail_df = detail_df.copy()
             detail_df["selection_mode"] = "top_k"
             detail_df["top_k_requested"] = int(top_k)
+            detail_df["selected_pair"] = selected_pair_for_summary.reshape(-1)
             detail_df["selected_galaxy"] = detail_df["component_index"].map(
                 {
                     int(component_index): bool(selected_per_candidate[index])
@@ -9611,6 +9647,7 @@ def _perturbation_discovery_union_from_evaluator(
             detail_df["rank_position"] = detail_df["component_index"].map(
                 {component_index: values[1] for component_index, values in component_rank.items()}
             )
+            detail_df["image_rank_position"] = image_rank_position.reshape(-1)
     valid_components = {int(value) for value in candidates[selected_per_candidate].reshape(-1).tolist() if int(value) >= 0}
     component_to_record = {
         int(record.get("component_index", -1)): (
@@ -9627,14 +9664,21 @@ def _perturbation_discovery_union_from_evaluator(
         else:
             missing_components.append(int(component_index))
     score_total = float(np.sum(score))
-    score_selected = float(np.sum(score[selected_per_candidate, :])) if score.size else 0.0
+    if top_k is not None:
+        score_selected = float(np.sum(score[selected_pair_for_summary])) if score.size else 0.0
+        selected_scores = score[selected_pair_for_summary] if np.any(selected_pair_for_summary) else np.asarray([], dtype=float)
+        unselected_scores = score[~selected_pair_for_summary] if np.any(~selected_pair_for_summary) else np.asarray([], dtype=float)
+        selected_pair_count = int(np.count_nonzero(selected_pair_for_summary))
+    else:
+        score_selected = float(np.sum(score[selected_per_candidate, :])) if score.size else 0.0
+        selected_scores = score[selected_per_candidate, :] if np.any(selected_per_candidate) else np.asarray([], dtype=float)
+        unselected_scores = score[~selected_per_candidate, :] if np.any(~selected_per_candidate) else np.asarray([], dtype=float)
+        selected_pair_count = int(np.count_nonzero(above_threshold))
     score_fraction = score_selected / score_total if score_total > 0.0 else 0.0
-    selected_scores = score[selected_per_candidate, :] if np.any(selected_per_candidate) else np.asarray([], dtype=float)
-    unselected_scores = score[~selected_per_candidate, :] if np.any(~selected_per_candidate) else np.asarray([], dtype=float)
     return selected_by_potfile, {
         "count": int(sum(len(values) for values in selected_by_potfile)),
         "exact_unique": int(len(valid_components)),
-        "pairs": int(np.count_nonzero(above_threshold)),
+        "pairs": selected_pair_count,
         "missing_components": missing_components,
         "source": "perturbation_discovery_full_scaling",
         "score_fraction": float(score_fraction),

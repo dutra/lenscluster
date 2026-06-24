@@ -5721,7 +5721,7 @@ def test_perturbation_discovery_scores_free_branch_but_selects_scaling_identity(
     assert bool(table.loc[0, "selected_galaxy"]) is True
 
 
-def test_perturbation_discovery_top_k_selects_ranked_candidates_below_threshold() -> None:
+def test_perturbation_discovery_top_k_selects_per_image_union_below_threshold() -> None:
     state = SimpleNamespace(
         potfiles=[{"id": "members"}],
         scaling_component_records=[
@@ -5763,7 +5763,7 @@ def test_perturbation_discovery_top_k_selects_ranked_candidates_below_threshold(
         perturbation_discovery_alpha_tol_arcsec = 10.0
         perturbation_discovery_jacobian_tol = 10.0
         perturbation_discovery_jacobian_weight = 1.0
-        perturbation_discovery_top_k = 2
+        perturbation_discovery_top_k = 1
 
         def _physical_parameter_vector(self, reference):
             return reference
@@ -5790,7 +5790,7 @@ def test_perturbation_discovery_top_k_selects_ranked_candidates_below_threshold(
         ):
             np.testing.assert_array_equal(np.asarray(components, dtype=np.int32), np.asarray([10, 11, 12], dtype=np.int32))
             return (
-                np.asarray([[3.0, 0.0], [1.0, 0.0], [2.0, 0.0]], dtype=float),
+                np.asarray([[3.0, 0.0], [2.0, 4.0], [1.0, 3.0]], dtype=float),
                 np.zeros((3, 2), dtype=float),
                 np.zeros((3, 2), dtype=float),
                 np.zeros((3, 2), dtype=float),
@@ -5804,25 +5804,58 @@ def test_perturbation_discovery_top_k_selects_ranked_candidates_below_threshold(
         np.zeros(1, dtype=float),
     )
 
-    assert selected == [{0, 2}]
+    assert selected == [{0, 1}]
     assert diagnostics["selection_mode"] == "top_k"
-    assert diagnostics["top_k_requested"] == 2
+    assert diagnostics["top_k_requested"] == 1
     assert diagnostics["count"] == 2
-    assert diagnostics["pairs"] == 0
-    assert set(table.columns) >= {"selection_mode", "top_k_requested", "rank_score", "rank_position"}
+    assert diagnostics["pairs"] == 2
+    assert set(table.columns) >= {
+        "selection_mode",
+        "top_k_requested",
+        "rank_score",
+        "rank_position",
+        "image_rank_position",
+    }
     selected_by_id = table.groupby("catalog_id")["selected_galaxy"].first().to_dict()
-    assert selected_by_id == {"g1": True, "g2": False, "g3": True}
+    assert selected_by_id == {"g1": True, "g2": True, "g3": False}
     rank_by_id = table.groupby("catalog_id")["rank_position"].first().to_dict()
-    assert rank_by_id == {"g1": 1, "g2": 3, "g3": 2}
+    assert rank_by_id == {"g1": 2, "g2": 1, "g3": 3}
+    selected_pairs = table.pivot(index="catalog_id", columns="image_index", values="selected_pair")
+    assert selected_pairs.to_dict() == {
+        0: {"g1": True, "g2": False, "g3": False},
+        1: {"g1": False, "g2": True, "g3": False},
+    }
+    image_rank = table.pivot(index="catalog_id", columns="image_index", values="image_rank_position")
+    assert image_rank.to_dict() == {
+        0: {"g1": 1, "g2": 2, "g3": 3},
+        1: {"g1": 3, "g2": 1, "g3": 2},
+    }
 
 
 def test_perturbation_discovery_top_k_larger_than_candidates_selects_all() -> None:
     score = np.asarray([[0.2, 0.1], [0.4, 0.3]], dtype=float)
-    selected, rank_score, rank_position = cluster_solver._perturbation_discovery_top_k_selected(score, 10)
+    selected, selected_pair, rank_score, rank_position, image_rank_position = (
+        cluster_solver._perturbation_discovery_top_k_selected(score, 10)
+    )
 
     np.testing.assert_array_equal(selected, np.asarray([True, True]))
+    np.testing.assert_array_equal(selected_pair, np.asarray([[True, True], [True, True]]))
     np.testing.assert_allclose(rank_score, np.asarray([0.2, 0.4]))
     np.testing.assert_array_equal(rank_position, np.asarray([2, 1]))
+    np.testing.assert_array_equal(image_rank_position, np.asarray([[2, 2], [1, 1]]))
+
+
+def test_perturbation_discovery_top_k_breaks_ties_by_candidate_order() -> None:
+    score = np.asarray([[1.0, 0.0], [1.0, 2.0], [0.5, 2.0]], dtype=float)
+    selected, selected_pair, rank_score, rank_position, image_rank_position = (
+        cluster_solver._perturbation_discovery_top_k_selected(score, 1)
+    )
+
+    np.testing.assert_array_equal(selected_pair, np.asarray([[True, False], [False, True], [False, False]]))
+    np.testing.assert_array_equal(selected, np.asarray([True, True, False]))
+    np.testing.assert_allclose(rank_score, np.asarray([1.0, 2.0, 2.0]))
+    np.testing.assert_array_equal(rank_position, np.asarray([3, 1, 2]))
+    np.testing.assert_array_equal(image_rank_position, np.asarray([[1, 3], [2, 1], [3, 2]]))
 
 
 def test_refreshing_surrogate_flat_still_uses_active_scaling_galaxies_normally(
