@@ -1,5 +1,6 @@
 """Playground utilities and runnable prototypes for lenstronomy experiments."""
 
+from .artifacts import ParameterArtifact, load_parameter_artifact
 from .config import (
     ImageCatalogCutoutConfig,
     ImageDiagnosticsConfig,
@@ -25,6 +26,7 @@ __all__ = [
     "LensClusterRunner",
     "LensClusterSolverConfig",
     "LikelihoodConfig",
+    "ParameterArtifact",
     "MemberSelectionConfig",
     "OutputPlan",
     "PerturbationDiscoveryConfig",
@@ -40,4 +42,5 @@ __all__ = [
     "TruthRecoveryConfig",
     "WorkflowConfig",
     "compile_run_plan",
+    "load_parameter_artifact",
 ]
