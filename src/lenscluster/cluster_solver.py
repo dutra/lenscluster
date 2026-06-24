@@ -12224,6 +12224,22 @@ def _parse_refresh_every_value(value: Any) -> int | None:
     return None if cadence == 0 else cadence
 
 
+def _parse_saved_refresh_every_value(value: Any) -> int | None:
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return _parse_refresh_every_value(DEFAULT_REFRESH_EVERY)
+        value = value[-1]
+    return _parse_refresh_every_value(value)
+
+
+def _saved_stage_scalar(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple)):
+        return value[-1] if value else default
+    return value
+
+
 def _stage_arg_values(value: Any, *, flag_name: str) -> list[Any]:
     if isinstance(value, (list, tuple)):
         values = list(value)
@@ -25249,7 +25265,7 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
             saved_args.get("active_scaling_cumulative_fraction", DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION)
         ),
         active_scaling_min=int(saved_args.get("active_scaling_min", DEFAULT_ACTIVE_SCALING_MIN)),
-        refresh_every=_parse_refresh_every_value(saved_args.get("refresh_every", DEFAULT_REFRESH_EVERY)),
+        refresh_every=_parse_saved_refresh_every_value(saved_args.get("refresh_every", DEFAULT_REFRESH_EVERY)),
         refresh_param_drift_frac=float(saved_args.get("refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
         source_plane_covariance_floor=float(saved_args.get("source_plane_covariance_floor", 1.0e-6)),
         source_plane_covariance_mode=str(
@@ -28604,7 +28620,7 @@ def _rerender_plots(
             plot_saved_args.get("active_scaling_cumulative_fraction", DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION)
         ),
         active_scaling_min=int(plot_saved_args.get("active_scaling_min", DEFAULT_ACTIVE_SCALING_MIN)),
-        refresh_every=_parse_refresh_every_value(plot_saved_args.get("refresh_every", DEFAULT_REFRESH_EVERY)),
+        refresh_every=_parse_saved_refresh_every_value(plot_saved_args.get("refresh_every", DEFAULT_REFRESH_EVERY)),
         refresh_param_drift_frac=float(plot_saved_args.get("refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC)),
         source_plane_covariance_floor=float(plot_saved_args.get("source_plane_covariance_floor", 1.0e-6)),
         source_plane_covariance_mode=str(
@@ -28765,9 +28781,9 @@ def _rerender_plots(
         accept_prob=np.asarray(arrays["accept_prob"], dtype=float),
         diverging=np.asarray(arrays["diverging"], dtype=bool),
         num_steps=np.asarray(arrays["num_steps"], dtype=float),
-        warmup_steps=int(plot_saved_args.get("warmup", 0)),
-        sample_steps=int(plot_saved_args.get("samples", 0)),
-        num_chains=int(plot_saved_args.get("chains", 1)),
+        warmup_steps=int(_saved_stage_scalar(plot_saved_args.get("warmup"), 0)),
+        sample_steps=int(_saved_stage_scalar(plot_saved_args.get("samples"), 0)),
+        num_chains=int(_saved_stage_scalar(plot_saved_args.get("chains"), 1)),
         init_diagnostics=init_diagnostics,
         grouped_samples=np.asarray(arrays["grouped_samples"], dtype=float) if "grouped_samples" in arrays else None,
         grouped_log_prob=np.asarray(arrays["grouped_log_prob"], dtype=float) if "grouped_log_prob" in arrays else None,

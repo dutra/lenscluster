@@ -148,6 +148,33 @@ NUMPYRO_MODEL_ROLE_PRIORITY = (
     "large",
     "other",
 )
+_DISPLAY_PLOTS_IN_NOTEBOOK = False
+
+
+def _stage_scalar(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple)):
+        for item in reversed(value):
+            if item is not None:
+                return item
+        return default
+    return value
+
+
+def _finish_figure(fig: Any, path: Path, *, dpi: int = 180, bbox_inches: str | None = "tight") -> None:
+    fig.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
+    if _DISPLAY_PLOTS_IN_NOTEBOOK:
+        try:
+            from IPython.display import display
+
+            display(fig)
+        except Exception:
+            plt.show()
+        finally:
+            plt.close(fig)
+    else:
+        plt.close(fig)
 
 
 def _log10_dpie_mass_msun(v_disp: Any, cut_radius_kpc: Any) -> np.ndarray:
@@ -3761,7 +3788,7 @@ def _run_summary(
         "z_lens": float(lens_redshift) if lens_redshift is not None and np.isfinite(float(lens_redshift)) else None,
         "z_source_min": float(np.min(finite_source_redshifts)) if finite_source_redshifts.size else None,
         "z_source_max": float(np.max(finite_source_redshifts)) if finite_source_redshifts.size else None,
-        "fit_method": str(getattr(args, "fit_method", "svi+nuts")),
+        "fit_method": str(_stage_scalar(getattr(args, "fit_method", None), "svi+nuts")),
         "sample_likelihood_mode": sample_likelihood_mode,
         "local_jacobian_metric": str(
             getattr(evaluator, "local_jacobian_metric_mode", init_diagnostics.get("local_jacobian_metric", "not_used"))
@@ -3951,8 +3978,10 @@ def _run_summary(
         "nuts_init_settings": {
             "boundary_frac": float(getattr(args, "nuts_init_boundary_frac", DEFAULT_NUTS_INIT_BOUNDARY_FRAC)),
             "jitter_frac": float(getattr(args, "nuts_init_jitter_frac", DEFAULT_NUTS_INIT_JITTER_FRAC)),
-            "svi_steps": int(getattr(args, "svi_steps", DEFAULT_SVI_STEPS)),
-            "svi_learning_rate": float(getattr(args, "svi_learning_rate", DEFAULT_SVI_LEARNING_RATE)),
+            "svi_steps": int(_stage_scalar(getattr(args, "svi_steps", None), DEFAULT_SVI_STEPS)),
+            "svi_learning_rate": float(
+                _stage_scalar(getattr(args, "svi_learning_rate", None), DEFAULT_SVI_LEARNING_RATE)
+            ),
         },
         "nuts_init_diagnostics": {
             "distinct_chain_seeds": int(init_diagnostics.get("distinct_chain_seeds", 0)),
@@ -3990,13 +4019,15 @@ def _run_summary(
         "ns_posterior_resampling": init_diagnostics.get("ns_posterior_resampling"),
         "ns_total_num_likelihood_evaluations": init_diagnostics.get("ns_total_num_likelihood_evaluations"),
         "ns_termination_reason": init_diagnostics.get("ns_termination_reason"),
-        "warmup": args.warmup,
-        "samples": args.samples,
+        "warmup": int(_stage_scalar(getattr(args, "warmup", None), results.warmup_steps)),
+        "samples": int(_stage_scalar(getattr(args, "samples", None), results.sample_steps)),
         "chains": results.num_chains,
-        "requested_chains": int(init_diagnostics.get("requested_chains", args.chains)),
-        "thin": args.thin,
+        "requested_chains": int(
+            _stage_scalar(init_diagnostics.get("requested_chains", getattr(args, "chains", results.num_chains)), results.num_chains)
+        ),
+        "thin": int(_stage_scalar(getattr(args, "thin", None), 1)),
         "max_tree_depth": max_tree_depth,
-        "target_accept": args.target_accept,
+        "target_accept": float(_stage_scalar(getattr(args, "target_accept", None), 0.85)),
         "runtime_sec": runtime_sec,
         "best_loglike": best_loglike,
         "seed": args.seed,
@@ -6711,7 +6742,10 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
             )
         ),
         active_scaling_min=int(getattr(args, "active_scaling_min", getattr(evaluator, "active_scaling_min", DEFAULT_ACTIVE_SCALING_MIN))),
-        refresh_every=int(getattr(args, "refresh_every", getattr(evaluator, "refresh_every", DEFAULT_REFRESH_EVERY))),
+        refresh_every=_stage_scalar(
+            getattr(args, "refresh_every", None),
+            getattr(evaluator, "refresh_every", DEFAULT_REFRESH_EVERY),
+        ),
         refresh_param_drift_frac=float(
             getattr(args, "refresh_param_drift_frac", getattr(evaluator, "refresh_param_drift_frac", DEFAULT_REFRESH_PARAM_DRIFT_FRAC))
         ),
@@ -7555,8 +7589,7 @@ def _plot_image_recovery_fit_quality(
         axes[1].set_xticks(x_index)
         axes[1].set_xticklabels(image_df["image_label"].astype(str), rotation=90, fontsize=7)
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _plot_image_count_recovery(
@@ -7720,8 +7753,7 @@ def _plot_normalized_image_residuals(image_df: pd.DataFrame, path: Path) -> None
         axes[1].set_xticks(x_index)
         axes[1].set_xticklabels(labels, rotation=90, fontsize=7)
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _write_placeholder_plot(path: Path, title: str, message: str) -> None:
@@ -7875,8 +7907,7 @@ def _plot_image_residual_histogram(
         ax.spines[spine].set_visible(False)
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=1, fontsize=8.5, frameon=False)
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
 def _finite_plot_values(values: np.ndarray) -> np.ndarray:
@@ -9971,8 +10002,7 @@ def _plot_quantity_recovery(
             ax.set_title(title)
         ax.legend(loc="upper left", fontsize=8, frameon=True)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
-    plt.close(fig)
+    _finish_figure(fig, output_path, dpi=220, bbox_inches="tight")
 
 
 def _write_kappa_recovery_from_grid(
@@ -13851,7 +13881,6 @@ def _generate_plots_and_tables(
             ),
         ),
         ("write_initial_run_summary", "plots.run_diagnostics.write_initial_run_summary", _write_run_summary_files),
-        ("numpyro_model", "plots.numpyro_model", lambda: _plot_numpyro_model(run_dir, state, evaluator, args)),
         (
             "corner",
             "plots.corner",
@@ -14001,6 +14030,14 @@ def _generate_plots_and_tables(
             else []
         ),
     ]
+    if bool(getattr(args, "plot_numpyro_model", False)):
+        run_diagnostics_tasks.append(
+            (
+                "numpyro_model",
+                "plots.numpyro_model",
+                lambda: _plot_numpyro_model(run_dir, state, evaluator, args),
+            )
+        )
 
     image_recovery_tasks: list[PlotTask] = [
         (
@@ -14315,14 +14352,20 @@ def _generate_plots_and_tables(
                 ),
             )
         )
-    _run_plot_stages_with_progress(
-        args,
-        [
-            ("run_diagnostics", run_diagnostics_tasks),
-            ("image_recovery", image_recovery_tasks),
-            ("truth_recovery", truth_recovery_tasks),
-        ],
-    )
+    global _DISPLAY_PLOTS_IN_NOTEBOOK
+    previous_display_setting = _DISPLAY_PLOTS_IN_NOTEBOOK
+    _DISPLAY_PLOTS_IN_NOTEBOOK = bool(getattr(args, "display_plots_in_notebook", False))
+    try:
+        _run_plot_stages_with_progress(
+            args,
+            [
+                ("run_diagnostics", run_diagnostics_tasks),
+                ("image_recovery", image_recovery_tasks),
+                ("truth_recovery", truth_recovery_tasks),
+            ],
+        )
+    finally:
+        _DISPLAY_PLOTS_IN_NOTEBOOK = previous_display_setting
     _log(args, "[done] run summary\n" + str(context["run_summary_text"]).rstrip())
     return context["run_summary"]
 

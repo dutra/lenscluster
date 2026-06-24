@@ -326,6 +326,8 @@ def _runtime_payload(config: LensClusterSolverConfig) -> dict[str, Any]:
         "plots_only": config.runtime.plots_only,
         "skip_validation": config.runtime.skip_validation,
         "skip_plots": config.runtime.skip_plots,
+        "plot_numpyro_model": config.runtime.plot_numpyro_model,
+        "display_plots_in_notebook": config.runtime.display_plots_in_notebook,
         "quick_diagnostics": config.runtime.quick_diagnostics,
         "quiet": config.runtime.quiet,
         "debug_sampler_diagnostics": config.runtime.debug_sampler_diagnostics,
