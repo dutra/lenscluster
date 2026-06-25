@@ -835,19 +835,30 @@ def test_critical_line_replot_notebook_is_artifact_only() -> None:
         "results/jun24l_anistropic/ares_PD0.1_TOPK_5_0.1_T(8, 8)W(5000, 1000)S(1000, 500)maglikelihoodTrue"
         in source
     )
-    assert "truth_recovery_critical_line_recovery.pdf" in source
-    assert "truth_recovery_kappa_model_truth_fractional_residual.pdf" in source
-    assert "truth_recovery_mu_model_truth_fractional_residual.pdf" in source
+    assert "ares_truth_recovery_critical_line_recovery.pdf" in source
+    assert "ares_truth_recovery_kappa_model_truth_fractional_residual.pdf" in source
+    assert "ares_truth_recovery_mu_model_truth_fractional_residual.pdf" in source
+    assert "ares_truth_recovery_m2d_aperture_ratio.pdf" in source
     assert "truth_recovery_summary.csv" in source
+    assert "truth_recovery_m2d_aperture_profile.csv" in source
+    assert "plot_bundle.h5" in source
+    assert "REGENERATE_ARTIFACTS" in source
+    assert "_rerender_plots" in source
+    assert "SolverRuntime" in source
+    assert 'for fits_key in ("kappa_true_fits", "gammax_true_fits", "gammay_true_fits")' in source
+    assert "runtime_args[fits_key] = str(require_file(fits_value))" in source
+    assert '"image_catalog_family_cutouts": False' in source
+    assert '"image_catalog_family_cutout_image_dir": None' in source
     assert "truth_recovery_detA_model_median.fits" in source
     assert "truth_recovery_kappa_model_median.fits" in source
     assert "truth_recovery_abs_mu_model_median.fits" in source
+    assert 'require_file(summary_by_quantity["kappa"].source_truth_fits)' in source
     assert "plt.show()" in source
     assert "_plot_kappa_model_truth_fractional_residual_from_grid" in source
     assert "_plot_abs_mu_model_truth_fractional_residual_from_grid" in source
+    assert "_plot_truth_recovery_m2d_aperture_ratio" in source
     assert "LensClusterRunner" not in source
     assert "compile_run_plan" not in source
-    assert "plots_only=True" not in source
     assert "posterior" not in source.lower()
 
 

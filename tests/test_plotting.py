@@ -20,6 +20,20 @@ from lenscluster.plotting import plot_path
 from lenscluster.model import PosteriorResults, ParameterSpec
 
 
+def test_lenscluster_plot_style_is_loaded() -> None:
+    assert plotting.plt.rcParams["font.size"] == pytest.approx(16.0)
+    assert plotting.plt.rcParams["axes.labelsize"] == pytest.approx(16.0)
+    assert plotting.plt.rcParams["legend.fontsize"] == pytest.approx(14.0)
+    assert plotting.plt.rcParams["figure.figsize"] == pytest.approx([6.0, 6.0])
+    assert plotting.plt.rcParams["axes.linewidth"] == pytest.approx(1.8)
+    assert plotting.plt.rcParams["axes.grid"] is False
+    assert plotting.plt.rcParams["xtick.direction"] == "in"
+    assert plotting.plt.rcParams["xtick.top"] is True
+    assert plotting.plt.rcParams["ytick.right"] is True
+    assert plotting.plt.rcParams["savefig.dpi"] == pytest.approx(300.0)
+    assert plotting.plt.rcParams["savefig.bbox"] == "tight"
+
+
 def _potfile_parameter_spec(
     potfile_id: str,
     field: str,
@@ -47,6 +61,36 @@ def test_plot_path_creates_directory(tmp_path: Path) -> None:
 
     assert output == tmp_path / "plots" / "summary.pdf"
     assert output.parent.is_dir()
+
+
+def test_plot_path_prefixes_cluster_stage_plot_names(tmp_path: Path) -> None:
+    run_dir = tmp_path / "ares_S1local-jacobian_S2none" / "stage2_free_source_forward_fit"
+
+    output = plot_path(run_dir, "truth_recovery_mu_model_truth_fractional_residual.pdf")
+
+    assert output == run_dir / "ares_truth_recovery_mu_model_truth_fractional_residual.pdf"
+
+
+def test_plot_path_prefixes_cluster_output_label_plot_names(tmp_path: Path) -> None:
+    run_dir = tmp_path / "ares_PD0.1_TOPK_5" / "stage2_free_source_forward_fit"
+
+    output = plot_path(run_dir, "image_recovery.pdf")
+
+    assert output == run_dir / "ares_image_recovery.pdf"
+
+
+def test_plot_path_does_not_double_prefix_cluster_plot_names(tmp_path: Path) -> None:
+    run_dir = tmp_path / "ares_S1local-jacobian_S2none" / "stage2_free_source_forward_fit"
+
+    output = plot_path(run_dir, "ares_truth_recovery_mu_model_truth_fractional_residual.pdf")
+
+    assert output == run_dir / "ares_truth_recovery_mu_model_truth_fractional_residual.pdf"
+
+
+def test_plot_path_preserves_generic_tmp_plot_names(tmp_path: Path) -> None:
+    output = plot_path(tmp_path / "plots", "truth_recovery_mu_model_truth_fractional_residual.pdf")
+
+    assert output == tmp_path / "plots" / "truth_recovery_mu_model_truth_fractional_residual.pdf"
 
 
 def test_finish_figure_saves_and_closes_without_show(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5332,8 +5376,12 @@ def test_kappa_truth_diagnostics_write_posterior_median_fits_with_truth_wcs(tmp_
     )
     assert (tmp_path / "truth_recovery_m2d_aperture_ratio.pdf").exists()
     aperture = pd.read_csv(tmp_path / "tables" / "truth_recovery_m2d_aperture_profile.csv")
-    assert aperture["center_mode"].unique().tolist() == ["brightest_galaxy"]
-    assert aperture["center_catalog_id"].unique().tolist() == ["bright"]
+    assert aperture["center_mode"].unique().tolist() == ["smoothed_truth_kappa_peak"]
+    assert aperture["center_catalog_id"].fillna("").astype(str).unique().tolist() == [""]
+    assert np.isnan(aperture["center_catalog_mag"].to_numpy(dtype=float)).all()
+    assert aperture["center_smoothing_sigma_pix"].unique().tolist() == [
+        plotting.TRUTH_RECOVERY_APERTURE_CENTER_SMOOTHING_SIGMA_PIX
+    ]
     assert np.isfinite(aperture["m2d_ratio"].to_numpy(dtype=float)).any()
     assert {"m2d_ratio_q16", "m2d_ratio_median", "m2d_ratio_q84"}.issubset(aperture.columns)
     assert np.isnan(aperture["m2d_ratio_q16"].to_numpy(dtype=float)).all()
@@ -5466,26 +5514,68 @@ def test_kappa_truth_diagnostics_requires_precomputed_grid_when_requested(tmp_pa
         )
 
 
-def test_brightest_member_aperture_center_uses_lowest_finite_magnitude() -> None:
-    evaluator = SimpleNamespace(
-        state=SimpleNamespace(
-            scaling_component_records=[
-                {"catalog_id": "invalid-position", "catalog_mag": 10.0, "x_centre": np.nan, "y_centre": 0.0},
-                {"catalog_id": "faint", "catalog_mag": 21.0, "x_centre": 4.0, "y_centre": 5.0},
-                {"catalog_id": "bright", "catalog_mag": 18.0, "x_centre": 1.0, "y_centre": -2.0},
-                {"catalog_id": "invalid-mag", "catalog_mag": np.nan, "x_centre": 0.0, "y_centre": 0.0},
-            ]
-        )
+def test_smoothed_truth_kappa_peak_aperture_center_uses_real_grid_coordinates() -> None:
+    x_arcsec, y_arcsec = np.meshgrid(
+        np.asarray([10.0, 20.0, 30.0], dtype=float),
+        np.asarray([-2.0, -1.0, 0.0], dtype=float),
+    )
+    kappa_true = np.asarray(
+        [
+            [1.0, 2.0, 3.0],
+            [4.0, 100.0, 5.0],
+            [6.0, 7.0, 8.0],
+        ],
+        dtype=float,
     )
 
-    center = plotting._brightest_member_aperture_center(evaluator)
+    center = plotting._smoothed_truth_kappa_peak_aperture_center(
+        kappa_true,
+        x_arcsec,
+        y_arcsec,
+        sigma_pix=1.0e-6,
+    )
 
     assert center is not None
-    assert center["center_mode"] == "brightest_galaxy"
-    assert center["center_catalog_id"] == "bright"
-    assert center["center_catalog_mag"] == pytest.approx(18.0)
+    assert center["center_mode"] == "smoothed_truth_kappa_peak"
+    assert center["center_x_arcsec"] == pytest.approx(20.0)
+    assert center["center_y_arcsec"] == pytest.approx(-1.0)
+    assert center["center_catalog_id"] == ""
+    assert np.isnan(center["center_catalog_mag"])
+    assert center["center_smoothing_sigma_pix"] == pytest.approx(1.0e-6)
+    assert center["center_smoothed_kappa_peak"] == pytest.approx(100.0)
+
+
+def test_smoothed_truth_kappa_peak_aperture_center_ignores_nans() -> None:
+    x_arcsec, y_arcsec = np.meshgrid(np.asarray([0.0, 1.0, 2.0], dtype=float), np.asarray([0.0, 1.0, 2.0], dtype=float))
+    kappa_true = np.asarray(
+        [
+            [np.nan, np.nan, np.nan],
+            [np.nan, 10.0, np.nan],
+            [np.nan, np.nan, 4.0],
+        ],
+        dtype=float,
+    )
+
+    center = plotting._smoothed_truth_kappa_peak_aperture_center(
+        kappa_true,
+        x_arcsec,
+        y_arcsec,
+        sigma_pix=1.0,
+    )
+
+    assert center is not None
     assert center["center_x_arcsec"] == pytest.approx(1.0)
-    assert center["center_y_arcsec"] == pytest.approx(-2.0)
+    assert center["center_y_arcsec"] == pytest.approx(1.0)
+
+
+def test_smoothed_truth_kappa_peak_aperture_center_returns_none_for_all_nan() -> None:
+    x_arcsec, y_arcsec = np.meshgrid(np.asarray([0.0, 1.0], dtype=float), np.asarray([0.0, 1.0], dtype=float))
+    center = plotting._smoothed_truth_kappa_peak_aperture_center(
+        np.full((2, 2), np.nan, dtype=float),
+        x_arcsec,
+        y_arcsec,
+    )
+    assert center is None
 
 
 def test_truth_recovery_aperture_profile_ratio_uses_finite_kappa_pixels() -> None:
@@ -5493,11 +5583,13 @@ def test_truth_recovery_aperture_profile_ratio_uses_finite_kappa_pixels() -> Non
     kappa_true = np.asarray([[1.0, 2.0], [np.nan, 4.0]], dtype=float)
     model_kappa = np.asarray([[2.0, 4.0], [6.0, 8.0]], dtype=float)
     center = {
-        "center_mode": "brightest_galaxy",
+        "center_mode": "smoothed_truth_kappa_peak",
         "center_x_arcsec": 0.0,
         "center_y_arcsec": 0.0,
-        "center_catalog_id": "bcg",
-        "center_catalog_mag": 18.0,
+        "center_catalog_id": "",
+        "center_catalog_mag": np.nan,
+        "center_smoothing_sigma_pix": 1.0,
+        "center_smoothed_kappa_peak": 4.0,
     }
 
     profile = plotting._truth_recovery_aperture_profile(
@@ -5525,16 +5617,22 @@ def test_truth_recovery_aperture_profile_ratio_uses_finite_kappa_pixels() -> Non
         "center_y_arcsec",
         "center_catalog_id",
         "center_catalog_mag",
+        "center_smoothing_sigma_pix",
+        "center_smoothed_kappa_peak",
     ]
     assert profile.loc[0, "m2d_ratio"] == pytest.approx(2.0)
     assert profile.loc[1, "m2d_ratio"] == pytest.approx(2.0)
+    assert profile["center_smoothing_sigma_pix"].unique().tolist() == [1.0]
+    assert profile["center_smoothed_kappa_peak"].unique().tolist() == [4.0]
 
 
 def test_truth_recovery_m2d_aperture_plot_draws_posterior_band(monkeypatch: Any, tmp_path: Path) -> None:
     from matplotlib.axes import Axes
 
     fill_calls: list[dict[str, np.ndarray]] = []
+    text_calls: list[str] = []
     original_fill_between = Axes.fill_between
+    original_text = Axes.text
 
     def record_fill_between(self: Axes, x: Any, y1: Any, y2: Any, *args: Any, **kwargs: Any) -> Any:
         fill_calls.append(
@@ -5546,7 +5644,12 @@ def test_truth_recovery_m2d_aperture_plot_draws_posterior_band(monkeypatch: Any,
         )
         return original_fill_between(self, x, y1, y2, *args, **kwargs)
 
+    def record_text(self: Axes, x: Any, y: Any, s: str, *args: Any, **kwargs: Any) -> Any:
+        text_calls.append(str(s))
+        return original_text(self, x, y, s, *args, **kwargs)
+
     monkeypatch.setattr(Axes, "fill_between", record_fill_between)
+    monkeypatch.setattr(Axes, "text", record_text)
     profile = pd.DataFrame(
         {
             "radius_arcsec": [1.0, 2.0],
@@ -5557,10 +5660,13 @@ def test_truth_recovery_m2d_aperture_plot_draws_posterior_band(monkeypatch: Any,
         }
     )
     center = {
-        "center_catalog_id": "bcg",
+        "center_mode": "smoothed_truth_kappa_peak",
+        "center_catalog_id": "",
         "center_x_arcsec": 0.0,
         "center_y_arcsec": 0.0,
-        "center_catalog_mag": 18.0,
+        "center_catalog_mag": np.nan,
+        "center_smoothing_sigma_pix": 1.0,
+        "center_smoothed_kappa_peak": 2.5,
     }
 
     plotting._plot_truth_recovery_m2d_aperture_ratio(tmp_path, profile, center)
@@ -5569,6 +5675,8 @@ def test_truth_recovery_m2d_aperture_plot_draws_posterior_band(monkeypatch: Any,
     assert len(fill_calls) == 1
     np.testing.assert_allclose(fill_calls[0]["y1"], [0.8, 0.9])
     np.testing.assert_allclose(fill_calls[0]["y2"], [1.2, 1.3])
+    assert any("smoothed truth kappa peak" in text for text in text_calls)
+    assert any("smoothing sigma=1 pix" in text for text in text_calls)
 
 
 def test_posterior_truth_grid_quantiles_reuses_cached_model_grids(
@@ -7080,6 +7188,51 @@ def test_plot_image_residual_histogram_writes_placeholder_without_finite_values(
 
     assert path.exists()
     assert path.stat().st_size > 0
+
+
+def test_flux_magnification_ratio_consistency_colors_by_log_p_arc(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+
+    scatter_kwargs: list[dict[str, Any]] = []
+    colorbar_labels: list[str] = []
+    original_scatter = Axes.scatter
+
+    class FakeColorbar:
+        def set_label(self, label: str) -> None:
+            colorbar_labels.append(label)
+
+    def record_scatter(self: Axes, *args: Any, **kwargs: Any) -> Any:
+        scatter_kwargs.append(dict(kwargs))
+        return original_scatter(self, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "scatter", record_scatter)
+    monkeypatch.setattr(Figure, "colorbar", lambda self, *_args, **_kwargs: FakeColorbar())
+
+    pair_df = pd.DataFrame(
+        {
+            "observed_mag_difference": [0.0, 0.5, 1.0],
+            "observed_mag_difference_error": [0.1, 0.1, 0.1],
+            "model_mag_difference": [0.1, 0.4, 1.2],
+            "band": ["f160w", "f160w", "f160w"],
+            "p_arc_pair": [1.0, 1.0e-2, 0.0],
+        }
+    )
+
+    plotting._plot_flux_magnification_ratio_consistency(
+        pair_df,
+        tmp_path / "flux_magnification_ratio_consistency.pdf",
+    )
+
+    assert (tmp_path / "flux_magnification_ratio_consistency.pdf").exists()
+    color_values = np.asarray(scatter_kwargs[0]["c"], dtype=float)
+    np.testing.assert_allclose(color_values, [0.0, -2.0, -6.0])
+    assert scatter_kwargs[0]["vmin"] == pytest.approx(-6.0)
+    assert scatter_kwargs[0]["vmax"] == pytest.approx(0.0)
+    assert colorbar_labels == [r"$\log_{10}$ pair $p_{\rm arc}$"]
 
 
 def test_exact_vs_approx_prediction_error_skips_missing_rows(tmp_path: Path) -> None:

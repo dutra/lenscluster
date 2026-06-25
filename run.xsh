@@ -40,7 +40,7 @@ from lenscluster.config import (
 from lenscluster.planning import compile_run_plan
 from lenscluster.runner import LensClusterRunner
 
-OUTPUT_DIR_LABEL = "jun24l_anistropic"
+OUTPUT_DIR_LABEL = "jun25b_anistropic_possigma0_nomaglikelihood"
 
 # Kept here for HFF display tuning reuse, but this runner intentionally has no
 # HFF/Bergamini model configurations.
@@ -207,8 +207,8 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
     perturbation_alpha_tol = 0.1
     perturbation_jacobian_tol = 0.1
     perturbation_top_k = 5
-    warmup = 5000, 1000
-    samples = 1000, 500
+    warmup = 3000, 3000
+    samples = 500, 500
     max_tree_depth = 8, 8
     stage0_likelihood = "source"
     stage1_likelihood = "source"
@@ -225,8 +225,8 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         f"{perturbation_jacobian_tol:g}_T{max_tree_depth}W{warmup}S{samples}"
         f"maglikelihood{use_magnitude_likelihood}"
     )
-    run_name = f"{cluster_config['cluster_key']}_S1{stage1_likelihood}_S2{stage2_forward_mode}"
-
+    run_name = f"{cluster_config['cluster_key']}_S1{stage1_likelihood}_S2{stage2_forward_mode}" 
+    
     return LensClusterSolverConfig(
         model=LensModelConfig(
             reference=ReferenceFrameConfig(reference=3, ra0_deg=0.0, dec0_deg=0.0),
@@ -240,7 +240,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         runtime=RuntimeConfig(
             seed=seed,
             chains=cores,
-            resume="all",
+            resume=False,
             quick_diagnostics=False,
             debug_sampler_diagnostics=True,
             numpyro_print_summary=True,
@@ -264,7 +264,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         ),
         schedule=StageScheduleConfig(
             fit_method=("svi+nuts", "svi+nuts"),
-            refresh_every=(None, 1000, 1000),
+            refresh_every=(None, None, None),
             svi_steps=(10_000, 10_000, 10_000),
             warmup=warmup,
             samples=samples,
@@ -298,7 +298,21 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         ),
         likelihood=LikelihoodConfig(
             use_magnitude_likelihood=use_magnitude_likelihood,
-            pos_sigma_arcsec=0.1,
+            # magnitude_base_scatter_prior=PriorConfig(
+            #     kind="lognormal",
+            #     lower=0.01,
+            #     upper=0.50,
+            #     mean=0.3,
+            #     std=0.20,
+            # ),
+            # magnitude_arc_scatter_prior=PriorConfig(
+            #     kind="lognormal",
+            #     lower=0.01,
+            #     upper=0.50,
+            #     mean=0.3,
+            #     std=0.2,
+            # ),
+            pos_sigma_arcsec=0.0,
             source_plane_covariance_mode="magnification",
             image_presence_penalty_weight=2.0,
             image_presence_match_radius_arcsec=1.0,

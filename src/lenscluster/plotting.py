@@ -30,9 +30,13 @@ from matplotlib.patches import Circle
 import numpy as np
 import pandas as pd
 from rich.progress import BarColumn, MofNCompleteColumn, TextColumn, TimeElapsedColumn
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import gaussian_filter, map_coordinates
 from scipy.stats import norm
 from skimage.measure import find_contours
+
+from .plot_style import apply_lenscluster_plot_style
+
+apply_lenscluster_plot_style()
 
 try:
     import corner
@@ -95,6 +99,7 @@ MAP_RECOVERY_STAT_BINS = 16
 RECOVERY_ONE_SIGMA_PERCENTILES = (16.0, 84.0)
 RECOVERY_TWO_SIGMA_PERCENTILES = (2.5, 97.5)
 MODEL_GRID_CHUNK_PIXELS = 1024 * 1024
+FLUX_MAGNIFICATION_P_ARC_LOG10_FLOOR = 1.0e-6
 DEFAULT_TRUTH_GRID_SIZE = 256
 KAPPA_RECOVERY_LIMITS = (0.0, 5.0)
 RECOVERY_IMAGE_POINT_COLUMNS = [
@@ -112,6 +117,7 @@ TRUTH_GRID_MODE_POSTERIOR = "posterior"
 TRUTH_GRID_DRAW_SELECTION_ALL = "all_finite"
 TRUTH_GRID_DRAW_SELECTION_GROUPED_RANDOM = "chain_stratified_random_without_replacement"
 TRUTH_GRID_DRAW_SELECTION_FLAT_RANDOM = "flat_random_without_replacement"
+TRUTH_RECOVERY_APERTURE_CENTER_SMOOTHING_SIGMA_PIX = 1.0
 DEFAULT_RUNTIME_SEED = 12345
 TRUTH_GRID_QUANTITY_OUTPUT_NAMES = {
     "kappa": "kappa",
@@ -319,7 +325,9 @@ def _first_int_value(value: Any, default: int) -> int:
 def plot_path(root: Path, name: str) -> Path:
     """Return an output plot path, creating the output directory first."""
     root.mkdir(parents=True, exist_ok=True)
-    path = root / name
+    prefix = _cluster_plot_filename_prefix(root)
+    output_name = _prefixed_plot_filename(name, prefix)
+    path = root / output_name
     if path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
         path = path.with_suffix(".pdf")
     return path
@@ -327,6 +335,29 @@ def plot_path(root: Path, name: str) -> Path:
 
 def _plot_path(root: Path, name: str) -> Path:
     return plot_path(root, name)
+
+
+def _cluster_plot_filename_prefix(root: Path) -> str | None:
+    path = Path(root)
+    candidates = [path.name]
+    if path.parent != path:
+        candidates.append(path.parent.name)
+    for raw_name in candidates:
+        name = str(raw_name).strip()
+        match = re.match(r"^([A-Za-z][A-Za-z0-9]*)_(?:S\d|PD)", name)
+        if match:
+            return match.group(1).lower()
+    return None
+
+
+def _prefixed_plot_filename(name: str, prefix: str | None) -> str:
+    if prefix is None:
+        return str(name)
+    path = Path(str(name))
+    filename = path.name
+    if filename.startswith(f"{prefix}_"):
+        return str(name)
+    return str(path.with_name(f"{prefix}_{filename}"))
 
 
 PlotTask = tuple[str, str, Callable[..., Any]]
@@ -8821,13 +8852,17 @@ def _plot_flux_magnification_ratio_consistency(pair_df: pd.DataFrame, path: Path
         )
     finite_p_arc = np.isfinite(p_arc_pair)
     if np.any(finite_p_arc):
+        log_p_arc_pair = np.full_like(p_arc_pair, np.nan, dtype=float)
+        log_p_arc_pair[finite_p_arc] = np.log10(
+            np.clip(p_arc_pair[finite_p_arc], FLUX_MAGNIFICATION_P_ARC_LOG10_FLOOR, 1.0)
+        )
         scatter = ax.scatter(
             observed,
             model,
-            c=np.clip(p_arc_pair, 0.0, 1.0),
+            c=log_p_arc_pair,
             cmap="viridis",
-            vmin=0.0,
-            vmax=1.0,
+            vmin=float(np.log10(FLUX_MAGNIFICATION_P_ARC_LOG10_FLOOR)),
+            vmax=0.0,
             marker="o",
             s=24,
             alpha=0.86,
@@ -8837,7 +8872,7 @@ def _plot_flux_magnification_ratio_consistency(pair_df: pd.DataFrame, path: Path
             zorder=4,
         )
         colorbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
-        colorbar.set_label(r"pair $p_{\rm arc}$")
+        colorbar.set_label(r"$\log_{10}$ pair $p_{\rm arc}$")
     else:
         band = bands[0] if len(set(bands.tolist())) == 1 else "image pairs"
         ax.scatter(
@@ -9816,6 +9851,14 @@ def _posterior_truth_grid_quantiles(
     flat_x = np.asarray(x_arcsec, dtype=np.float64).reshape(-1)
     flat_y = np.asarray(y_arcsec, dtype=np.float64).reshape(-1)
     total_pixels = int(flat_x.size)
+    if aperture_center is None and aperture_kappa_true is not None and "kappa" in requested_quantities:
+        aperture_center = _smoothed_truth_kappa_peak_aperture_center(
+            aperture_kappa_true,
+            x_arcsec,
+            y_arcsec,
+        )
+        if aperture_center is None:
+            _log(None, "[truth-recovery:m2d] skipped: no finite smoothed truth-kappa peak center")
     chunk_size = total_pixels
     chunk_count = 1
     estimated_grid_buffer_bytes = int(
@@ -10040,6 +10083,12 @@ def _posterior_truth_grid_quantiles(
                     "center_y_arcsec": float(aperture_center["center_y_arcsec"]),
                     "center_catalog_id": str(aperture_center["center_catalog_id"]),
                     "center_catalog_mag": float(aperture_center["center_catalog_mag"]),
+                    "center_smoothing_sigma_pix": _finite_float_or_nan(
+                        aperture_center.get("center_smoothing_sigma_pix")
+                    ),
+                    "center_smoothed_kappa_peak": _finite_float_or_nan(
+                        aperture_center.get("center_smoothed_kappa_peak")
+                    ),
                 }
             )
         aperture_profile_df = pd.DataFrame(rows)
@@ -10900,29 +10949,49 @@ def _plot_kappa_model_truth_fractional_residual_from_grid(
     _finish_figure(fig, _plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
 
 
-def _brightest_member_aperture_center(evaluator: ClusterJAXEvaluator) -> dict[str, Any] | None:
-    records = getattr(getattr(evaluator, "state", None), "scaling_component_records", []) or []
-    candidates: list[dict[str, Any]] = []
-    for raw_record in records:
-        if not isinstance(raw_record, dict):
-            continue
-        catalog_mag = _finite_float_or_nan(raw_record.get("catalog_mag"))
-        x_centre = _finite_float_or_nan(raw_record.get("x_centre"))
-        y_centre = _finite_float_or_nan(raw_record.get("y_centre"))
-        if not (np.isfinite(catalog_mag) and np.isfinite(x_centre) and np.isfinite(y_centre)):
-            continue
-        candidates.append(
-            {
-                "center_mode": "brightest_galaxy",
-                "center_x_arcsec": float(x_centre),
-                "center_y_arcsec": float(y_centre),
-                "center_catalog_id": str(raw_record.get("catalog_id", "")),
-                "center_catalog_mag": float(catalog_mag),
-            }
-        )
-    if not candidates:
+def _finite_aware_gaussian_smooth(values: np.ndarray, sigma_pix: float) -> np.ndarray:
+    array = np.asarray(values, dtype=float)
+    finite = np.isfinite(array)
+    smoothed = np.full(array.shape, np.nan, dtype=float)
+    if not np.any(finite):
+        return smoothed
+    weights = gaussian_filter(finite.astype(float), sigma=float(sigma_pix), mode="nearest")
+    weighted_values = gaussian_filter(np.where(finite, array, 0.0), sigma=float(sigma_pix), mode="nearest")
+    valid_weights = np.isfinite(weights) & (weights > 0.0)
+    smoothed[valid_weights] = weighted_values[valid_weights] / weights[valid_weights]
+    return smoothed
+
+
+def _smoothed_truth_kappa_peak_aperture_center(
+    kappa_true: np.ndarray,
+    x_arcsec: np.ndarray,
+    y_arcsec: np.ndarray,
+    *,
+    sigma_pix: float = TRUTH_RECOVERY_APERTURE_CENTER_SMOOTHING_SIGMA_PIX,
+) -> dict[str, Any] | None:
+    true_values = np.asarray(kappa_true, dtype=float)
+    x_values = np.asarray(x_arcsec, dtype=float)
+    y_values = np.asarray(y_arcsec, dtype=float)
+    if true_values.shape != x_values.shape or true_values.shape != y_values.shape:
+        raise ValueError("Truth kappa, x grid, and y grid must have matching shapes for aperture center selection.")
+    smoothed = _finite_aware_gaussian_smooth(true_values, float(sigma_pix))
+    valid = np.isfinite(true_values) & np.isfinite(smoothed) & np.isfinite(x_values) & np.isfinite(y_values)
+    if not np.any(valid):
         return None
-    return min(candidates, key=lambda item: item["center_catalog_mag"])
+    score = np.where(valid, smoothed, -np.inf)
+    row_index, col_index = np.unravel_index(int(np.argmax(score)), score.shape)
+    peak_value = float(smoothed[row_index, col_index])
+    if not np.isfinite(peak_value):
+        return None
+    return {
+        "center_mode": "smoothed_truth_kappa_peak",
+        "center_x_arcsec": float(x_values[row_index, col_index]),
+        "center_y_arcsec": float(y_values[row_index, col_index]),
+        "center_catalog_id": "",
+        "center_catalog_mag": float("nan"),
+        "center_smoothing_sigma_pix": float(sigma_pix),
+        "center_smoothed_kappa_peak": peak_value,
+    }
 
 
 def _truth_recovery_pixel_scale_arcsec(x_arcsec: np.ndarray, y_arcsec: np.ndarray) -> float:
@@ -10977,6 +11046,8 @@ def _truth_recovery_aperture_profile(
         "center_y_arcsec",
         "center_catalog_id",
         "center_catalog_mag",
+        "center_smoothing_sigma_pix",
+        "center_smoothed_kappa_peak",
     ]
     if not np.any(valid):
         return pd.DataFrame(columns=columns)
@@ -11023,6 +11094,8 @@ def _truth_recovery_aperture_profile(
                 "center_y_arcsec": float(center["center_y_arcsec"]),
                 "center_catalog_id": str(center["center_catalog_id"]),
                 "center_catalog_mag": float(center["center_catalog_mag"]),
+                "center_smoothing_sigma_pix": _finite_float_or_nan(center.get("center_smoothing_sigma_pix")),
+                "center_smoothed_kappa_peak": _finite_float_or_nan(center.get("center_smoothed_kappa_peak")),
             }
         )
     return pd.DataFrame(rows, columns=columns)
@@ -11065,14 +11138,28 @@ def _plot_truth_recovery_m2d_aperture_ratio(
     ax.set_ylabel(r"$M_{\rm 2D,model}(<R) / M_{\rm 2D,true}(<R)$")
     ax.set_title("Projected aperture mass recovery")
     ax.grid(True, alpha=0.25)
+    center_mode = str(center.get("center_mode", ""))
+    if center_mode == "smoothed_truth_kappa_peak":
+        center_label = "smoothed truth kappa peak"
+    else:
+        center_label = str(center.get("center_catalog_id", center_mode or "unknown"))
+    annotation_lines = [
+        f"center: {center_label}",
+        f"x={float(center['center_x_arcsec']):.3g}\"  y={float(center['center_y_arcsec']):.3g}\"",
+    ]
+    smoothing_sigma = _finite_float_or_nan(center.get("center_smoothing_sigma_pix"))
+    smoothed_peak = _finite_float_or_nan(center.get("center_smoothed_kappa_peak"))
+    catalog_mag = _finite_float_or_nan(center.get("center_catalog_mag"))
+    if np.isfinite(smoothing_sigma):
+        annotation_lines.append(f"smoothing sigma={smoothing_sigma:g} pix")
+    if np.isfinite(smoothed_peak):
+        annotation_lines.append(f"smoothed kappa peak={smoothed_peak:.3g}")
+    if center_mode != "smoothed_truth_kappa_peak" and np.isfinite(catalog_mag):
+        annotation_lines.append(f"mag={catalog_mag:.3g}")
     ax.text(
         0.02,
         0.98,
-        (
-            f"center: {center['center_catalog_id']}\n"
-            f"x={float(center['center_x_arcsec']):.3g}\"  y={float(center['center_y_arcsec']):.3g}\"\n"
-            f"mag={float(center['center_catalog_mag']):.3g}"
-        ),
+        "\n".join(annotation_lines),
         transform=ax.transAxes,
         ha="left",
         va="top",
@@ -11092,9 +11179,10 @@ def _write_truth_recovery_m2d_aperture_profile(
     x_arcsec: np.ndarray,
     y_arcsec: np.ndarray,
 ) -> None:
-    center = _brightest_member_aperture_center(evaluator)
+    del evaluator
+    center = _smoothed_truth_kappa_peak_aperture_center(kappa_true, x_arcsec, y_arcsec)
     if center is None:
-        _log(None, "[truth-recovery:m2d] skipped: no finite brightest member center")
+        _log(None, "[truth-recovery:m2d] skipped: no finite smoothed truth-kappa peak center")
         return
     profile_df = _truth_recovery_aperture_profile(
         kappa_true,
@@ -11208,7 +11296,7 @@ def _plot_kappa_truth_diagnostics(
         truth_grid_mode=truth_grid_mode,
         cache=truth_grid_cache,
         require_cache=require_precomputed_truth_grid,
-        aperture_center=_brightest_member_aperture_center(evaluator),
+        aperture_center=None,
         aperture_kappa_true=kappa_true,
         truth_grid_metadata=grid_metadata,
         draw_seed=truth_grid_draw_seed,
@@ -11586,7 +11674,7 @@ def _plot_abs_mu_truth_diagnostics(
         truth_grid_mode=truth_grid_mode,
         cache=truth_grid_cache,
         require_cache=require_precomputed_truth_grid,
-        aperture_center=_brightest_member_aperture_center(evaluator),
+        aperture_center=None,
         aperture_kappa_true=kappa_true,
         truth_grid_metadata=grid_metadata,
         draw_seed=truth_grid_draw_seed,
@@ -11688,9 +11776,6 @@ def _precompute_truth_recovery_grids(
         source_truth_fits = {"kappa": str(kappa_true_fits)}
         quantities = ("kappa",)
 
-    center = _brightest_member_aperture_center(evaluator)
-    if center is None:
-        _log(args, "[truth-recovery:m2d] skipped: no finite brightest member center")
     _posterior_truth_grid_quantiles(
         run_dir,
         evaluator,
@@ -11703,8 +11788,8 @@ def _precompute_truth_recovery_grids(
         max_draws=getattr(args, "truth_grid_draws", None),
         truth_grid_mode=str(getattr(args, "truth_grid_mode", TRUTH_GRID_MODE_MEDIAN)),
         cache=truth_grid_cache,
-        aperture_center=center,
-        aperture_kappa_true=kappa_true if center is not None else None,
+        aperture_center=None,
+        aperture_kappa_true=kappa_true,
         progress=progress,
         truth_grid_metadata=grid_metadata,
         draw_seed=getattr(args, "seed", DEFAULT_RUNTIME_SEED),

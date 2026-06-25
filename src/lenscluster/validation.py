@@ -66,6 +66,10 @@ from matplotlib.path import Path as MplPath
 from matplotlib.ticker import AutoMinorLocator
 from matplotlib import pyplot as plt
 
+from .plot_style import apply_lenscluster_plot_style
+
+apply_lenscluster_plot_style()
+
 from .mock_cluster import (
     DEFAULT_CAUSTIC_BOUNDARY_MARGIN_ARCSEC,
     DEFAULT_CAUSTIC_COMPUTE_WINDOW_ARCSEC,
