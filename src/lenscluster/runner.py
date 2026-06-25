@@ -28,7 +28,7 @@ class LensClusterRunner:
         from . import cluster_solver
 
         args = plan.runtime_args
-        stage_fit_controls = {} if bool(getattr(args, "plots_only", False)) else cluster_solver._normalize_stage_fit_controls(args)
+        stage_fit_controls = {} if bool(getattr(args, "plots_only", False)) else _stage_fit_controls_from_plan(plan, cluster_solver)
         if plan.runtime.seed is not None:
             cluster_solver.np.random.seed(plan.runtime.seed)
         cluster_solver._configure_debug_log(args, plan.output.run_name, None)
@@ -49,3 +49,26 @@ class LensClusterRunner:
             run_dir=root_run_dir(plan),
             completed=bool(getattr(result, "completed", True)),
         )
+
+
+def _stage_fit_controls_from_plan(plan: RunPlan, cluster_solver_module: Any) -> dict[str, Any]:
+    controls: dict[str, Any] = {}
+    for stage in plan.stages:
+        if stage.name == "stage0_fast_initializer":
+            key = "stage0"
+        elif stage.name == "stage1_backprojected_centroid_fit":
+            key = "stage1"
+        elif stage.name == "stage2_free_source_forward_fit":
+            key = "stage2"
+        else:
+            key = stage.name
+        controls[key] = cluster_solver_module.StageFitControls(
+            fit_method=stage.fit_method,
+            svi_steps=stage.svi_steps,
+            refresh_every=stage.refresh_every,
+            warmup=stage.warmup,
+            samples=stage.samples,
+            sampling_refresh_runs=stage.sampling_refresh_runs,
+            max_tree_depth=stage.max_tree_depth,
+        )
+    return controls

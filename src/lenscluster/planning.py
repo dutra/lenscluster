@@ -47,6 +47,7 @@ class StagePlan:
     refresh_every: int | None
     warmup: int
     samples: int
+    sampling_refresh_runs: int
     max_tree_depth: int
     output_plan: OutputPlan
 
@@ -221,39 +222,44 @@ def _stage_plans(config: LensClusterSolverConfig, output: OutputPlan) -> tuple[S
                 refresh_every=schedule.refresh_every[0],
                 warmup=schedule.warmup[0],
                 samples=schedule.samples[0],
+                sampling_refresh_runs=schedule.sampling_refresh_runs[0],
                 max_tree_depth=schedule.max_tree_depth[0],
                 output_plan=output,
             ),
         )
+    production_index_stage1 = 0
+    production_index_stage2 = 1
     stages = [
         StagePlan(
             name="stage0_fast_initializer",
             fit_mode="stage0_fast_initializer",
-            fit_method=schedule.fit_method[0],
+            fit_method="svi",
             sampling_engine="full_flat",
             sample_likelihood_mode=_stage_likelihood_sample_mode(workflow.stage0_likelihood, field_name="stage0_likelihood"),
             likelihood_family=_stage_likelihood_family(workflow.stage0_likelihood, field_name="stage0_likelihood"),
             source_position_policy=_stage_likelihood_source_position_policy(workflow.stage0_likelihood),
             svi_steps=schedule.svi_steps[0],
             refresh_every=schedule.refresh_every[0],
-            warmup=schedule.warmup[0],
-            samples=schedule.samples[0],
-            max_tree_depth=schedule.max_tree_depth[0],
+            warmup=schedule.warmup[production_index_stage1],
+            samples=schedule.samples[production_index_stage1],
+            sampling_refresh_runs=schedule.sampling_refresh_runs[production_index_stage1],
+            max_tree_depth=schedule.max_tree_depth[production_index_stage1],
             output_plan=OutputPlan(output.run_name, output.output_dir, stage0_minimal_outputs=True),
         ),
         StagePlan(
             name="stage1_backprojected_centroid_fit",
             fit_mode="stage1_backprojected_centroid_fit",
-            fit_method=schedule.fit_method[0],
+            fit_method=schedule.fit_method[production_index_stage1],
             sampling_engine=workflow.stage1_sampling_engine,
             sample_likelihood_mode=_stage1_sample_likelihood_mode(workflow.stage1_likelihood),
             likelihood_family=_stage1_likelihood_family(workflow.stage1_likelihood),
             source_position_policy=_stage1_source_position_policy(workflow.stage1_likelihood),
             svi_steps=schedule.svi_steps[1],
             refresh_every=schedule.refresh_every[1],
-            warmup=schedule.warmup[0],
-            samples=schedule.samples[0],
-            max_tree_depth=schedule.max_tree_depth[0],
+            warmup=schedule.warmup[production_index_stage1],
+            samples=schedule.samples[production_index_stage1],
+            sampling_refresh_runs=schedule.sampling_refresh_runs[production_index_stage1],
+            max_tree_depth=schedule.max_tree_depth[production_index_stage1],
             output_plan=output,
         ),
     ]
@@ -262,16 +268,17 @@ def _stage_plans(config: LensClusterSolverConfig, output: OutputPlan) -> tuple[S
             StagePlan(
                 name="stage2_free_source_forward_fit",
                 fit_mode="stage2_free_source_forward_fit",
-                fit_method=schedule.fit_method[-1],
+                fit_method=schedule.fit_method[production_index_stage2],
                 sampling_engine=workflow.stage2_sampling_engine,
                 sample_likelihood_mode=_stage2_sample_likelihood_mode(workflow.stage2_forward_mode),
                 likelihood_family=_stage2_likelihood_family(workflow.stage2_forward_mode),
                 source_position_policy=_stage2_source_position_policy(workflow.stage2_forward_mode),
                 svi_steps=schedule.svi_steps[2],
                 refresh_every=schedule.refresh_every[2],
-                warmup=schedule.warmup[-1],
-                samples=schedule.samples[-1],
-                max_tree_depth=schedule.max_tree_depth[-1],
+                warmup=schedule.warmup[production_index_stage2],
+                samples=schedule.samples[production_index_stage2],
+                sampling_refresh_runs=schedule.sampling_refresh_runs[production_index_stage2],
+                max_tree_depth=schedule.max_tree_depth[production_index_stage2],
                 output_plan=output,
             )
         )

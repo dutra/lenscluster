@@ -16,7 +16,7 @@ from lenscluster.image_tools import TruthMagnitudeConfig, build_truth_magnitude_
 SUPPORTED_CLUSTERS = ("ares", "hera")
 CLUSTER_COSMOLOGY = {
     "ares": {"h0": 70.4, "om0": 0.272, "z_lens": 0.5},
-    "hera": {"h0": 70.4, "om0": 0.272, "z_lens": 0.5},
+    "hera": {"h0": 72.0, "om0": 0.24, "z_lens": 0.507},
 }
 
 
@@ -62,7 +62,7 @@ def _process_cluster(cluster: str, data_root: Path, args: argparse.Namespace) ->
     cosmo = CLUSTER_COSMOLOGY[cluster]
     image_catalog = data_root / cluster / f"{cluster}_obs_arcs.cat"
     map_dir = data_root / "published" / cluster
-    output_catalog = data_root / cluster / f"{cluster}_obs_arcs_truthmag.cat"
+    output_catalog = image_catalog
     output_band_table = data_root / cluster / f"{cluster}_obs_arcs_truthmag_band_magnitudes.csv"
     config = TruthMagnitudeConfig(
         z_lens=float(cosmo["z_lens"]),

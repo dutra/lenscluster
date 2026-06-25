@@ -39,7 +39,7 @@ from lenscluster.config import (
 from lenscluster.planning import compile_run_plan
 from lenscluster.runner import LensClusterRunner
 
-OUTPUT_DIR_LABEL = "jun24g_flatpackedlenstate_vectorized_newconfig_anistropic"
+OUTPUT_DIR_LABEL = "jun24l_anistropic"
 
 # Kept here for HFF display tuning reuse, but this runner intentionally has no
 # HFF/Bergamini model configurations.
@@ -201,27 +201,30 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         raise ValueError(f"cluster must be one of {', '.join(sorted(FF_SIMS_CLUSTERS))}; got {cluster!r}.")
     cluster_config = FF_SIMS_CLUSTERS[cluster]
 
+    use_magnitude_likelihood = False
+
     perturbation_alpha_tol = 0.1
     perturbation_jacobian_tol = 0.1
-    perturbation_top_k = 200
-    warmup = 3000
-    samples = 1000
-    max_tree_depth = 8
-    mode = "none"
+    perturbation_top_k = 5
+    warmup = 5000, 1000
+    samples = 1000, 500
+    max_tree_depth = 8, 8
     stage0_likelihood = "source"
     stage1_likelihood = "source"
-
-
-    #stage1_likelihood = "critical-arc-anisotropic"
     
     stage0_likelihood = "local-jacobian"
     stage1_likelihood = "local-jacobian"
+    stage2_forward_mode = "critical-arc-anisotropic"
     
+    #stage1_likelihood = "critical-arc-anisotropic"
+
+
     output_dir = (
         f"{cluster_config['output_dir']}_PD{perturbation_alpha_tol:g}_TOPK_{perturbation_top_k}_"
         f"{perturbation_jacobian_tol:g}_T{max_tree_depth}W{warmup}S{samples}"
+        f"maglikelihood{use_magnitude_likelihood}"
     )
-    run_name = f"{cluster_config['cluster_key']}_S1{stage1_likelihood}_S2{mode}"
+    run_name = f"{cluster_config['cluster_key']}_S1{stage1_likelihood}_S2{stage2_forward_mode}"
 
     return LensClusterSolverConfig(
         model=LensModelConfig(
@@ -247,7 +250,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             fit_mode="sequential",
             stage0_likelihood=stage0_likelihood,
             stage1_likelihood=stage1_likelihood,
-            stage2_forward_mode=mode,
+            stage2_forward_mode=stage2_forward_mode,
             stage1_sampling_engine="full_flat",
             stage2_sampling_engine="full_flat",
             stage2_fresh_process=True,
@@ -258,13 +261,13 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             source_position_parameterization="prior-whitened",
         ),
         schedule=StageScheduleConfig(
-            fit_method=("svi+nuts",),
-            refresh_every=(None, 1000),
-            svi_steps=(10000, 10000),
-            warmup=(warmup,),
-            samples=(samples,),
-            sampling_refresh_runs=(1,),
-            max_tree_depth=(max_tree_depth,),
+            fit_method=("svi+nuts", "svi+nuts"),
+            refresh_every=(None, 1000, 1000),
+            svi_steps=(10_000, 10_000, 10_000),
+            warmup=warmup,
+            samples=samples,
+            sampling_refresh_runs=(1, 1),
+            max_tree_depth=max_tree_depth,
             target_accept=0.8,
             z_bin_efficiency_tol=0.0,
         ),
@@ -292,6 +295,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             softening_length_prior_log_sigma=float(cluster_config["softening_length_prior_log_sigma"]),
         ),
         likelihood=LikelihoodConfig(
+            use_magnitude_likelihood=use_magnitude_likelihood,
             pos_sigma_arcsec=0.1,
             source_plane_covariance_mode="magnification",
             image_presence_penalty_weight=2.0,
@@ -316,7 +320,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             gammax_true_fits=cluster_config["gammax_true_fits"],
             gammay_true_fits=cluster_config["gammay_true_fits"],
             truth_grid_mode="posterior",
-            truth_grid_draws=16,
+            truth_grid_draws=64,
             truth_grid_size=256,
             caustic_source_redshift=9.0,
         ),

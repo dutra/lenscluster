@@ -30812,25 +30812,24 @@ def _stage2_sample_likelihood_mode(args: argparse.Namespace) -> str | None:
     raise ValueError(f"Unsupported stage2_forward_mode={requested!r}.")
 
 
-def _run_sequential_v2(args: argparse.Namespace) -> None:
-    stage_fit_controls = _normalize_stage_fit_controls(args)
-    default_controls = StageFitControls(
-        FIT_METHOD_SVI_NUTS,
-        DEFAULT_SVI_STEPS,
-        DEFAULT_REFRESH_EVERY,
-        DEFAULT_WARMUP,
-        DEFAULT_SAMPLES,
-        DEFAULT_SAMPLING_REFRESH_RUNS,
-        DEFAULT_MAX_TREE_DEPTH,
-    )
-    stage0_controls = stage_fit_controls.get("stage0", default_controls)
-    stage1_controls = stage_fit_controls.get("stage1", default_controls)
-    stage2_controls = stage_fit_controls.get("stage2", stage1_controls)
+def _run_sequential_v2(args: argparse.Namespace, stage_fit_controls: dict[str, StageFitControls]) -> None:
+    if not stage_fit_controls:
+        raise ValueError("stage_fit_controls must be derived from RunPlan.stages for sequential execution.")
     root_run_name = args.run_name or "cluster_solver"
     resume_mode = _resume_mode(args)
     resume = resume_mode is not None
     fast_resume = resume_mode == RESUME_MODE_FAST
     stage2_enabled = _stage2_forward_enabled(args)
+    required_stage_control_keys = {"stage0", "stage1"} | ({"stage2"} if stage2_enabled else set())
+    missing_stage_control_keys = sorted(required_stage_control_keys.difference(stage_fit_controls))
+    if missing_stage_control_keys:
+        raise ValueError(
+            "stage_fit_controls missing required RunPlan-derived stage(s): "
+            + ", ".join(missing_stage_control_keys)
+        )
+    stage0_controls = stage_fit_controls["stage0"]
+    stage1_controls = stage_fit_controls["stage1"]
+    stage2_controls = stage_fit_controls.get("stage2", stage1_controls)
     stage0_likelihood = _stage0_sample_likelihood_mode(args)
     stage1_likelihood = _stage1_sample_likelihood_mode(args)
     stage2_likelihood = _stage2_sample_likelihood_mode(args)
@@ -31671,7 +31670,7 @@ def _run_typed_plan_dispatch(args: argparse.Namespace, stage_fit_controls: dict[
         _rerender_plots(args, run_dir)
         return
     if args.fit_mode == FIT_MODE_SEQUENTIAL:
-        _run_sequential_v2(args)
+        _run_sequential_v2(args, stage_fit_controls)
     elif args.fit_mode == FIT_MODE_EVIDENCE_NS:
         _run_evidence_ns(args)
     else:

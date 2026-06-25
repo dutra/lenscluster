@@ -29257,8 +29257,13 @@ def test_sequential_stage2_linearized_runs_as_free_source_forward_fit(
         model_config=object(),
     )
     args = SolverRuntime(vars(args))
+    stage_fit_controls = {
+        "stage0": cluster_solver.StageFitControls("svi", 1000, 100, 2000, 250, 1, 8),
+        "stage1": cluster_solver.StageFitControls("svi+nuts", 400, 50, 2000, 250, 1, 8),
+        "stage2": cluster_solver.StageFitControls("svi+nuts", 200, 25, 1000, 100, 1, 8),
+    }
 
-    cluster_solver._run_sequential_v2(args)
+    cluster_solver._run_sequential_v2(args, stage_fit_controls)
 
     assert [item[1] for item in calls] == [
         "fit/stage0_fast_initializer",
@@ -29599,8 +29604,13 @@ def test_sequential_stage2_critical_arc_runs_as_free_source_forward_fit(
         model_config=object(),
     )
     args = SolverRuntime(vars(args))
+    stage_fit_controls = {
+        "stage0": cluster_solver.StageFitControls("svi", 1000, 100, 2000, 250, 1, 8),
+        "stage1": cluster_solver.StageFitControls("svi+nuts", 400, 50, 2000, 250, 1, 8),
+        "stage2": cluster_solver.StageFitControls("smc", 200, 25, 1000, 100, 1, 8),
+    }
 
-    cluster_solver._run_sequential_v2(args)
+    cluster_solver._run_sequential_v2(args, stage_fit_controls)
 
     assert [item[1] for item in calls] == [
         "fit/stage0_fast_initializer",

@@ -225,8 +225,10 @@ def test_compile_run_plan_resolves_runtime_stages_and_outputs() -> None:
     assert plan.output.output_dir == Path("results/demo")
     assert [stage.name for stage in plan.stages] == ["stage0_fast_initializer", "stage1_backprojected_centroid_fit"]
     assert plan.stages[0].sampling_engine == "full_flat"
+    assert plan.stages[0].fit_method == "svi"
     assert plan.stages[0].sample_likelihood_mode == "local-jacobian"
     assert plan.stages[0].output_plan.stage0_minimal_outputs is True
+    assert plan.stages[1].fit_method == "svi+nuts"
     assert plan.stages[1].svi_steps == 20
     assert plan.stages[1].refresh_every == 100
     assert plan.runtime.chains == 1
@@ -248,7 +250,7 @@ def test_compile_run_plan_resolves_unified_critical_arc_stage_policies() -> None
             refresh_every=(None, 100, 100),
             warmup=(1, 1),
             samples=(2, 2),
-            sampling_refresh_runs=(1,),
+            sampling_refresh_runs=(1, 1),
             max_tree_depth=(8, 8),
         ),
     )
@@ -286,7 +288,7 @@ def test_compile_run_plan_resolves_critical_arc_anisotropic_stage_policies() -> 
             refresh_every=(None, 100, 100),
             warmup=(1, 1),
             samples=(2, 2),
-            sampling_refresh_runs=(1,),
+            sampling_refresh_runs=(1, 1),
             max_tree_depth=(8, 8),
         ),
     )
@@ -481,10 +483,10 @@ def test_compile_run_plan_adds_stage2_when_enabled() -> None:
             fit_method=("svi+nuts", "svi+nuts"),
             svi_steps=(10, 20, 30),
             refresh_every=(None, 100, 100),
-            warmup=(1, 1),
-            samples=(2, 2),
-            sampling_refresh_runs=(1,),
-            max_tree_depth=(8, 8),
+            warmup=(5000, 1000),
+            samples=(1000, 500),
+            sampling_refresh_runs=(1, 2),
+            max_tree_depth=(8, 10),
         ),
     )
 
@@ -495,7 +497,12 @@ def test_compile_run_plan_adds_stage2_when_enabled() -> None:
         "stage1_backprojected_centroid_fit",
         "stage2_free_source_forward_fit",
     ]
+    assert [stage.fit_method for stage in plan.stages] == ["svi", "svi+nuts", "svi+nuts"]
     assert plan.stages[2].svi_steps == 30
+    assert [stage.warmup for stage in plan.stages] == [5000, 5000, 1000]
+    assert [stage.samples for stage in plan.stages] == [1000, 1000, 500]
+    assert [stage.sampling_refresh_runs for stage in plan.stages] == [1, 1, 2]
+    assert [stage.max_tree_depth for stage in plan.stages] == [8, 8, 10]
 
 
 def test_config_validation_rejects_wrong_stage_counts_and_bad_priors() -> None:
@@ -517,6 +524,77 @@ def test_config_validation_rejects_wrong_stage_counts_and_bad_priors() -> None:
         bad_prior.validate()
 
 
+@pytest.mark.parametrize("field_name", ["fit_method", "warmup", "samples", "sampling_refresh_runs", "max_tree_depth"])
+def test_config_validation_rejects_extra_production_control_without_stage2(field_name: str) -> None:
+    config = _minimal_sequential_config()
+    schedule_kwargs = {
+        "fit_method": ("svi+nuts",),
+        "svi_steps": (10, 20),
+        "refresh_every": (None, 100),
+        "warmup": (1,),
+        "samples": (2,),
+        "sampling_refresh_runs": (1,),
+        "max_tree_depth": (8,),
+    }
+    schedule_kwargs[field_name] = ("svi+nuts", "svi+nuts") if field_name == "fit_method" else (1, 2)
+    config = config.with_updates(schedule=StageScheduleConfig(**schedule_kwargs))
+
+    with pytest.raises(ValueError, match=field_name):
+        config.validate()
+
+
+@pytest.mark.parametrize("field_name", ["fit_method", "warmup", "samples", "sampling_refresh_runs", "max_tree_depth"])
+def test_config_validation_requires_two_production_controls_with_stage2(field_name: str) -> None:
+    schedule_kwargs = {
+        "fit_method": ("svi+nuts", "svi+nuts"),
+        "svi_steps": (10, 20, 30),
+        "refresh_every": (None, 100, 100),
+        "warmup": (1, 2),
+        "samples": (2, 3),
+        "sampling_refresh_runs": (1, 2),
+        "max_tree_depth": (8, 10),
+    }
+    schedule_kwargs[field_name] = ("svi+nuts",) if field_name == "fit_method" else (1,)
+    config = _minimal_sequential_config().with_updates(
+        workflow=WorkflowConfig(
+            fit_mode="sequential",
+            stage0_likelihood="local-jacobian",
+            stage2_forward_mode="linearized",
+        ),
+        schedule=StageScheduleConfig(**schedule_kwargs),
+    )
+
+    with pytest.raises(ValueError, match=field_name):
+        config.validate()
+
+
+@pytest.mark.parametrize("field_name", ["fit_method", "warmup", "samples", "sampling_refresh_runs", "max_tree_depth"])
+def test_config_validation_rejects_three_production_controls_with_stage2(field_name: str) -> None:
+    schedule_kwargs = {
+        "fit_method": ("svi+nuts", "svi+nuts"),
+        "svi_steps": (10, 20, 30),
+        "refresh_every": (None, 100, 100),
+        "warmup": (1, 2),
+        "samples": (2, 3),
+        "sampling_refresh_runs": (1, 2),
+        "max_tree_depth": (8, 10),
+    }
+    schedule_kwargs[field_name] = (
+        ("svi+nuts", "svi+nuts", "svi+nuts") if field_name == "fit_method" else (1, 2, 3)
+    )
+    config = _minimal_sequential_config().with_updates(
+        workflow=WorkflowConfig(
+            fit_mode="sequential",
+            stage0_likelihood="local-jacobian",
+            stage2_forward_mode="linearized",
+        ),
+        schedule=StageScheduleConfig(**schedule_kwargs),
+    )
+
+    with pytest.raises(ValueError, match=field_name):
+        config.validate()
+
+
 def test_runner_owns_execution_setup_and_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     plan = compile_run_plan(_minimal_sequential_config())
     captured: dict[str, Any] = {}
@@ -525,6 +603,11 @@ def test_runner_owns_execution_setup_and_dispatch(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(cluster_solver, "_log", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cluster_solver, "_log_runtime_summary", lambda *_args, **_kwargs: captured.setdefault("runtime_log", True))
     monkeypatch.setattr(cluster_solver, "_log_jax_device_policy", lambda *_args, **_kwargs: captured.setdefault("device_log", True))
+    monkeypatch.setattr(
+        cluster_solver,
+        "_normalize_stage_fit_controls",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy normalizer was called")),
+    )
 
     class FakeExecutor:
         def execute(self, passed_plan: RunPlan, stage_fit_controls: dict[str, Any]) -> StageExecutionResult:
@@ -541,6 +624,8 @@ def test_runner_owns_execution_setup_and_dispatch(monkeypatch: pytest.MonkeyPatc
     assert not hasattr(plan, "_internal_args")
     assert captured["stage_fit_controls"]["stage0"].svi_steps == 10
     assert captured["stage_fit_controls"]["stage1"].svi_steps == 20
+    assert captured["stage_fit_controls"]["stage0"].fit_method == "svi"
+    assert captured["stage_fit_controls"]["stage1"].fit_method == "svi+nuts"
     assert captured["debug_log"] is True
     assert captured["runtime_log"] is True
     assert captured["device_log"] is True

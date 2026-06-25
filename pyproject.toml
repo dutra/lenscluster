@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Cluster strong-lensing inference utilities."
 requires-python = ">=3.11"
 dependencies = [
-    "astropy>=5",
+    "astropy>=8.0.0",
     "blackjax>=1.5",
     "graphviz>=0.21",
     "jax-cosmo>=0.1.0",

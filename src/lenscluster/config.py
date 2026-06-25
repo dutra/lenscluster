@@ -340,18 +340,30 @@ def validate_config(config: LensClusterSolverConfig) -> None:
         )
     schedule = config.schedule
     expected_stages = _expected_stage_count(workflow)
+    expected_production_controls = _expected_production_control_count(workflow)
     if len(schedule.svi_steps) != expected_stages:
         raise ValueError(f"svi_steps requires exactly {expected_stages} values for this workflow.")
     if len(schedule.refresh_every) != expected_stages:
         raise ValueError(f"refresh_every requires exactly {expected_stages} values for this workflow.")
+    for name, values in (
+        ("fit_method", schedule.fit_method),
+        ("warmup", schedule.warmup),
+        ("samples", schedule.samples),
+        ("sampling_refresh_runs", schedule.sampling_refresh_runs),
+        ("max_tree_depth", schedule.max_tree_depth),
+    ):
+        if len(values) != expected_production_controls:
+            raise ValueError(
+                f"{name} requires exactly {expected_production_controls} "
+                "production control value"
+                f"{'' if expected_production_controls == 1 else 's'} for this workflow."
+            )
     _validate_positive_int_sequence("svi_steps", schedule.svi_steps)
     _validate_nonnegative_refresh_sequence(schedule.refresh_every)
     _validate_positive_int_sequence("warmup", schedule.warmup)
     _validate_positive_int_sequence("samples", schedule.samples)
     _validate_positive_int_sequence("sampling_refresh_runs", schedule.sampling_refresh_runs)
     _validate_positive_int_sequence("max_tree_depth", schedule.max_tree_depth)
-    if not schedule.fit_method:
-        raise ValueError("fit_method must contain at least one stage method.")
     if schedule.target_accept <= 0.0 or schedule.target_accept >= 1.0:
         raise ValueError("target_accept must lie between 0 and 1.")
     if schedule.z_bin_efficiency_tol < 0.0:
@@ -516,6 +528,12 @@ def _catalog_ids_from_member_catalog(path: str | Path) -> set[str]:
 def _expected_stage_count(workflow: WorkflowConfig) -> int:
     if workflow.fit_mode == "sequential":
         return 3 if workflow.stage2_forward_mode != "none" else 2
+    return 1
+
+
+def _expected_production_control_count(workflow: WorkflowConfig) -> int:
+    if workflow.fit_mode == "sequential" and workflow.stage2_forward_mode != "none":
+        return 2
     return 1
 
 
