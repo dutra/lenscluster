@@ -209,6 +209,24 @@ class LikelihoodConfig:
     magnitude_sigma_floor: float = 0.05
     magnitude_mu_floor: float = 1.0e-3
     magnitude_min_reliability: float = 1.0e-3
+    magnitude_base_scatter_prior: PriorConfig = field(
+        default_factory=lambda: PriorConfig(
+            kind="lognormal",
+            lower=1.0e-3,
+            upper=2.0,
+            mean=0.10,
+            std=0.75,
+        )
+    )
+    magnitude_arc_scatter_prior: PriorConfig = field(
+        default_factory=lambda: PriorConfig(
+            kind="lognormal",
+            lower=1.0e-3,
+            upper=5.0,
+            mean=0.50,
+            std=0.75,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -389,6 +407,14 @@ def validate_config(config: LensClusterSolverConfig) -> None:
         or likelihood.magnitude_min_reliability > 1.0
     ):
         raise ValueError("magnitude_min_reliability must be in [0, 1].")
+    _validate_positive_lognormal_prior(
+        "magnitude_base_scatter_prior",
+        likelihood.magnitude_base_scatter_prior,
+    )
+    _validate_positive_lognormal_prior(
+        "magnitude_arc_scatter_prior",
+        likelihood.magnitude_arc_scatter_prior,
+    )
 
 
 def _validate_model_config(model: LensModelConfig | None) -> None:
@@ -516,3 +542,22 @@ def _validate_truncated_normal(name: str, *, mean: float, std: float, lower: flo
         raise ValueError(f"{name}_lower must be less than {name}_upper.")
     if not lower <= mean <= upper:
         raise ValueError(f"{name}_mean must lie inside the configured bounds.")
+
+
+def _validate_positive_lognormal_prior(name: str, prior: PriorConfig) -> None:
+    if str(prior.kind).replace("-", "_") != "lognormal":
+        raise ValueError(f"{name}.kind must be 'lognormal'.")
+    if prior.lower is None or prior.upper is None or prior.mean is None or prior.std is None:
+        raise ValueError(f"{name} requires lower, upper, mean, and std.")
+    lower = float(prior.lower)
+    upper = float(prior.upper)
+    mean = float(prior.mean)
+    std = float(prior.std)
+    if not all(math.isfinite(value) for value in (lower, upper, mean, std)):
+        raise ValueError(f"{name} values must be finite.")
+    if lower <= 0.0 or upper <= lower:
+        raise ValueError(f"{name} must have 0 < lower < upper.")
+    if not lower < mean < upper:
+        raise ValueError(f"{name}.mean must lie strictly inside bounds.")
+    if std <= 0.0:
+        raise ValueError(f"{name}.std must be positive.")

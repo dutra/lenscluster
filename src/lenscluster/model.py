@@ -182,6 +182,7 @@ class FamilyData:
     reliability: np.ndarray
     catalog_mag: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
     catalog_mag_err: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    catalog_mag_band_names: list[str] = field(default_factory=list)
 
     @property
     def n_images(self) -> int:
