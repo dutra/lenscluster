@@ -3625,6 +3625,117 @@ def test_subhalo_distribution_plots_write_placeholders_without_finite_values(tmp
     assert radial_path.stat().st_size > 0
 
 
+def test_free_galaxy_shape_helpers_wrap_periodic_angles() -> None:
+    ellipticite, angle = plotting._e1e2_to_lenstool_shape(0.2, 0.0)
+
+    assert np.isfinite(ellipticite)
+    assert ellipticite > 0.0
+    assert angle == pytest.approx(0.0)
+    assert plotting._wrapped_position_angle_delta_deg(179.0, -179.0) == pytest.approx(-2.0)
+
+
+def test_free_galaxy_shape_comparison_table_includes_scaling_and_independent_members() -> None:
+    packed = SimpleNamespace(
+        profile_type=np.asarray([81, 81, 81, 81], dtype=np.int32),
+        e1_base=np.asarray([0.0, 0.10, 0.10, 0.05], dtype=float),
+        e2_base=np.asarray([0.0, 0.00, 0.00, 0.02], dtype=float),
+        e1_param_index=np.asarray([-1, -1, 0, 2], dtype=np.int32),
+        e2_param_index=np.asarray([-1, -1, 1, 3], dtype=np.int32),
+    )
+    state = SimpleNamespace(
+        packed_lens_spec=packed,
+        scaling_component_records=[
+            {
+                "potfile_id": "members",
+                "catalog_id": "inactive",
+                "component_index": 0,
+                "free_component_index": -1,
+                "selected_independent": False,
+            },
+            {
+                "potfile_id": "members",
+                "catalog_id": "free",
+                "component_index": 1,
+                "free_component_index": 2,
+                "selected_independent": True,
+            },
+        ],
+        base_components=[
+            {},
+            {},
+            {},
+            {
+                "id": "independent_member_members_bcg",
+                "independent_member_population_id": "members",
+                "independent_member_catalog_id": "bcg",
+            },
+        ],
+    )
+    best_fit = np.asarray([0.20, 0.10, 0.08, -0.04], dtype=float)
+
+    table = plotting._free_galaxy_shape_comparison_table(state, best_fit)
+
+    assert table["member_type"].tolist() == ["independent_member_halo", "selected_scaling_free"]
+    assert table["catalog_id"].tolist() == ["bcg", "free"]
+    assert "inactive" not in table["catalog_id"].tolist()
+    free_row = table.loc[table["catalog_id"] == "free"].iloc[0]
+    assert int(free_row["catalog_component_index"]) == 1
+    assert int(free_row["model_component_index"]) == 2
+    assert free_row["model_ellipticite"] != pytest.approx(free_row["catalog_ellipticite"])
+    independent_row = table.loc[table["catalog_id"] == "bcg"].iloc[0]
+    assert int(independent_row["catalog_component_index"]) == 3
+    assert int(independent_row["model_component_index"]) == 3
+
+
+def test_free_galaxy_shape_comparison_plot_writes_pdf_and_distinct_markers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from matplotlib.axes import Axes
+
+    scatter_markers: list[str | None] = []
+    original_scatter = Axes.scatter
+
+    def record_scatter(self: Axes, *args: Any, **kwargs: Any) -> Any:
+        scatter_markers.append(kwargs.get("marker"))
+        return original_scatter(self, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "scatter", record_scatter)
+    shape_df = pd.DataFrame(
+        {
+            "member_type": ["selected_scaling_free", "independent_member_halo"],
+            "potfile_id": ["members", "members"],
+            "catalog_id": ["free", "bcg"],
+            "component_index": [1, 3],
+            "catalog_component_index": [1, 3],
+            "model_component_index": [2, 3],
+            "catalog_ellipticite": [0.10, 0.20],
+            "model_ellipticite": [0.30, 0.25],
+            "delta_ellipticite": [0.20, 0.05],
+            "catalog_angle_pos_deg": [10.0, -20.0],
+            "model_angle_pos_deg": [15.0, -10.0],
+            "delta_angle_pos_deg": [5.0, 10.0],
+        }
+    )
+    output = tmp_path / "free_galaxy_shape_comparison.pdf"
+
+    plotting._plot_free_galaxy_shape_comparison(shape_df, output)
+
+    assert output.exists()
+    assert output.stat().st_size > 0
+    assert "D" in scatter_markers
+    assert "s" in scatter_markers
+
+
+def test_free_galaxy_shape_comparison_plot_writes_placeholder_for_empty_table(tmp_path: Path) -> None:
+    output = tmp_path / "free_galaxy_shape_comparison.pdf"
+
+    plotting._plot_free_galaxy_shape_comparison(pd.DataFrame(), output)
+
+    assert output.exists()
+    assert output.stat().st_size > 0
+
+
 def test_run_summary_quality_metrics_from_image_fit_quality() -> None:
     state = SimpleNamespace(
         parameter_specs=[ParameterSpec("p", "p", "mock", 81, "x", "uniform", -1.0, 1.0, 0.1)],

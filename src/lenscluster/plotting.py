@@ -2493,6 +2493,278 @@ def _independent_scaling_plot_table(
     return plot_df.sort_values(["potfile_id", "rank"]).reset_index(drop=True)
 
 
+FREE_GALAXY_SHAPE_COMPARISON_COLUMNS = [
+    "member_type",
+    "potfile_id",
+    "catalog_id",
+    "component_index",
+    "catalog_component_index",
+    "model_component_index",
+    "catalog_ellipticite",
+    "model_ellipticite",
+    "delta_ellipticite",
+    "catalog_angle_pos_deg",
+    "model_angle_pos_deg",
+    "delta_angle_pos_deg",
+]
+
+
+def _axis_ratio_to_lenstool_ellipticite_from_modulus(modulus: float) -> float:
+    safe_modulus = min(max(float(modulus), 0.0), 1.0 - 1.0e-12)
+    q = (1.0 - safe_modulus) / (1.0 + safe_modulus)
+    q = min(max(float(q), 1.0e-3), 1.0)
+    return float((1.0 - q * q) / (1.0 + q * q))
+
+
+def _periodic_angle_deg(angle_deg: float) -> float:
+    if not np.isfinite(float(angle_deg)):
+        return float("nan")
+    return float(((float(angle_deg) + 90.0) % 180.0) - 90.0)
+
+
+def _wrapped_position_angle_delta_deg(model_angle_deg: float, catalog_angle_deg: float) -> float:
+    if not np.isfinite(float(model_angle_deg)) or not np.isfinite(float(catalog_angle_deg)):
+        return float("nan")
+    return _periodic_angle_deg(float(model_angle_deg) - float(catalog_angle_deg))
+
+
+def _e1e2_to_lenstool_shape(e1: float, e2: float) -> tuple[float, float]:
+    e1_f = float(e1)
+    e2_f = float(e2)
+    if not np.isfinite(e1_f) or not np.isfinite(e2_f):
+        return float("nan"), float("nan")
+    modulus = float(np.hypot(e1_f, e2_f))
+    ellipticite = _axis_ratio_to_lenstool_ellipticite_from_modulus(modulus)
+    angle_pos = _periodic_angle_deg(0.5 * np.rad2deg(np.arctan2(e2_f, e1_f)))
+    return ellipticite, angle_pos
+
+
+def _packed_component_shape(
+    packed_lens_spec: Any,
+    best_fit: np.ndarray,
+    component_index: int,
+) -> tuple[float, float]:
+    n_components = int(np.asarray(getattr(packed_lens_spec, "profile_type", []), dtype=np.int32).size)
+    if component_index < 0 or component_index >= n_components:
+        return float("nan"), float("nan")
+    e1_base = _component_array_from_packed(packed_lens_spec, "e1_base", n_components, dtype=float, fill_value=0.0)
+    e2_base = _component_array_from_packed(packed_lens_spec, "e2_base", n_components, dtype=float, fill_value=0.0)
+    e1_indices = _component_array_from_packed(packed_lens_spec, "e1_param_index", n_components, dtype=np.int32, fill_value=-1)
+    e2_indices = _component_array_from_packed(packed_lens_spec, "e2_param_index", n_components, dtype=np.int32, fill_value=-1)
+    best_fit_array = np.asarray(best_fit, dtype=float).reshape(-1)
+    e1 = float(e1_base[component_index])
+    e2 = float(e2_base[component_index])
+    e1_index = int(e1_indices[component_index])
+    e2_index = int(e2_indices[component_index])
+    if 0 <= e1_index < best_fit_array.size:
+        e1 = float(best_fit_array[e1_index])
+    if 0 <= e2_index < best_fit_array.size:
+        e2 = float(best_fit_array[e2_index])
+    return _e1e2_to_lenstool_shape(e1, e2)
+
+
+def _free_galaxy_shape_row(
+    *,
+    member_type: str,
+    potfile_id: str,
+    catalog_id: str,
+    component_index: int,
+    catalog_component_index: int,
+    model_component_index: int,
+    packed_lens_spec: Any,
+    best_fit: np.ndarray,
+) -> dict[str, Any] | None:
+    catalog_ellipticite, catalog_angle = _packed_component_shape(
+        packed_lens_spec,
+        np.empty((0,), dtype=float),
+        int(catalog_component_index),
+    )
+    model_ellipticite, model_angle = _packed_component_shape(
+        packed_lens_spec,
+        best_fit,
+        int(model_component_index),
+    )
+    if not (
+        np.isfinite(catalog_ellipticite)
+        and np.isfinite(catalog_angle)
+        and np.isfinite(model_ellipticite)
+        and np.isfinite(model_angle)
+    ):
+        return None
+    return {
+        "member_type": str(member_type),
+        "potfile_id": str(potfile_id),
+        "catalog_id": str(catalog_id),
+        "component_index": int(component_index),
+        "catalog_component_index": int(catalog_component_index),
+        "model_component_index": int(model_component_index),
+        "catalog_ellipticite": float(catalog_ellipticite),
+        "model_ellipticite": float(model_ellipticite),
+        "delta_ellipticite": float(model_ellipticite - catalog_ellipticite),
+        "catalog_angle_pos_deg": float(catalog_angle),
+        "model_angle_pos_deg": float(model_angle),
+        "delta_angle_pos_deg": _wrapped_position_angle_delta_deg(model_angle, catalog_angle),
+    }
+
+
+def _free_galaxy_shape_comparison_table(
+    state: BuildState,
+    best_fit: np.ndarray,
+) -> pd.DataFrame:
+    packed_lens_spec = getattr(state, "packed_lens_spec", None)
+    if packed_lens_spec is None:
+        return pd.DataFrame(columns=FREE_GALAXY_SHAPE_COMPARISON_COLUMNS)
+    rows: list[dict[str, Any]] = []
+    for record in getattr(state, "scaling_component_records", []) or []:
+        if not isinstance(record, dict):
+            continue
+        selected = bool(record.get("selected_independent", False))
+        free_component_index = int(record.get("free_component_index", -1))
+        if not selected and free_component_index < 0:
+            continue
+        component_index = int(record.get("component_index", -1))
+        if free_component_index < 0:
+            free_component_index = component_index
+        row = _free_galaxy_shape_row(
+            member_type="selected_scaling_free",
+            potfile_id=str(record.get("potfile_id", "")),
+            catalog_id=str(record.get("catalog_id", component_index)),
+            component_index=component_index,
+            catalog_component_index=component_index,
+            model_component_index=free_component_index,
+            packed_lens_spec=packed_lens_spec,
+            best_fit=best_fit,
+        )
+        if row is not None:
+            rows.append(row)
+
+    for component_index, component in enumerate(getattr(state, "base_components", []) or []):
+        if not isinstance(component, dict) or "independent_member_catalog_id" not in component:
+            continue
+        row = _free_galaxy_shape_row(
+            member_type="independent_member_halo",
+            potfile_id=str(component.get("independent_member_population_id", "")),
+            catalog_id=str(component.get("independent_member_catalog_id", component.get("id", component_index))),
+            component_index=int(component_index),
+            catalog_component_index=int(component_index),
+            model_component_index=int(component_index),
+            packed_lens_spec=packed_lens_spec,
+            best_fit=best_fit,
+        )
+        if row is not None:
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=FREE_GALAXY_SHAPE_COMPARISON_COLUMNS)
+    return pd.DataFrame(rows, columns=FREE_GALAXY_SHAPE_COMPARISON_COLUMNS).sort_values(
+        ["member_type", "potfile_id", "catalog_id"],
+    ).reset_index(drop=True)
+
+
+def _plot_free_galaxy_shape_comparison(shape_df: pd.DataFrame, path: Path) -> None:
+    if shape_df is None or shape_df.empty:
+        _write_placeholder_plot(
+            path,
+            "Free Galaxy Shape Comparison",
+            "No free member galaxy shape diagnostics are available.",
+        )
+        return
+    df = shape_df.copy()
+    for column in [
+        "catalog_ellipticite",
+        "model_ellipticite",
+        "catalog_angle_pos_deg",
+        "model_angle_pos_deg",
+    ]:
+        df[column] = pd.to_numeric(df.get(column), errors="coerce")
+    finite_shape = np.isfinite(df["catalog_ellipticite"]) & np.isfinite(df["model_ellipticite"])
+    finite_angle = np.isfinite(df["catalog_angle_pos_deg"]) & np.isfinite(df["model_angle_pos_deg"])
+    if not finite_shape.any() and not finite_angle.any():
+        _write_placeholder_plot(
+            path,
+            "Free Galaxy Shape Comparison",
+            "No finite catalog/model free-member shapes are available.",
+        )
+        return
+
+    styles = {
+        "selected_scaling_free": {"marker": "D", "color": "tab:blue", "label": "selected scaling free"},
+        "independent_member_halo": {"marker": "s", "color": "tab:orange", "label": "independent member halo"},
+    }
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.0))
+
+    for member_type, style in styles.items():
+        mask = df["member_type"].astype(str) == member_type
+        shape_mask = mask & finite_shape
+        if shape_mask.any():
+            axes[0].scatter(
+                df.loc[shape_mask, "catalog_ellipticite"],
+                df.loc[shape_mask, "model_ellipticite"],
+                marker=style["marker"],
+                color=style["color"],
+                edgecolors="white",
+                linewidths=0.45,
+                s=48,
+                alpha=0.85,
+                label=style["label"],
+            )
+        angle_mask = mask & finite_angle
+        if angle_mask.any():
+            axes[1].scatter(
+                df.loc[angle_mask, "catalog_angle_pos_deg"],
+                df.loc[angle_mask, "model_angle_pos_deg"],
+                marker=style["marker"],
+                color=style["color"],
+                edgecolors="white",
+                linewidths=0.45,
+                s=48,
+                alpha=0.85,
+                label=style["label"],
+            )
+
+    axes[0].plot([0.0, 1.0], [0.0, 1.0], color="0.25", linestyle="--", linewidth=1.0)
+    axes[0].set_xlim(-0.02, 1.02)
+    axes[0].set_ylim(-0.02, 1.02)
+    axes[0].set_xlabel("catalog ellipticite")
+    axes[0].set_ylabel("model ellipticite")
+    axes[0].set_title("Ellipticity")
+
+    axes[1].plot([-90.0, 90.0], [-90.0, 90.0], color="0.25", linestyle="--", linewidth=1.0)
+    axes[1].set_xlim(-95.0, 95.0)
+    axes[1].set_ylim(-95.0, 95.0)
+    axes[1].set_xlabel("catalog angle_pos [deg]")
+    axes[1].set_ylabel("model angle_pos [deg]")
+    axes[1].set_title("Position Angle")
+
+    if len(df) <= 30:
+        for row in df.itertuples(index=False):
+            label = str(getattr(row, "catalog_id", ""))
+            if np.isfinite(float(getattr(row, "catalog_ellipticite"))) and np.isfinite(float(getattr(row, "model_ellipticite"))):
+                axes[0].annotate(
+                    label,
+                    (float(getattr(row, "catalog_ellipticite")), float(getattr(row, "model_ellipticite"))),
+                    xytext=(3, 3),
+                    textcoords="offset points",
+                    fontsize=7,
+                )
+            if np.isfinite(float(getattr(row, "catalog_angle_pos_deg"))) and np.isfinite(float(getattr(row, "model_angle_pos_deg"))):
+                axes[1].annotate(
+                    label,
+                    (float(getattr(row, "catalog_angle_pos_deg")), float(getattr(row, "model_angle_pos_deg"))),
+                    xytext=(3, 3),
+                    textcoords="offset points",
+                    fontsize=7,
+                )
+
+    for ax in axes:
+        ax.grid(alpha=0.25)
+    handles, labels = axes[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper center", ncol=2, fontsize=8)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
+    _finish_figure(fig, path, dpi=180, bbox_inches="tight")
+
+
 def _scaling_relation_summary_table(
     scaling_rank_df: pd.DataFrame,
     parameter_specs: list[ParameterSpec],
@@ -13832,6 +14104,7 @@ def _generate_plots_and_tables(
         "scaling_results_df": pd.DataFrame(),
         "independent_scaling_df": pd.DataFrame(),
         "independent_scaling_plot_df": pd.DataFrame(),
+        "free_galaxy_shape_df": pd.DataFrame(),
         "scaling_relation_df": pd.DataFrame(),
         "trace_specs": [],
         "trace_grouped_samples": np.empty((0, 0, 0), dtype=float),
@@ -14067,6 +14340,14 @@ def _generate_plots_and_tables(
             ),
         ),
         (
+            "free_galaxy_shape_comparison_table",
+            "plots.run_diagnostics.free_galaxy_shape_comparison_table",
+            lambda: context.__setitem__(
+                "free_galaxy_shape_df",
+                _free_galaxy_shape_comparison_table(state, best_fit),
+            ),
+        ),
+        (
             "perturbation_discovery_diagnostics_table",
             "plots.run_diagnostics.perturbation_discovery_diagnostics_table",
             lambda: context.__setitem__(
@@ -14106,6 +14387,14 @@ def _generate_plots_and_tables(
             "write_subhalo_properties_csv",
             "plots.run_diagnostics.write_subhalo_properties_csv",
             lambda: context["subhalo_df"].to_csv(tables_dir / "subhalo_properties.csv", index=False),
+        ),
+        (
+            "write_free_galaxy_shape_comparison_csv",
+            "plots.run_diagnostics.write_free_galaxy_shape_comparison_csv",
+            lambda: context["free_galaxy_shape_df"].to_csv(
+                tables_dir / "free_galaxy_shape_comparison.csv",
+                index=False,
+            ),
         ),
         (
             "write_potfile_summary_txt",
@@ -14284,6 +14573,14 @@ def _generate_plots_and_tables(
             "subhalo_radial_distribution",
             "plots.subhalo_radial_distribution",
             lambda: _plot_subhalo_radial_distribution(context["subhalo_df"], _plot_path(run_dir, "subhalo_radial_distribution.pdf")),
+        ),
+        (
+            "free_galaxy_shape_comparison",
+            "plots.free_galaxy_shape_comparison",
+            lambda: _plot_free_galaxy_shape_comparison(
+                context["free_galaxy_shape_df"],
+                _plot_path(run_dir, "free_galaxy_shape_comparison.pdf"),
+            ),
         ),
         (
             "per_potential_summary",

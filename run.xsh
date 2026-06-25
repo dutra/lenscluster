@@ -39,7 +39,7 @@ from lenscluster.config import (
 from lenscluster.planning import compile_run_plan
 from lenscluster.runner import LensClusterRunner
 
-OUTPUT_DIR_LABEL = "jun24f_flatpackedlenstate_vectorized_newconfig_anistropic"
+OUTPUT_DIR_LABEL = "jun24g_flatpackedlenstate_vectorized_newconfig_anistropic"
 
 # Kept here for HFF display tuning reuse, but this runner intentionally has no
 # HFF/Bergamini model configurations.
@@ -204,12 +204,14 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
     perturbation_alpha_tol = 0.1
     perturbation_jacobian_tol = 0.1
     perturbation_top_k = 200
-    warmup = 1000
-    samples = 500
+    warmup = 3000
+    samples = 1000
     max_tree_depth = 8
     mode = "none"
     stage0_likelihood = "source"
-    stage1_likelihood = "critical-arc-anisotropic"
+    stage1_likelihood = "source"
+
+
     #stage1_likelihood = "critical-arc-anisotropic"
     
     stage0_likelihood = "local-jacobian"
@@ -266,7 +268,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             target_accept=0.8,
             z_bin_efficiency_tol=0.0,
         ),
-        members=MemberSelectionConfig(potfile_member_mag_max=(22.0,)),
+        members=MemberSelectionConfig(potfile_member_mag_max=(20.0,)),
         perturbation=PerturbationDiscoveryConfig(
             perturbation_discovery_alpha_tol_arcsec=perturbation_alpha_tol,
             perturbation_discovery_jacobian_tol=perturbation_jacobian_tol,
