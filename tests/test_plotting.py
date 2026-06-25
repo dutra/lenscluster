@@ -5847,6 +5847,71 @@ def test_posterior_truth_grid_quantiles_reuses_cached_model_grids(
     np.testing.assert_allclose(kappa_quantiles["kappa"]["median"], all_quantiles["kappa"]["median"])
 
 
+def test_truth_grid_posterior_samples_use_seeded_chain_stratified_selection() -> None:
+    grouped = np.arange(3 * 4, dtype=float).reshape(3, 4, 1)
+    grouped[1, 2, 0] = np.nan
+    results = PosteriorResults(
+        samples=grouped.reshape(-1, 1),
+        grouped_samples=grouped,
+        log_prob=np.zeros(12, dtype=float),
+        accept_prob=np.zeros(12, dtype=float),
+        diverging=np.zeros(12, dtype=bool),
+        num_steps=np.zeros(12, dtype=int),
+        warmup_steps=0,
+        sample_steps=4,
+        num_chains=3,
+    )
+
+    samples_a, indices_a, mode_a = plotting._select_truth_grid_posterior_samples(results, max_draws=5, seed=12345)
+    samples_b, indices_b, mode_b = plotting._select_truth_grid_posterior_samples(results, max_draws=5, seed=12345)
+    samples_c, indices_c, mode_c = plotting._select_truth_grid_posterior_samples(results, max_draws=5, seed=54321)
+
+    assert mode_a == plotting.TRUTH_GRID_DRAW_SELECTION_GROUPED_RANDOM
+    assert mode_b == mode_a
+    assert mode_c == mode_a
+    np.testing.assert_allclose(samples_b, samples_a)
+    pd.testing.assert_frame_equal(indices_b, indices_a)
+    assert len(indices_a) == 5
+    assert indices_a["truth_grid_draw_seed"].unique().tolist() == [12345]
+    assert indices_a.groupby("chain_index").size().to_dict() == {0: 2, 1: 2, 2: 1}
+    assert indices_a["draw_index"].between(0, 3).all()
+    assert indices_a["flat_index"].tolist() == (
+        indices_a["chain_index"].to_numpy(dtype=int) * 4 + indices_a["draw_index"].to_numpy(dtype=int)
+    ).tolist()
+    assert indices_c["draw_index"].tolist() != indices_a["draw_index"].tolist()
+    assert np.isfinite(samples_a).all()
+
+
+def test_truth_grid_posterior_samples_all_and_flat_fallback_are_deterministic() -> None:
+    samples = np.asarray([[0.0], [1.0], [np.nan], [3.0], [4.0]], dtype=float)
+    results = PosteriorResults(
+        samples=samples,
+        log_prob=np.zeros(5, dtype=float),
+        accept_prob=np.zeros(5, dtype=float),
+        diverging=np.zeros(5, dtype=bool),
+        num_steps=np.zeros(5, dtype=int),
+        warmup_steps=0,
+        sample_steps=5,
+        num_chains=1,
+    )
+
+    all_samples, all_indices, all_mode = plotting._select_truth_grid_posterior_samples(results, max_draws=None, seed=7)
+    selected_a, indices_a, mode_a = plotting._select_truth_grid_posterior_samples(results, max_draws=2, seed=7)
+    selected_b, indices_b, mode_b = plotting._select_truth_grid_posterior_samples(results, max_draws=2, seed=7)
+
+    np.testing.assert_allclose(all_samples[:, 0], [0.0, 1.0, 3.0, 4.0])
+    assert all_mode == plotting.TRUTH_GRID_DRAW_SELECTION_ALL
+    assert all_indices["flat_index"].tolist() == [0, 1, 3, 4]
+    assert mode_a == plotting.TRUTH_GRID_DRAW_SELECTION_FLAT_RANDOM
+    assert mode_b == mode_a
+    np.testing.assert_allclose(selected_b, selected_a)
+    pd.testing.assert_frame_equal(indices_b, indices_a)
+    assert indices_a["truth_grid_draw_seed"].unique().tolist() == [7]
+    assert indices_a["chain_index"].tolist() == [-1, -1]
+    assert indices_a["draw_index"].tolist() == [-1, -1]
+    assert set(indices_a["flat_index"]).issubset({0, 1, 3, 4})
+
+
 def test_posterior_truth_grid_quantiles_uses_jax_bulk_draw_backend(tmp_path: Path) -> None:
     wcs = WCS(naxis=2)
     wcs.wcs.crpix = [1.0, 1.0]
@@ -5932,8 +5997,14 @@ def test_posterior_truth_grid_quantiles_uses_jax_bulk_draw_backend(tmp_path: Pat
     np.testing.assert_allclose(quantiles["mu"]["median"], np.full((2, 2), 1.0 / 0.64))
     summary = pd.read_csv(tmp_path / "tables" / "truth_recovery_summary.csv")
     assert set(summary["truth_grid_backend"]) == {"jax_bulk_hessian"}
+    assert set(summary["truth_grid_draw_seed"]) == {12345}
+    assert set(summary["truth_grid_draw_selection"]) == {plotting.TRUTH_GRID_DRAW_SELECTION_ALL}
     assert set(summary["chunk_count"]) == {1}
     assert set(summary["chunk_pixels"]) == {4}
+    draw_indices = pd.read_csv(tmp_path / "tables" / "truth_recovery_draw_indices.csv")
+    assert draw_indices["selection_order"].tolist() == [0, 1, 2]
+    assert draw_indices["truth_grid_draw_seed"].unique().tolist() == [12345]
+    assert draw_indices["flat_index"].tolist() == [0, 1, 2]
     assert evaluator.build_count == 3
     assert progress.advanced == 3
 

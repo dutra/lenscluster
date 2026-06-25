@@ -109,6 +109,10 @@ TRUTH_GRID_QUANTILE_PERCENTILES = (16.0, 50.0, 84.0)
 TRUTH_GRID_QUANTILE_SUFFIXES = ("q16", "median", "q84")
 TRUTH_GRID_MODE_MEDIAN = "median"
 TRUTH_GRID_MODE_POSTERIOR = "posterior"
+TRUTH_GRID_DRAW_SELECTION_ALL = "all_finite"
+TRUTH_GRID_DRAW_SELECTION_GROUPED_RANDOM = "chain_stratified_random_without_replacement"
+TRUTH_GRID_DRAW_SELECTION_FLAT_RANDOM = "flat_random_without_replacement"
+DEFAULT_RUNTIME_SEED = 12345
 TRUTH_GRID_QUANTITY_OUTPUT_NAMES = {
     "kappa": "kappa",
     "gamma1": "gamma1",
@@ -9595,25 +9599,164 @@ def _lens_model_quantity_on_arcsec_grid(
     return flat_values.reshape(x_arcsec.shape)
 
 
-def _truth_grid_posterior_samples(results: PosteriorResults, max_draws: int | None = None) -> np.ndarray:
+def _empty_truth_grid_draw_indices() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "selection_order",
+            "selection_mode",
+            "truth_grid_draw_seed",
+            "chain_index",
+            "draw_index",
+            "flat_index",
+        ]
+    )
+
+
+def _truth_grid_draw_seed(seed: int | None) -> int:
+    if seed is None:
+        return DEFAULT_RUNTIME_SEED
+    if isinstance(seed, bool):
+        raise ValueError("truth-grid draw seed must be a nonnegative integer.")
+    seed_int = int(seed)
+    if seed_int < 0:
+        raise ValueError("truth-grid draw seed must be a nonnegative integer.")
+    return seed_int
+
+
+def _truth_grid_flat_selection(
+    samples: np.ndarray,
+    max_draws: int | None,
+    seed: int,
+) -> tuple[np.ndarray, pd.DataFrame, str]:
+    samples_array = np.asarray(samples, dtype=float)
+    if samples_array.ndim != 2 or samples_array.shape[0] == 0 or samples_array.shape[1] == 0:
+        raise ValueError("Truth-grid recovery requires non-empty finite posterior samples; no best-fit fallback is used.")
+    finite_mask = np.isfinite(samples_array).all(axis=1)
+    finite_indices = np.flatnonzero(finite_mask)
+    if finite_indices.size == 0:
+        raise ValueError("Truth-grid recovery requires finite posterior samples; no best-fit fallback is used.")
+    selection_mode = TRUTH_GRID_DRAW_SELECTION_ALL
+    selected_indices = finite_indices
+    if max_draws is not None:
+        max_draws_int = int(max_draws)
+        if max_draws_int <= 0:
+            raise ValueError("--truth-grid-draws must be 'all' or a positive integer.")
+        if finite_indices.size > max_draws_int:
+            selection_mode = TRUTH_GRID_DRAW_SELECTION_FLAT_RANDOM
+            rng = np.random.default_rng(seed)
+            selected_indices = np.sort(rng.choice(finite_indices, size=max_draws_int, replace=False))
+    rows = [
+        {
+            "selection_order": int(order),
+            "selection_mode": selection_mode,
+            "truth_grid_draw_seed": int(seed),
+            "chain_index": -1,
+            "draw_index": -1,
+            "flat_index": int(flat_index),
+        }
+        for order, flat_index in enumerate(selected_indices)
+    ]
+    return samples_array[selected_indices], pd.DataFrame(rows, columns=_empty_truth_grid_draw_indices().columns), selection_mode
+
+
+def _truth_grid_grouped_selection(
+    grouped_samples: np.ndarray,
+    max_draws: int | None,
+    seed: int,
+) -> tuple[np.ndarray, pd.DataFrame, str]:
+    grouped = np.asarray(grouped_samples, dtype=float)
+    if grouped.ndim != 3 or grouped.shape[0] == 0 or grouped.shape[1] == 0 or grouped.shape[2] == 0:
+        raise ValueError("Truth-grid recovery requires non-empty finite grouped posterior samples.")
+    finite_mask = np.isfinite(grouped).all(axis=2)
+    available_by_chain = [np.flatnonzero(finite_mask[chain_index]) for chain_index in range(grouped.shape[0])]
+    available_counts = np.asarray([draws.size for draws in available_by_chain], dtype=int)
+    total_finite = int(available_counts.sum())
+    if total_finite == 0:
+        raise ValueError("Truth-grid recovery requires finite posterior samples; no best-fit fallback is used.")
+
+    if max_draws is None or total_finite <= int(max_draws):
+        selection_mode = TRUTH_GRID_DRAW_SELECTION_ALL
+        quotas = available_counts
+    else:
+        max_draws_int = int(max_draws)
+        if max_draws_int <= 0:
+            raise ValueError("--truth-grid-draws must be 'all' or a positive integer.")
+        selection_mode = TRUTH_GRID_DRAW_SELECTION_GROUPED_RANDOM
+        quotas = np.zeros_like(available_counts)
+        for _ in range(max_draws_int):
+            candidate_chains = np.flatnonzero(quotas < available_counts)
+            if candidate_chains.size == 0:
+                break
+            min_quota = int(np.min(quotas[candidate_chains]))
+            tied = candidate_chains[quotas[candidate_chains] == min_quota]
+            quotas[int(tied[0])] += 1
+
+    rng = np.random.default_rng(seed)
+    selected_rows: list[np.ndarray] = []
+    audit_rows: list[dict[str, Any]] = []
+    selection_order = 0
+    n_draws_per_chain = int(grouped.shape[1])
+    for chain_index, quota in enumerate(quotas):
+        quota_int = int(quota)
+        if quota_int <= 0:
+            continue
+        available_draws = available_by_chain[chain_index]
+        if selection_mode == TRUTH_GRID_DRAW_SELECTION_ALL:
+            selected_draws = available_draws
+        else:
+            selected_draws = np.sort(rng.choice(available_draws, size=quota_int, replace=False))
+        for draw_index in selected_draws:
+            selected_rows.append(np.asarray(grouped[chain_index, int(draw_index)], dtype=float))
+            audit_rows.append(
+                {
+                    "selection_order": int(selection_order),
+                    "selection_mode": selection_mode,
+                    "truth_grid_draw_seed": int(seed),
+                    "chain_index": int(chain_index),
+                    "draw_index": int(draw_index),
+                    "flat_index": int(chain_index * n_draws_per_chain + int(draw_index)),
+                }
+            )
+            selection_order += 1
+    if not selected_rows:
+        raise ValueError("Truth-grid recovery requires finite posterior samples; no best-fit fallback is used.")
+    return (
+        np.asarray(selected_rows, dtype=float),
+        pd.DataFrame(audit_rows, columns=_empty_truth_grid_draw_indices().columns),
+        selection_mode,
+    )
+
+
+def _select_truth_grid_posterior_samples(
+    results: PosteriorResults,
+    max_draws: int | None = None,
+    *,
+    seed: int | None = None,
+) -> tuple[np.ndarray, pd.DataFrame, str]:
+    seed_int = _truth_grid_draw_seed(seed)
+    grouped_samples = getattr(results, "grouped_samples", None)
+    if grouped_samples is not None:
+        grouped = np.asarray(grouped_samples, dtype=float)
+        if grouped.ndim == 3 and grouped.shape[0] > 0 and grouped.shape[1] > 0 and grouped.shape[2] > 0:
+            return _truth_grid_grouped_selection(grouped, max_draws, seed_int)
     raw_samples = getattr(results, "samples", None)
     if raw_samples is None:
         raise ValueError("Truth-grid recovery requires non-empty finite posterior samples; no best-fit fallback is used.")
-    samples = np.asarray(raw_samples, dtype=float)
-    if samples.ndim != 2 or samples.shape[0] == 0 or samples.shape[1] == 0:
-        raise ValueError("Truth-grid recovery requires non-empty finite posterior samples; no best-fit fallback is used.")
-    finite_samples = _finite_sample_rows(samples)
-    if finite_samples.shape[0] == 0:
-        raise ValueError("Truth-grid recovery requires finite posterior samples; no best-fit fallback is used.")
-    if max_draws is None:
-        return finite_samples
-    max_draws_int = int(max_draws)
-    if max_draws_int <= 0:
-        raise ValueError("--truth-grid-draws must be 'all' or a positive integer.")
-    if finite_samples.shape[0] <= max_draws_int:
-        return finite_samples
-    indices = np.linspace(0, finite_samples.shape[0] - 1, max_draws_int, dtype=int)
-    return finite_samples[indices]
+    return _truth_grid_flat_selection(np.asarray(raw_samples, dtype=float), max_draws, seed_int)
+
+
+def _truth_grid_posterior_samples(
+    results: PosteriorResults,
+    max_draws: int | None = None,
+    *,
+    seed: int | None = None,
+) -> np.ndarray:
+    samples, _draw_indices, _selection_mode = _select_truth_grid_posterior_samples(
+        results,
+        max_draws=max_draws,
+        seed=seed,
+    )
+    return samples
 
 
 def _truth_grid_median_sample(results: PosteriorResults) -> np.ndarray:
@@ -9743,16 +9886,32 @@ def _write_truth_grid_summary(
     new_df.to_csv(path, index=False)
 
 
+def _write_truth_grid_draw_indices(plot_dir: Path, draw_indices: pd.DataFrame) -> None:
+    if draw_indices.empty:
+        return
+    tables_dir = plot_dir / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    draw_indices.to_csv(tables_dir / "truth_recovery_draw_indices.csv", index=False)
+
+
 def _truth_grid_cache_key(
     source_truth_fits: dict[str, str | Path],
     image_shape: tuple[int, int],
     z_source: float,
     max_draws: int | None,
     truth_grid_mode: str,
+    draw_seed: int,
 ) -> tuple[Any, ...]:
     paths = tuple(sorted((str(key), str(value)) for key, value in source_truth_fits.items()))
     draw_key = None if max_draws is None else int(max_draws)
-    return (str(truth_grid_mode), paths, tuple(int(value) for value in image_shape), float(z_source), draw_key)
+    return (
+        str(truth_grid_mode),
+        paths,
+        tuple(int(value) for value in image_shape),
+        float(z_source),
+        draw_key,
+        int(draw_seed),
+    )
 
 
 def _posterior_truth_grid_quantiles(
@@ -9774,13 +9933,22 @@ def _posterior_truth_grid_quantiles(
     aperture_n_radii: int = 40,
     progress: Any | None = None,
     truth_grid_metadata: dict[str, Any] | None = None,
+    draw_seed: int | None = None,
 ) -> tuple[dict[str, dict[str, np.ndarray]], np.ndarray, np.ndarray]:
     requested_quantities = tuple(dict.fromkeys(str(quantity) for quantity in quantities))
     truth_grid_mode = str(truth_grid_mode)
     if truth_grid_mode not in {TRUTH_GRID_MODE_MEDIAN, TRUTH_GRID_MODE_POSTERIOR}:
         raise ValueError(f"Unsupported truth-grid mode: {truth_grid_mode!r}")
     effective_max_draws = max_draws if truth_grid_mode == TRUTH_GRID_MODE_POSTERIOR else 1
-    cache_key = _truth_grid_cache_key(source_truth_fits, image_shape, z_source, effective_max_draws, truth_grid_mode)
+    draw_seed_int = _truth_grid_draw_seed(draw_seed)
+    cache_key = _truth_grid_cache_key(
+        source_truth_fits,
+        image_shape,
+        z_source,
+        effective_max_draws,
+        truth_grid_mode,
+        draw_seed_int,
+    )
     if cache is not None and cache_key in cache:
         cached = cache[cache_key]
         cached_quantiles = cached.get("quantiles", {})
@@ -9794,8 +9962,14 @@ def _posterior_truth_grid_quantiles(
         raise RuntimeError(
             "Truth-recovery plot requested posterior grids before the truth_recovery_grids stage populated them."
         )
+    draw_indices = _empty_truth_grid_draw_indices()
+    draw_selection_mode = "single_median_realization"
     if truth_grid_mode == TRUTH_GRID_MODE_POSTERIOR:
-        samples = _truth_grid_posterior_samples(results, max_draws=max_draws)
+        samples, draw_indices, draw_selection_mode = _select_truth_grid_posterior_samples(
+            results,
+            max_draws=max_draws,
+            seed=draw_seed_int,
+        )
     else:
         samples = _truth_grid_median_sample(results)[None, :]
     if not hasattr(evaluator, "_build_truth_grid_packed_lens_state") or not hasattr(evaluator, "_flat_lensing_jacobian_for_components"):
@@ -9961,6 +10135,8 @@ def _posterior_truth_grid_quantiles(
                 "quantity": quantity,
                 "truth_grid_mode": truth_grid_mode,
                 "truth_grid_backend": backend_used,
+                "truth_grid_draw_seed": int(draw_seed_int),
+                "truth_grid_draw_selection": draw_selection_mode,
                 "spread_available": bool(truth_grid_mode == TRUTH_GRID_MODE_POSTERIOR),
                 "draw_count_used": int(samples.shape[0]),
                 "total_pixels": int(total_pixels),
@@ -9989,6 +10165,8 @@ def _posterior_truth_grid_quantiles(
             }
         )
     _write_truth_grid_summary(plot_dir, summary_rows)
+    if truth_grid_mode == TRUTH_GRID_MODE_POSTERIOR:
+        _write_truth_grid_draw_indices(plot_dir, draw_indices)
     aperture_profile_df: pd.DataFrame | None = None
     if (
         aperture_profile_draw_sums is not None
@@ -11070,6 +11248,7 @@ def _plot_kappa_truth_diagnostics(
     precompute_quantities: Sequence[str] | None = None,
     truth_grid_source_fits: dict[str, str | Path] | None = None,
     require_precomputed_truth_grid: bool = False,
+    truth_grid_draw_seed: int | None = None,
 ) -> None:
     z_source = float(caustic_source_redshift)
     z_lens = getattr(evaluator.state, "z_lens", None)
@@ -11111,6 +11290,7 @@ def _plot_kappa_truth_diagnostics(
         aperture_center=_brightest_member_aperture_center(evaluator),
         aperture_kappa_true=kappa_true,
         truth_grid_metadata=grid_metadata,
+        draw_seed=truth_grid_draw_seed,
     )
     model_kappa = quantiles["kappa"]["median"]
     _plot_kappa_true_comparison_from_grid(
@@ -11378,6 +11558,7 @@ def _plot_abs_mu_truth_diagnostics(
     truth_grid_size: int = DEFAULT_TRUTH_GRID_SIZE,
     truth_grid_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
     require_precomputed_truth_grid: bool = False,
+    truth_grid_draw_seed: int | None = None,
 ) -> None:
     z_source = float(caustic_source_redshift)
     z_lens = getattr(evaluator.state, "z_lens", None)
@@ -11447,6 +11628,7 @@ def _plot_abs_mu_truth_diagnostics(
         aperture_center=_brightest_member_aperture_center(evaluator),
         aperture_kappa_true=kappa_true,
         truth_grid_metadata=grid_metadata,
+        draw_seed=truth_grid_draw_seed,
     )
     abs_mu_model = quantiles["abs_mu"]["median"]
     truth_determinant = _critical_determinant_from_kappa_gamma(kappa_true, gammax_true, gammay_true)
@@ -11564,6 +11746,7 @@ def _precompute_truth_recovery_grids(
         aperture_kappa_true=kappa_true if center is not None else None,
         progress=progress,
         truth_grid_metadata=grid_metadata,
+        draw_seed=getattr(args, "seed", DEFAULT_RUNTIME_SEED),
     )
     return True
 
@@ -14851,6 +15034,7 @@ def _generate_plots_and_tables(
     truth_grid_draws = getattr(args, "truth_grid_draws", None)
     truth_grid_mode = str(getattr(args, "truth_grid_mode", TRUTH_GRID_MODE_MEDIAN))
     truth_grid_size = int(getattr(args, "truth_grid_size", DEFAULT_TRUTH_GRID_SIZE))
+    truth_grid_draw_seed = _truth_grid_draw_seed(getattr(args, "seed", DEFAULT_RUNTIME_SEED))
     if not skip_grid_diagnostics and kappa_true_fits is not None and str(kappa_true_fits).strip():
         gamma_truth_available = (
             gammax_true_fits is not None
@@ -14900,6 +15084,7 @@ def _generate_plots_and_tables(
                         truth_grid_size=truth_grid_size,
                         truth_grid_cache=context["truth_grid_cache"],
                         require_precomputed_truth_grid=True,
+                        truth_grid_draw_seed=truth_grid_draw_seed,
                     ),
                 )
             )
@@ -14940,6 +15125,7 @@ def _generate_plots_and_tables(
                         else ("kappa",)
                     ),
                     truth_grid_source_fits=truth_grid_source_fits,
+                    truth_grid_draw_seed=truth_grid_draw_seed,
                 ),
             )
         )

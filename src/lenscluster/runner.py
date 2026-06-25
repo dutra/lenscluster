@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import random
 from typing import Any
 
 from .artifacts import root_run_dir
@@ -29,8 +30,8 @@ class LensClusterRunner:
 
         args = plan.runtime_args
         stage_fit_controls = {} if bool(getattr(args, "plots_only", False)) else _stage_fit_controls_from_plan(plan, cluster_solver)
-        if plan.runtime.seed is not None:
-            cluster_solver.np.random.seed(plan.runtime.seed)
+        cluster_solver.np.random.seed(plan.runtime.seed)
+        random.seed(plan.runtime.seed)
         cluster_solver._configure_debug_log(args, plan.output.run_name, None)
         cluster_solver._log(args, "[main] startup")
         cluster_solver._log_runtime_summary(args)

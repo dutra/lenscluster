@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 cores = 4  # Fixed to match JAX CPU devices and NUTS chains.
+seed = 12345
 
 $JAX_NUM_CPU_DEVICES = str(cores)
 $MPLCONFIGDIR = "/tmp/matplotlib-lenscluster"
@@ -237,6 +238,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         ),
         paths=RunPathsConfig(output_dir=output_dir, run_name=run_name),
         runtime=RuntimeConfig(
+            seed=seed,
             chains=cores,
             resume="all",
             quick_diagnostics=False,

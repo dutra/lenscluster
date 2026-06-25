@@ -9,7 +9,7 @@ from .config import LensClusterSolverConfig, PriorConfig
 
 @dataclass(frozen=True)
 class RuntimeSettings:
-    seed: int | None
+    seed: int
     chains: int
     resume: str | bool
     plots_only: bool

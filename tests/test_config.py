@@ -23,12 +23,14 @@ from lenscluster.config import (
     PriorConfig,
     ReferenceFrameConfig,
     RunPathsConfig,
+    RuntimeConfig,
     ScalingModelConfig,
     StageScheduleConfig,
     TruthRecoveryConfig,
     WorkflowConfig,
 )
 from lenscluster.planning import RunPlan, compile_run_plan
+import lenscluster.runner as runner_module
 from lenscluster.runner import LensClusterRunner
 from lenscluster.stages import StageExecutionResult
 
@@ -133,6 +135,7 @@ def test_config_defaults_validate_without_solver_namespace() -> None:
     assert config.workflow.stage1_likelihood == "local-jacobian"
     assert config.workflow.stage2_forward_mode == "none"
     assert config.workflow.best_value == "map"
+    assert config.runtime.seed == 12345
     assert config.runtime.show_plots is False
     assert config.schedule.svi_steps == (2000, 2000)
     assert config.schedule.refresh_every == (250, 250)
@@ -140,6 +143,17 @@ def test_config_defaults_validate_without_solver_namespace() -> None:
     assert config.truth.truth_grid_draws == 64
     assert config.truth.truth_grid_size == 256
     config.validate()
+    plan = compile_run_plan(config)
+    assert plan.runtime.seed == 12345
+    assert plan.runtime_args.seed == 12345
+
+
+def test_runtime_seed_validation() -> None:
+    LensClusterSolverConfig(model=_minimal_model_config(), runtime=RuntimeConfig(seed=0)).validate()
+    LensClusterSolverConfig(model=_minimal_model_config(), runtime=RuntimeConfig(seed=12345)).validate()
+    for bad_seed in (None, True, -1, 1.2, "123"):
+        with pytest.raises(ValueError, match="seed"):
+            LensClusterSolverConfig(model=_minimal_model_config(), runtime=RuntimeConfig(seed=bad_seed)).validate()  # type: ignore[arg-type]
 
 
 def test_independent_member_halo_config_validation() -> None:
@@ -603,6 +617,8 @@ def test_runner_owns_execution_setup_and_dispatch(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(cluster_solver, "_log", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cluster_solver, "_log_runtime_summary", lambda *_args, **_kwargs: captured.setdefault("runtime_log", True))
     monkeypatch.setattr(cluster_solver, "_log_jax_device_policy", lambda *_args, **_kwargs: captured.setdefault("device_log", True))
+    monkeypatch.setattr(cluster_solver.np.random, "seed", lambda value: captured.setdefault("numpy_seed", value))
+    monkeypatch.setattr(runner_module.random, "seed", lambda value: captured.setdefault("python_seed", value))
     monkeypatch.setattr(
         cluster_solver,
         "_normalize_stage_fit_controls",
@@ -626,6 +642,8 @@ def test_runner_owns_execution_setup_and_dispatch(monkeypatch: pytest.MonkeyPatc
     assert captured["stage_fit_controls"]["stage1"].svi_steps == 20
     assert captured["stage_fit_controls"]["stage0"].fit_method == "svi"
     assert captured["stage_fit_controls"]["stage1"].fit_method == "svi+nuts"
+    assert captured["numpy_seed"] == 12345
+    assert captured["python_seed"] == 12345
     assert captured["debug_log"] is True
     assert captured["runtime_log"] is True
     assert captured["device_log"] is True
@@ -660,6 +678,8 @@ def test_run_xsh_is_self_contained_ff_sims_runner() -> None:
     assert "exclude_catalog_ids=(\"1\", \"2\")" not in text
     assert "2.3 / 0.72" in text
     assert "cores = 4" in text
+    assert "seed = 12345" in text
+    assert "seed=seed" in text
     assert "chains=cores" in text
     assert "show_plots=True" not in text
     assert "display_plots_in_notebook" not in text
@@ -696,8 +716,10 @@ def test_ff_sims_notebook_is_self_contained_and_config_native() -> None:
     assert "exclude_catalog_ids=(\"2\", \"3\")" not in source
     assert "exclude_catalog_ids=(\"1\", \"2\")" not in source
     assert "cores = 4" in source
+    assert "seed = 12345" in source
     assert "os.environ[\"JAX_NUM_CPU_DEVICES\"] = str(cores)" in source
     assert "RuntimeConfig" in source
+    assert "seed=seed" in source
     assert "chains=cores" in source
     assert "show_plots=True" in source
     assert "display_plots_in_notebook" not in source

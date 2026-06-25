@@ -102,7 +102,7 @@ class LensModelConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
-    seed: int | None = None
+    seed: int = 12345
     chains: int = 1
     resume: str | bool = False
     plots_only: bool = False
@@ -321,6 +321,8 @@ def _jsonable(value: Any) -> Any:
 
 def validate_config(config: LensClusterSolverConfig) -> None:
     _validate_model_config(config.model)
+    if isinstance(config.runtime.seed, bool) or not isinstance(config.runtime.seed, Integral) or int(config.runtime.seed) < 0:
+        raise ValueError("seed must be a nonnegative integer.")
     workflow = config.workflow
     stage_likelihoods = {"source", "local-jacobian", "critical-arc", "critical-arc-anisotropic"}
     if workflow.stage0_likelihood not in stage_likelihoods:
