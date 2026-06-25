@@ -124,7 +124,7 @@ class RuntimeConfig:
 @dataclass(frozen=True)
 class WorkflowConfig:
     fit_mode: str = "sequential"
-    sampling_engine: str = "refreshing_surrogate"
+    sampling_engine: str = "refreshing_surrogate_flat"
     stage1_sampling_engine: str = "refreshing_surrogate_flat"
     stage0_likelihood: str = "source"
     stage1_likelihood: str = "local-jacobian"
@@ -324,6 +324,17 @@ def validate_config(config: LensClusterSolverConfig) -> None:
     if isinstance(config.runtime.seed, bool) or not isinstance(config.runtime.seed, Integral) or int(config.runtime.seed) < 0:
         raise ValueError("seed must be a nonnegative integer.")
     workflow = config.workflow
+    flat_sampling_engines = {"full_flat", "refreshing_surrogate_flat"}
+    for field_name, value in (
+        ("sampling_engine", workflow.sampling_engine),
+        ("stage1_sampling_engine", workflow.stage1_sampling_engine),
+        ("stage2_sampling_engine", workflow.stage2_sampling_engine),
+    ):
+        if value not in flat_sampling_engines:
+            raise ValueError(
+                f"{field_name} must be 'full_flat' or 'refreshing_surrogate_flat'; "
+                f"got {value!r}."
+            )
     stage_likelihoods = {"source", "local-jacobian", "critical-arc", "critical-arc-anisotropic"}
     if workflow.stage0_likelihood not in stage_likelihoods:
         raise ValueError(

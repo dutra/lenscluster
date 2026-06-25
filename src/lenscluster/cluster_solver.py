@@ -288,14 +288,10 @@ DEFAULT_MCHMC_NUM_WINDOWS = 1
 DEFAULT_MCHMC_TUNING_FACTOR = 1.3
 MCHMC_L_ESTIMATORS = ("avg", "max")
 DEFAULT_MCHMC_L_ESTIMATOR = "avg"
-SAMPLING_ENGINE_FULL = "full"
 SAMPLING_ENGINE_FULL_FLAT = "full_flat"
-SAMPLING_ENGINE_REFRESHING_SURROGATE = "refreshing_surrogate"
 SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT = "refreshing_surrogate_flat"
 SINGLE_STAGE_SAMPLING_ENGINES = (
-    SAMPLING_ENGINE_FULL,
     SAMPLING_ENGINE_FULL_FLAT,
-    SAMPLING_ENGINE_REFRESHING_SURROGATE,
     SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
 )
 SAMPLING_ENGINES = SINGLE_STAGE_SAMPLING_ENGINES
@@ -1438,7 +1434,7 @@ def _local_jacobian_metric_mode_for_values(
 
 def _local_jacobian_metric_mode(evaluator: Any) -> str:
     return _local_jacobian_metric_mode_for_values(
-        str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)),
+        str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL_FLAT)),
         str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE)),
         str(getattr(evaluator, "source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION)),
     )
@@ -1464,7 +1460,7 @@ def _log_runtime_summary(args: argparse.Namespace) -> None:
         getattr(args, "source_plane_covariance_mode", SOURCE_PLANE_COVARIANCE_MODE_MAGNIFICATION)
     )
     local_jacobian_metric = _local_jacobian_metric_mode_for_values(
-        str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)),
+        str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL_FLAT)),
         sample_likelihood_mode,
         source_plane_covariance_mode,
     )
@@ -1753,11 +1749,11 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
     perturbation_stage0 = bool(getattr(state, "perturbation_discovery_stage0", False))
     if bool(getattr(evaluator, "surrogate_enabled", False)):
         items.append(
-            "refreshing_surrogate=active "
+            "refreshing_surrogate_flat=active "
             f"cached_scaling={_count_items(getattr(evaluator, 'cached_scaling_component_indices', getattr(evaluator, 'inactive_scaling_component_indices', [])))} "
             f"free_correction={_count_items(getattr(evaluator, 'free_correction_scaling_component_indices', []))}"
         )
-    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_FULL_FLAT:
+    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL_FLAT)) == SAMPLING_ENGINE_FULL_FLAT:
         sample_likelihood_mode = str(getattr(evaluator, "sample_likelihood_mode", SAMPLE_LIKELIHOOD_SOURCE))
         if perturbation_stage0:
             items.append(
@@ -1771,9 +1767,7 @@ def _solver_active_approximation_items(evaluator: Any) -> list[str]:
             items.append("sampling_engine=full_flat exact flattened local-metric likelihood")
         else:
             items.append("sampling_engine=full_flat exact flattened critical-arc likelihood")
-    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_REFRESHING_SURROGATE:
-        items.append("sampling_engine=refreshing_surrogate legacy per-bin surrogate")
-    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT:
+    if str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL_FLAT)) == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT:
         items.append("sampling_engine=refreshing_surrogate_flat flattened surrogate")
     if family_count > 0 and bin_count < family_count:
         items.append(f"z_bins=active grouped_families={family_count} bins={bin_count}")
@@ -10479,7 +10473,7 @@ def _log_evaluator_memory_shape_diagnostics(
         getattr(evaluator, "surrogate_enabled", False)
         and _flat_surrogate_refresh_needs_inactive_jacobian(
             sample_likelihood_mode,
-            sampling_engine=str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL)),
+            sampling_engine=str(getattr(evaluator, "sampling_engine", SAMPLING_ENGINE_FULL_FLAT)),
         )
     )
     _log(
@@ -14101,12 +14095,11 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         if bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)):
             _fail("--skip-stage3-image-plane-local-jacobian is not valid with --fit-mode evidence-ns.")
         if (
-            str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL))
-            in {SAMPLING_ENGINE_REFRESHING_SURROGATE, SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT}
+            str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL_FLAT)) == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT
             and int(getattr(args, "image_plane_newton_steps", 0)) > 0
         ):
             _fail(
-                "--sampling-engine refreshing_surrogate or refreshing_surrogate_flat with linearized-forward-beta-image-plane "
+                "--sampling-engine refreshing_surrogate_flat with linearized-forward-beta-image-plane "
                 "requires --image-plane-newton-steps 0."
             )
         if (
@@ -14172,12 +14165,11 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
             )
     if (
         mode == IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA
-        and str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL))
-        in {SAMPLING_ENGINE_REFRESHING_SURROGATE, SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT}
+        and str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL_FLAT)) == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT
         and anchored_solve_steps > 0
     ):
         _fail(
-            "--sampling-engine refreshing_surrogate or refreshing_surrogate_flat is not supported with "
+            "--sampling-engine refreshing_surrogate_flat is not supported with "
             "--image-plane-mode anchored-solved-forward-beta-image-plane unless "
             "--anchored-image-plane-solve-steps is 0."
         )
@@ -14339,12 +14331,11 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         _fail("Stage-4 image-plane modes require --fit-mode sequential.")
     if (
         _linearized_stage_enabled(args)
-        and str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL))
-        in {SAMPLING_ENGINE_REFRESHING_SURROGATE, SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT}
+        and str(getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL_FLAT)) == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT
         and int(getattr(args, "image_plane_newton_steps", 0)) > 0
     ):
         _fail(
-            "--sampling-engine refreshing_surrogate or refreshing_surrogate_flat with linearized-forward-beta-image-plane "
+            "--sampling-engine refreshing_surrogate_flat with linearized-forward-beta-image-plane "
             "requires --image-plane-newton-steps 0."
         )
     if has_stage_specific_values and not has_stage3_or_stage4:
@@ -17721,7 +17712,7 @@ class ClusterJAXEvaluator:
         exact_image_lm_max_iter: int = DEFAULT_EXACT_IMAGE_LM_MAX_ITER,
         exact_image_lm_trust_radius_arcsec: float = DEFAULT_EXACT_IMAGE_LM_TRUST_RADIUS_ARCSEC,
         exact_image_adaptive_max_levels: int = DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
-        sampling_engine: str = "full",
+        sampling_engine: str = SAMPLING_ENGINE_FULL_FLAT,
         active_scaling_galaxies: list[int] | int | None = None,
         active_scaling_selection: str = "adaptive",
         active_scaling_cumulative_fraction: float = DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
@@ -17915,8 +17906,7 @@ class ClusterJAXEvaluator:
         }:
             raise ValueError(
                 "sampling_engine='refreshing_surrogate_flat' does not yet support "
-                f"sample_likelihood_mode={self.sample_likelihood_mode!r}; use "
-                "sampling_engine='refreshing_surrogate' for the legacy per-bin surrogate path."
+                f"sample_likelihood_mode={self.sample_likelihood_mode!r}."
             )
         self.local_jacobian_metric_mode = _local_jacobian_metric_mode_for_values(
             self.sampling_engine,
@@ -17936,12 +17926,12 @@ class ClusterJAXEvaluator:
         ):
             raise ValueError(f"{self.sample_likelihood_mode} requires image_plane_newton_steps=0.")
         if (
-            self.sampling_engine in {SAMPLING_ENGINE_REFRESHING_SURROGATE, SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT}
+            self.sampling_engine == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT
             and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE
             and requested_image_plane_newton_steps > 0
         ):
             raise ValueError(
-                "refreshing_surrogate or refreshing_surrogate_flat with linearized-forward-beta-image-plane requires "
+                "refreshing_surrogate_flat with linearized-forward-beta-image-plane requires "
                 "image_plane_newton_steps=0; Newton updates move image positions away from the observed-position cache."
             )
         self.image_plane_newton_steps = max(0, min(3, requested_image_plane_newton_steps))
@@ -17949,12 +17939,12 @@ class ClusterJAXEvaluator:
         if requested_anchored_steps < 0:
             raise ValueError("anchored_image_plane_solve_steps must be non-negative.")
         if (
-            self.sampling_engine in {SAMPLING_ENGINE_REFRESHING_SURROGATE, SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT}
+            self.sampling_engine == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT
             and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE
             and requested_anchored_steps > 0
         ):
             raise ValueError(
-                "anchored-solved-forward-beta-image-plane with refreshing_surrogate or refreshing_surrogate_flat requires "
+                "anchored-solved-forward-beta-image-plane with refreshing_surrogate_flat requires "
                 "anchored_image_plane_solve_steps=0."
             )
         self.anchored_image_plane_solve_steps = requested_anchored_steps
@@ -18612,10 +18602,7 @@ class ClusterJAXEvaluator:
             and self.active_scaling_inference_likelihood == ACTIVE_SCALING_INFERENCE_LIKELIHOOD_BLEND
         )
         self.surrogate_enabled = (
-            self.sampling_engine in {
-                SAMPLING_ENGINE_REFRESHING_SURROGATE,
-                SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
-            }
+            self.sampling_engine == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT
             and not self.active_inference_enabled
             and self.use_bulk_ray_shooting
             and len(self.scaling_component_indices) > 0
@@ -23804,7 +23791,8 @@ class ClusterJAXEvaluator:
         return kwargs_lens
 
     def _source_loglike_impl(self, params: jnp.ndarray) -> jnp.ndarray:
-        if str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL)) == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT:
+        engine = str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL_FLAT))
+        if engine == SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT:
             if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_SOURCE:
                 return self._flat_refreshing_surrogate_source_loglike_impl(params)
             if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
@@ -23815,855 +23803,20 @@ class ClusterJAXEvaluator:
             }:
                 return self._flat_refreshing_surrogate_critical_arc_source_loglike_impl(params)
             return jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64)
-        if (
-            str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
-            in {SAMPLING_ENGINE_FULL_FLAT}
-            and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_SOURCE
-        ):
-            return self._flat_source_loglike_impl(params)
-        if (
-            str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
-            in {SAMPLING_ENGINE_FULL_FLAT}
-            and self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
-        ):
-            return self._flat_local_jacobian_source_loglike_impl(params)
-        if (
-            str(getattr(self, "sampling_engine", SAMPLING_ENGINE_FULL))
-            in {SAMPLING_ENGINE_FULL_FLAT}
-            and self.sample_likelihood_mode in {
+        if engine == SAMPLING_ENGINE_FULL_FLAT:
+            if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_SOURCE:
+                return self._flat_source_loglike_impl(params)
+            if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
+                return self._flat_local_jacobian_source_loglike_impl(params)
+            if self.sample_likelihood_mode in {
                 SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
                 SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
-            }
-        ):
-            return self._flat_critical_arc_source_loglike_impl(params)
-
-        total_loglike = jnp.array(0.0, dtype=jnp.float64)
-        invalid_seen = jnp.array(False)
-        physical_params = self._physical_parameter_vector(jnp.asarray(params, dtype=jnp.float64))
-        source_sigma_int = self._source_sigma_int_from_physical(physical_params)
-        image_sigma_int = self._image_sigma_int_from_physical(physical_params)
-        critical_arc_singular_threshold = (
-            self._critical_arc_singular_threshold_from_physical(physical_params)
-            if hasattr(self, "_critical_arc_singular_threshold_from_physical")
-            else jnp.asarray(
-                float(getattr(self, "critical_arc_singular_threshold", DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD)),
-                dtype=jnp.float64,
-            )
-        )
-        critical_arc_singular_softness = (
-            self._critical_arc_singular_softness_from_physical(physical_params)
-            if hasattr(self, "_critical_arc_singular_softness_from_physical")
-            else jnp.asarray(
-                float(getattr(self, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)),
-                dtype=jnp.float64,
-            )
-        )
-        fit_component_indices = self._fit_component_indices() if hasattr(self, "_fit_component_indices") else None
-        if self.sample_likelihood_mode in {
-            SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
-            SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
-            SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
-        }:
-            fit_component_indices = None
-        sampled_kpc_per_arcsec = None
-        sampled_dpie_sigma0_factors = None
-        if bool(getattr(self, "fit_cosmology_flat_wcdm", False)):
-            sampled_kpc_per_arcsec, sampled_dpie_sigma0_factors = self._sampled_cosmology_geometry_for_physical(
-                physical_params
-            )
-        for bin_data in self.traced_bin_data:
-            x_obs = bin_data.x_obs
-            y_obs = bin_data.y_obs
-            bin_kpc_per_arcsec = sampled_kpc_per_arcsec
-            bin_dpie_sigma0_factor = None
-            if sampled_dpie_sigma0_factors is not None and bin_data.effective_z_index >= 0:
-                bin_dpie_sigma0_factor = jnp.take(
-                    sampled_dpie_sigma0_factors,
-                    jnp.asarray(bin_data.effective_z_index, dtype=jnp.int32),
-                )
-            if self.surrogate_enabled and self.surrogate_cache_by_z:
-                if bin_dpie_sigma0_factor is None:
-                    beta_x, beta_y, invalid, packed_state = self._surrogate_beta(params, physical_params, bin_data)
-                else:
-                    beta_x, beta_y, invalid, packed_state = self._surrogate_beta(
-                        params,
-                        physical_params,
-                        bin_data,
-                        kpc_per_arcsec=bin_kpc_per_arcsec,
-                        dpie_sigma0_factor=bin_dpie_sigma0_factor,
-                    )
-            else:
-                if bin_dpie_sigma0_factor is None:
-                    packed_state, validity = self._build_packed_lens_state_with_validity_from_physical(
-                        physical_params,
-                        bin_data.effective_z_source,
-                        stop_gradient=True,
-                    )
-                else:
-                    packed_state, validity = self._build_packed_lens_state_with_validity_from_physical(
-                        physical_params,
-                        bin_data.effective_z_source,
-                        stop_gradient=True,
-                        kpc_per_arcsec=bin_kpc_per_arcsec,
-                        dpie_sigma0_factor=bin_dpie_sigma0_factor,
-                    )
-                invalid = ~validity.is_valid
-                if fit_component_indices is None:
-                    beta_x, beta_y = jax.lax.cond(
-                        invalid,
-                        lambda _: (x_obs, y_obs),
-                        lambda current_state: self._ray_shooting_for_components(
-                            bin_data.effective_z_source,
-                            x_obs,
-                            y_obs,
-                            current_state,
-                        ),
-                        packed_state,
-                    )
-                else:
-                    beta_x, beta_y = jax.lax.cond(
-                        invalid,
-                        lambda _: (x_obs, y_obs),
-                        lambda current_state: self._ray_shooting_for_components(
-                            bin_data.effective_z_source,
-                            x_obs,
-                            y_obs,
-                            current_state,
-                            fit_component_indices,
-                        ),
-                        packed_state,
-                    )
-            family_idx = bin_data.family_index_per_image
-            sigma_base = bin_data.sigma_per_image
-            scatter_var_x, scatter_var_y = self._scaling_scatter_extra_variance_from_physical(
-                physical_params,
-                bin_data,
-                beta_x,
-                beta_y,
-            )
-            n_families = bin_data.n_families
-            image_has_constraint = bin_data.image_has_constraint
-
-            reliability = jnp.clip(bin_data.reliability_per_image, 1.0e-6, 1.0 - 1.0e-6)
-
-            if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE:
-                observed_beta_x = beta_x
-                observed_beta_y = beta_y
-                if self.surrogate_enabled and self.surrogate_cache_by_z:
-                    observed_jacobian_entries = self._surrogate_jacobian_entries(
-                        jnp.asarray(params, dtype=jnp.float64),
-                        bin_data,
-                        packed_state,
-                        invalid,
-                    )
-                else:
-                    if fit_component_indices is None:
-                        observed_jacobian_entries = self._lensing_jacobian_for_components(
-                            bin_data.effective_z_source,
-                            x_obs,
-                            y_obs,
-                            packed_state,
-                        )
-                    else:
-                        observed_jacobian_entries = self._lensing_jacobian_for_components(
-                            bin_data.effective_z_source,
-                            x_obs,
-                            y_obs,
-                            packed_state,
-                            fit_component_indices,
-                        )
-                beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._explicit_source_position_vectors_for_bin(
-                    jnp.asarray(params, dtype=jnp.float64),
-                    physical_params,
-                    bin_data,
-                    observed_beta_x,
-                    observed_beta_y,
-                    image_sigma_int,
-                    observed_jacobian_entries,
-                )
-                if self.image_plane_newton_steps == 0:
-                    residual_x, residual_y, residual_finite = self._linearized_image_plane_residuals_from_observed_beta(
-                        observed_beta_x,
-                        observed_beta_y,
-                        beta_family_x,
-                        beta_family_y,
-                        observed_jacobian_entries,
-                    )
-                else:
-                    residual_x, residual_y, residual_finite = self._linearized_image_plane_residuals_for_components(
-                        bin_data.effective_z_source,
-                        x_obs,
-                        y_obs,
-                        beta_family_x,
-                        beta_family_y,
-                        packed_state,
-                        initial_jacobian_entries=observed_jacobian_entries,
-                        component_indices=fit_component_indices,
-                    )
-                invalid = invalid | (~has_source_positions) | (~jnp.all(residual_finite))
-                bin_loglike = _linearized_image_plane_bin_loglike(
-                    residual_x=residual_x,
-                    residual_y=residual_y,
-                    family_idx=family_idx,
-                    n_families=n_families,
-                    sigma_per_image=sigma_base,
-                    reliability_per_image=reliability,
-                    image_has_constraint=image_has_constraint,
-                    image_sigma_int=image_sigma_int,
-                    covariance_floor=self.source_plane_covariance_floor,
-                    outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                    image_presence_penalty_weight=self.image_presence_penalty_weight,
-                    image_presence_match_radius_arcsec=self.image_presence_match_radius_arcsec,
-                    image_presence_temperature_arcsec=self.image_presence_temperature_arcsec,
-                    image_presence_count_softness=self.image_presence_count_softness,
-                    image_presence_count_margin=self.image_presence_count_margin,
-                    residual_loss=self.likelihood_stabilizer_residual_loss,
-                    student_t_nu=self.likelihood_stabilizer_student_t_nu,
-                )
-                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
-                    bin_data,
-                    physical_params,
-                    observed_jacobian_entries,
-                )
-                bin_loglike = bin_loglike + source_transport_correction
-            elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE:
-                observed_beta_x = beta_x
-                observed_beta_y = beta_y
-                if self.surrogate_enabled and self.surrogate_cache_by_z:
-                    observed_jacobian_entries = self._surrogate_jacobian_entries(
-                        jnp.asarray(params, dtype=jnp.float64),
-                        bin_data,
-                        packed_state,
-                        invalid,
-                    )
-                else:
-                    observed_jacobian_entries = self._lensing_jacobian_for_components(
-                        bin_data.effective_z_source,
-                        x_obs,
-                        y_obs,
-                        packed_state,
-                    )
-                beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._explicit_source_position_vectors_for_bin(
-                    jnp.asarray(params, dtype=jnp.float64),
-                    physical_params,
-                    bin_data,
-                    observed_beta_x,
-                    observed_beta_y,
-                    image_sigma_int,
-                    observed_jacobian_entries,
-                )
-                if self.anchored_image_plane_solve_steps == 0:
-                    residual_x, residual_y, residual_finite = _anchored_solved_image_plane_step_from_jacobian(
-                        observed_beta_x - beta_family_x,
-                        observed_beta_y - beta_family_y,
-                        *observed_jacobian_entries,
-                        trust_radius_arcsec=self.anchored_image_plane_trust_radius_arcsec,
-                        lm_damping_relative=self.anchored_image_plane_lm_damping_relative,
-                        lm_damping_absolute=self.anchored_image_plane_lm_damping_absolute,
-                    )
-                else:
-                    residual_x, residual_y, residual_finite = self._anchored_solved_image_plane_residuals_for_components(
-                        bin_data.effective_z_source,
-                        x_obs,
-                        y_obs,
-                        beta_family_x,
-                        beta_family_y,
-                        packed_state,
-                    )
-                invalid = invalid | (~has_source_positions) | (~jnp.all(residual_finite))
-                bin_loglike = _linearized_image_plane_bin_loglike(
-                    residual_x=residual_x,
-                    residual_y=residual_y,
-                    family_idx=family_idx,
-                    n_families=n_families,
-                    sigma_per_image=sigma_base,
-                    reliability_per_image=reliability,
-                    image_has_constraint=image_has_constraint,
-                    image_sigma_int=image_sigma_int,
-                    covariance_floor=self.source_plane_covariance_floor,
-                    outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                    image_presence_penalty_weight=self.image_presence_penalty_weight,
-                    image_presence_match_radius_arcsec=self.image_presence_match_radius_arcsec,
-                    image_presence_temperature_arcsec=self.image_presence_temperature_arcsec,
-                    image_presence_count_softness=self.image_presence_count_softness,
-                    image_presence_count_margin=self.image_presence_count_margin,
-                    residual_loss=self.likelihood_stabilizer_residual_loss,
-                    student_t_nu=self.likelihood_stabilizer_student_t_nu,
-                )
-                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
-                    bin_data,
-                    physical_params,
-                    observed_jacobian_entries,
-                )
-                bin_loglike = bin_loglike + source_transport_correction
-            elif _sample_likelihood_uses_critical_arc_terms(self.sample_likelihood_mode):
-                observed_beta_x = beta_x
-                observed_beta_y = beta_y
-                if self.surrogate_enabled and self.surrogate_cache_by_z:
-                    observed_jacobian_entries = self._surrogate_jacobian_entries(
-                        jnp.asarray(params, dtype=jnp.float64),
-                        bin_data,
-                        packed_state,
-                        invalid,
-                    )
-                else:
-                    observed_jacobian_entries = self._lensing_jacobian_for_components(
-                        bin_data.effective_z_source,
-                        x_obs,
-                        y_obs,
-                        packed_state,
-                    )
-                if not _critical_arc_uses_sampled_source_positions(self.critical_arc_source_position_policy):
-                    beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._centroid_source_position_vectors_for_bin(
-                        bin_data,
-                        observed_beta_x,
-                        observed_beta_y,
-                        image_sigma_int,
-                    )
-                else:
-                    beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._explicit_source_position_vectors_for_bin(
-                        jnp.asarray(params, dtype=jnp.float64),
-                        physical_params,
-                        bin_data,
-                        observed_beta_x,
-                        observed_beta_y,
-                        image_sigma_int,
-                        observed_jacobian_entries,
-                    )
-                (
-                    residual_x,
-                    residual_y,
-                    singular_min,
-                    singular_max,
-                    critical_p00,
-                    critical_p01,
-                    critical_p11,
-                    residual_finite,
-                ) = _critical_arc_lm_geometry_from_jacobian(
-                    observed_beta_x - beta_family_x,
-                    observed_beta_y - beta_family_y,
-                    *observed_jacobian_entries,
-                    trust_radius_arcsec=self.critical_arc_lm_trust_radius_arcsec,
-                    lm_damping_relative=self.critical_arc_lm_damping_relative,
-                    lm_damping_absolute=self.critical_arc_lm_damping_absolute,
-                )
-                (
-                    critical_inv00,
-                    critical_inv01,
-                    critical_inv10,
-                    critical_inv11,
-                    critical_inverse_finite,
-                ) = _critical_arc_lm_inverse_operator_from_jacobian(
-                    *observed_jacobian_entries,
-                    lm_damping_relative=self.critical_arc_lm_damping_relative,
-                    lm_damping_absolute=self.critical_arc_lm_damping_absolute,
-                )
-                scatter_cov00, scatter_cov01, scatter_cov11, scatter_cov_finite = (
-                    self._scaling_scatter_image_covariance_from_inverse(
-                        physical_params,
-                        bin_data,
-                        critical_inv00,
-                        critical_inv01,
-                        critical_inv10,
-                        critical_inv11,
-                        critical_inverse_finite,
-                    )
-                )
-                invalid = (
-                    invalid
-                    | (~has_source_positions)
-                    | (~jnp.all(residual_finite))
-                    | (~jnp.all(scatter_cov_finite))
-                )
-                critical_arc_bin_loglike = (
-                    _critical_arc_anisotropic_image_plane_bin_loglike
-                    if self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE
-                    else _critical_arc_mixture_image_plane_bin_loglike
-                )
-                bin_loglike = critical_arc_bin_loglike(
-                    residual_x=residual_x,
-                    residual_y=residual_y,
-                    jac_a00=observed_jacobian_entries[0],
-                    jac_a01=observed_jacobian_entries[1],
-                    jac_a10=observed_jacobian_entries[2],
-                    jac_a11=observed_jacobian_entries[3],
-                    family_idx=family_idx,
-                    n_families=n_families,
-                    sigma_per_image=sigma_base,
-                    reliability_per_image=reliability,
-                    image_has_constraint=image_has_constraint,
-                    image_sigma_int=image_sigma_int,
-                    covariance_floor=self.source_plane_covariance_floor,
-                    outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                    image_presence_penalty_weight=self.image_presence_penalty_weight,
-                    image_presence_match_radius_arcsec=self.image_presence_match_radius_arcsec,
-                    image_presence_temperature_arcsec=self.image_presence_temperature_arcsec,
-                    image_presence_count_softness=self.image_presence_count_softness,
-                    image_presence_count_margin=self.image_presence_count_margin,
-                    residual_loss=self.likelihood_stabilizer_residual_loss,
-                    student_t_nu=self.likelihood_stabilizer_student_t_nu,
-                    critical_direction_sigma_arcsec=self.critical_arc_critical_direction_sigma_arcsec,
-                    base_prob=self.critical_arc_base_prob,
-                    max_prob=self.critical_arc_max_prob,
-                    singular_threshold=critical_arc_singular_threshold,
-                    singular_softness=critical_arc_singular_softness,
-                    singular_min_precomputed=singular_min,
-                    singular_max_precomputed=singular_max,
-                    critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
-                    scatter_cov00=scatter_cov00,
-                    scatter_cov01=scatter_cov01,
-                    scatter_cov11=scatter_cov11,
-                )
-                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
-                    bin_data,
-                    physical_params,
-                    observed_jacobian_entries,
-                    singular_min=singular_min,
-                    singular_threshold=critical_arc_singular_threshold,
-                    singular_softness=critical_arc_singular_softness,
-                )
-                bin_loglike = bin_loglike + source_transport_correction
-            elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE:
-                observed_beta_x = beta_x
-                observed_beta_y = beta_y
-                if self.surrogate_enabled and self.surrogate_cache_by_z:
-                    observed_jacobian_entries = self._surrogate_jacobian_entries(
-                        jnp.asarray(params, dtype=jnp.float64),
-                        bin_data,
-                        packed_state,
-                        invalid,
-                    )
-                else:
-                    if fit_component_indices is None:
-                        observed_jacobian_entries = self._lensing_jacobian_for_components(
-                            bin_data.effective_z_source,
-                            x_obs,
-                            y_obs,
-                            packed_state,
-                        )
-                    else:
-                        observed_jacobian_entries = self._lensing_jacobian_for_components(
-                            bin_data.effective_z_source,
-                            x_obs,
-                            y_obs,
-                            packed_state,
-                            fit_component_indices,
-                        )
-                beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._explicit_source_position_vectors_for_bin(
-                    jnp.asarray(params, dtype=jnp.float64),
-                    physical_params,
-                    bin_data,
-                    observed_beta_x,
-                    observed_beta_y,
-                    image_sigma_int,
-                    observed_jacobian_entries,
-                )
-                invalid = invalid | (~has_source_positions)
-                residual_beta_x = observed_beta_x - beta_family_x
-                residual_beta_y = observed_beta_y - beta_family_y
-                fold_cache = None
-                use_cached_fold_regularization = False
-                if (
-                    self.surrogate_enabled
-                    and self.surrogate_cache_by_z
-                    and float(self.image_presence_penalty_weight) <= 0.0
-                ):
-                    fold_cache = self.surrogate_cache_by_z.get(bin_data.effective_z_source)
-                    use_cached_fold_regularization = (
-                        fold_cache is not None
-                        and fold_cache.fold_regularized_kappa_eff is not None
-                        and fold_cache.fold_regularized_near_indices is not None
-                        and fold_cache.fold_regularized_far_indices is not None
-                    )
-                if use_cached_fold_regularization and fold_cache is not None:
-                    def take_rows(value: jnp.ndarray, indices: np.ndarray) -> jnp.ndarray:
-                        return jnp.take(value, jnp.asarray(indices, dtype=jnp.int32), axis=0)
-
-                    fold_near_indices = np.asarray(fold_cache.fold_regularized_near_indices, dtype=np.int32)
-                    fold_far_indices = np.asarray(fold_cache.fold_regularized_far_indices, dtype=np.int32)
-                    fold_kappa_eff = jnp.asarray(fold_cache.fold_regularized_kappa_eff, dtype=jnp.float64)
-                    bin_loglike = jnp.asarray(0.0, dtype=jnp.float64)
-                    if int(fold_near_indices.size) > 0:
-                        bin_loglike = bin_loglike + _fold_regularized_image_plane_bin_loglike(
-                            residual_beta_x=take_rows(residual_beta_x, fold_near_indices),
-                            residual_beta_y=take_rows(residual_beta_y, fold_near_indices),
-                            jac_a00=take_rows(observed_jacobian_entries[0], fold_near_indices),
-                            jac_a01=take_rows(observed_jacobian_entries[1], fold_near_indices),
-                            jac_a10=take_rows(observed_jacobian_entries[2], fold_near_indices),
-                            jac_a11=take_rows(observed_jacobian_entries[3], fold_near_indices),
-                            family_idx=None,
-                            n_families=None,
-                            sigma_per_image=take_rows(sigma_base, fold_near_indices),
-                            reliability_per_image=take_rows(reliability, fold_near_indices),
-                            image_has_constraint=take_rows(image_has_constraint, fold_near_indices),
-                            image_sigma_int=image_sigma_int,
-                            scatter_var_x=take_rows(scatter_var_x, fold_near_indices),
-                            scatter_var_y=take_rows(scatter_var_y, fold_near_indices),
-                            covariance_floor=self.source_plane_covariance_floor,
-                            outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                            fold_curvature_arcsec_inv=self.fold_curvature_arcsec_inv,
-                            fold_kappa_eff=take_rows(fold_kappa_eff, fold_near_indices),
-                            max_gain=self.likelihood_stabilizer_max_gain,
-                            max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
-                            residual_loss=self.likelihood_stabilizer_residual_loss,
-                            student_t_nu=self.likelihood_stabilizer_student_t_nu,
-                            image_presence_penalty_weight=0.0,
-                        )
-                    if int(fold_far_indices.size) > 0:
-                        bin_loglike = bin_loglike + _forward_metric_image_plane_bin_loglike(
-                            residual_beta_x=take_rows(residual_beta_x, fold_far_indices),
-                            residual_beta_y=take_rows(residual_beta_y, fold_far_indices),
-                            jac_a00=take_rows(observed_jacobian_entries[0], fold_far_indices),
-                            jac_a01=take_rows(observed_jacobian_entries[1], fold_far_indices),
-                            jac_a10=take_rows(observed_jacobian_entries[2], fold_far_indices),
-                            jac_a11=take_rows(observed_jacobian_entries[3], fold_far_indices),
-                            family_idx=None,
-                            n_families=None,
-                            sigma_per_image=take_rows(sigma_base, fold_far_indices),
-                            reliability_per_image=take_rows(reliability, fold_far_indices),
-                            image_has_constraint=take_rows(image_has_constraint, fold_far_indices),
-                            image_sigma_int=image_sigma_int,
-                            scatter_var_x=take_rows(scatter_var_x, fold_far_indices),
-                            scatter_var_y=take_rows(scatter_var_y, fold_far_indices),
-                            covariance_floor=self.source_plane_covariance_floor,
-                            outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                            max_gain=self.likelihood_stabilizer_max_gain,
-                            max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
-                            residual_loss=self.likelihood_stabilizer_residual_loss,
-                            student_t_nu=self.likelihood_stabilizer_student_t_nu,
-                            image_presence_penalty_weight=0.0,
-                        )
-                else:
-                    curvature_component_indices = fit_component_indices if fit_component_indices is not None else None
-                    fold_frame = _fold_regularized_singular_frame_from_jacobian(*observed_jacobian_entries)
-                    fold_curvature_fill = jnp.asarray(self.fold_curvature_arcsec_inv, dtype=jnp.float64)
-                    curvature_image_indices = getattr(bin_data, "constrained_image_indices", None)
-                    fold_kappa_eff = jax.lax.cond(
-                        invalid,
-                        lambda _: jnp.full_like(x_obs, fold_curvature_fill),
-                        lambda _: self._fold_signed_curvature_from_observed_jacobian(
-                            bin_data.effective_z_source,
-                            x_obs,
-                            y_obs,
-                            packed_state,
-                            observed_jacobian_entries,
-                            curvature_component_indices,
-                            fold_frame=fold_frame,
-                            image_indices=curvature_image_indices,
-                            fill_value=fold_curvature_fill,
-                        ),
-                        operand=None,
-                    )
-                    bin_loglike = _fold_regularized_image_plane_bin_loglike(
-                        residual_beta_x=residual_beta_x,
-                        residual_beta_y=residual_beta_y,
-                        jac_a00=observed_jacobian_entries[0],
-                        jac_a01=observed_jacobian_entries[1],
-                        jac_a10=observed_jacobian_entries[2],
-                        jac_a11=observed_jacobian_entries[3],
-                        family_idx=family_idx,
-                        n_families=n_families,
-                        sigma_per_image=sigma_base,
-                        reliability_per_image=reliability,
-                        image_has_constraint=image_has_constraint,
-                        image_sigma_int=image_sigma_int,
-                        scatter_var_x=scatter_var_x,
-                        scatter_var_y=scatter_var_y,
-                        covariance_floor=self.source_plane_covariance_floor,
-                        outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                        fold_curvature_arcsec_inv=self.fold_curvature_arcsec_inv,
-                        fold_kappa_eff=fold_kappa_eff,
-                        fold_frame=fold_frame,
-                        max_gain=self.likelihood_stabilizer_max_gain,
-                        max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
-                        residual_loss=self.likelihood_stabilizer_residual_loss,
-                        student_t_nu=self.likelihood_stabilizer_student_t_nu,
-                        image_presence_penalty_weight=self.image_presence_penalty_weight,
-                        image_presence_match_radius_arcsec=self.image_presence_match_radius_arcsec,
-                        image_presence_temperature_arcsec=self.image_presence_temperature_arcsec,
-                        image_presence_count_softness=self.image_presence_count_softness,
-                        image_presence_count_margin=self.image_presence_count_margin,
-                    )
-                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
-                    bin_data,
-                    physical_params,
-                    observed_jacobian_entries,
-                )
-                bin_loglike = bin_loglike + source_transport_correction
-            elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE:
-                observed_beta_x = beta_x
-                observed_beta_y = beta_y
-                if self.surrogate_enabled and self.surrogate_cache_by_z:
-                    observed_jacobian_entries = self._surrogate_jacobian_entries(
-                        jnp.asarray(params, dtype=jnp.float64),
-                        bin_data,
-                        packed_state,
-                        invalid,
-                    )
-                else:
-                    if fit_component_indices is None:
-                        observed_jacobian_entries = self._lensing_jacobian_for_components(
-                            bin_data.effective_z_source,
-                            x_obs,
-                            y_obs,
-                            packed_state,
-                        )
-                    else:
-                        observed_jacobian_entries = self._lensing_jacobian_for_components(
-                            bin_data.effective_z_source,
-                            x_obs,
-                            y_obs,
-                            packed_state,
-                            fit_component_indices,
-                        )
-                beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._explicit_source_position_vectors_for_bin(
-                    jnp.asarray(params, dtype=jnp.float64),
-                    physical_params,
-                    bin_data,
-                    observed_beta_x,
-                    observed_beta_y,
-                    image_sigma_int,
-                    observed_jacobian_entries,
-                )
-                invalid = invalid | (~has_source_positions)
-                residual_beta_x = observed_beta_x - beta_family_x
-                residual_beta_y = observed_beta_y - beta_family_y
-                catastrophe_cache = None
-                use_cached_catastrophe_coefficients = False
-                if self.surrogate_enabled and self.surrogate_cache_by_z:
-                    catastrophe_cache = self.surrogate_cache_by_z.get(bin_data.effective_z_source)
-                    use_cached_catastrophe_coefficients = (
-                        catastrophe_cache is not None
-                        and catastrophe_cache.catastrophe_kappa is not None
-                        and catastrophe_cache.catastrophe_rho is not None
-                        and catastrophe_cache.catastrophe_kappa_tangent_x is not None
-                        and catastrophe_cache.catastrophe_kappa_tangent_y is not None
-                    )
-                if use_cached_catastrophe_coefficients and catastrophe_cache is not None:
-                    catastrophe_kappa = jnp.asarray(catastrophe_cache.catastrophe_kappa, dtype=jnp.float64)
-                    catastrophe_rho = jnp.asarray(catastrophe_cache.catastrophe_rho, dtype=jnp.float64)
-                    catastrophe_kappa_tangent_x = jnp.asarray(
-                        catastrophe_cache.catastrophe_kappa_tangent_x,
-                        dtype=jnp.float64,
-                    )
-                    catastrophe_kappa_tangent_y = jnp.asarray(
-                        catastrophe_cache.catastrophe_kappa_tangent_y,
-                        dtype=jnp.float64,
-                    )
-                else:
-                    catastrophe_component_indices = fit_component_indices if fit_component_indices is not None else None
-                    zeros = (
-                        jnp.zeros_like(x_obs, dtype=jnp.float64),
-                        jnp.zeros_like(x_obs, dtype=jnp.float64),
-                        jnp.zeros_like(x_obs, dtype=jnp.float64),
-                        jnp.zeros_like(x_obs, dtype=jnp.float64),
-                    )
-                    (
-                        catastrophe_kappa,
-                        catastrophe_rho,
-                        catastrophe_kappa_tangent_x,
-                        catastrophe_kappa_tangent_y,
-                    ) = jax.lax.cond(
-                        invalid,
-                        lambda _: zeros,
-                        lambda _: self._catastrophe_moment_coefficients_from_observed_jacobian(
-                            bin_data.effective_z_source,
-                            x_obs,
-                            y_obs,
-                            packed_state,
-                            observed_jacobian_entries,
-                            catastrophe_component_indices,
-                        ),
-                        operand=None,
-                    )
-                bin_loglike = _catastrophe_normal_form_image_plane_bin_loglike(
-                    residual_beta_x=residual_beta_x,
-                    residual_beta_y=residual_beta_y,
-                    jac_a00=observed_jacobian_entries[0],
-                    jac_a01=observed_jacobian_entries[1],
-                    jac_a10=observed_jacobian_entries[2],
-                    jac_a11=observed_jacobian_entries[3],
-                    family_idx=family_idx,
-                    n_families=n_families,
-                    sigma_per_image=sigma_base,
-                    reliability_per_image=reliability,
-                    image_has_constraint=image_has_constraint,
-                    image_sigma_int=image_sigma_int,
-                    scatter_var_x=scatter_var_x,
-                    scatter_var_y=scatter_var_y,
-                    covariance_floor=self.source_plane_covariance_floor,
-                    outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                    catastrophe_kappa=catastrophe_kappa,
-                    catastrophe_rho=catastrophe_rho,
-                    catastrophe_kappa_tangent_x=catastrophe_kappa_tangent_x,
-                    catastrophe_kappa_tangent_y=catastrophe_kappa_tangent_y,
-                    catastrophe_likelihood=self.catastrophe_likelihood,
-                    catastrophe_lambda_on=self.catastrophe_lambda_on,
-                    catastrophe_lambda_off=self.catastrophe_lambda_off,
-                    catastrophe_gap_on=self.catastrophe_gap_on,
-                    catastrophe_gap_off=self.catastrophe_gap_off,
-                    catastrophe_tangential_variance_min=self.catastrophe_tangential_variance_min,
-                    max_gain=self.likelihood_stabilizer_max_gain,
-                    max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
-                    residual_loss=self.likelihood_stabilizer_residual_loss,
-                    student_t_nu=self.likelihood_stabilizer_student_t_nu,
-                    image_presence_penalty_weight=self.image_presence_penalty_weight,
-                    image_presence_match_radius_arcsec=self.image_presence_match_radius_arcsec,
-                    image_presence_temperature_arcsec=self.image_presence_temperature_arcsec,
-                    image_presence_count_softness=self.image_presence_count_softness,
-                    image_presence_count_margin=self.image_presence_count_margin,
-                )
-                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
-                    bin_data,
-                    physical_params,
-                    observed_jacobian_entries,
-                )
-                bin_loglike = bin_loglike + source_transport_correction
-            elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_FORWARD_METRIC_IMAGE_PLANE:
-                observed_beta_x = beta_x
-                observed_beta_y = beta_y
-                if self.surrogate_enabled and self.surrogate_cache_by_z:
-                    observed_jacobian_entries = self._surrogate_jacobian_entries(
-                        jnp.asarray(params, dtype=jnp.float64),
-                        bin_data,
-                        packed_state,
-                        invalid,
-                    )
-                else:
-                    if fit_component_indices is None:
-                        observed_jacobian_entries = self._lensing_jacobian_for_components(
-                            bin_data.effective_z_source,
-                            x_obs,
-                            y_obs,
-                            packed_state,
-                        )
-                    else:
-                        observed_jacobian_entries = self._lensing_jacobian_for_components(
-                            bin_data.effective_z_source,
-                            x_obs,
-                            y_obs,
-                            packed_state,
-                            fit_component_indices,
-                        )
-                beta_family_x, beta_family_y, has_source_positions, source_transport_correction = self._explicit_source_position_vectors_for_bin(
-                    jnp.asarray(params, dtype=jnp.float64),
-                    physical_params,
-                    bin_data,
-                    observed_beta_x,
-                    observed_beta_y,
-                    image_sigma_int,
-                    observed_jacobian_entries,
-                )
-                invalid = invalid | (~has_source_positions)
-                bin_loglike = _forward_metric_image_plane_bin_loglike(
-                    residual_beta_x=observed_beta_x - beta_family_x,
-                    residual_beta_y=observed_beta_y - beta_family_y,
-                    jac_a00=observed_jacobian_entries[0],
-                    jac_a01=observed_jacobian_entries[1],
-                    jac_a10=observed_jacobian_entries[2],
-                    jac_a11=observed_jacobian_entries[3],
-                    family_idx=family_idx,
-                    n_families=n_families,
-                    sigma_per_image=sigma_base,
-                    reliability_per_image=reliability,
-                    image_has_constraint=image_has_constraint,
-                    image_sigma_int=image_sigma_int,
-                    scatter_var_x=scatter_var_x,
-                    scatter_var_y=scatter_var_y,
-                    covariance_floor=self.source_plane_covariance_floor,
-                    outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                    max_gain=self.likelihood_stabilizer_max_gain,
-                    max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
-                    residual_loss=self.likelihood_stabilizer_residual_loss,
-                    student_t_nu=self.likelihood_stabilizer_student_t_nu,
-                    image_presence_penalty_weight=self.image_presence_penalty_weight,
-                    image_presence_match_radius_arcsec=self.image_presence_match_radius_arcsec,
-                    image_presence_temperature_arcsec=self.image_presence_temperature_arcsec,
-                    image_presence_count_softness=self.image_presence_count_softness,
-                    image_presence_count_margin=self.image_presence_count_margin,
-                )
-                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
-                    bin_data,
-                    physical_params,
-                    observed_jacobian_entries,
-                )
-                bin_loglike = bin_loglike + source_transport_correction
-            elif self.sample_likelihood_mode == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN:
-                jac_a00, jac_a01, jac_a10, jac_a11 = self._source_metric_jacobian_entries(bin_data)
-                bin_loglike = _local_jacobian_bin_loglike(
-                    beta_x=beta_x,
-                    beta_y=beta_y,
-                    family_idx=family_idx,
-                    n_families=n_families,
-                    sigma_per_image=sigma_base,
-                    reliability_per_image=reliability,
-                    image_has_constraint=image_has_constraint,
-                    source_sigma_int=source_sigma_int,
-                    scatter_var_x=scatter_var_x,
-                    scatter_var_y=scatter_var_y,
-                    jac_a00=jac_a00,
-                    jac_a01=jac_a01,
-                    jac_a10=jac_a10,
-                    jac_a11=jac_a11,
-                    covariance_floor=self.source_plane_covariance_floor,
-                    outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                    max_gain=self.likelihood_stabilizer_max_gain,
-                    max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
-                    residual_loss=self.likelihood_stabilizer_residual_loss,
-                    student_t_nu=self.likelihood_stabilizer_student_t_nu,
-                )
-                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
-                    bin_data,
-                    physical_params,
-                    (jac_a00, jac_a01, jac_a10, jac_a11),
-                )
-            else:
-                bin_loglike = _source_plane_bin_loglike(
-                    beta_x=beta_x,
-                    beta_y=beta_y,
-                    family_idx=family_idx,
-                    n_families=n_families,
-                    sigma_per_image=sigma_base,
-                    reliability_per_image=reliability,
-                    image_has_constraint=image_has_constraint,
-                    source_sigma_int=source_sigma_int,
-                    scatter_var_x=scatter_var_x,
-                    scatter_var_y=scatter_var_y,
-                    inv_abs_mu=self._magnification_inv_abs_mu(bin_data),
-                    covariance_floor=self.source_plane_covariance_floor,
-                    outlier_sigma_arcsec=self.source_plane_outlier_sigma_arcsec,
-                    max_gain=self.likelihood_stabilizer_max_gain,
-                    max_residual_arcsec=self.likelihood_stabilizer_max_residual_arcsec,
-                    residual_loss=self.likelihood_stabilizer_residual_loss,
-                    student_t_nu=self.likelihood_stabilizer_student_t_nu,
-                )
-                source_jacobian_entries = self._source_metric_jacobian_entries(bin_data)
-                bin_loglike = bin_loglike + self._magnitude_loglike_for_bin(
-                    bin_data,
-                    physical_params,
-                    source_jacobian_entries,
-                )
-            total_loglike = jnp.where(invalid, total_loglike, total_loglike + bin_loglike)
-            invalid_seen = jnp.logical_or(invalid_seen, invalid)
-        arc_data = getattr(self, "traced_arc_data", None)
-        cab_likelihood_weight = float(getattr(self, "cab_likelihood_weight", 0.0))
-        if arc_data is not None and int(getattr(arc_data, "n_arcs", 0)) > 0 and cab_likelihood_weight > 0.0:
-            cab_packed_state, cab_validity = self._build_cab_packed_lens_state_with_validity_from_physical(
-                physical_params,
-                stop_gradient=True,
-            )
-            cab_invalid = ~cab_validity.is_valid
-            cab_loglike = self._cab_morphology_loglike_for_arcs(
-                arc_data,
-                cab_packed_state,
-                fit_component_indices,
-            )
-            total_loglike = jnp.where(cab_invalid, total_loglike, total_loglike + cab_loglike)
-            invalid_seen = jnp.logical_or(invalid_seen, cab_invalid)
-        return jnp.where(
-            invalid_seen,
-            jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64),
-            jnp.nan_to_num(total_loglike, nan=BAD_LOG_LIKE, posinf=BAD_LOG_LIKE, neginf=BAD_LOG_LIKE),
+            }:
+                return self._flat_critical_arc_source_loglike_impl(params)
+            return jnp.asarray(BAD_LOG_LIKE, dtype=jnp.float64)
+        raise RuntimeError(
+            f"Unsupported sampling_engine={engine!r}; non-flat sampling engines have been removed. "
+            "Use 'full_flat' or 'refreshing_surrogate_flat'."
         )
 
     def source_loglike(self, params: np.ndarray | jnp.ndarray) -> float:
@@ -26566,7 +25719,7 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
         exact_image_adaptive_max_levels=int(
             saved_args.get("exact_image_adaptive_max_levels", DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS)
         ),
-        sampling_engine="full",
+        sampling_engine=SAMPLING_ENGINE_FULL_FLAT,
         active_scaling_galaxies=saved_args.get("active_scaling_galaxies"),
         active_scaling_selection=str(saved_args.get("active_scaling_selection", "adaptive")),
         active_scaling_cumulative_fraction=float(
@@ -26934,7 +26087,7 @@ def _run_stage3_critical_det_diagnostic(
     evaluator = _build_cluster_evaluator_from_args(
         diagnostic_args,
         state,
-        sampling_engine=SAMPLING_ENGINE_FULL,
+        sampling_engine=SAMPLING_ENGINE_FULL_FLAT,
         quick_diagnostics=False,
     )
     try:
@@ -28293,7 +27446,9 @@ def _build_cluster_evaluator_from_args(
         exact_image_adaptive_max_levels=int(
             getattr(args, "exact_image_adaptive_max_levels", DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS)
         ),
-        sampling_engine=str(sampling_engine if sampling_engine is not None else getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL)),
+        sampling_engine=str(
+            sampling_engine if sampling_engine is not None else getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL_FLAT)
+        ),
         active_scaling_galaxies=None,
         active_scaling_selection="fixed",
         active_scaling_cumulative_fraction=1.0,
@@ -29949,7 +29104,7 @@ def _rerender_plots(
         image_plane_mode=str(plot_saved_args.get("image_plane_mode", IMAGE_PLANE_MODE_NONE)),
     )
     cab_likelihood_weight = _effective_cab_likelihood_weight(plot_saved_args.get("cab_likelihood_weight"), state)
-    saved_sampling_engine = str(plot_saved_args.get("sampling_engine", SAMPLING_ENGINE_FULL))
+    saved_sampling_engine = str(plot_saved_args.get("sampling_engine", SAMPLING_ENGINE_FULL_FLAT))
     plot_sampling_engine = saved_sampling_engine
     match_tolerance_arcsec = float(plot_saved_args.get("match_tolerance_arcsec", DEFAULT_MATCH_TOLERANCE))
     evaluator = ClusterJAXEvaluator(
@@ -31559,7 +30714,7 @@ def _run_sequential(args: argparse.Namespace) -> None:
             getattr(
                 stage4_args,
                 "sampling_engine",
-                getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL),
+                getattr(args, "sampling_engine", SAMPLING_ENGINE_FULL_FLAT),
             )
         )
         summary_payload["stage4_fresh_process"] = bool(stage4_runs_fresh)

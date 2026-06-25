@@ -855,7 +855,7 @@ def _recovered_model_tables(
                 DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
             )
         ),
-        sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full")),
+        sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full_flat")),
         active_scaling_galaxies=_artifact_arg(artifact_args, "active_scaling_galaxies", DEFAULT_ACTIVE_SCALING_GALAXIES),
         active_scaling_selection=str(_artifact_arg(artifact_args, "active_scaling_selection", "adaptive")),
         active_scaling_cumulative_fraction=float(
@@ -1551,7 +1551,7 @@ def _posterior_prediction_uncertainty_tables(
                     DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
                 )
             ),
-            sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full")),
+            sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full_flat")),
             active_scaling_galaxies=_artifact_arg(artifact_args, "active_scaling_galaxies", DEFAULT_ACTIVE_SCALING_GALAXIES),
             active_scaling_selection=str(_artifact_arg(artifact_args, "active_scaling_selection", "adaptive")),
             active_scaling_cumulative_fraction=float(
@@ -2122,7 +2122,7 @@ def _deflection_profile_for_samples(
     evaluator = ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=DEFAULT_MATCH_TOLERANCE,
-        sampling_engine="full",
+        sampling_engine="full_flat",
         active_scaling_galaxies=DEFAULT_ACTIVE_SCALING_GALAXIES,
         active_scaling_selection="adaptive",
         active_scaling_cumulative_fraction=DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
@@ -2212,7 +2212,7 @@ def _surface_density_profile_for_samples(
     evaluator = ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=DEFAULT_MATCH_TOLERANCE,
-        sampling_engine="full",
+        sampling_engine="full_flat",
         active_scaling_galaxies=DEFAULT_ACTIVE_SCALING_GALAXIES,
         active_scaling_selection="adaptive",
         active_scaling_cumulative_fraction=DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
@@ -2319,7 +2319,7 @@ def _mass_and_surface_density_profiles_for_samples(
         return ClusterJAXEvaluator(
             state=state,
             match_tolerance_arcsec=DEFAULT_MATCH_TOLERANCE,
-            sampling_engine="full",
+            sampling_engine="full_flat",
             active_scaling_galaxies=DEFAULT_ACTIVE_SCALING_GALAXIES,
             active_scaling_selection="adaptive",
             active_scaling_cumulative_fraction=DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
@@ -2540,7 +2540,7 @@ def _recovered_caustic_contours_by_z(
     evaluator = ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=DEFAULT_MATCH_TOLERANCE,
-        sampling_engine="full",
+        sampling_engine="full_flat",
         active_scaling_galaxies=DEFAULT_ACTIVE_SCALING_GALAXIES,
         active_scaling_selection="adaptive",
         active_scaling_cumulative_fraction=DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
@@ -3807,7 +3807,7 @@ def _absolute_magnification_recovery_grid(
     evaluator = ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=DEFAULT_MATCH_TOLERANCE,
-        sampling_engine="full",
+        sampling_engine="full_flat",
         active_scaling_galaxies=DEFAULT_ACTIVE_SCALING_GALAXIES,
         active_scaling_selection="adaptive",
         active_scaling_cumulative_fraction=DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
@@ -5603,16 +5603,16 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             raise SystemExit("--solver-fit-mode evidence-ns requires --evidence-source-prior-sigma-arcsec.")
         if mode != IMAGE_PLANE_MODE_NONE:
             raise SystemExit("--solver-fit-mode evidence-ns requires --image-plane-mode none.")
-        if str(getattr(args, "sampling_engine", "full")) == "active_subset":
+        if str(getattr(args, "sampling_engine", "full_flat")) == "active_subset":
             raise SystemExit("--sampling-engine active_subset is not valid with --solver-fit-mode evidence-ns.")
         if bool(getattr(args, "skip_stage3_image_plane_local_jacobian", False)):
             raise SystemExit("--skip-stage3-image-plane-local-jacobian is not valid with --solver-fit-mode evidence-ns.")
         if (
-            str(getattr(args, "sampling_engine", "full")) in {"refreshing_surrogate", "refreshing_surrogate_flat"}
+            str(getattr(args, "sampling_engine", "full_flat")) == "refreshing_surrogate_flat"
             and int(getattr(args, "image_plane_newton_steps", 0)) > 0
         ):
             raise SystemExit(
-                "--sampling-engine refreshing_surrogate or refreshing_surrogate_flat with linearized-forward-beta-image-plane "
+                "--sampling-engine refreshing_surrogate_flat with linearized-forward-beta-image-plane "
                 "requires --image-plane-newton-steps 0."
             )
         controls = {
@@ -5659,11 +5659,11 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
             )
     if (
         mode == IMAGE_PLANE_MODE_ANCHORED_SOLVED_FORWARD_BETA
-        and str(getattr(args, "sampling_engine", "full")) in {"refreshing_surrogate", "refreshing_surrogate_flat"}
+        and str(getattr(args, "sampling_engine", "full_flat")) == "refreshing_surrogate_flat"
         and anchored_solve_steps > 0
     ):
         raise SystemExit(
-            "--sampling-engine refreshing_surrogate or refreshing_surrogate_flat is not supported with "
+            "--sampling-engine refreshing_surrogate_flat is not supported with "
             "--image-plane-mode anchored-solved-forward-beta-image-plane unless "
             "--anchored-image-plane-solve-steps is 0."
         )
@@ -5771,11 +5771,11 @@ def _normalize_validation_stage_fit_controls(args: argparse.Namespace) -> dict[s
         )
     if (
         _validation_linearized_stage_enabled(args)
-        and str(getattr(args, "sampling_engine", "full")) in {"refreshing_surrogate", "refreshing_surrogate_flat"}
+        and str(getattr(args, "sampling_engine", "full_flat")) == "refreshing_surrogate_flat"
         and int(getattr(args, "image_plane_newton_steps", 0)) > 0
     ):
         raise SystemExit(
-            "--sampling-engine refreshing_surrogate or refreshing_surrogate_flat with linearized-forward-beta-image-plane "
+            "--sampling-engine refreshing_surrogate_flat with linearized-forward-beta-image-plane "
             "requires --image-plane-newton-steps 0."
         )
     if has_stage_specific_values and not has_stage3_or_stage4:
@@ -6204,10 +6204,8 @@ def _finite_active_scaling_values(values: Any) -> list[int]:
 
 def _validation_configured_approximation_items(args: argparse.Namespace) -> list[str]:
     items: list[str] = []
-    sampling_engine = str(getattr(args, "sampling_engine", "full"))
-    if sampling_engine == "refreshing_surrogate":
-        items.append("refreshing_surrogate=configured first-order inactive-deflection surrogate")
-    elif sampling_engine == "refreshing_surrogate_flat":
+    sampling_engine = str(getattr(args, "sampling_engine", "full_flat"))
+    if sampling_engine == "refreshing_surrogate_flat":
         items.append("refreshing_surrogate_flat=configured flattened inactive-deflection surrogate")
     elif sampling_engine == "active_subset":
         items.append("active_subset=configured inactive scaling potentials omitted during solver fitting")
@@ -7809,12 +7807,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sampling-engine",
         choices=(
-            "full",
             "full_flat",
-            "refreshing_surrogate",
             "refreshing_surrogate_flat",
         ),
-        default="refreshing_surrogate",
+        default="refreshing_surrogate_flat",
     )
     parser.add_argument(
         "--stage1-sampling-engine",

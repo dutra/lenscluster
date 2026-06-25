@@ -294,6 +294,47 @@ def test_compile_run_plan_resolves_runtime_stages_and_outputs() -> None:
     assert plan.run_metadata["paths"]["run_name"] == "hera_demo"
 
 
+def test_workflow_config_accepts_only_flat_sampling_engines() -> None:
+    for engine in ("full_flat", "refreshing_surrogate_flat"):
+        config = _minimal_sequential_config().with_updates(
+            workflow=WorkflowConfig(
+                fit_mode="sequential",
+                stage0_likelihood="source",
+                stage1_likelihood="local-jacobian",
+                stage1_sampling_engine=engine,
+                stage2_sampling_engine=engine,
+            )
+        )
+        plan = compile_run_plan(config)
+
+        assert plan.stages[1].sampling_engine == engine
+
+    for engine in ("full", "refreshing_surrogate"):
+        config = _minimal_sequential_config().with_updates(
+            workflow=WorkflowConfig(
+                fit_mode="sequential",
+                stage0_likelihood="source",
+                stage1_likelihood="local-jacobian",
+                stage1_sampling_engine=engine,
+            )
+        )
+        with pytest.raises(ValueError, match="stage1_sampling_engine.*full_flat.*refreshing_surrogate_flat"):
+            config.validate()
+
+
+def test_cluster_solver_runtime_exposes_only_flat_sampling_engines() -> None:
+    assert cluster_solver.SAMPLING_ENGINES == ("full_flat", "refreshing_surrogate_flat")
+    assert not hasattr(cluster_solver, "SAMPLING_ENGINE_FULL")
+    assert not hasattr(cluster_solver, "SAMPLING_ENGINE_REFRESHING_SURROGATE")
+    assert hasattr(cluster_solver.ClusterJAXEvaluator, "_flat_refreshing_surrogate_source_loglike_impl")
+    assert hasattr(cluster_solver.ClusterJAXEvaluator, "_flat_refreshing_surrogate_local_jacobian_source_loglike_impl")
+    assert hasattr(cluster_solver.ClusterJAXEvaluator, "_flat_refreshing_surrogate_critical_arc_source_loglike_impl")
+
+    source = Path(cluster_solver.__file__).read_text(encoding="utf-8")
+    source_loglike_body = source.split("    def _source_loglike_impl", 1)[1].split("    def source_loglike", 1)[0]
+    assert "for bin_data in self.traced_bin_data" not in source_loglike_body
+
+
 def test_compile_run_plan_resolves_unified_critical_arc_stage_policies() -> None:
     config = _minimal_sequential_config().with_updates(
         workflow=WorkflowConfig(
@@ -782,6 +823,30 @@ def test_ff_sims_notebook_is_self_contained_and_config_native() -> None:
     assert "os.cpu_count" not in source
     assert "ARTIFACT_RUN_DIR = None" in source
     assert "plots_only=True" in source
+
+
+def test_critical_line_replot_notebook_is_artifact_only() -> None:
+    nbformat.read("notebooks/replot_truth_recovery_critical_line.ipynb", as_version=4)
+    source = _notebook_source("notebooks/replot_truth_recovery_critical_line.ipynb")
+
+    assert (
+        "results/jun24l_anistropic/ares_PD0.1_TOPK_5_0.1_T(8, 8)W(5000, 1000)S(1000, 500)maglikelihoodTrue"
+        in source
+    )
+    assert "truth_recovery_critical_line_recovery.pdf" in source
+    assert "truth_recovery_kappa_model_truth_fractional_residual.pdf" in source
+    assert "truth_recovery_mu_model_truth_fractional_residual.pdf" in source
+    assert "truth_recovery_summary.csv" in source
+    assert "truth_recovery_detA_model_median.fits" in source
+    assert "truth_recovery_kappa_model_median.fits" in source
+    assert "truth_recovery_abs_mu_model_median.fits" in source
+    assert "plt.show()" in source
+    assert "_plot_kappa_model_truth_fractional_residual_from_grid" in source
+    assert "_plot_abs_mu_model_truth_fractional_residual_from_grid" in source
+    assert "LensClusterRunner" not in source
+    assert "compile_run_plan" not in source
+    assert "plots_only=True" not in source
+    assert "posterior" not in source.lower()
 
 
 def test_dataset_specific_runs_are_composed_from_generic_config_groups() -> None:

@@ -154,7 +154,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--sampling-engine",
         choices=single.SAMPLING_ENGINES,
-        default=single.SAMPLING_ENGINE_REFRESHING_SURROGATE,
+        default=single.SAMPLING_ENGINE_REFRESHING_SURROGATE_FLAT,
     )
     parser.add_argument("--source-plane-covariance-floor", type=float, default=1.0e-6)
     parser.add_argument("--scaling-scatter", action="store_true")

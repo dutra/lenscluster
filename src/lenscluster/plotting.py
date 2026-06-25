@@ -24,7 +24,7 @@ from astropy.io import fits
 from astropy.wcs import FITSFixedWarning, WCS
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.cm import ScalarMappable
-from matplotlib.colors import LogNorm, Normalize, TwoSlopeNorm, to_rgba
+from matplotlib.colors import LinearSegmentedColormap, LogNorm, Normalize, TwoSlopeNorm, to_rgba
 from matplotlib.lines import Line2D
 from matplotlib.patches import Circle
 import numpy as np
@@ -9269,63 +9269,6 @@ def _plot_caustic_overlay(
     _finish_figure(fig, _plot_path(plot_dir, "caustic_overlay.png"), dpi=180, bbox_inches="tight")
 
 
-def _plot_absolute_magnification(
-    plot_dir: Path,
-    evaluator: ClusterJAXEvaluator,
-    best_fit: np.ndarray,
-    caustic_plot_grid_scale_arcsec: float,
-    caustic_source_redshift: float,
-    *,
-    cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP,
-) -> None:
-    z_source = float(caustic_source_redshift)
-    z_lens = getattr(evaluator.state, "z_lens", None)
-    if z_lens is not None and np.isfinite(float(z_lens)) and z_source <= float(z_lens):
-        _log(
-            None,
-            f"[plot:absolute_magnification] skipped: caustic source redshift z={z_source:g} "
-            f"is not behind lens redshift z={float(z_lens):g}",
-        )
-        return
-    if float(cap) <= 0.0:
-        raise ValueError("cap must be positive.")
-
-    best_fit_latent = _reported_physical_to_latent_vector(evaluator, np.asarray(best_fit, dtype=float))
-    x_grid, y_grid = _caustic_plot_grid_axes(caustic_plot_grid_scale_arcsec)
-    xx, yy = np.meshgrid(x_grid, y_grid)
-    flat_x = xx.reshape(-1)
-    flat_y = yy.reshape(-1)
-
-    exact_models_by_z = getattr(evaluator, "exact_models_by_z", {})
-    model = exact_models_by_z.get(z_source) if exact_models_by_z is not None else None
-    if model is None:
-        model, _ = evaluator._get_exact_model_solver(z_source)
-    packed_state = evaluator._build_packed_lens_state(jnp.asarray(best_fit_latent, dtype=jnp.float64), z_source)
-    kwargs_lens = evaluator._packed_to_kwargs_lens(packed_state)
-    mu = np.asarray(model.magnification(flat_x, flat_y, kwargs_lens), dtype=float).reshape(xx.shape)
-    abs_mu = np.minimum(np.abs(mu), float(cap))
-
-    extent = [float(x_grid[0]), float(x_grid[-1]), float(y_grid[0]), float(y_grid[-1])]
-    fig, ax = plt.subplots(figsize=(6.4, 5.5))
-    image = ax.imshow(
-        np.ma.masked_invalid(abs_mu),
-        origin="lower",
-        extent=extent,
-        cmap="viridis",
-        vmin=0.0,
-        vmax=float(cap),
-        aspect="equal",
-    )
-    colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-    colorbar.set_label(r"$|\mu|$")
-    ax.invert_xaxis()
-    ax.set_xlabel("x [arcsec]")
-    ax.set_ylabel("y [arcsec]")
-    ax.set_title(f"Absolute Magnification (z={z_source:g})")
-    fig.tight_layout()
-    _finish_figure(fig, _plot_path(plot_dir, "absolute_magnification.pdf"), dpi=180, bbox_inches="tight")
-
-
 def _load_kappa_true_fits(path: str | Path) -> tuple[np.ndarray, WCS]:
     fits_path = Path(path)
     with fits.open(fits_path, memmap=True) as hdul:
@@ -9467,12 +9410,6 @@ def _critical_determinant_from_kappa_gamma(kappa: np.ndarray, gamma_x: np.ndarra
     gamma_x = np.asarray(gamma_x, dtype=float)
     gamma_y = np.asarray(gamma_y, dtype=float)
     return (1.0 - kappa) ** 2 - gamma_x**2 - gamma_y**2
-
-
-def _capped_absolute_magnification(values: np.ndarray, cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP) -> np.ndarray:
-    if float(cap) <= 0.0:
-        raise ValueError("cap must be positive.")
-    return np.minimum(np.abs(np.asarray(values, dtype=float)), float(cap))
 
 
 def _radec_to_solver_arcsec_offsets(
@@ -10783,7 +10720,7 @@ def _plot_truth_recovery_spatial_map(
     y_arcsec: np.ndarray,
     image_data: np.ndarray,
     *,
-    cmap: str,
+    cmap: Any,
     vmin: float | None = None,
     vmax: float | None = None,
     norm: Normalize | None = None,
@@ -10811,6 +10748,23 @@ def _plot_truth_recovery_spatial_map(
     )
     ax.set_aspect("equal", adjustable="box")
     return mesh
+
+
+def _shifted_diverging_colormap(cmap_name: str, zero_position: float, *, samples: int = 256) -> LinearSegmentedColormap:
+    zero = float(zero_position)
+    if not np.isfinite(zero) or zero <= 0.0 or zero >= 1.0:
+        raise ValueError("zero_position must be finite and strictly between 0 and 1")
+    sample_count = max(int(samples), 3)
+    base_cmap = plt.get_cmap(cmap_name)
+    left_count = max(2, int(round(sample_count * zero)) + 1)
+    right_count = max(2, sample_count - left_count + 1)
+    left_x = np.linspace(0.0, zero, left_count, dtype=float)
+    right_x = np.linspace(zero, 1.0, right_count, dtype=float)[1:]
+    left_colors = base_cmap(np.linspace(0.0, 0.5, left_count, dtype=float))
+    right_colors = base_cmap(np.linspace(0.5, 1.0, right_count, dtype=float))[1:]
+    color_points = [(float(x), color) for x, color in zip(left_x, left_colors, strict=True)]
+    color_points.extend((float(x), color) for x, color in zip(right_x, right_colors, strict=True))
+    return LinearSegmentedColormap.from_list(f"{cmap_name}_zero_at_{zero:g}", color_points, N=sample_count)
 
 
 def _plot_kappa_recovery(
@@ -10861,6 +10815,10 @@ def _plot_kappa_true_comparison_from_grid(
     member_overlays: pd.DataFrame | None = None,
     image_overlays: pd.DataFrame | None = None,
 ) -> None:
+    valid_residual = np.isfinite(model_kappa) & np.isfinite(kappa_true) & (kappa_true > 0.0)
+    fractional_residual = np.full(kappa_true.shape, np.nan, dtype=float)
+    fractional_residual[valid_residual] = (model_kappa[valid_residual] - kappa_true[valid_residual]) / kappa_true[valid_residual]
+
     def _plot_map_overlays(ax: Any) -> None:
         plotted_overlay = False
         if image_overlays is not None and not image_overlays.empty:
@@ -10958,17 +10916,6 @@ def _plot_kappa_true_comparison_from_grid(
         fig.tight_layout()
         _finish_figure(fig, _plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
 
-    valid_residual = np.isfinite(model_kappa) & np.isfinite(kappa_true) & (kappa_true > 0.0)
-    fractional_residual = np.full(kappa_true.shape, np.nan, dtype=float)
-    fractional_residual[valid_residual] = (model_kappa[valid_residual] - kappa_true[valid_residual]) / kappa_true[valid_residual]
-    _plot_comparison_map(
-        "truth_recovery_kappa_model.pdf",
-        model_kappa,
-        cmap="magma",
-        vmin=0.0,
-        vmax=3.0,
-        colorbar_label=r"$\kappa_{\rm model}$",
-    )
     _plot_comparison_map(
         "truth_recovery_kappa_fractional_residual.pdf",
         fractional_residual,
@@ -10977,6 +10924,87 @@ def _plot_kappa_true_comparison_from_grid(
         colorbar_label=r"$(\kappa_{\rm model} - \kappa_{\rm true}) / \kappa_{\rm true}$",
         overlays=True,
     )
+    _plot_kappa_model_truth_fractional_residual_from_grid(
+        plot_dir,
+        kappa_true,
+        model_kappa,
+        x_arcsec,
+        y_arcsec,
+        z_source,
+        fractional_residual=fractional_residual,
+    )
+
+
+def _plot_kappa_model_truth_fractional_residual_from_grid(
+    plot_dir: Path,
+    kappa_true: np.ndarray,
+    model_kappa: np.ndarray,
+    x_arcsec: np.ndarray,
+    y_arcsec: np.ndarray,
+    z_source: float,
+    *,
+    fractional_residual: np.ndarray | None = None,
+    output_name: str = "truth_recovery_kappa_model_truth_fractional_residual.pdf",
+) -> None:
+    if fractional_residual is None:
+        valid_residual = np.isfinite(model_kappa) & np.isfinite(kappa_true) & (kappa_true > 0.0)
+        fractional_residual = np.full(np.asarray(kappa_true).shape, np.nan, dtype=float)
+        fractional_residual[valid_residual] = (
+            np.asarray(model_kappa, dtype=float)[valid_residual] - np.asarray(kappa_true, dtype=float)[valid_residual]
+        ) / np.asarray(kappa_true, dtype=float)[valid_residual]
+
+    panels = [
+        (
+            np.asarray(model_kappa, dtype=float),
+            r"$\kappa_{\rm model}$",
+            "magma",
+            {"vmin": 0.0, "vmax": 3.0},
+        ),
+        (
+            np.asarray(kappa_true, dtype=float),
+            r"$\kappa_{\rm true}$",
+            "magma",
+            {"vmin": 0.0, "vmax": 3.0},
+        ),
+        (
+            np.asarray(fractional_residual, dtype=float),
+            r"$(\kappa_{\rm model} - \kappa_{\rm true}) / \kappa_{\rm true}$",
+            _shifted_diverging_colormap("RdBu_r", 1.0 / 3.0),
+            {"norm": Normalize(vmin=-1.0, vmax=2.0, clip=True)},
+        ),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(14.4, 4.8), sharey=True)
+    if hasattr(fig, "subplots_adjust"):
+        fig.subplots_adjust(top=0.82, wspace=0.08)
+    panel_images: list[tuple[Any, Any, str]] = []
+    for panel_index, (ax, (image_data, colorbar_label, cmap, kwargs)) in enumerate(
+        zip(np.ravel(axes), panels, strict=True)
+    ):
+        image = _plot_truth_recovery_spatial_map(
+            ax,
+            x_arcsec,
+            y_arcsec,
+            image_data,
+            cmap=cmap,
+            **kwargs,
+        )
+        panel_images.append((image, ax, colorbar_label))
+        ax.set_xlabel("x [arcsec]")
+        if panel_index == 0:
+            ax.set_ylabel("y [arcsec]")
+    canvas = getattr(fig, "canvas", None)
+    if canvas is not None and hasattr(canvas, "draw"):
+        canvas.draw()
+    for image, ax, colorbar_label in panel_images:
+        bbox = ax.get_position()
+        cax = fig.add_axes([float(bbox.x0), float(bbox.y1) + 0.018, float(bbox.width), 0.026])
+        colorbar = fig.colorbar(image, cax=cax, orientation="horizontal")
+        colorbar.set_label(colorbar_label)
+        colorbar_axis = getattr(colorbar, "ax", None)
+        if colorbar_axis is not None:
+            colorbar_axis.xaxis.set_label_position("top")
+            colorbar_axis.xaxis.set_ticks_position("top")
+    _finish_figure(fig, _plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
 
 
 def _brightest_member_aperture_center(evaluator: ClusterJAXEvaluator) -> dict[str, Any] | None:
@@ -11433,54 +11461,94 @@ def _plot_abs_mu_true_comparison_from_grid(
     *,
     cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP,
 ) -> None:
-    def _plot_comparison_map(
-        output_name: str,
-        image_data: np.ndarray,
-        *,
-        cmap: str,
-        colorbar_label: str,
-        vmin: float | None = None,
-        vmax: float | None = None,
-        norm: Normalize | None = None,
-    ) -> None:
-        fig, ax = plt.subplots(figsize=(6.0, 5.2))
+    valid_residual = np.isfinite(abs_mu_model) & np.isfinite(abs_mu_true) & (abs_mu_true > 0.0)
+    fractional_residual = np.full(abs_mu_true.shape, np.nan, dtype=float)
+    fractional_residual[valid_residual] = (
+        (abs_mu_model[valid_residual] - abs_mu_true[valid_residual]) / abs_mu_true[valid_residual]
+    )
+    _plot_abs_mu_model_truth_fractional_residual_from_grid(
+        plot_dir,
+        abs_mu_true,
+        abs_mu_model,
+        x_arcsec,
+        y_arcsec,
+        z_source,
+        cap=cap,
+        fractional_residual=fractional_residual,
+    )
+
+
+def _plot_abs_mu_model_truth_fractional_residual_from_grid(
+    plot_dir: Path,
+    abs_mu_true: np.ndarray,
+    abs_mu_model: np.ndarray,
+    x_arcsec: np.ndarray,
+    y_arcsec: np.ndarray,
+    z_source: float,
+    *,
+    cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP,
+    fractional_residual: np.ndarray | None = None,
+    output_name: str = "truth_recovery_mu_model_truth_fractional_residual.pdf",
+) -> None:
+    if fractional_residual is None:
+        valid_residual = np.isfinite(abs_mu_model) & np.isfinite(abs_mu_true) & (abs_mu_true > 0.0)
+        fractional_residual = np.full(np.asarray(abs_mu_true).shape, np.nan, dtype=float)
+        fractional_residual[valid_residual] = (
+            np.asarray(abs_mu_model, dtype=float)[valid_residual] - np.asarray(abs_mu_true, dtype=float)[valid_residual]
+        ) / np.asarray(abs_mu_true, dtype=float)[valid_residual]
+
+    panels = [
+        (
+            np.asarray(abs_mu_model, dtype=float),
+            r"$|\mu_{\rm model}|$",
+            "viridis",
+            {"vmin": 0.0, "vmax": float(cap)},
+        ),
+        (
+            np.asarray(abs_mu_true, dtype=float),
+            r"$|\mu_{\rm true}|$",
+            "viridis",
+            {"vmin": 0.0, "vmax": float(cap)},
+        ),
+        (
+            np.asarray(fractional_residual, dtype=float),
+            r"$(|\mu_{\rm model}| - |\mu_{\rm true}|) / |\mu_{\rm true}|$",
+            _shifted_diverging_colormap("RdBu_r", 1.0 / 3.0),
+            {"norm": Normalize(vmin=-1.0, vmax=2.0, clip=True)},
+        ),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(14.4, 4.8), sharey=True)
+    if hasattr(fig, "subplots_adjust"):
+        fig.subplots_adjust(top=0.82, wspace=0.08)
+    panel_images: list[tuple[Any, Any, str]] = []
+    for panel_index, (ax, (image_data, colorbar_label, cmap, kwargs)) in enumerate(
+        zip(np.ravel(axes), panels, strict=True)
+    ):
         image = _plot_truth_recovery_spatial_map(
             ax,
             x_arcsec,
             y_arcsec,
             image_data,
             cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-            norm=norm,
+            **kwargs,
         )
-        colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-        colorbar.set_label(colorbar_label)
+        panel_images.append((image, ax, colorbar_label))
         ax.set_xlabel("x [arcsec]")
-        ax.set_ylabel("y [arcsec]")
-        fig.tight_layout()
-        _finish_figure(fig, _plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
-
-    valid_residual = np.isfinite(abs_mu_model) & np.isfinite(abs_mu_true) & (abs_mu_true > 0.0)
-    fractional_residual = np.full(abs_mu_true.shape, np.nan, dtype=float)
-    fractional_residual[valid_residual] = (
-        (abs_mu_model[valid_residual] - abs_mu_true[valid_residual]) / abs_mu_true[valid_residual]
-    )
-    _plot_comparison_map(
-        "truth_recovery_mu_model.pdf",
-        abs_mu_model,
-        cmap="viridis",
-        vmin=0.0,
-        vmax=float(cap),
-        colorbar_label=r"$|\mu_{\rm model}|$",
-    )
-    _plot_comparison_map(
-        "truth_recovery_mu_fractional_residual.pdf",
-        fractional_residual,
-        cmap="RdBu_r",
-        norm=TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=4.0),
-        colorbar_label=r"$(|\mu_{\rm model}| - |\mu_{\rm true}|) / |\mu_{\rm true}|$",
-    )
+        if panel_index == 0:
+            ax.set_ylabel("y [arcsec]")
+    canvas = getattr(fig, "canvas", None)
+    if canvas is not None and hasattr(canvas, "draw"):
+        canvas.draw()
+    for image, ax, colorbar_label in panel_images:
+        bbox = ax.get_position()
+        cax = fig.add_axes([float(bbox.x0), float(bbox.y1) + 0.018, float(bbox.width), 0.026])
+        colorbar = fig.colorbar(image, cax=cax, orientation="horizontal")
+        colorbar.set_label(colorbar_label)
+        colorbar_axis = getattr(colorbar, "ax", None)
+        if colorbar_axis is not None:
+            colorbar_axis.xaxis.set_label_position("top")
+            colorbar_axis.xaxis.set_ticks_position("top")
+    _finish_figure(fig, _plot_path(plot_dir, output_name), dpi=180, bbox_inches="tight")
 
 
 def _has_zero_contour(field: np.ndarray) -> bool:
@@ -15134,19 +15202,6 @@ def _generate_plots_and_tables(
             args,
             "caustic_plot_grid_scale_arcsec",
             CAUSTIC_PLOT_GRID_SCALE_ARCSEC,
-        )
-        truth_recovery_tasks.append(
-            (
-                "absolute_magnification",
-                "plots.absolute_magnification",
-                lambda: _plot_absolute_magnification(
-                    run_dir,
-                    evaluator,
-                    best_fit,
-                    caustic_plot_grid_scale_arcsec,
-                    getattr(args, "caustic_source_redshift", 9.0),
-                ),
-            )
         )
         truth_recovery_tasks.append(
             (

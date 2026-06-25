@@ -3001,7 +3001,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert "kappa_truth_diagnostics" not in captured_tasks
     assert "kappa_recovery" not in captured_tasks
     assert "mu_truth_diagnostics" not in captured_tasks
-    assert "absolute_magnification" in captured_tasks
+    assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" in captured_tasks
     assert captured_stages == ["run_diagnostics", "image_recovery", "truth_recovery"]
 
@@ -3019,7 +3019,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         args=argparse.Namespace(quiet=True),
     )
     assert "numpyro_model" in captured_tasks
-    assert "absolute_magnification" in captured_tasks
+    assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" in captured_tasks
     assert "critical_arc_support_histogram" not in captured_tasks
     assert "critical_arc_support_phase_space" not in captured_tasks
@@ -3039,7 +3039,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         args=argparse.Namespace(quiet=True),
     )
     assert "numpyro_model" in captured_tasks
-    assert "absolute_magnification" in captured_tasks
+    assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" in captured_tasks
     assert "critical_arc_support_histogram" in captured_tasks
     assert "critical_arc_support_phase_space" in captured_tasks
@@ -3064,7 +3064,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         ),
     )
     assert "numpyro_model" in captured_tasks
-    assert "absolute_magnification" in captured_tasks
+    assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" in captured_tasks
 
     captured_tasks.clear()
@@ -3089,7 +3089,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert "kappa_recovery" not in captured_tasks
     assert "mu_truth_diagnostics" not in captured_tasks
     assert "truth_recovery_grids" in captured_tasks
-    assert "absolute_magnification" in captured_tasks
+    assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" in captured_tasks
 
     captured_tasks.clear()
@@ -3115,7 +3115,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert "kappa_truth_diagnostics" in captured_tasks
     assert "mu_truth_diagnostics" in captured_tasks
     assert "truth_recovery_grids" in captured_tasks
-    assert "absolute_magnification" in captured_tasks
+    assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" in captured_tasks
 
     captured_tasks.clear()
@@ -3144,7 +3144,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert "kappa_truth_diagnostics" in captured_tasks
     assert "mu_truth_diagnostics" in captured_tasks
     assert "truth_recovery_grids" in captured_tasks
-    assert "absolute_magnification" in captured_tasks
+    assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" in captured_tasks
 
 
@@ -4730,147 +4730,6 @@ def test_plot_caustic_overlay_uses_configured_redshift_and_scatter(monkeypatch: 
     np.testing.assert_allclose(source_ax.scatters[0][1], [-0.1, -0.2])
 
 
-def test_plot_absolute_magnification_uses_configured_grid_redshift_and_capped_abs(
-    monkeypatch: Any,
-    tmp_path: Path,
-) -> None:
-    state = SimpleNamespace(z_lens=0.3, parameter_specs=[], family_data=[])
-
-    class FakeModel:
-        def __init__(self) -> None:
-            self.inputs: list[tuple[np.ndarray, np.ndarray, list[dict[str, float]]]] = []
-
-        def magnification(self, x: Any, y: Any, kwargs_lens: list[dict[str, float]]) -> np.ndarray:
-            x_array = np.asarray(x, dtype=float)
-            y_array = np.asarray(y, dtype=float)
-            self.inputs.append((x_array.copy(), y_array.copy(), kwargs_lens))
-            values = np.zeros_like(x_array)
-            values[0] = -2.0
-            values[1] = 100.0
-            values[2] = np.nan
-            return values
-
-    class FakeEvaluator:
-        def __init__(self) -> None:
-            self.state = state
-            self.exact_models_by_z: dict[float, FakeModel] = {}
-            self.converted: list[np.ndarray] = []
-            self.model_z: list[float] = []
-            self.packed_z: list[float] = []
-            self.model = FakeModel()
-
-        def reported_physical_to_latent_parameter_vector(self, theta: np.ndarray) -> np.ndarray:
-            theta_array = np.asarray(theta, dtype=float)
-            self.converted.append(theta_array.copy())
-            return theta_array + 1.0
-
-        def _get_exact_model_solver(self, z_source: float) -> tuple[FakeModel, None]:
-            self.model_z.append(float(z_source))
-            return self.model, None
-
-        def _build_packed_lens_state(self, sample_latent: Any, z_source: float) -> dict[str, float]:
-            self.packed_z.append(float(z_source))
-            return {"latent": float(np.asarray(sample_latent, dtype=float)[0])}
-
-        def _packed_to_kwargs_lens(self, packed_state: dict[str, float]) -> list[dict[str, float]]:
-            return [packed_state]
-
-    class FakeColorbar:
-        def __init__(self) -> None:
-            self.labels: list[str] = []
-
-        def set_label(self, label: str) -> None:
-            self.labels.append(label)
-
-    class FakeAxis:
-        def __init__(self) -> None:
-            self.imshow_calls: list[tuple[np.ndarray, dict[str, Any]]] = []
-            self.inverted = False
-            self.xlabel: str | None = None
-            self.ylabel: str | None = None
-            self.title: str | None = None
-
-        def imshow(self, data: Any, **kwargs: Any) -> str:
-            self.imshow_calls.append((np.ma.asarray(data).filled(np.nan), dict(kwargs)))
-            return "image"
-
-        def invert_xaxis(self) -> None:
-            self.inverted = True
-
-        def set_xlabel(self, label: str) -> None:
-            self.xlabel = label
-
-        def set_ylabel(self, label: str) -> None:
-            self.ylabel = label
-
-        def set_title(self, title: str) -> None:
-            self.title = title
-
-    class FakeFig:
-        def __init__(self, colorbar: FakeColorbar) -> None:
-            self.colorbar_obj = colorbar
-            self.saved_paths: list[Path] = []
-
-        def colorbar(self, image: Any, ax: FakeAxis, **kwargs: Any) -> FakeColorbar:
-            assert image == "image"
-            assert isinstance(ax, FakeAxis)
-            assert kwargs["fraction"] == pytest.approx(0.046)
-            assert kwargs["pad"] == pytest.approx(0.04)
-            return self.colorbar_obj
-
-        def tight_layout(self) -> None:
-            return None
-
-        def savefig(self, path: Path, **_kwargs: Any) -> None:
-            self.saved_paths.append(Path(path))
-            Path(path).touch()
-
-    axis = FakeAxis()
-    colorbar = FakeColorbar()
-    fig = FakeFig(colorbar)
-
-    monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: (fig, axis))
-    monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
-    evaluator = FakeEvaluator()
-
-    plotting._plot_absolute_magnification(
-        tmp_path,
-        evaluator,
-        np.asarray([4.0], dtype=float),
-        caustic_plot_grid_scale_arcsec=0.2,
-        caustic_source_redshift=9.0,
-    )
-
-    assert (tmp_path / "absolute_magnification.pdf").exists()
-    assert fig.saved_paths == [tmp_path / "absolute_magnification.pdf"]
-    assert [float(item[0]) for item in evaluator.converted] == [4.0]
-    assert evaluator.model_z == [9.0]
-    assert evaluator.packed_z == [9.0]
-    assert len(evaluator.model.inputs) == 1
-    x_input, y_input, kwargs_lens = evaluator.model.inputs[0]
-    assert kwargs_lens == [{"latent": 5.0}]
-    assert x_input.size == 1001 * 1001
-    assert y_input.size == 1001 * 1001
-    np.testing.assert_allclose([np.nanmin(x_input), np.nanmax(x_input)], [-100.0, 100.0])
-    np.testing.assert_allclose([np.nanmin(y_input), np.nanmax(y_input)], [-100.0, 100.0])
-    assert x_input[1] - x_input[0] == pytest.approx(0.2)
-    assert y_input[1001] - y_input[0] == pytest.approx(0.2)
-    assert len(axis.imshow_calls) == 1
-    image_data, image_kwargs = axis.imshow_calls[0]
-    assert image_data.shape == (1001, 1001)
-    assert image_data[0, 0] == pytest.approx(2.0)
-    assert image_data[0, 1] == pytest.approx(plotting.ABSOLUTE_MAGNIFICATION_PLOT_CAP)
-    assert np.isnan(image_data[0, 2])
-    assert image_kwargs["cmap"] == "viridis"
-    assert image_kwargs["vmin"] == pytest.approx(0.0)
-    assert image_kwargs["vmax"] == pytest.approx(plotting.ABSOLUTE_MAGNIFICATION_PLOT_CAP)
-    assert axis.inverted is True
-    assert axis.xlabel == "x [arcsec]"
-    assert axis.ylabel == "y [arcsec]"
-    assert axis.title == "Absolute Magnification (z=9)"
-    assert colorbar.labels == [r"$|\mu|$"]
-
-
 def test_load_kappa_true_fits_suppresses_only_radecsys_warning(tmp_path: Path) -> None:
     true_path = tmp_path / "radecsys_kappa.fits"
     header = fits.Header()
@@ -5033,6 +4892,31 @@ def test_plot_kappa_true_comparison_uses_fits_grid_redshift_and_fixed_limits(
 
     monkeypatch.setattr(plotting.plt, "subplots", fake_subplots)
     monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
+    three_panel_calls: list[dict[str, Any]] = []
+
+    def fake_three_panel(
+        plot_dir: Path,
+        kappa_true: np.ndarray,
+        model_kappa: np.ndarray,
+        x_arcsec: np.ndarray,
+        y_arcsec: np.ndarray,
+        z_source: float,
+        **kwargs: Any,
+    ) -> None:
+        three_panel_calls.append(
+            {
+                "plot_dir": Path(plot_dir),
+                "kappa_true": np.asarray(kappa_true, dtype=float),
+                "model_kappa": np.asarray(model_kappa, dtype=float),
+                "x_arcsec": np.asarray(x_arcsec, dtype=float),
+                "y_arcsec": np.asarray(y_arcsec, dtype=float),
+                "z_source": float(z_source),
+                "kwargs": dict(kwargs),
+            }
+        )
+        (Path(plot_dir) / "truth_recovery_kappa_model_truth_fractional_residual.pdf").touch()
+
+    monkeypatch.setattr(plotting, "_plot_kappa_model_truth_fractional_residual_from_grid", fake_three_panel)
     evaluator = FakeEvaluator()
 
     plotting._plot_kappa_true_comparison(
@@ -5046,12 +4930,20 @@ def test_plot_kappa_true_comparison_uses_fits_grid_redshift_and_fixed_limits(
     assert not (tmp_path / "kappa_comparison.pdf").exists()
     assert not (tmp_path / "kappa_model.pdf").exists()
     assert not (tmp_path / "kappa_fractional_residual.pdf").exists()
-    assert (tmp_path / "truth_recovery_kappa_model.pdf").exists()
+    assert not (tmp_path / "truth_recovery_kappa_model.pdf").exists()
     assert (tmp_path / "truth_recovery_kappa_fractional_residual.pdf").exists()
+    assert (tmp_path / "truth_recovery_kappa_model_truth_fractional_residual.pdf").exists()
     assert [path for fig in figs for path in fig.saved_paths] == [
-        tmp_path / "truth_recovery_kappa_model.pdf",
         tmp_path / "truth_recovery_kappa_fractional_residual.pdf",
     ]
+    assert len(three_panel_calls) == 1
+    assert three_panel_calls[0]["plot_dir"] == tmp_path
+    np.testing.assert_allclose(three_panel_calls[0]["model_kappa"], [[2.0, 2.0], [2.0, 5.0]])
+    np.testing.assert_allclose(
+        three_panel_calls[0]["kwargs"]["fractional_residual"],
+        [[1.0, np.nan], [np.nan, 1.5]],
+        equal_nan=True,
+    )
     assert [float(item[0]) for item in evaluator.converted] == [4.0]
     assert evaluator.model_z == [9.0]
     assert evaluator.packed_z == [9.0]
@@ -5059,21 +4951,15 @@ def test_plot_kappa_true_comparison_uses_fits_grid_redshift_and_fixed_limits(
     _x_input, _y_input, kwargs_lens = evaluator.model.inputs[0]
     assert kwargs_lens == [{"latent": 5.0}]
 
-    model_x, model_y, model_data, model_kwargs = axes[0].pcolormesh_calls[0]
-    residual_x, residual_y, residual_data, residual_kwargs = axes[1].pcolormesh_calls[0]
-    np.testing.assert_allclose(model_data, [[2.0, 2.0], [2.0, 5.0]])
+    residual_x, residual_y, residual_data, residual_kwargs = axes[0].pcolormesh_calls[0]
     np.testing.assert_allclose(residual_data, [[1.0, np.nan], [np.nan, 1.5]], equal_nan=True)
-    np.testing.assert_allclose(model_x, residual_x)
-    np.testing.assert_allclose(model_y, residual_y)
-    assert model_kwargs["shading"] == "nearest"
+    np.testing.assert_allclose(residual_x, [[0.0, -1.0], [0.0, -1.0]])
+    np.testing.assert_allclose(residual_y, [[0.0, 0.0], [1.0, 1.0]], atol=1.0e-9)
     assert residual_kwargs["shading"] == "nearest"
-    for kwargs in (model_kwargs, residual_kwargs):
-        assert kwargs["edgecolors"] == "none"
-        assert kwargs["linewidth"] == pytest.approx(0.0)
-        assert kwargs["antialiased"] is False
-        assert kwargs["rasterized"] is True
-    assert model_kwargs["vmin"] == pytest.approx(0.0)
-    assert model_kwargs["vmax"] == pytest.approx(3.0)
+    assert residual_kwargs["edgecolors"] == "none"
+    assert residual_kwargs["linewidth"] == pytest.approx(0.0)
+    assert residual_kwargs["antialiased"] is False
+    assert residual_kwargs["rasterized"] is True
     assert "vmin" not in residual_kwargs
     assert "vmax" not in residual_kwargs
     residual_norm = residual_kwargs["norm"]
@@ -5082,13 +4968,188 @@ def test_plot_kappa_true_comparison_uses_fits_grid_redshift_and_fixed_limits(
     assert residual_norm.vcenter == pytest.approx(0.0)
     assert residual_norm.vmax == pytest.approx(2.0)
     assert axes[0].inverted is False
-    assert axes[1].inverted is False
     assert axes[0].title is None
-    assert axes[1].title is None
     assert [colorbar.labels for fig in figs for colorbar in fig.colorbars] == [
-        [r"$\kappa_{\rm model}$"],
         [r"$(\kappa_{\rm model} - \kappa_{\rm true}) / \kappa_{\rm true}$"],
     ]
+
+
+def test_kappa_model_truth_fractional_residual_three_panel_plot(monkeypatch: Any, tmp_path: Path) -> None:
+    class FakeColorbar:
+        def __init__(self) -> None:
+            self.label: str | None = None
+            self.ax = type(
+                "FakeColorbarAxis",
+                (),
+                {
+                    "xaxis": type(
+                        "FakeXAxis",
+                        (),
+                        {
+                            "set_label_position": lambda self, _position: None,
+                            "set_ticks_position": lambda self, _position: None,
+                        },
+                    )()
+                },
+            )()
+
+        def set_label(self, label: str) -> None:
+            self.label = label
+
+    class FakeAxis:
+        def __init__(self, x0: float, y1: float, width: float) -> None:
+            self.pcolormesh_calls: list[tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]] = []
+            self.inverted = False
+            self.xlabel: str | None = None
+            self.ylabel: str | None = None
+            self._position = type("FakeBbox", (), {"x0": x0, "y1": y1, "width": width})()
+
+        def pcolormesh(self, x: Any, y: Any, data: Any, **kwargs: Any) -> str:
+            self.pcolormesh_calls.append(
+                (
+                    np.asarray(x, dtype=float),
+                    np.asarray(y, dtype=float),
+                    np.ma.asarray(data).filled(np.nan),
+                    dict(kwargs),
+                )
+            )
+            return f"mesh-{len(self.pcolormesh_calls)}"
+
+        def invert_xaxis(self) -> None:
+            self.inverted = True
+
+        def set_aspect(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def set_xlabel(self, label: str) -> None:
+            self.xlabel = label
+
+        def set_ylabel(self, label: str) -> None:
+            self.ylabel = label
+
+        def get_position(self) -> Any:
+            return self._position
+
+    class FakeColorbarAxis:
+        def __init__(self, bounds: list[float]) -> None:
+            self.bounds = bounds
+
+    class FakeFig:
+        def __init__(self) -> None:
+            self.colorbars: list[tuple[str, FakeColorbarAxis, FakeColorbar, dict[str, Any]]] = []
+            self.added_axes: list[FakeColorbarAxis] = []
+            self.saved_paths: list[Path] = []
+            self.title: str | None = None
+            self.subplots_adjust_kwargs: dict[str, Any] | None = None
+
+        def subplots_adjust(self, **kwargs: Any) -> None:
+            self.subplots_adjust_kwargs = dict(kwargs)
+
+        def add_axes(self, bounds: list[float]) -> FakeColorbarAxis:
+            axis = FakeColorbarAxis(bounds)
+            self.added_axes.append(axis)
+            return axis
+
+        def colorbar(self, image: str, cax: FakeColorbarAxis, **kwargs: Any) -> FakeColorbar:
+            assert kwargs["orientation"] == "horizontal"
+            colorbar = FakeColorbar()
+            self.colorbars.append((image, cax, colorbar, dict(kwargs)))
+            return colorbar
+
+        def suptitle(self, title: str) -> None:
+            self.title = title
+
+        def savefig(self, path: Path, **_kwargs: Any) -> None:
+            self.saved_paths.append(Path(path))
+            Path(path).touch()
+
+    axes = np.asarray(
+        [
+            FakeAxis(0.10, 0.80, 0.22),
+            FakeAxis(0.40, 0.80, 0.22),
+            FakeAxis(0.70, 0.80, 0.22),
+        ],
+        dtype=object,
+    )
+    fig = FakeFig()
+    subplots_calls: list[dict[str, Any]] = []
+
+    def fake_subplots(*_args: Any, **kwargs: Any) -> tuple[FakeFig, np.ndarray]:
+        subplots_calls.append(dict(kwargs))
+        return fig, axes
+
+    monkeypatch.setattr(plotting.plt, "subplots", fake_subplots)
+    monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
+    x_arcsec = np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=float)
+    y_arcsec = np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=float)
+
+    plotting._plot_kappa_model_truth_fractional_residual_from_grid(
+        tmp_path,
+        np.asarray([[1.0, 2.0], [0.0, np.nan]], dtype=float),
+        np.asarray([[2.0, 1.0], [3.0, 4.0]], dtype=float),
+        x_arcsec,
+        y_arcsec,
+        z_source=9.0,
+    )
+
+    assert (tmp_path / "truth_recovery_kappa_model_truth_fractional_residual.pdf").exists()
+    assert fig.saved_paths == [tmp_path / "truth_recovery_kappa_model_truth_fractional_residual.pdf"]
+    assert fig.title is None
+    assert subplots_calls[0]["sharey"] is True
+    assert fig.subplots_adjust_kwargs == {"top": 0.82, "wspace": 0.08}
+    assert len(fig.colorbars) == 3
+    assert [axis.bounds for axis in fig.added_axes] == [
+        [0.10, 0.8180000000000001, 0.22, 0.026],
+        [0.40, 0.8180000000000001, 0.22, 0.026],
+        [0.70, 0.8180000000000001, 0.22, 0.026],
+    ]
+    assert [kwargs["orientation"] for _image, _axis, _colorbar, kwargs in fig.colorbars] == [
+        "horizontal",
+        "horizontal",
+        "horizontal",
+    ]
+    assert [colorbar.label for _image, _axis, colorbar, _kwargs in fig.colorbars] == [
+        r"$\kappa_{\rm model}$",
+        r"$\kappa_{\rm true}$",
+        r"$(\kappa_{\rm model} - \kappa_{\rm true}) / \kappa_{\rm true}$",
+    ]
+    for axis_index, axis in enumerate(axes):
+        assert axis.inverted is False
+        assert axis.xlabel == "x [arcsec]"
+        assert axis.ylabel == ("y [arcsec]" if axis_index == 0 else None)
+        assert len(axis.pcolormesh_calls) == 1
+        np.testing.assert_allclose(axis.pcolormesh_calls[0][0], x_arcsec)
+        np.testing.assert_allclose(axis.pcolormesh_calls[0][1], y_arcsec)
+        kwargs = axis.pcolormesh_calls[0][3]
+        assert kwargs["shading"] == "nearest"
+        assert kwargs["edgecolors"] == "none"
+        assert kwargs["linewidth"] == pytest.approx(0.0)
+        assert kwargs["antialiased"] is False
+        assert kwargs["rasterized"] is True
+    assert axes[0].pcolormesh_calls[0][3]["vmin"] == pytest.approx(0.0)
+    assert axes[0].pcolormesh_calls[0][3]["vmax"] == pytest.approx(3.0)
+    assert axes[0].pcolormesh_calls[0][3]["cmap"] == "magma"
+    assert axes[1].pcolormesh_calls[0][3]["vmin"] == pytest.approx(0.0)
+    assert axes[1].pcolormesh_calls[0][3]["vmax"] == pytest.approx(3.0)
+    assert axes[1].pcolormesh_calls[0][3]["cmap"] == "magma"
+    residual_norm = axes[2].pcolormesh_calls[0][3]["norm"]
+    assert isinstance(residual_norm, plotting.Normalize)
+    assert residual_norm.vmin == pytest.approx(-1.0)
+    assert residual_norm.vmax == pytest.approx(2.0)
+    assert residual_norm.clip is True
+    assert residual_norm(-1.0) == pytest.approx(0.0)
+    assert residual_norm(0.0) == pytest.approx(1.0 / 3.0)
+    assert residual_norm(1.0) == pytest.approx(2.0 / 3.0)
+    assert residual_norm(2.0) == pytest.approx(1.0)
+    residual_cmap = axes[2].pcolormesh_calls[0][3]["cmap"]
+    assert isinstance(residual_cmap, plotting.LinearSegmentedColormap)
+    assert residual_cmap.name.startswith("RdBu_r_zero_at_")
+    assert residual_cmap.name != "RdBu_r"
+    np.testing.assert_allclose(
+        axes[2].pcolormesh_calls[0][2],
+        [[1.0, -0.5], [np.nan, np.nan]],
+        equal_nan=True,
+    )
 
 
 def test_kappa_fractional_residual_overlays_members_and_images(monkeypatch: Any, tmp_path: Path) -> None:
@@ -5155,6 +5216,11 @@ def test_kappa_fractional_residual_overlays_members_and_images(monkeypatch: Any,
     subplots_calls = iter(zip(figures, axes, strict=True))
     monkeypatch.setattr(plotting.plt, "subplots", lambda *_args, **_kwargs: next(subplots_calls))
     monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        plotting,
+        "_plot_kappa_model_truth_fractional_residual_from_grid",
+        lambda plot_dir, *_args, **_kwargs: (Path(plot_dir) / "truth_recovery_kappa_model_truth_fractional_residual.pdf").touch(),
+    )
 
     member_overlays = pd.DataFrame(
         [
@@ -5181,9 +5247,10 @@ def test_kappa_fractional_residual_overlays_members_and_images(monkeypatch: Any,
         image_overlays=image_overlays,
     )
 
-    model_axis, residual_axis = axes
-    assert model_axis.scatter_calls == []
-    assert model_axis.text_calls == []
+    residual_axis = axes[0]
+    unused_axis = axes[1]
+    assert unused_axis.scatter_calls == []
+    assert unused_axis.text_calls == []
     assert [call[2]["marker"] for call in residual_axis.scatter_calls] == ["x", "s", "D"]
     np.testing.assert_allclose(residual_axis.pcolormesh_calls[0][0], [[1.0, 0.0], [1.0, 0.0]])
     np.testing.assert_allclose(residual_axis.pcolormesh_calls[0][2], [[1.2, 0.2], [0.2, 0.2]])
@@ -5196,8 +5263,8 @@ def test_kappa_fractional_residual_overlays_members_and_images(monkeypatch: Any,
     assert residual_axis.text_calls[1][0] == pytest.approx(1.0)
     assert residual_axis.text_calls[1][1] == pytest.approx(1.5)
     assert residual_axis.legend_calls
-    assert model_axis.inverted is False
     assert residual_axis.inverted is False
+    assert unused_axis.inverted is False
 
 
 def test_plot_kappa_recovery_samples_every_pixel_and_writes_reduced_tables(tmp_path: Path) -> None:
@@ -6257,8 +6324,9 @@ def test_plot_absolute_mu_truth_diagnostics_samples_every_pixel_and_writes_outpu
     assert not (tmp_path / "tables" / "mu_recovery_binned.csv").exists()
     assert not (tmp_path / "tables" / "mu_recovery_summary.csv").exists()
     assert not (tmp_path / "tables" / "truth_grid_summary.csv").exists()
-    assert (tmp_path / "truth_recovery_mu_model.pdf").exists()
-    assert (tmp_path / "truth_recovery_mu_fractional_residual.pdf").exists()
+    assert not (tmp_path / "truth_recovery_mu_model.pdf").exists()
+    assert not (tmp_path / "truth_recovery_mu_fractional_residual.pdf").exists()
+    assert (tmp_path / "truth_recovery_mu_model_truth_fractional_residual.pdf").exists()
     assert (tmp_path / "truth_recovery_mu_recovery.pdf").exists()
     assert (tmp_path / "truth_recovery_critical_line_recovery.pdf").exists()
     assert (tmp_path / "fits" / "truth_recovery_abs_mu_model_q16.fits").exists()
@@ -6426,29 +6494,46 @@ def test_absolute_mu_recovery_overlays_observed_image_points(monkeypatch: Any, t
     assert image_points["image_label"].tolist() == ["1.a", "1.b"]
 
 
-def test_absolute_mu_comparison_labels_are_not_capped(monkeypatch: Any, tmp_path: Path) -> None:
+def test_abs_mu_model_truth_fractional_residual_three_panel_plot(monkeypatch: Any, tmp_path: Path) -> None:
     class FakeColorbar:
         def __init__(self) -> None:
-            self.labels: list[str] = []
+            self.label: str | None = None
+            self.ax = type(
+                "FakeColorbarAxis",
+                (),
+                {
+                    "xaxis": type(
+                        "FakeXAxis",
+                        (),
+                        {
+                            "set_label_position": lambda self, _position: None,
+                            "set_ticks_position": lambda self, _position: None,
+                        },
+                    )()
+                },
+            )()
 
         def set_label(self, label: str) -> None:
-            self.labels.append(label)
+            self.label = label
 
     class FakeAxis:
-        def __init__(self) -> None:
-            self.pcolormesh_data: list[np.ndarray] = []
-            self.pcolormesh_x: list[np.ndarray] = []
-            self.pcolormesh_y: list[np.ndarray] = []
-            self.pcolormesh_kwargs: list[dict[str, Any]] = []
-            self.title: str | None = None
+        def __init__(self, x0: float, y1: float, width: float) -> None:
+            self.pcolormesh_calls: list[tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]] = []
             self.inverted = False
+            self.xlabel: str | None = None
+            self.ylabel: str | None = None
+            self._position = type("FakeBbox", (), {"x0": x0, "y1": y1, "width": width})()
 
         def pcolormesh(self, x: Any, y: Any, data: Any, **kwargs: Any) -> str:
-            self.pcolormesh_x.append(np.asarray(x, dtype=float))
-            self.pcolormesh_y.append(np.asarray(y, dtype=float))
-            self.pcolormesh_data.append(np.ma.asarray(data).filled(np.nan))
-            self.pcolormesh_kwargs.append(dict(kwargs))
-            return f"mesh-{len(self.pcolormesh_kwargs)}"
+            self.pcolormesh_calls.append(
+                (
+                    np.asarray(x, dtype=float),
+                    np.asarray(y, dtype=float),
+                    np.ma.asarray(data).filled(np.nan),
+                    dict(kwargs),
+                )
+            )
+            return f"mesh-{len(self.pcolormesh_calls)}"
 
         def invert_xaxis(self) -> None:
             self.inverted = True
@@ -6457,40 +6542,135 @@ def test_absolute_mu_comparison_labels_are_not_capped(monkeypatch: Any, tmp_path
             return None
 
         def set_xlabel(self, label: str) -> None:
-            return None
+            self.xlabel = label
 
         def set_ylabel(self, label: str) -> None:
-            return None
+            self.ylabel = label
 
-        def set_title(self, title: str) -> None:
-            self.title = title
+        def get_position(self) -> Any:
+            return self._position
+
+    class FakeColorbarAxis:
+        def __init__(self, bounds: list[float]) -> None:
+            self.bounds = bounds
 
     class FakeFig:
         def __init__(self) -> None:
-            self.colorbars: list[FakeColorbar] = []
+            self.colorbars: list[tuple[str, FakeColorbarAxis, FakeColorbar, dict[str, Any]]] = []
+            self.added_axes: list[FakeColorbarAxis] = []
             self.saved_paths: list[Path] = []
+            self.title: str | None = None
+            self.subplots_adjust_kwargs: dict[str, Any] | None = None
 
-        def colorbar(self, *_args: Any, **_kwargs: Any) -> FakeColorbar:
+        def subplots_adjust(self, **kwargs: Any) -> None:
+            self.subplots_adjust_kwargs = dict(kwargs)
+
+        def add_axes(self, bounds: list[float]) -> FakeColorbarAxis:
+            axis = FakeColorbarAxis(bounds)
+            self.added_axes.append(axis)
+            return axis
+
+        def colorbar(self, image: str, cax: FakeColorbarAxis, **kwargs: Any) -> FakeColorbar:
+            assert kwargs["orientation"] == "horizontal"
             colorbar = FakeColorbar()
-            self.colorbars.append(colorbar)
+            self.colorbars.append((image, cax, colorbar, dict(kwargs)))
             return colorbar
 
-        def tight_layout(self) -> None:
-            return None
+        def suptitle(self, title: str) -> None:
+            self.title = title
 
         def savefig(self, path: Path, **_kwargs: Any) -> None:
             self.saved_paths.append(Path(path))
             Path(path).touch()
 
-    axes = [FakeAxis(), FakeAxis()]
-    figs = [FakeFig(), FakeFig()]
-    subplots_calls = iter(zip(figs, axes, strict=True))
+    axes = np.asarray(
+        [
+            FakeAxis(0.10, 0.80, 0.22),
+            FakeAxis(0.40, 0.80, 0.22),
+            FakeAxis(0.70, 0.80, 0.22),
+        ],
+        dtype=object,
+    )
+    fig = FakeFig()
+    subplots_calls: list[dict[str, Any]] = []
 
-    def fake_subplots(*_args: Any, **_kwargs: Any) -> tuple[FakeFig, FakeAxis]:
-        return next(subplots_calls)
+    def fake_subplots(*_args: Any, **kwargs: Any) -> tuple[FakeFig, np.ndarray]:
+        subplots_calls.append(dict(kwargs))
+        return fig, axes
 
     monkeypatch.setattr(plotting.plt, "subplots", fake_subplots)
     monkeypatch.setattr(plotting.plt, "close", lambda *_args, **_kwargs: None)
+    x_arcsec = np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=float)
+    y_arcsec = np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=float)
+
+    plotting._plot_abs_mu_model_truth_fractional_residual_from_grid(
+        tmp_path,
+        np.asarray([[1.0, 2.0], [0.0, np.nan]], dtype=float),
+        np.asarray([[2.0, 1.0], [3.0, 4.0]], dtype=float),
+        x_arcsec,
+        y_arcsec,
+        z_source=9.0,
+        cap=40.0,
+    )
+
+    assert (tmp_path / "truth_recovery_mu_model_truth_fractional_residual.pdf").exists()
+    assert fig.saved_paths == [tmp_path / "truth_recovery_mu_model_truth_fractional_residual.pdf"]
+    assert fig.title is None
+    assert subplots_calls[0]["sharey"] is True
+    assert fig.subplots_adjust_kwargs == {"top": 0.82, "wspace": 0.08}
+    assert [axis.bounds for axis in fig.added_axes] == [
+        [0.10, 0.8180000000000001, 0.22, 0.026],
+        [0.40, 0.8180000000000001, 0.22, 0.026],
+        [0.70, 0.8180000000000001, 0.22, 0.026],
+    ]
+    assert [colorbar.label for _image, _axis, colorbar, _kwargs in fig.colorbars] == [
+        r"$|\mu_{\rm model}|$",
+        r"$|\mu_{\rm true}|$",
+        r"$(|\mu_{\rm model}| - |\mu_{\rm true}|) / |\mu_{\rm true}|$",
+    ]
+    for axis_index, axis in enumerate(axes):
+        assert axis.inverted is False
+        assert axis.xlabel == "x [arcsec]"
+        assert axis.ylabel == ("y [arcsec]" if axis_index == 0 else None)
+        assert len(axis.pcolormesh_calls) == 1
+        np.testing.assert_allclose(axis.pcolormesh_calls[0][0], x_arcsec)
+        np.testing.assert_allclose(axis.pcolormesh_calls[0][1], y_arcsec)
+        kwargs = axis.pcolormesh_calls[0][3]
+        assert kwargs["shading"] == "nearest"
+        assert kwargs["edgecolors"] == "none"
+        assert kwargs["linewidth"] == pytest.approx(0.0)
+        assert kwargs["antialiased"] is False
+        assert kwargs["rasterized"] is True
+    assert axes[0].pcolormesh_calls[0][3]["cmap"] == "viridis"
+    assert axes[0].pcolormesh_calls[0][3]["vmin"] == pytest.approx(0.0)
+    assert axes[0].pcolormesh_calls[0][3]["vmax"] == pytest.approx(40.0)
+    assert axes[1].pcolormesh_calls[0][3]["cmap"] == "viridis"
+    assert axes[1].pcolormesh_calls[0][3]["vmin"] == pytest.approx(0.0)
+    assert axes[1].pcolormesh_calls[0][3]["vmax"] == pytest.approx(40.0)
+    residual_norm = axes[2].pcolormesh_calls[0][3]["norm"]
+    assert isinstance(residual_norm, plotting.Normalize)
+    assert residual_norm.vmin == pytest.approx(-1.0)
+    assert residual_norm.vmax == pytest.approx(2.0)
+    assert residual_norm.clip is True
+    assert residual_norm(0.0) == pytest.approx(1.0 / 3.0)
+    residual_cmap = axes[2].pcolormesh_calls[0][3]["cmap"]
+    assert isinstance(residual_cmap, plotting.LinearSegmentedColormap)
+    assert residual_cmap.name.startswith("RdBu_r_zero_at_")
+    np.testing.assert_allclose(
+        axes[2].pcolormesh_calls[0][2],
+        [[1.0, -0.5], [np.nan, np.nan]],
+        equal_nan=True,
+    )
+
+
+def test_absolute_mu_comparison_labels_are_not_capped(monkeypatch: Any, tmp_path: Path) -> None:
+    three_panel_calls: list[dict[str, Any]] = []
+
+    def fake_three_panel(plot_dir: Path, *_args: Any, **kwargs: Any) -> None:
+        three_panel_calls.append({"plot_dir": Path(plot_dir), "kwargs": dict(kwargs)})
+        (Path(plot_dir) / "truth_recovery_mu_model_truth_fractional_residual.pdf").touch()
+
+    monkeypatch.setattr(plotting, "_plot_abs_mu_model_truth_fractional_residual_from_grid", fake_three_panel)
 
     plotting._plot_abs_mu_true_comparison_from_grid(
         tmp_path,
@@ -6504,41 +6684,16 @@ def test_absolute_mu_comparison_labels_are_not_capped(monkeypatch: Any, tmp_path
     assert not (tmp_path / "mu_comparison.pdf").exists()
     assert not (tmp_path / "mu_model.pdf").exists()
     assert not (tmp_path / "mu_fractional_residual.pdf").exists()
-    assert (tmp_path / "truth_recovery_mu_model.pdf").exists()
-    assert (tmp_path / "truth_recovery_mu_fractional_residual.pdf").exists()
-    assert [path for fig in figs for path in fig.saved_paths] == [
-        tmp_path / "truth_recovery_mu_model.pdf",
-        tmp_path / "truth_recovery_mu_fractional_residual.pdf",
-    ]
-    all_text = [
-        *(label for fig in figs for colorbar in fig.colorbars for label in colorbar.labels),
-        *(axis.title or "" for axis in axes),
-    ]
-    assert all("capped" not in text.lower() for text in all_text)
-    assert axes[0].title is None
-    assert axes[1].title is None
-    assert axes[0].inverted is False
-    assert axes[1].inverted is False
-    np.testing.assert_allclose(axes[0].pcolormesh_data[0], [[2.0, 25.0], [5.0, 60.0]])
-    np.testing.assert_allclose(axes[1].pcolormesh_data[0], [[1.0, -0.5], [np.nan, np.nan]], equal_nan=True)
-    np.testing.assert_allclose(axes[0].pcolormesh_x[0], [[0.0, 1.0], [0.0, 1.0]])
-    np.testing.assert_allclose(axes[1].pcolormesh_y[0], [[0.0, 0.0], [1.0, 1.0]])
-    assert axes[0].pcolormesh_kwargs[0]["shading"] == "nearest"
-    for kwargs in (axes[0].pcolormesh_kwargs[0], axes[1].pcolormesh_kwargs[0]):
-        assert kwargs["edgecolors"] == "none"
-        assert kwargs["linewidth"] == pytest.approx(0.0)
-        assert kwargs["antialiased"] is False
-        assert kwargs["rasterized"] is True
-    assert axes[0].pcolormesh_kwargs[0]["vmax"] == pytest.approx(plotting.ABSOLUTE_MAGNIFICATION_PLOT_CAP)
-    residual_norm = axes[1].pcolormesh_kwargs[0]["norm"]
-    assert isinstance(residual_norm, plotting.TwoSlopeNorm)
-    assert residual_norm.vmin == pytest.approx(-1.0)
-    assert residual_norm.vcenter == pytest.approx(0.0)
-    assert residual_norm.vmax == pytest.approx(4.0)
-    assert [colorbar.labels for fig in figs for colorbar in fig.colorbars] == [
-        [r"$|\mu_{\rm model}|$"],
-        [r"$(|\mu_{\rm model}| - |\mu_{\rm true}|) / |\mu_{\rm true}|$"],
-    ]
+    assert not (tmp_path / "truth_recovery_mu_model.pdf").exists()
+    assert not (tmp_path / "truth_recovery_mu_fractional_residual.pdf").exists()
+    assert (tmp_path / "truth_recovery_mu_model_truth_fractional_residual.pdf").exists()
+    assert len(three_panel_calls) == 1
+    assert three_panel_calls[0]["plot_dir"] == tmp_path
+    np.testing.assert_allclose(
+        three_panel_calls[0]["kwargs"]["fractional_residual"],
+        [[1.0, -0.5], [np.nan, np.nan]],
+        equal_nan=True,
+    )
 
 
 def test_absolute_mu_recovery_keeps_raw_values_with_fixed_axis_and_uncapped_labels(
