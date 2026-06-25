@@ -148,6 +148,7 @@ def test_config_defaults_validate_without_solver_namespace() -> None:
     assert config.workflow.best_value == "map"
     assert config.runtime.seed == 12345
     assert config.runtime.show_plots is False
+    assert config.runtime.plot_numpyro_model is False
     assert config.schedule.svi_steps == (2000, 2000)
     assert config.schedule.refresh_every == (250, 250)
     assert config.truth.truth_grid_mode == "median"
@@ -157,6 +158,7 @@ def test_config_defaults_validate_without_solver_namespace() -> None:
     plan = compile_run_plan(config)
     assert plan.runtime.seed == 12345
     assert plan.runtime_args.seed == 12345
+    assert plan.runtime_args.plot_numpyro_model is False
 
 
 def test_runtime_seed_validation() -> None:

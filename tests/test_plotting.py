@@ -1,7 +1,7 @@
 import argparse
+import inspect
 import json
 import math
-import sys
 import warnings
 from concurrent.futures import Future
 from pathlib import Path
@@ -1376,136 +1376,13 @@ def test_bayes_corner_overlay_uses_existing_corner_figure(tmp_path: Path, monkey
     assert calls[1][2]["plot_datapoints"] is False
 
 
-def test_load_best_par_marker_values_maps_large_and_potfile_values(tmp_path: Path) -> None:
-    lum2 = 10.0 ** (-0.4)
-    best_path = tmp_path / "best.par"
-    best_path.write_text(
-        f"""
-runmode
-    reference 3 342.0 -44.0
-    end
-cosmology
-    H0 70
-    omega 0.3
-    lambda 0.7
-    end
-potentiel O1
-    profil 81
-    x_centre 1.5
-    y_centre -0.5
-    ellipticite 0.6
-    angle_pos -40
-    core_radius 10
-    core_radius_kpc 50
-    cut_radius 2000
-    cut_radius_kpc 10000
-    v_disp 1100
-    z_lens 0.35
-    end
-potentiel 101
-    profil 81
-    x_centre 0
-    y_centre 0
-    ellipticite 0
-    angle_pos 0
-    core_radius 0.1
-    core_radius_kpc 2
-    cut_radius 10
-    cut_radius_kpc 50
-    v_disp 300
-    z_lens 0.35
-    end
-potentiel 102
-    profil 81
-    x_centre 0
-    y_centre 0
-    ellipticite 0
-    angle_pos 0
-    core_radius 0.1
-    core_radius_kpc {2 * lum2:.12g}
-    cut_radius 10
-    cut_radius_kpc {50 * lum2:.12g}
-    v_disp {300 * lum2 ** 0.25:.12g}
-    z_lens 0.35
-    end
-fini
-""",
-        encoding="utf-8",
-    )
-    state = SimpleNamespace(
-        par_path=None,
-        potfiles=[
-            {
-                "id": "potfile",
-                "mag0": 20.0,
-                "vdslope_nominal": 4.0,
-                "slope_nominal": 2.0,
-                "catalog_df": pd.DataFrame(
-                    {
-                        "id": ["101", "102"],
-                        "catalog_mag": [20.0, 21.0],
-                    }
-                ),
-            }
-        ],
-    )
-
-    values = plotting._load_best_par_marker_values(best_path, state)
-
-    assert values is not None
-    assert values["1.x_centre"] == pytest.approx(1.5)
-    assert values["1.core_radius_kpc"] == pytest.approx(50.0)
-    assert values["1.v_disp"] == pytest.approx(1100.0)
-    assert values["potfile.sigma"] == pytest.approx(300.0)
-    assert values["potfile.cutkpc"] == pytest.approx(50.0)
-    assert values["potfile.corekpc"] == pytest.approx(2.0)
+def test_best_par_overlay_support_is_removed_from_supported_plot_apis() -> None:
+    assert not hasattr(plotting, "_load_best_par_marker_values")
+    assert "best_par_marker_values" not in inspect.signature(plotting._plot_corner).parameters
+    assert "best_par_marker_values" not in inspect.signature(plotting._plot_per_potential_summary).parameters
 
 
-def test_best_par_marker_draws_without_fit_markers(tmp_path: Path, monkeypatch: Any) -> None:
-    calls: list[tuple[str, Any, dict[str, Any]]] = []
-
-    class FakeFig:
-        def savefig(self, path: Path, **_kwargs: Any) -> None:
-            Path(path).write_text("pdf", encoding="utf-8")
-
-    class FakeCorner:
-        def corner(self, samples: np.ndarray, **kwargs: Any) -> FakeFig:
-            calls.append(("corner", np.asarray(samples), kwargs))
-            return FakeFig()
-
-        def overplot_lines(self, _fig: FakeFig, xs: list[float | None], **kwargs: Any) -> None:
-            calls.append(("lines", xs, kwargs))
-
-        def overplot_points(self, _fig: FakeFig, xs: list[list[float]], **kwargs: Any) -> None:
-            calls.append(("points", xs, kwargs))
-
-    monkeypatch.setattr(plotting, "corner", FakeCorner())
-    monkeypatch.setattr(plotting.plt, "close", lambda _fig: None)
-
-    plotting._plot_corner(
-        tmp_path,
-        np.asarray([[0.0, 1.0], [1.0, 2.0], [2.0, 4.0]], dtype=float),
-        _corner_test_specs(),
-        best_fit_values=None,
-        previous_stage_best_values=None,
-        best_par_marker_values={"x": 1.5, "y": 3.5},
-    )
-
-    assert calls[0][0] == "corner"
-    assert calls[1] == (
-        "points",
-        [[1.5, 3.5]],
-        {
-            "marker": "x",
-            "color": plotting.CORNER_BEST_PAR_COLOR,
-            "markersize": 5,
-            "markeredgewidth": 1.2,
-        },
-    )
-    assert len(calls) == 2
-
-
-def test_per_potential_summary_uses_corner_marker_colors_and_limits(tmp_path: Path, monkeypatch: Any) -> None:
+def test_per_potential_summary_uses_current_marker_colors_and_limits(tmp_path: Path, monkeypatch: Any) -> None:
     class FakeAxis:
         def __init__(self) -> None:
             self.hlines_calls: list[tuple[Any, Any, Any, dict[str, Any]]] = []
@@ -1569,7 +1446,6 @@ def test_per_potential_summary_uses_corner_marker_colors_and_limits(tmp_path: Pa
     plotting._plot_per_potential_summary(
         tmp_path,
         summary_df,
-        best_par_marker_values={"potfile.sigma": 20.0},
         previous_stage_best_values={"potfile_sigma": -5.0},
         parameter_specs=[
             ParameterSpec(
@@ -1595,11 +1471,6 @@ def test_per_potential_summary_uses_corner_marker_colors_and_limits(tmp_path: Pa
         {"color": plotting.CORNER_BEST_FIT_COLOR, "marker": "x", "s": 30, "label": "best fit"},
     )
     assert axis.scatters[2] == (
-        [20.0],
-        [1],
-        {"color": plotting.CORNER_BEST_PAR_COLOR, "marker": "x", "s": 30, "label": "best.par"},
-    )
-    assert axis.scatters[3] == (
         [-5.0],
         [1],
         {
@@ -1611,7 +1482,7 @@ def test_per_potential_summary_uses_corner_marker_colors_and_limits(tmp_path: Pa
     )
     assert axis.xlim is not None
     assert axis.xlim[0] < -5.0
-    assert axis.xlim[1] > 20.0
+    assert axis.xlim[1] >= 10.0
     assert axis.title == "potfile.sigma"
     assert fig.saved_path == tmp_path / "per_potential_summary.pdf"
 
@@ -2983,7 +2854,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert (tmp_path / "tables" / "run_summary.txt").exists()
     assert run_summary == {"ok": True, "image_recovery_stage": "complete"}
     assert json.loads((tmp_path / "tables" / "run_summary.json").read_text(encoding="utf-8")) == run_summary
-    assert "numpyro_model" in captured_tasks
+    assert "numpyro_model" not in captured_tasks
     assert "image_recovery" in captured_tasks
     assert "image_count_recovery" in captured_tasks
     assert "model_magnification" in captured_tasks
@@ -3018,7 +2889,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         runtime_sec=0.0,
         args=argparse.Namespace(quiet=True),
     )
-    assert "numpyro_model" in captured_tasks
+    assert "numpyro_model" not in captured_tasks
     assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" in captured_tasks
     assert "critical_arc_support_histogram" not in captured_tasks
@@ -3038,7 +2909,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
         runtime_sec=0.0,
         args=argparse.Namespace(quiet=True),
     )
-    assert "numpyro_model" in captured_tasks
+    assert "numpyro_model" not in captured_tasks
     assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" in captured_tasks
     assert "critical_arc_support_histogram" in captured_tasks
@@ -3063,7 +2934,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
             caustic_source_redshift=9.0,
         ),
     )
-    assert "numpyro_model" in captured_tasks
+    assert "numpyro_model" not in captured_tasks
     assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" in captured_tasks
 
@@ -3083,7 +2954,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
             caustic_source_redshift=9.0,
         ),
     )
-    assert "numpyro_model" in captured_tasks
+    assert "numpyro_model" not in captured_tasks
     assert "kappa_truth_diagnostics" in captured_tasks
     assert "kappa_comparison" not in captured_tasks
     assert "kappa_recovery" not in captured_tasks
@@ -3111,7 +2982,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
             gammay_true_fits="data/ff_sims/published/hera/gammay_z9_0.fits",
         ),
     )
-    assert "numpyro_model" in captured_tasks
+    assert "numpyro_model" not in captured_tasks
     assert "kappa_truth_diagnostics" in captured_tasks
     assert "mu_truth_diagnostics" in captured_tasks
     assert "truth_recovery_grids" in captured_tasks
@@ -3138,7 +3009,7 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
             gammay_true_fits="data/ff_sims/published/hera/gammay_z9_0.fits",
         ),
     )
-    assert "numpyro_model" in captured_tasks
+    assert "numpyro_model" not in captured_tasks
     assert "kappa_comparison" not in captured_tasks
     assert "kappa_recovery" not in captured_tasks
     assert "kappa_truth_diagnostics" in captured_tasks
@@ -3146,6 +3017,26 @@ def test_generate_plots_and_tables_writes_fit_quality_outputs(tmp_path: Path, mo
     assert "truth_recovery_grids" in captured_tasks
     assert "absolute_magnification" not in captured_tasks
     assert "caustic_overlay" in captured_tasks
+
+    captured_tasks.clear()
+    captured_stages.clear()
+    plotting._generate_plots_and_tables(
+        run_dir=tmp_path,
+        state=state,
+        evaluator=evaluator,
+        best_fit=np.empty((0,), dtype=float),
+        best_eval=SimpleNamespace(loglike=0.0),
+        results=results,
+        runtime_sec=0.0,
+        args=argparse.Namespace(
+            quiet=True,
+            plot_numpyro_model=True,
+            caustic_plot_grid_scale_arcsec=0.2,
+            caustic_source_redshift=9.0,
+        ),
+    )
+    assert "numpyro_model" in captured_tasks
+    assert "absolute_magnification" not in captured_tasks
 
 
 def test_generate_plots_and_tables_stage0_minimal_outputs(tmp_path: Path, monkeypatch: Any) -> None:
@@ -4396,155 +4287,6 @@ def test_format_sequential_run_summary_text_gates_arc_aware_columns() -> None:
     assert "9.9" not in mixed
     assert "8.8" not in mixed
     assert "99" not in mixed
-
-
-def test_parse_args_caustic_source_redshift_default_and_explicit(monkeypatch: Any) -> None:
-    from lenscluster import cluster_solver
-
-    monkeypatch.setattr(sys, "argv", ["cluster_solver"])
-    args = cluster_solver._parse_args()
-    assert args.caustic_source_redshift == pytest.approx(9.0)
-    assert args.caustic_plot_grid_scale_arcsec == pytest.approx(0.2)
-    assert args.kappa_true_fits is None
-    assert args.gammax_true_fits is None
-    assert args.gammay_true_fits is None
-    assert not hasattr(args, "plot_caustics")
-    assert not hasattr(args, "caustic_num_pix")
-    assert not hasattr(args, "validate_top_k_families")
-    assert not hasattr(args, "validation_approx")
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "cluster_solver",
-            "--caustic-source-redshift",
-            "9.5",
-            "--kappa-true-fits",
-            "data/ff_sims/published/hera/kappa_z9_0.fits",
-            "--gammax-true-fits",
-            "data/ff_sims/published/hera/gammax_z9_0.fits",
-            "--gammay-true-fits",
-            "data/ff_sims/published/hera/gammay_z9_0.fits",
-        ],
-    )
-    args = cluster_solver._parse_args()
-    assert args.caustic_source_redshift == pytest.approx(9.5)
-    assert args.kappa_true_fits == "data/ff_sims/published/hera/kappa_z9_0.fits"
-    assert args.gammax_true_fits == "data/ff_sims/published/hera/gammax_z9_0.fits"
-    assert args.gammay_true_fits == "data/ff_sims/published/hera/gammay_z9_0.fits"
-
-
-def test_parse_args_image_catalog_rgb_display_controls(monkeypatch: Any) -> None:
-    from lenscluster import cluster_solver
-
-    monkeypatch.setattr(sys, "argv", ["cluster_solver"])
-    args = cluster_solver._parse_args()
-    assert args.image_catalog_family_cutout_rgb_q is None
-    assert args.image_catalog_family_cutout_rgb_stretch is None
-    assert args.image_catalog_family_cutout_rgb_minimum is None
-    assert args.image_catalog_family_cutout_rgb_red_gain is None
-    assert args.image_catalog_family_cutout_rgb_green_gain is None
-    assert args.image_catalog_family_cutout_rgb_blue_gain is None
-    assert args.image_catalog_family_cutout_mode == "full"
-    assert args.image_catalog_family_cutout_dpi is None
-    assert args.image_catalog_family_cutout_max_side_pixels is None
-    assert args.image_catalog_family_cutout_critical_lines == "auto"
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "cluster_solver",
-            "--image-catalog-family-cutout-rgb-q",
-            "6.5",
-            "--image-catalog-family-cutout-rgb-stretch",
-            "0.0165",
-            "--image-catalog-family-cutout-rgb-minimum",
-            "-0.001",
-            "--image-catalog-family-cutout-rgb-red-gain",
-            "0.68",
-            "--image-catalog-family-cutout-rgb-green-gain",
-            "0.75",
-            "--image-catalog-family-cutout-rgb-blue-gain",
-            "3.5",
-            "--image-catalog-family-cutout-mode",
-            "fast",
-            "--image-catalog-family-cutout-dpi",
-            "120",
-            "--image-catalog-family-cutout-max-side-pixels",
-            "256",
-            "--image-catalog-family-cutout-critical-lines",
-            "off",
-        ],
-    )
-    args = cluster_solver._parse_args()
-    assert args.image_catalog_family_cutout_rgb_q == pytest.approx(6.5)
-    assert args.image_catalog_family_cutout_rgb_stretch == pytest.approx(0.0165)
-    assert args.image_catalog_family_cutout_rgb_minimum == pytest.approx(-0.001)
-    assert args.image_catalog_family_cutout_rgb_red_gain == pytest.approx(0.68)
-    assert args.image_catalog_family_cutout_rgb_green_gain == pytest.approx(0.75)
-    assert args.image_catalog_family_cutout_rgb_blue_gain == pytest.approx(3.5)
-    assert args.image_catalog_family_cutout_mode == "fast"
-    assert args.image_catalog_family_cutout_dpi == 120
-    assert args.image_catalog_family_cutout_max_side_pixels == 256
-    assert args.image_catalog_family_cutout_critical_lines == "off"
-
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--image-catalog-family-cutout-rgb-q", "0"])
-    with pytest.raises(SystemExit):
-        cluster_solver._parse_args()
-
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--image-catalog-family-cutout-rgb-minimum", "nan"])
-    with pytest.raises(SystemExit):
-        cluster_solver._parse_args()
-
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--image-catalog-family-cutout-dpi", "0"])
-    with pytest.raises(SystemExit):
-        cluster_solver._parse_args()
-
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--image-catalog-family-cutout-max-side-pixels", "-1"])
-    with pytest.raises(SystemExit):
-        cluster_solver._parse_args()
-
-
-def test_parse_args_caustic_plot_grid_scale_and_removed_num_pix(monkeypatch: Any) -> None:
-    from lenscluster import cluster_solver
-
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--caustic-plot-grid-scale-arcsec", "0.5"])
-    args = cluster_solver._parse_args()
-    assert args.caustic_plot_grid_scale_arcsec == pytest.approx(0.5)
-
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--caustic-plot-grid-scale-arcsec", "0"])
-    with pytest.raises(SystemExit):
-        cluster_solver._parse_args()
-
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--caustic-num-pix", "250"])
-    with pytest.raises(SystemExit):
-        cluster_solver._parse_args()
-
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--plot-caustics"])
-    with pytest.raises(SystemExit):
-        cluster_solver._parse_args()
-
-
-def test_parse_args_rejects_removed_main_validation_flags(monkeypatch: Any) -> None:
-    from lenscluster import cluster_solver
-
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--validate-top-k-families", "1"])
-    with pytest.raises(SystemExit):
-        cluster_solver._parse_args()
-
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--validation-approx", "exact"])
-    with pytest.raises(SystemExit):
-        cluster_solver._parse_args()
-
-
-def test_parse_args_rejects_removed_corner_suppress_fit_markers(monkeypatch: Any) -> None:
-    from lenscluster import cluster_solver
-
-    monkeypatch.setattr(sys, "argv", ["cluster_solver", "--corner-suppress-fit-markers"])
-    with pytest.raises(SystemExit):
-        cluster_solver._parse_args()
 
 
 def test_tangential_critical_curve_caustics_converts_and_rayshoots(monkeypatch: Any) -> None:
