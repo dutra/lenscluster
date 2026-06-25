@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .config import LensClusterSolverConfig
+from .config import LensClusterSolverConfig, PriorConfig
 
 
 @dataclass(frozen=True)
@@ -71,6 +71,15 @@ class SolverRuntime:
             return self.values[name]
         except KeyError as exc:
             raise AttributeError(name) from exc
+
+
+def _positive_lognormal_prior_payload(prefix: str, prior: PriorConfig) -> dict[str, float]:
+    return {
+        f"{prefix}_lower": float(prior.lower),
+        f"{prefix}_upper": float(prior.upper),
+        f"{prefix}_prior_median": float(prior.mean),
+        f"{prefix}_prior_log_sigma": float(prior.std),
+    }
 
 
 SOLVER_RUNTIME_DEFAULTS: dict[str, Any] = {
@@ -430,6 +439,14 @@ def _runtime_payload(config: LensClusterSolverConfig) -> dict[str, Any]:
             "magnitude_sigma_floor": config.likelihood.magnitude_sigma_floor,
             "magnitude_mu_floor": config.likelihood.magnitude_mu_floor,
             "magnitude_min_reliability": config.likelihood.magnitude_min_reliability,
+            **_positive_lognormal_prior_payload(
+                "magnitude_base_scatter",
+                config.likelihood.magnitude_base_scatter_prior,
+            ),
+            **_positive_lognormal_prior_payload(
+                "magnitude_arc_scatter",
+                config.likelihood.magnitude_arc_scatter_prior,
+            ),
             "fit_quality_draws": config.image_diagnostics.fit_quality_draws,
             "exact_image_min_distance_arcsec": config.image_diagnostics.exact_image_min_distance_arcsec,
             "exact_image_precision_limit": config.image_diagnostics.exact_image_precision_limit,

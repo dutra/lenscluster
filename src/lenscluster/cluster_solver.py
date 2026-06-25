@@ -13930,6 +13930,32 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
     )
     if not np.isfinite(magnitude_min_reliability) or not (0.0 <= magnitude_min_reliability <= 1.0):
         _fail("--magnitude-min-reliability must be finite and in [0, 1].")
+    for prefix, label, default_upper, default_median, default_log_sigma in (
+        (
+            "magnitude_base_scatter",
+            "magnitude base scatter",
+            DEFAULT_MAGNITUDE_BASE_SCATTER_UPPER,
+            DEFAULT_MAGNITUDE_BASE_SCATTER_PRIOR_MEDIAN,
+            DEFAULT_MAGNITUDE_BASE_SCATTER_PRIOR_LOG_SIGMA,
+        ),
+        (
+            "magnitude_arc_scatter",
+            "magnitude arc scatter",
+            DEFAULT_MAGNITUDE_ARC_SCATTER_UPPER,
+            DEFAULT_MAGNITUDE_ARC_SCATTER_PRIOR_MEDIAN,
+            DEFAULT_MAGNITUDE_ARC_SCATTER_PRIOR_LOG_SIGMA,
+        ),
+    ):
+        lower = float(getattr(args, f"{prefix}_lower", DEFAULT_MAGNITUDE_SCATTER_LOWER))
+        upper = float(getattr(args, f"{prefix}_upper", default_upper))
+        median = float(getattr(args, f"{prefix}_prior_median", default_median))
+        log_sigma = float(getattr(args, f"{prefix}_prior_log_sigma", default_log_sigma))
+        if not (np.isfinite(lower) and np.isfinite(upper) and 0.0 < lower < upper):
+            _fail(f"--{prefix.replace('_', '-')}-lower/upper must satisfy 0 < lower < upper.")
+        if not np.isfinite(median) or not (lower < median < upper):
+            _fail(f"--{prefix.replace('_', '-')}-prior-median must lie between lower and upper for {label}.")
+        if not np.isfinite(log_sigma) or log_sigma <= 0.0:
+            _fail(f"--{prefix.replace('_', '-')}-prior-log-sigma must be positive for {label}.")
     image_presence_penalty_weight = getattr(args, "image_presence_penalty_weight", None)
     if image_presence_penalty_weight is not None and (
         not np.isfinite(float(image_presence_penalty_weight)) or float(image_presence_penalty_weight) < 0.0
@@ -16421,11 +16447,12 @@ def _build_magnitude_scatter_parameter_spec(
     *,
     sample_name: str,
     field: str,
+    lower_mag: float = DEFAULT_MAGNITUDE_SCATTER_LOWER,
     upper_mag: float,
     prior_median_mag: float,
     prior_log_sigma: float,
 ) -> ParameterSpec:
-    lower = float(DEFAULT_MAGNITUDE_SCATTER_LOWER)
+    lower = float(lower_mag)
     upper = float(upper_mag)
     median = float(prior_median_mag)
     log_sigma = float(prior_log_sigma)
@@ -17494,6 +17521,7 @@ def _prepare_family_data(
             dec0_deg,
         )
         catalog_mag, catalog_mag_err = _family_magnitude_arrays(family_df, len(family_df))
+        catalog_mag_band_names = _family_magnitude_band_names(family_df)
         families.append(
             FamilyData(
                 family_id=family_id,
@@ -17505,6 +17533,7 @@ def _prepare_family_data(
                 y_obs=np.asarray(y_obs, dtype=float),
                 catalog_mag=catalog_mag,
                 catalog_mag_err=catalog_mag_err,
+                catalog_mag_band_names=catalog_mag_band_names,
                 reliability=np.asarray(
                     pd.to_numeric(family_df.get("family_reliability", 1.0), errors="coerce")
                     .fillna(1.0)
@@ -17606,6 +17635,13 @@ def _family_magnitude_arrays(family_df: pd.DataFrame, n_images: int) -> tuple[np
     if catalog_mag_err.shape != (n_images,):
         catalog_mag_err = np.full(n_images, np.nan, dtype=float)
     return catalog_mag, catalog_mag_err
+
+
+def _family_magnitude_band_names(family_df: pd.DataFrame) -> list[str]:
+    band_pairs = _image_catalog_band_magnitude_columns(family_df)
+    if band_pairs:
+        return [mag_column.removeprefix("mag_") for mag_column, _err_column in band_pairs]
+    return ["catalog"]
 
 
 def _build_bin_data(families: list[FamilyData]) -> list[BinData]:
@@ -26129,6 +26165,7 @@ def _save_plot_bundle_h5(
                         "y_obs": family.y_obs,
                         "catalog_mag": family.catalog_mag,
                         "catalog_mag_err": family.catalog_mag_err,
+                        "catalog_mag_band_names": family.catalog_mag_band_names,
                         "reliability": family.reliability,
                     }
                     for family in state.family_data
@@ -26223,6 +26260,7 @@ def _rebuild_state_from_h5(path: Path) -> tuple[BuildState, dict[str, Any], dict
                         item.get("catalog_mag_err", np.full(len(item["image_labels"]), np.nan)),
                         dtype=float,
                     ),
+                    catalog_mag_band_names=[str(name) for name in item.get("catalog_mag_band_names", [])],
                     reliability=np.asarray(
                         item.get("reliability", np.ones(len(item["image_labels"]), dtype=float)),
                         dtype=float,
@@ -27674,18 +27712,28 @@ def _build_state_from_inputs(
             _build_magnitude_scatter_parameter_spec(
                 sample_name=MAGNITUDE_BASE_SCATTER_SAMPLE_NAME,
                 field="base_scatter",
-                upper_mag=DEFAULT_MAGNITUDE_BASE_SCATTER_UPPER,
-                prior_median_mag=DEFAULT_MAGNITUDE_BASE_SCATTER_PRIOR_MEDIAN,
-                prior_log_sigma=DEFAULT_MAGNITUDE_BASE_SCATTER_PRIOR_LOG_SIGMA,
+                lower_mag=float(getattr(args, "magnitude_base_scatter_lower", DEFAULT_MAGNITUDE_SCATTER_LOWER)),
+                upper_mag=float(getattr(args, "magnitude_base_scatter_upper", DEFAULT_MAGNITUDE_BASE_SCATTER_UPPER)),
+                prior_median_mag=float(
+                    getattr(args, "magnitude_base_scatter_prior_median", DEFAULT_MAGNITUDE_BASE_SCATTER_PRIOR_MEDIAN)
+                ),
+                prior_log_sigma=float(
+                    getattr(args, "magnitude_base_scatter_prior_log_sigma", DEFAULT_MAGNITUDE_BASE_SCATTER_PRIOR_LOG_SIGMA)
+                ),
             )
         )
         parameter_specs.append(
             _build_magnitude_scatter_parameter_spec(
                 sample_name=MAGNITUDE_ARC_SCATTER_SAMPLE_NAME,
                 field="arc_scatter",
-                upper_mag=DEFAULT_MAGNITUDE_ARC_SCATTER_UPPER,
-                prior_median_mag=DEFAULT_MAGNITUDE_ARC_SCATTER_PRIOR_MEDIAN,
-                prior_log_sigma=DEFAULT_MAGNITUDE_ARC_SCATTER_PRIOR_LOG_SIGMA,
+                lower_mag=float(getattr(args, "magnitude_arc_scatter_lower", DEFAULT_MAGNITUDE_SCATTER_LOWER)),
+                upper_mag=float(getattr(args, "magnitude_arc_scatter_upper", DEFAULT_MAGNITUDE_ARC_SCATTER_UPPER)),
+                prior_median_mag=float(
+                    getattr(args, "magnitude_arc_scatter_prior_median", DEFAULT_MAGNITUDE_ARC_SCATTER_PRIOR_MEDIAN)
+                ),
+                prior_log_sigma=float(
+                    getattr(args, "magnitude_arc_scatter_prior_log_sigma", DEFAULT_MAGNITUDE_ARC_SCATTER_PRIOR_LOG_SIGMA)
+                ),
             )
         )
         parameter_specs.append(_build_magnitude_arc_bias_parameter_spec())

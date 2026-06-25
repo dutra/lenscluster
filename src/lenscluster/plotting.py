@@ -8430,6 +8430,288 @@ def _plot_residual_vs_magnification(image_df: pd.DataFrame, magnification_df: pd
     _finish_figure(fig, path, dpi=180, bbox_inches="tight")
 
 
+def _family_magnitude_matrix(family: Any) -> tuple[np.ndarray, np.ndarray]:
+    n_images = int(getattr(family, "n_images", 0))
+    magnitudes = np.asarray(getattr(family, "catalog_mag", np.empty((0,))), dtype=float)
+    magnitude_errors = np.asarray(getattr(family, "catalog_mag_err", np.empty((0,))), dtype=float)
+    if n_images <= 0:
+        return np.empty((0, 0), dtype=float), np.empty((0, 0), dtype=float)
+    if magnitudes.ndim == 1:
+        if magnitudes.shape != (n_images,):
+            magnitudes = np.full((n_images,), np.nan, dtype=float)
+        magnitudes = magnitudes[:, None]
+    elif magnitudes.ndim == 2:
+        if magnitudes.shape[0] != n_images:
+            magnitudes = np.full((n_images, 0), np.nan, dtype=float)
+    else:
+        magnitudes = np.full((n_images, 0), np.nan, dtype=float)
+
+    if magnitude_errors.ndim == 1:
+        if magnitude_errors.shape == (n_images,):
+            magnitude_errors = magnitude_errors[:, None]
+        else:
+            magnitude_errors = np.full(magnitudes.shape, np.nan, dtype=float)
+    elif magnitude_errors.ndim == 2:
+        if magnitude_errors.shape != magnitudes.shape:
+            magnitude_errors = np.full(magnitudes.shape, np.nan, dtype=float)
+    else:
+        magnitude_errors = np.full(magnitudes.shape, np.nan, dtype=float)
+    return magnitudes, magnitude_errors
+
+
+def _family_magnitude_band_names_for_plot(family: Any, n_bands: int) -> list[str]:
+    names = [str(name).removeprefix("mag_").lower() for name in getattr(family, "catalog_mag_band_names", []) or []]
+    if len(names) == int(n_bands):
+        return names
+    if int(n_bands) == 1:
+        return ["catalog"]
+    if int(n_bands) == 7:
+        return ["f105w", "f125w", "f140w", "f160w", "f435w", "f606w", "f814w"]
+    return [f"band_{idx + 1}" for idx in range(int(n_bands))]
+
+
+def _reference_magnitude_band_index(band_names: Sequence[str]) -> int:
+    normalized = [str(name).removeprefix("mag_").lower() for name in band_names]
+    for preferred in ("f160w", "hst_f160w"):
+        if preferred in normalized:
+            return int(normalized.index(preferred))
+    for preferred in ("f140w", "hst_f140w", "f125w", "hst_f125w", "f105w", "hst_f105w"):
+        if preferred in normalized:
+            return int(normalized.index(preferred))
+    return 0
+
+
+def _flux_magnification_ratio_pair_table(
+    state: BuildState,
+    magnification_df: pd.DataFrame,
+    image_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    columns = [
+        "family_id",
+        "band",
+        "band_index",
+        "image_label_i",
+        "image_label_j",
+        "magnitude_i",
+        "magnitude_j",
+        "magnitude_error_i",
+        "magnitude_error_j",
+        "observed_mag_difference",
+        "observed_mag_difference_error",
+        "magnification_i",
+        "magnification_j",
+        "p_arc_i",
+        "p_arc_j",
+        "p_arc_pair",
+        "model_mag_difference",
+        "model_minus_observed",
+    ]
+    if magnification_df is None or magnification_df.empty:
+        return pd.DataFrame(columns=columns)
+    required = {"family_id", "image_label"}
+    if not required.issubset(magnification_df.columns):
+        return pd.DataFrame(columns=columns)
+    mu_column = "magnification_model_q50" if "magnification_model_q50" in magnification_df.columns else "magnification_model"
+    if mu_column not in magnification_df.columns:
+        return pd.DataFrame(columns=columns)
+
+    mu_lookup: dict[tuple[str, str], float] = {}
+    for _, row in magnification_df.iterrows():
+        family_id = str(row.get("family_id", ""))
+        image_label = str(row.get("image_label", ""))
+        mu_value = pd.to_numeric(pd.Series([row.get(mu_column, np.nan)]), errors="coerce").iloc[0]
+        if not np.isfinite(mu_value) and "magnification_model" in magnification_df.columns:
+            mu_value = pd.to_numeric(pd.Series([row.get("magnification_model", np.nan)]), errors="coerce").iloc[0]
+        mu_lookup[(family_id, image_label)] = float(mu_value) if np.isfinite(mu_value) else np.nan
+
+    p_arc_lookup: dict[tuple[str, str], float] = {}
+    if image_df is not None and not image_df.empty and {"family_id", "image_label", "p_arc"}.issubset(image_df.columns):
+        for _, row in image_df.iterrows():
+            family_id = str(row.get("family_id", ""))
+            image_label = str(row.get("image_label", ""))
+            p_arc_value = pd.to_numeric(pd.Series([row.get("p_arc", np.nan)]), errors="coerce").iloc[0]
+            p_arc_lookup[(family_id, image_label)] = float(p_arc_value) if np.isfinite(p_arc_value) else np.nan
+
+    rows: list[dict[str, Any]] = []
+    for family in getattr(state, "family_data", []) or []:
+        family_id = str(getattr(family, "family_id", ""))
+        labels = [str(label) for label in getattr(family, "image_labels", [])]
+        n_images = len(labels)
+        if n_images < 2:
+            continue
+        magnitudes, magnitude_errors = _family_magnitude_matrix(family)
+        if magnitudes.shape[0] != n_images or magnitudes.shape[1] == 0:
+            continue
+        n_bands = int(magnitudes.shape[1])
+        band_names = _family_magnitude_band_names_for_plot(family, n_bands)
+        band_index = _reference_magnitude_band_index(band_names)
+        band_name = band_names[band_index]
+        for i in range(n_images - 1):
+            mu_i = mu_lookup.get((family_id, labels[i]), np.nan)
+            p_arc_i = p_arc_lookup.get((family_id, labels[i]), np.nan)
+            for j in range(i + 1, n_images):
+                mu_j = mu_lookup.get((family_id, labels[j]), np.nan)
+                p_arc_j = p_arc_lookup.get((family_id, labels[j]), np.nan)
+                if not (np.isfinite(mu_i) and np.isfinite(mu_j) and abs(mu_i) > 0.0 and abs(mu_j) > 0.0):
+                    continue
+                model_mag_difference = -2.5 * np.log10(abs(mu_i) / abs(mu_j))
+                mag_i = float(magnitudes[i, band_index])
+                mag_j = float(magnitudes[j, band_index])
+                if not (np.isfinite(mag_i) and np.isfinite(mag_j)):
+                    continue
+                err_i = float(magnitude_errors[i, band_index]) if magnitude_errors.shape == magnitudes.shape else np.nan
+                err_j = float(magnitude_errors[j, band_index]) if magnitude_errors.shape == magnitudes.shape else np.nan
+                observed_mag_difference = mag_i - mag_j
+                observed_mag_difference_error = (
+                    float(np.sqrt(err_i**2 + err_j**2))
+                    if np.isfinite(err_i) and np.isfinite(err_j) and err_i >= 0.0 and err_j >= 0.0
+                    else np.nan
+                )
+                rows.append(
+                    {
+                        "family_id": family_id,
+                        "band": band_name,
+                        "band_index": int(band_index),
+                        "image_label_i": labels[i],
+                        "image_label_j": labels[j],
+                        "magnitude_i": mag_i,
+                        "magnitude_j": mag_j,
+                        "magnitude_error_i": err_i,
+                        "magnitude_error_j": err_j,
+                        "observed_mag_difference": float(observed_mag_difference),
+                        "observed_mag_difference_error": observed_mag_difference_error,
+                        "magnification_i": float(mu_i),
+                        "magnification_j": float(mu_j),
+                        "p_arc_i": float(p_arc_i) if np.isfinite(p_arc_i) else np.nan,
+                        "p_arc_j": float(p_arc_j) if np.isfinite(p_arc_j) else np.nan,
+                        "p_arc_pair": float(np.nanmax([p_arc_i, p_arc_j])) if np.isfinite([p_arc_i, p_arc_j]).any() else np.nan,
+                        "model_mag_difference": float(model_mag_difference),
+                        "model_minus_observed": float(model_mag_difference - observed_mag_difference),
+                    }
+                )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _plot_flux_magnification_ratio_consistency(pair_df: pd.DataFrame, path: Path) -> None:
+    if pair_df is None or pair_df.empty:
+        _write_placeholder_plot(
+            path,
+            "Flux-Magnification Ratio Consistency",
+            "No same-family image pairs with finite magnitudes and model magnifications are available.",
+        )
+        return
+    observed = pd.to_numeric(pair_df["observed_mag_difference"], errors="coerce").to_numpy(dtype=float)
+    model = pd.to_numeric(pair_df["model_mag_difference"], errors="coerce").to_numpy(dtype=float)
+    errors = pd.to_numeric(pair_df["observed_mag_difference_error"], errors="coerce").to_numpy(dtype=float)
+    finite = np.isfinite(observed) & np.isfinite(model)
+    if not np.any(finite):
+        _write_placeholder_plot(
+            path,
+            "Flux-Magnification Ratio Consistency",
+            "No finite same-family magnitude-ratio residuals are available.",
+        )
+        return
+
+    observed = observed[finite]
+    model = model[finite]
+    errors = errors[finite]
+    bands = pair_df.loc[finite, "band"].astype(str).to_numpy()
+    p_arc_pair = (
+        pd.to_numeric(pair_df.loc[finite, "p_arc_pair"], errors="coerce").to_numpy(dtype=float)
+        if "p_arc_pair" in pair_df.columns
+        else np.full(observed.shape, np.nan, dtype=float)
+    )
+    residual = model - observed
+    bias = float(np.nanmedian(residual))
+    nmad = float(1.4826 * np.nanmedian(np.abs(residual - bias)))
+    rmse = float(np.sqrt(np.nanmean(np.square(residual))))
+
+    combined = np.concatenate([observed, model])
+    finite_combined = combined[np.isfinite(combined)]
+    lower = float(np.nanmin(finite_combined))
+    upper = float(np.nanmax(finite_combined))
+    if lower == upper:
+        span = max(abs(lower), 1.0) * 0.05
+    else:
+        span = upper - lower
+    limits = (lower - 0.06 * span, upper + 0.06 * span)
+    guide = np.linspace(limits[0], limits[1], 128)
+
+    fig, ax = plt.subplots(figsize=(6.4, 5.6))
+    ax.plot(guide, guide, color="0.15", linewidth=1.0, label="1:1")
+    finite_error = np.isfinite(errors) & (errors >= 0.0)
+    if np.any(finite_error):
+        ax.hlines(
+            model[finite_error],
+            observed[finite_error] - errors[finite_error],
+            observed[finite_error] + errors[finite_error],
+            color="0.6",
+            linewidth=0.7,
+            alpha=0.45,
+            zorder=2,
+        )
+    finite_p_arc = np.isfinite(p_arc_pair)
+    if np.any(finite_p_arc):
+        scatter = ax.scatter(
+            observed,
+            model,
+            c=np.clip(p_arc_pair, 0.0, 1.0),
+            cmap="viridis",
+            vmin=0.0,
+            vmax=1.0,
+            marker="o",
+            s=24,
+            alpha=0.86,
+            edgecolors="black",
+            linewidths=0.35,
+            label="image pairs",
+            zorder=4,
+        )
+        colorbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+        colorbar.set_label(r"pair $p_{\rm arc}$")
+    else:
+        band = bands[0] if len(set(bands.tolist())) == 1 else "image pairs"
+        ax.scatter(
+            observed,
+            model,
+            marker="o",
+            s=24,
+            color="tab:orange",
+            alpha=0.82,
+            edgecolors="black",
+            linewidths=0.35,
+            label=band,
+            zorder=4,
+        )
+    metric_text = "\n".join(
+        [
+            f"bias: {_format_recovery_metric(bias)}",
+            f"NMAD: {_format_recovery_metric(nmad)}",
+            f"RMSE: {_format_recovery_metric(rmse)}",
+            f"pairs: {int(np.count_nonzero(finite))}",
+        ]
+    )
+    ax.text(
+        0.98,
+        0.04,
+        metric_text,
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=8,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "0.75", "alpha": 0.88},
+    )
+    ax.set_xlim(*limits)
+    ax.set_ylim(*limits)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel(r"observed $m_i - m_j$ [mag]")
+    ax.set_ylabel(r"model $-2.5\log_{10}(|\mu_i|/|\mu_j|)$ [mag]")
+    ax.set_title("Same-Family Flux-Magnification Ratio Consistency")
+    ax.legend(loc="upper left", fontsize=8, frameon=True)
+    fig.tight_layout()
+    _finish_figure(fig, path, dpi=220, bbox_inches="tight")
+
+
 def _plot_residual_geometry_trends(image_df: pd.DataFrame, path: Path) -> None:
     if image_df.empty:
         return
@@ -14117,6 +14399,26 @@ def _generate_plots_and_tables(
             "plots.image_recovery.write_model_magnification_csv",
             lambda: context["model_magnification_df"].to_csv(tables_dir / "model_magnification.csv", index=False),
         ),
+        (
+            "flux_magnification_ratio_consistency_table",
+            "plots.image_recovery.flux_magnification_ratio_consistency_table",
+            lambda: context.__setitem__(
+                "flux_magnification_ratio_pair_df",
+                _flux_magnification_ratio_pair_table(
+                    state,
+                    context["model_magnification_df"],
+                    context["image_fit_quality_df"],
+                ),
+            ),
+        ),
+        (
+            "write_flux_magnification_ratio_consistency_csv",
+            "plots.image_recovery.write_flux_magnification_ratio_consistency_csv",
+            lambda: context["flux_magnification_ratio_pair_df"].to_csv(
+                tables_dir / "flux_magnification_ratio_consistency.csv",
+                index=False,
+            ),
+        ),
         ("write_final_run_summary", "plots.image_recovery.write_final_run_summary", _write_run_summary_files),
         (
             "image_recovery",
@@ -14182,6 +14484,14 @@ def _generate_plots_and_tables(
                 context["image_fit_quality_df"],
                 context["model_magnification_df"],
                 _plot_path(run_dir, "residual_vs_magnification.pdf"),
+            ),
+        ),
+        (
+            "flux_magnification_ratio_consistency",
+            "plots.flux_magnification_ratio_consistency",
+            lambda: _plot_flux_magnification_ratio_consistency(
+                context["flux_magnification_ratio_pair_df"],
+                _plot_path(run_dir, "flux_magnification_ratio_consistency.pdf"),
             ),
         ),
         (
