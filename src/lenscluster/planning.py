@@ -69,9 +69,22 @@ class SolverRuntime:
 
     def __getattr__(self, name: str) -> Any:
         try:
-            return self.values[name]
+            values = object.__getattribute__(self, "values")
+        except AttributeError as exc:
+            raise AttributeError(name) from exc
+        try:
+            return values[name]
         except KeyError as exc:
             raise AttributeError(name) from exc
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {"values": object.__getattribute__(self, "values")}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        values = state.get("values")
+        if not isinstance(values, dict):
+            raise TypeError("SolverRuntime pickle state must contain a values dictionary.")
+        object.__setattr__(self, "values", dict(values))
 
 
 def _positive_lognormal_prior_payload(prefix: str, prior: PriorConfig) -> dict[str, float]:

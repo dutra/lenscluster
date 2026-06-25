@@ -21371,6 +21371,7 @@ class ClusterJAXEvaluator:
         )
         flat_loglike = flat_loglike + self._magnitude_loglike_for_flat_data(
             flat_data,
+            physical_params,
             observed_jacobian_entries,
             singular_min=singular_min,
             singular_threshold=critical_arc_singular_threshold,
@@ -30498,7 +30499,7 @@ def _run_single_stage(
 
 def _run_single_stage_spawn_worker(
     result_queue: Any,
-    args: argparse.Namespace,
+    args: Any,
     fit_mode: str,
     run_name: str,
     stage1_prior_summary: Stage1PriorSummary | None,
@@ -30537,7 +30538,7 @@ def _run_single_stage_spawn_worker(
 
 
 def _run_single_stage_in_fresh_process(
-    args: argparse.Namespace,
+    args: Any,
     fit_mode: str,
     run_name: str,
     *,

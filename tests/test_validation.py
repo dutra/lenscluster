@@ -82,6 +82,7 @@ from lenscluster.cluster_solver import (
     _normalize_stage_fit_controls,
     _validation_metrics_summary,
 )
+
 from lenscluster.lenstool_parser import _load_arc_constraints_catalog, _split_image_label, load_best_par
 from lenscluster.model import (
     ArcConstraintData,
@@ -123,6 +124,23 @@ from lenscluster.validation import (
     parameter_recovery_table,
 )
 from lenscluster.utils import _rich_log_text, _should_log_to_console, format_stage_banner
+
+
+def _fresh_process_solver_runtime_echo_worker(
+    result_queue: Any,
+    args: SolverRuntime,
+    fit_mode: str,
+    run_name: str,
+    *_worker_args: Any,
+) -> None:
+    try:
+        if args.seed != 12345:
+            raise AssertionError(f"unexpected seed={args.seed!r}")
+        if fit_mode != cluster_solver.STAGE2_FREE_SOURCE_FORWARD_FIT_DIR:
+            raise AssertionError(f"unexpected fit_mode={fit_mode!r}")
+        result_queue.put({"status": "ok", "run_dir": str(Path(args.output_dir) / run_name)})
+    except BaseException:
+        result_queue.put({"status": "error", "traceback": "worker failed to read SolverRuntime"})
 
 
 def _install_recording_progress(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
@@ -29286,6 +29304,28 @@ def test_sequential_stage2_linearized_runs_as_free_source_forward_fit(
     assert summary["stage0_source_position_policy"] == cluster_solver.CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED
     assert summary["stage1_sample_likelihood_mode"] == SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN
     assert summary["stage2_forward_mode"] == cluster_solver.STAGE2_FORWARD_MODE_LINEARIZED
+
+
+def test_fresh_process_stage_accepts_pickled_solver_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = SolverRuntime(
+        {
+            "output_dir": str(tmp_path),
+            "seed": 12345,
+            "sampling_engine": "full_flat",
+        }
+    )
+    monkeypatch.setattr(cluster_solver, "_run_single_stage_spawn_worker", _fresh_process_solver_runtime_echo_worker)
+
+    run_dir = cluster_solver._run_single_stage_in_fresh_process(
+        runtime,
+        cluster_solver.STAGE2_FREE_SOURCE_FORWARD_FIT_DIR,
+        "fit/stage2_free_source_forward_fit",
+    )
+
+    assert run_dir == tmp_path / "fit" / "stage2_free_source_forward_fit"
 
 
 def test_sequential_forward_metric_image_plane_runs_as_stage4_with_cosmology(

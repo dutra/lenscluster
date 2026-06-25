@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import multiprocessing
 from pathlib import Path
+import pickle
+import queue
+from typing import Any
 
 import h5py
 import nbformat
@@ -29,7 +33,7 @@ from lenscluster.config import (
     TruthRecoveryConfig,
     WorkflowConfig,
 )
-from lenscluster.planning import RunPlan, compile_run_plan
+from lenscluster.planning import RunPlan, SolverRuntime, compile_run_plan
 import lenscluster.runner as runner_module
 from lenscluster.runner import LensClusterRunner
 from lenscluster.stages import StageExecutionResult
@@ -38,6 +42,13 @@ from lenscluster.stages import StageExecutionResult
 def _notebook_source(path: str | Path) -> str:
     notebook = nbformat.read(path, as_version=4)
     return "\n\n".join(str(cell.get("source", "")) for cell in notebook.cells)
+
+
+def _solver_runtime_spawn_echo_worker(result_queue: Any, runtime: SolverRuntime) -> None:
+    try:
+        result_queue.put({"seed": runtime.seed, "stage2_forward_mode": runtime.stage2_forward_mode})
+    except BaseException as exc:  # pragma: no cover - exercised only in spawned child failure
+        result_queue.put({"error": repr(exc)})
 
 
 def _minimal_sequential_config() -> LensClusterSolverConfig:
@@ -154,6 +165,39 @@ def test_runtime_seed_validation() -> None:
     for bad_seed in (None, True, -1, 1.2, "123"):
         with pytest.raises(ValueError, match="seed"):
             LensClusterSolverConfig(model=_minimal_model_config(), runtime=RuntimeConfig(seed=bad_seed)).validate()  # type: ignore[arg-type]
+
+
+def test_solver_runtime_pickle_roundtrip_supports_attribute_access() -> None:
+    runtime = SolverRuntime({"seed": 12345, "stage2_forward_mode": "critical-arc-anisotropic"})
+
+    restored = pickle.loads(pickle.dumps(runtime))
+
+    assert restored.seed == 12345
+    assert restored.stage2_forward_mode == "critical-arc-anisotropic"
+    with pytest.raises(AttributeError):
+        _ = restored.missing_runtime_field
+
+
+def test_solver_runtime_spawn_roundtrip() -> None:
+    runtime = SolverRuntime({"seed": 12345, "stage2_forward_mode": "critical-arc-anisotropic"})
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(target=_solver_runtime_spawn_echo_worker, args=(result_queue, runtime))
+    process.start()
+    process.join(timeout=15.0)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5.0)
+    try:
+        message = result_queue.get(timeout=1.0)
+    except queue.Empty:
+        message = {"error": f"spawn process did not report; exitcode={process.exitcode}"}
+    finally:
+        result_queue.close()
+        result_queue.join_thread()
+
+    assert process.exitcode == 0
+    assert message == {"seed": 12345, "stage2_forward_mode": "critical-arc-anisotropic"}
 
 
 def test_independent_member_halo_config_validation() -> None:
