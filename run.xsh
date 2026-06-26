@@ -33,6 +33,7 @@ from lenscluster.config import (
     RunPathsConfig,
     RuntimeConfig,
     ScalingModelConfig,
+    ShearHaloConfig,
     StageScheduleConfig,
     TruthRecoveryConfig,
     WorkflowConfig,
@@ -40,7 +41,7 @@ from lenscluster.config import (
 from lenscluster.planning import compile_run_plan
 from lenscluster.runner import LensClusterRunner
 
-OUTPUT_DIR_LABEL = "jun25b_anistropic_possigma0_nomaglikelihood"
+OUTPUT_DIR_LABEL = "jun26a_anistropic_possigma01_nomaglikelihood_magcut24_externalshear"
 
 # Kept here for HFF display tuning reuse, but this runner intentionally has no
 # HFF/Bergamini model configurations.
@@ -101,6 +102,16 @@ FF_SIMS_CLUSTERS = {
                     "angle_pos": PriorConfig("uniform", lower=-180.0, upper=180.0, step=1.0),
                     "core_radius_kpc": PriorConfig("uniform", lower=5.0, upper=45.0, step=1.0),
                     "v_disp": PriorConfig("truncated_normal", mean=950.0, std=175.0, lower=600.0, upper=1400.0),
+                },
+            ),
+            ShearHaloConfig(
+                id="S1",
+                gamma=0.0,
+                angle_pos=0.0,
+                z_lens=0.5,
+                priors={
+                    "gamma": PriorConfig("uniform", lower=0.0, upper=0.3, step=0.005),
+                    "angle_pos": PriorConfig("uniform", lower=-180.0, upper=180.0, step=0.5),
                 },
             ),
         ),
@@ -171,6 +182,16 @@ FF_SIMS_CLUSTERS = {
                     "v_disp": PriorConfig("truncated_normal", mean=700.0, std=245.0, lower=100.0, upper=2200.0),
                 },
             ),
+            ShearHaloConfig(
+                id="S1",
+                gamma=0.0,
+                angle_pos=0.0,
+                z_lens=0.507,
+                priors={
+                    "gamma": PriorConfig("uniform", lower=0.0, upper=0.3, step=0.005),
+                    "angle_pos": PriorConfig("uniform", lower=-180.0, upper=180.0, step=0.5),
+                },
+            ),
         ),
         "member_population": MemberPopulationConfig(
             id="potfile_1",
@@ -206,9 +227,9 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
 
     perturbation_alpha_tol = 0.1
     perturbation_jacobian_tol = 0.1
-    perturbation_top_k = 5
-    warmup = 3000, 3000
-    samples = 500, 500
+    perturbation_top_k = 10
+    warmup = 10000, 10000
+    samples = 1000, 1000
     max_tree_depth = 8, 8
     stage0_likelihood = "source"
     stage1_likelihood = "source"
@@ -240,7 +261,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         runtime=RuntimeConfig(
             seed=seed,
             chains=cores,
-            resume=False,
+            resume="all",
             quick_diagnostics=False,
             debug_sampler_diagnostics=True,
             numpyro_print_summary=True,
@@ -253,8 +274,8 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             stage0_likelihood=stage0_likelihood,
             stage1_likelihood=stage1_likelihood,
             stage2_forward_mode=stage2_forward_mode,
-            stage1_sampling_engine="full_flat",
-            stage2_sampling_engine="full_flat",
+            stage1_sampling_engine="refreshing_surrogate_flat",
+            stage2_sampling_engine="refreshing_surrogate_flat",
             stage2_fresh_process=True,
             exact_image_diagnostics_stage2=True,
             best_value="maximum-likelihood",
@@ -264,16 +285,17 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         ),
         schedule=StageScheduleConfig(
             fit_method=("svi+nuts", "svi+nuts"),
-            refresh_every=(None, None, None),
-            svi_steps=(10_000, 10_000, 10_000),
+            refresh_every=(None, 2000, 2000),
+            svi_steps=(10_000, 20_000, 20_000),
             warmup=warmup,
             samples=samples,
             sampling_refresh_runs=(1, 1),
             max_tree_depth=max_tree_depth,
             target_accept=0.8,
             z_bin_efficiency_tol=0.0,
+            svi_learning_rate=0.0005,
         ),
-        members=MemberSelectionConfig(potfile_member_mag_max=(20.0,)),
+        members=MemberSelectionConfig(potfile_member_mag_max=(24.0,)),
         perturbation=PerturbationDiscoveryConfig(
             perturbation_discovery_alpha_tol_arcsec=perturbation_alpha_tol,
             perturbation_discovery_jacobian_tol=perturbation_jacobian_tol,
@@ -312,7 +334,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             #     mean=0.3,
             #     std=0.2,
             # ),
-            pos_sigma_arcsec=0.0,
+            pos_sigma_arcsec=0.1,
             source_plane_covariance_mode="magnification",
             image_presence_penalty_weight=2.0,
             image_presence_match_radius_arcsec=1.0,
@@ -322,6 +344,8 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             image_plane_scatter_upper_arcsec=1.0,
         ),
         image_diagnostics=ImageDiagnosticsConfig(
+            critical_arc_singular_threshold=0.1,
+            arc_recovery_p_arc_threshold=0.1,
             fit_quality_draws=0,
             exact_image_min_distance_arcsec=0.5,
             exact_image_precision_limit=1.0e-2,
@@ -336,7 +360,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             gammax_true_fits=cluster_config["gammax_true_fits"],
             gammay_true_fits=cluster_config["gammay_true_fits"],
             truth_grid_mode="posterior",
-            truth_grid_draws=64,
+            truth_grid_draws=128,
             truth_grid_size=256,
             caustic_source_redshift=9.0,
         ),
@@ -345,7 +369,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             image_scale="auto",
             bands=FF_RGB_BANDS,
             rgb=FF_RGB_DISPLAY,
-            mode="fast",
+            mode="full",
             cutouts=False,
         ),
     )

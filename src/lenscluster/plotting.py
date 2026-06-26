@@ -128,7 +128,8 @@ TRUTH_GRID_QUANTITY_OUTPUT_NAMES = {
     "abs_mu": "abs_mu",
 }
 CRITICAL_ARC_MIXTURE_IMAGE_PLANE_MODE = "critical-arc-mixture-image-plane"
-CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD = 0.5
+CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE_MODE = "critical-arc-anisotropic-image-plane"
+CRITICAL_ARC_RECOVERY_P_ARC_THRESHOLD = 0.1
 CRITICAL_ARC_BASE_PROB = 0.10
 CRITICAL_ARC_MAX_PROB = 0.80
 CRITICAL_ARC_SINGULAR_THRESHOLD = 0.20
@@ -376,6 +377,7 @@ def _active_sample_likelihood_mode(evaluator: Any, args: argparse.Namespace) -> 
 def _uses_arc_aware_diagnostics(sample_likelihood_mode: Any) -> bool:
     return str(sample_likelihood_mode or "").strip() in {
         CRITICAL_ARC_MIXTURE_IMAGE_PLANE_MODE,
+        CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE_MODE,
     }
 
 
@@ -8197,10 +8199,13 @@ def _critical_arc_probability_curve(
     max_prob: float,
     singular_threshold: float,
     singular_softness: float,
+    sample_likelihood_mode: str = CRITICAL_ARC_MIXTURE_IMAGE_PLANE_MODE,
 ) -> np.ndarray:
     softness = max(float(singular_softness), 1.0e-12)
     argument = np.clip((float(singular_threshold) - np.asarray(s_min, dtype=float)) / softness, -700.0, 700.0)
     transition = 1.0 / (1.0 + np.exp(-argument))
+    if str(sample_likelihood_mode) == CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE_MODE:
+        return np.clip(transition, 1.0e-6, 1.0 - 1.0e-6)
     return np.clip(float(base_prob) + (float(max_prob) - float(base_prob)) * transition, 1.0e-6, 1.0 - 1.0e-6)
 
 
@@ -8213,6 +8218,7 @@ def _plot_critical_arc_support_histogram(
     critical_arc_max_prob: float = CRITICAL_ARC_MAX_PROB,
     singular_threshold: float = CRITICAL_ARC_SINGULAR_THRESHOLD,
     singular_softness: float = CRITICAL_ARC_SINGULAR_SOFTNESS,
+    sample_likelihood_mode: str = CRITICAL_ARC_MIXTURE_IMAGE_PLANE_MODE,
 ) -> None:
     if not _critical_arc_support_available(image_df):
         _write_placeholder_plot(
@@ -8356,6 +8362,7 @@ def _plot_critical_arc_support_histogram(
                     max_prob=critical_arc_max_prob,
                     singular_threshold=threshold,
                     singular_softness=softness,
+                    sample_likelihood_mode=sample_likelihood_mode,
                 ),
                 color="0.25",
                 linestyle=":",
@@ -8429,6 +8436,7 @@ def _plot_critical_arc_support_phase_space(
     critical_arc_max_prob: float = CRITICAL_ARC_MAX_PROB,
     singular_threshold: float = CRITICAL_ARC_SINGULAR_THRESHOLD,
     singular_softness: float = CRITICAL_ARC_SINGULAR_SOFTNESS,
+    sample_likelihood_mode: str = CRITICAL_ARC_MIXTURE_IMAGE_PLANE_MODE,
 ) -> None:
     if image_df.empty or "arc_s_min" not in image_df.columns or "p_arc" not in image_df.columns:
         _write_placeholder_plot(
@@ -8485,6 +8493,7 @@ def _plot_critical_arc_support_phase_space(
                 max_prob=float(critical_arc_max_prob),
                 singular_threshold=threshold,
                 singular_softness=softness,
+                sample_likelihood_mode=sample_likelihood_mode,
             ),
             color="0.25",
             linestyle=":",
@@ -9795,6 +9804,7 @@ def _posterior_truth_grid_quantiles(
     require_cache: bool = False,
     aperture_center: dict[str, Any] | None = None,
     aperture_kappa_true: np.ndarray | None = None,
+    aperture_image_df: pd.DataFrame | None = None,
     aperture_n_radii: int = 40,
     progress: Any | None = None,
     truth_grid_metadata: dict[str, Any] | None = None,
@@ -9818,6 +9828,18 @@ def _posterior_truth_grid_quantiles(
         cached = cache[cache_key]
         cached_quantiles = cached.get("quantiles", {})
         if set(requested_quantities).issubset(cached_quantiles):
+            aperture_profile = cached.get("aperture_profile")
+            cached_aperture_center = cached.get("aperture_center")
+            if isinstance(aperture_profile, pd.DataFrame) and isinstance(cached_aperture_center, dict):
+                _plot_truth_recovery_m2d_aperture_ratio(
+                    plot_dir,
+                    aperture_profile,
+                    cached_aperture_center,
+                    image_radii_arcsec=_truth_recovery_image_aperture_radii(
+                        aperture_image_df,
+                        cached_aperture_center,
+                    ),
+                )
             return (
                 {quantity: cached_quantiles[quantity] for quantity in requested_quantities},
                 np.asarray(cached["x_arcsec"], dtype=np.float64),
@@ -10095,13 +10117,19 @@ def _posterior_truth_grid_quantiles(
         tables_dir = plot_dir / "tables"
         tables_dir.mkdir(parents=True, exist_ok=True)
         aperture_profile_df.to_csv(tables_dir / "truth_recovery_m2d_aperture_profile.csv", index=False)
-        _plot_truth_recovery_m2d_aperture_ratio(plot_dir, aperture_profile_df, aperture_center)
+        _plot_truth_recovery_m2d_aperture_ratio(
+            plot_dir,
+            aperture_profile_df,
+            aperture_center,
+            image_radii_arcsec=_truth_recovery_image_aperture_radii(aperture_image_df, aperture_center),
+        )
     if cache is not None:
         cache[cache_key] = {
             "quantiles": shaped_quantiles,
             "x_arcsec": x_arcsec,
             "y_arcsec": y_arcsec,
             "aperture_profile": aperture_profile_df,
+            "aperture_center": aperture_center,
         }
     return shaped_quantiles, x_arcsec, y_arcsec
 
@@ -11101,43 +11129,132 @@ def _truth_recovery_aperture_profile(
     return pd.DataFrame(rows, columns=columns)
 
 
+def _truth_recovery_image_aperture_radii(
+    image_df: pd.DataFrame | None,
+    center: dict[str, Any] | None,
+) -> np.ndarray:
+    if image_df is None or image_df.empty or center is None:
+        return np.asarray([], dtype=float)
+    if "x_obs_arcsec" not in image_df or "y_obs_arcsec" not in image_df:
+        return np.asarray([], dtype=float)
+    center_x = _finite_float_or_nan(center.get("center_x_arcsec"))
+    center_y = _finite_float_or_nan(center.get("center_y_arcsec"))
+    if not (np.isfinite(center_x) and np.isfinite(center_y)):
+        return np.asarray([], dtype=float)
+    x_obs = pd.to_numeric(image_df["x_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
+    y_obs = pd.to_numeric(image_df["y_obs_arcsec"], errors="coerce").to_numpy(dtype=float)
+    radii = np.hypot(x_obs - center_x, y_obs - center_y)
+    return radii[np.isfinite(radii) & (radii > 0.0)]
+
+
 def _plot_truth_recovery_m2d_aperture_ratio(
     plot_dir: Path,
     profile_df: pd.DataFrame,
     center: dict[str, Any],
+    *,
+    image_radii_arcsec: np.ndarray | Sequence[float] | None = None,
 ) -> None:
     if profile_df.empty:
         return
     output_path = _plot_path(plot_dir, "truth_recovery_m2d_aperture_ratio.pdf")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(6.3, 4.8))
+    fig, (ax, ax_resid) = plt.subplots(
+        2,
+        1,
+        figsize=(6.3, 5.4),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3, 1], "hspace": 0.08},
+    )
     radius = pd.to_numeric(profile_df["radius_arcsec"], errors="coerce").to_numpy(dtype=float)
+    truth_m2d = pd.to_numeric(profile_df["kappa_true_sum"], errors="coerce").to_numpy(dtype=float)
+    model_m2d = pd.to_numeric(profile_df["kappa_model_sum"], errors="coerce").to_numpy(dtype=float)
     ratio_column = "m2d_ratio_median" if "m2d_ratio_median" in profile_df else "m2d_ratio"
     ratio = pd.to_numeric(profile_df[ratio_column], errors="coerce").to_numpy(dtype=float)
-    finite = np.isfinite(radius) & np.isfinite(ratio)
-    if np.any(finite):
+    positive_radius = np.isfinite(radius) & (radius > 0.0)
+    finite_truth = positive_radius & np.isfinite(truth_m2d) & (truth_m2d > 0.0)
+    finite_model = positive_radius & np.isfinite(model_m2d) & (model_m2d > 0.0)
+    finite_residual = positive_radius & np.isfinite(ratio)
+    if np.any(finite_truth) or np.any(finite_model):
+        if np.any(finite_model):
+            if {"kappa_model_sum_q16", "kappa_model_sum_q84"}.issubset(profile_df.columns):
+                model_q16 = pd.to_numeric(profile_df["kappa_model_sum_q16"], errors="coerce").to_numpy(dtype=float)
+                model_q84 = pd.to_numeric(profile_df["kappa_model_sum_q84"], errors="coerce").to_numpy(dtype=float)
+                finite_model_band = finite_model & np.isfinite(model_q16) & (model_q16 > 0.0)
+                finite_model_band &= np.isfinite(model_q84) & (model_q84 > 0.0)
+                if np.any(finite_model_band):
+                    ax.fill_between(
+                        radius[finite_model_band],
+                        model_q16[finite_model_band],
+                        model_q84[finite_model_band],
+                        color="tab:blue",
+                        alpha=0.18,
+                        linewidth=0.0,
+                        label="16-84% posterior",
+                    )
+            ax.plot(
+                radius[finite_model],
+                model_m2d[finite_model],
+                color="tab:blue",
+                linewidth=1.8,
+                label="model",
+            )
+        if np.any(finite_truth):
+            ax.plot(
+                radius[finite_truth],
+                truth_m2d[finite_truth],
+                color="0.2",
+                linestyle="--",
+                linewidth=1.3,
+                label="truth",
+            )
+    else:
+        ax.text(0.5, 0.5, "No finite aperture masses.", ha="center", va="center", transform=ax.transAxes)
+    image_radii = np.asarray([] if image_radii_arcsec is None else image_radii_arcsec, dtype=float).reshape(-1)
+    finite_image_radii = image_radii[np.isfinite(image_radii) & (image_radii > 0.0)]
+    if finite_image_radii.size:
+        ax.vlines(
+            finite_image_radii,
+            0.0,
+            0.06,
+            transform=ax.get_xaxis_transform(),
+            color="0.45",
+            linewidth=0.45,
+            alpha=0.65,
+            zorder=5,
+        )
+    if np.any(finite_residual):
         if {"m2d_ratio_q16", "m2d_ratio_q84"}.issubset(profile_df.columns):
             ratio_q16 = pd.to_numeric(profile_df["m2d_ratio_q16"], errors="coerce").to_numpy(dtype=float)
             ratio_q84 = pd.to_numeric(profile_df["m2d_ratio_q84"], errors="coerce").to_numpy(dtype=float)
-            finite_band = finite & np.isfinite(ratio_q16) & np.isfinite(ratio_q84)
-            if np.any(finite_band):
-                ax.fill_between(
-                    radius[finite_band],
-                    ratio_q16[finite_band],
-                    ratio_q84[finite_band],
+            finite_residual_band = finite_residual & np.isfinite(ratio_q16) & np.isfinite(ratio_q84)
+            if np.any(finite_residual_band):
+                ax_resid.fill_between(
+                    radius[finite_residual_band],
+                    ratio_q16[finite_residual_band] - 1.0,
+                    ratio_q84[finite_residual_band] - 1.0,
                     color="tab:blue",
                     alpha=0.18,
                     linewidth=0.0,
-                    label="16-84% posterior",
                 )
-        ax.plot(radius[finite], ratio[finite], color="tab:blue", linewidth=1.8)
+        ax_resid.plot(
+            radius[finite_residual],
+            ratio[finite_residual] - 1.0,
+            color="tab:blue",
+            linewidth=1.3,
+        )
     else:
-        ax.text(0.5, 0.5, "No finite aperture mass ratios.", ha="center", va="center", transform=ax.transAxes)
-    ax.axhline(1.0, color="0.2", linestyle="--", linewidth=1.0, label="truth")
-    ax.set_xlabel("R [arcsec]")
-    ax.set_ylabel(r"$M_{\rm 2D,model}(<R) / M_{\rm 2D,true}(<R)$")
+        ax_resid.text(0.5, 0.5, "No finite residuals.", ha="center", va="center", transform=ax_resid.transAxes)
+    ax_resid.axhline(0.0, color="0.2", linestyle="--", linewidth=1.0)
+    ax_resid.set_ylim(-0.1, 0.1)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax_resid.set_xlim(left=5.0)
+    ax_resid.set_xlabel("R [arcsec]")
+    ax_resid.set_ylabel("residual")
+    ax.set_ylabel(r"enclosed $M_{\rm 2D}(<R)$")
     ax.set_title("Projected aperture mass recovery")
     ax.grid(True, alpha=0.25)
+    ax_resid.grid(True, alpha=0.25)
     center_mode = str(center.get("center_mode", ""))
     if center_mode == "smoothed_truth_kappa_peak":
         center_label = "smoothed truth kappa peak"
@@ -11167,7 +11284,6 @@ def _plot_truth_recovery_m2d_aperture_ratio(
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "0.75", "alpha": 0.88},
     )
     ax.legend(loc="best", fontsize=8, frameon=True)
-    fig.tight_layout()
     _finish_figure(fig, output_path, dpi=220, bbox_inches="tight")
 
 
@@ -11298,6 +11414,7 @@ def _plot_kappa_truth_diagnostics(
         require_cache=require_precomputed_truth_grid,
         aperture_center=None,
         aperture_kappa_true=kappa_true,
+        aperture_image_df=image_df,
         truth_grid_metadata=grid_metadata,
         draw_seed=truth_grid_draw_seed,
     )
@@ -12922,6 +13039,7 @@ IMAGE_CATALOG_MIN_OVERVIEW_SIZE_ARCSEC = 40.0
 IMAGE_CATALOG_OVERVIEW_LABEL_FONT_SIZE = 8.6
 IMAGE_CATALOG_DETAIL_LABEL_FONT_SIZE = 8.0
 IMAGE_CATALOG_STATUS_LABEL_FONT_SIZE = 8.0
+IMAGE_CATALOG_MARKER_LABEL_FONT_SIZE = 6.4
 IMAGE_CATALOG_LEGEND_FONT_SIZE = 12.0
 IMAGE_CATALOG_TANGENTIAL_CRITICAL_COLOR = "#ffd54f"
 IMAGE_CATALOG_RADIAL_CRITICAL_COLOR = "#ff4da6"
@@ -13253,6 +13371,20 @@ def _format_image_catalog_extra_label(row: pd.Series) -> str:
     )
 
 
+def _format_image_catalog_marker_label(row: pd.Series) -> str:
+    for column in ("image_label", "family_id"):
+        value = row.get(column, "")
+        try:
+            if pd.isna(value):
+                continue
+        except (TypeError, ValueError):
+            pass
+        text = str(value).strip()
+        if text and text.lower() not in {"nan", "none", "null"}:
+            return text
+    return ""
+
+
 def _format_image_catalog_overview_label(block: dict[str, Any]) -> str:
     observed = block["observed"]
     extras = block["extras"]
@@ -13516,6 +13648,44 @@ def _draw_image_catalog_observed_marker(
     )
 
 
+def _draw_image_catalog_marker_label(
+    ax: plt.Axes,
+    image: Any,
+    center_coord: SkyCoord,
+    image_row: pd.Series,
+    reference: tuple[int, float, float],
+    *,
+    cutout_size_arcsec: float,
+    rendered_shape: tuple[int, int],
+) -> bool:
+    label = _format_image_catalog_marker_label(image_row)
+    if not label:
+        return False
+    target_coord = _arcsec_to_skycoord(image_row.get("x_obs_arcsec"), image_row.get("y_obs_arcsec"), reference)
+    if target_coord is None:
+        return False
+    pixel = _cutout_pixel_xy(image, center_coord, target_coord, cutout_size_arcsec=cutout_size_arcsec)
+    if pixel is None:
+        return False
+    x_pixel, y_pixel = pixel
+    height, width = rendered_shape
+    if x_pixel < 0.0 or x_pixel > width - 1 or y_pixel < 0.0 or y_pixel > height - 1:
+        return False
+    ax.text(
+        x_pixel + 4.0,
+        y_pixel - 4.0,
+        label,
+        va="bottom",
+        ha="left",
+        fontsize=IMAGE_CATALOG_MARKER_LABEL_FONT_SIZE,
+        color="white",
+        clip_on=True,
+        zorder=30,
+        bbox=IMAGE_CATALOG_PANEL_TEXT_BBOX,
+    )
+    return True
+
+
 def _draw_image_catalog_model_marker(
     ax: plt.Axes,
     image: Any,
@@ -13769,6 +13939,15 @@ def _draw_image_catalog_cluster_overview_panel(
     )
     for _, image_row in catalog_df.iterrows():
         _draw_image_catalog_observed_row_overlays(
+            ax,
+            display_image,
+            center_coord,
+            image_row,
+            reference,
+            cutout_size_arcsec=cutout_size_arcsec,
+            rendered_shape=rgb.shape[:2],
+        )
+        _draw_image_catalog_marker_label(
             ax,
             display_image,
             center_coord,
@@ -14406,6 +14585,19 @@ def _generate_plots_and_tables(
         arc_aware_family_df["family_id"] = arc_aware_family_df["family_id"].astype(str)
         context["family_df"] = family_df.merge(arc_aware_family_df, on="family_id", how="left")
 
+    def _critical_arc_support_plots_enabled() -> bool:
+        return use_arc_aware_diagnostics
+
+    def _critical_arc_support_plot_mode() -> str:
+        if _uses_arc_aware_diagnostics(sample_likelihood_mode):
+            return sample_likelihood_mode
+        stage2_forward_mode = str(getattr(args, "stage2_forward_mode", "") or "").strip()
+        if stage2_forward_mode == "critical-arc-anisotropic":
+            return CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE_MODE
+        if stage2_forward_mode == "critical-arc":
+            return CRITICAL_ARC_MIXTURE_IMAGE_PLANE_MODE
+        return sample_likelihood_mode
+
     run_diagnostics_tasks: list[PlotTask] = [
         (
             "summary_table",
@@ -15026,13 +15218,13 @@ def _generate_plots_and_tables(
             lambda: _plot_residual_geometry_trends(context["image_fit_quality_df"], _plot_path(run_dir, "residual_geometry_trends.pdf")),
         ),
     ]
-    if use_arc_aware_diagnostics:
-        image_recovery_tasks.extend(
-            [
-                (
-                    "critical_arc_support_histogram",
-                    "plots.critical_arc_support_histogram",
-                    lambda: _plot_critical_arc_support_histogram(
+    image_recovery_tasks.extend(
+        [
+            (
+                "critical_arc_support_histogram",
+                "plots.critical_arc_support_histogram",
+                lambda: (
+                    _plot_critical_arc_support_histogram(
                         context["image_fit_quality_df"],
                         _plot_path(run_dir, "critical_arc_support_histogram.pdf"),
                         arc_recovery_p_arc_threshold=float(
@@ -15042,12 +15234,17 @@ def _generate_plots_and_tables(
                         critical_arc_max_prob=float(getattr(evaluator, "critical_arc_max_prob", CRITICAL_ARC_MAX_PROB)),
                         singular_threshold=float(critical_arc_singular_threshold_best_fit),
                         singular_softness=float(critical_arc_singular_softness_best_fit),
-                    ),
+                        sample_likelihood_mode=_critical_arc_support_plot_mode(),
+                    )
+                    if _critical_arc_support_plots_enabled()
+                    else None
                 ),
-                (
-                    "critical_arc_support_phase_space",
-                    "plots.critical_arc_support_phase_space",
-                    lambda: _plot_critical_arc_support_phase_space(
+            ),
+            (
+                "critical_arc_support_phase_space",
+                "plots.critical_arc_support_phase_space",
+                lambda: (
+                    _plot_critical_arc_support_phase_space(
                         context["image_fit_quality_df"],
                         _plot_path(run_dir, "critical_arc_support_phase_space.pdf"),
                         arc_recovery_p_arc_threshold=float(
@@ -15057,18 +15254,26 @@ def _generate_plots_and_tables(
                         critical_arc_max_prob=float(getattr(evaluator, "critical_arc_max_prob", CRITICAL_ARC_MAX_PROB)),
                         singular_threshold=float(critical_arc_singular_threshold_best_fit),
                         singular_softness=float(critical_arc_singular_softness_best_fit),
-                    ),
+                        sample_likelihood_mode=_critical_arc_support_plot_mode(),
+                    )
+                    if _critical_arc_support_plots_enabled()
+                    else None
                 ),
-                (
-                    "critical_arc_recovery_by_family",
-                    "plots.critical_arc_recovery_by_family",
-                    lambda: _plot_critical_arc_recovery_by_family(
+            ),
+            (
+                "critical_arc_recovery_by_family",
+                "plots.critical_arc_recovery_by_family",
+                lambda: (
+                    _plot_critical_arc_recovery_by_family(
                         context["image_count_recovery_df"],
                         _plot_path(run_dir, "critical_arc_recovery_by_family.pdf"),
-                    ),
+                    )
+                    if _critical_arc_support_plots_enabled()
+                    else None
                 ),
-            ]
-        )
+            ),
+        ]
+    )
 
     truth_recovery_tasks: list[PlotTask] = []
     skip_grid_diagnostics = bool(getattr(args, "skip_grid_diagnostics", False))

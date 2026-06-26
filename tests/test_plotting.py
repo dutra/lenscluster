@@ -5630,9 +5630,21 @@ def test_truth_recovery_m2d_aperture_plot_draws_posterior_band(monkeypatch: Any,
     from matplotlib.axes import Axes
 
     fill_calls: list[dict[str, np.ndarray]] = []
+    plot_labels: list[str] = []
+    set_xscale_calls: list[str] = []
+    set_yscale_calls: list[str] = []
+    set_xlim_calls: list[tuple[float | None, float | None]] = []
+    set_ylim_calls: list[tuple[float | None, float | None]] = []
     text_calls: list[str] = []
+    vline_calls: list[np.ndarray] = []
     original_fill_between = Axes.fill_between
+    original_plot = Axes.plot
+    original_set_xscale = Axes.set_xscale
+    original_set_yscale = Axes.set_yscale
+    original_set_xlim = Axes.set_xlim
+    original_set_ylim = Axes.set_ylim
     original_text = Axes.text
+    original_vlines = Axes.vlines
 
     def record_fill_between(self: Axes, x: Any, y1: Any, y2: Any, *args: Any, **kwargs: Any) -> Any:
         fill_calls.append(
@@ -5644,15 +5656,55 @@ def test_truth_recovery_m2d_aperture_plot_draws_posterior_band(monkeypatch: Any,
         )
         return original_fill_between(self, x, y1, y2, *args, **kwargs)
 
+    def record_plot(self: Axes, *args: Any, **kwargs: Any) -> Any:
+        plot_labels.append(str(kwargs.get("label", "")))
+        return original_plot(self, *args, **kwargs)
+
+    def record_set_xscale(self: Axes, value: Any, *args: Any, **kwargs: Any) -> Any:
+        set_xscale_calls.append(str(value))
+        return original_set_xscale(self, value, *args, **kwargs)
+
+    def record_set_yscale(self: Axes, value: Any, *args: Any, **kwargs: Any) -> Any:
+        set_yscale_calls.append(str(value))
+        return original_set_yscale(self, value, *args, **kwargs)
+
+    def record_set_xlim(
+        self: Axes,
+        left: Any = None,
+        right: Any = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        set_xlim_calls.append((left, right))
+        return original_set_xlim(self, left, right, *args, **kwargs)
+
+    def record_set_ylim(self: Axes, bottom: Any = None, top: Any = None, *args: Any, **kwargs: Any) -> Any:
+        set_ylim_calls.append((bottom, top))
+        return original_set_ylim(self, bottom, top, *args, **kwargs)
+
     def record_text(self: Axes, x: Any, y: Any, s: str, *args: Any, **kwargs: Any) -> Any:
         text_calls.append(str(s))
         return original_text(self, x, y, s, *args, **kwargs)
 
+    def record_vlines(self: Axes, x: Any, ymin: Any, ymax: Any, *args: Any, **kwargs: Any) -> Any:
+        vline_calls.append(np.asarray(x, dtype=float))
+        return original_vlines(self, x, ymin, ymax, *args, **kwargs)
+
     monkeypatch.setattr(Axes, "fill_between", record_fill_between)
+    monkeypatch.setattr(Axes, "plot", record_plot)
+    monkeypatch.setattr(Axes, "set_xscale", record_set_xscale)
+    monkeypatch.setattr(Axes, "set_yscale", record_set_yscale)
+    monkeypatch.setattr(Axes, "set_xlim", record_set_xlim)
+    monkeypatch.setattr(Axes, "set_ylim", record_set_ylim)
     monkeypatch.setattr(Axes, "text", record_text)
+    monkeypatch.setattr(Axes, "vlines", record_vlines)
     profile = pd.DataFrame(
         {
-            "radius_arcsec": [1.0, 2.0],
+            "radius_arcsec": [5.0, 10.0],
+            "kappa_true_sum": [10.0, 20.0],
+            "kappa_model_sum": [10.0, 22.0],
+            "kappa_model_sum_q16": [8.0, 18.0],
+            "kappa_model_sum_q84": [12.0, 26.0],
             "m2d_ratio": [1.0, 1.1],
             "m2d_ratio_q16": [0.8, 0.9],
             "m2d_ratio_median": [1.0, 1.1],
@@ -5668,13 +5720,34 @@ def test_truth_recovery_m2d_aperture_plot_draws_posterior_band(monkeypatch: Any,
         "center_smoothing_sigma_pix": 1.0,
         "center_smoothed_kappa_peak": 2.5,
     }
+    image_df = pd.DataFrame(
+        {
+            "x_obs_arcsec": [0.0, 6.0, 9.0, np.nan],
+            "y_obs_arcsec": [0.0, 0.0, 0.0, 1.0],
+        }
+    )
+    image_radii = plotting._truth_recovery_image_aperture_radii(image_df, center)
 
-    plotting._plot_truth_recovery_m2d_aperture_ratio(tmp_path, profile, center)
+    plotting._plot_truth_recovery_m2d_aperture_ratio(
+        tmp_path,
+        profile,
+        center,
+        image_radii_arcsec=image_radii,
+    )
 
     assert (tmp_path / "truth_recovery_m2d_aperture_ratio.pdf").exists()
-    assert len(fill_calls) == 1
-    np.testing.assert_allclose(fill_calls[0]["y1"], [0.8, 0.9])
-    np.testing.assert_allclose(fill_calls[0]["y2"], [1.2, 1.3])
+    assert len(fill_calls) == 2
+    np.testing.assert_allclose(fill_calls[0]["y1"], [8.0, 18.0])
+    np.testing.assert_allclose(fill_calls[0]["y2"], [12.0, 26.0])
+    np.testing.assert_allclose(fill_calls[1]["y1"], [-0.2, -0.1])
+    np.testing.assert_allclose(fill_calls[1]["y2"], [0.2, 0.3])
+    assert plot_labels[:2] == ["model", "truth"]
+    assert "log" in set_xscale_calls
+    assert "log" in set_yscale_calls
+    assert (5.0, None) in set_xlim_calls
+    assert (-0.1, 0.1) in set_ylim_calls
+    assert len(vline_calls) == 1
+    np.testing.assert_allclose(vline_calls[0], [6.0, 9.0])
     assert any("smoothed truth kappa peak" in text for text in text_calls)
     assert any("smoothing sigma=1 pix" in text for text in text_calls)
 

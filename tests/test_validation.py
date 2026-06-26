@@ -24,8 +24,10 @@ import lenscluster.cluster_solver as cluster_solver
 import lenscluster.image_diagnostics as image_diagnostics
 import lenscluster.mock_cluster as mock_cluster
 import lenscluster.multi_cluster_solver as multi_cluster_solver
+import lenscluster.planning as planning
 import lenscluster.plotting as plotting
 import lenscluster.validation as validation
+from lenscluster.config import ImageDiagnosticsConfig, LensClusterSolverConfig
 from lenscluster.planning import SolverRuntime
 from lenscluster.jax_cosmology import (
     ARCSEC_TO_RAD,
@@ -50,6 +52,7 @@ from lenscluster.cluster_solver import (
     IMAGE_PLANE_MODE_NONE,
     SAMPLE_LIKELIHOOD_ANCHORED_SOLVED_FORWARD_BETA_IMAGE_PLANE,
     SAMPLE_LIKELIHOOD_CATASTROPHE_NORMAL_FORM_IMAGE_PLANE,
+    SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
     SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
     SAMPLE_LIKELIHOOD_FOLD_REGULARIZED_FORWARD_BETA_IMAGE_PLANE,
     SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
@@ -3759,7 +3762,84 @@ def test_plot_critical_arc_support_histogram_uses_q50_and_thresholds(
     np.testing.assert_allclose(np.sort(all_probability_x), np.sort(expected_log_s_min))
     np.testing.assert_allclose(np.sort(all_probability_y), [0.31, 0.82])
     assert any(value == pytest.approx(float(np.log10(0.2))) for value in axvline_values)
-    assert any(value == pytest.approx(0.5) for value in axhline_values)
+    assert any(value == pytest.approx(0.1) for value in axhline_values)
+
+
+@pytest.mark.parametrize(
+    "sample_likelihood_mode",
+    [
+        SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
+        SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
+    ],
+)
+def test_plotting_arc_aware_diagnostics_enabled_for_critical_arc_modes(sample_likelihood_mode: str) -> None:
+    assert plotting._uses_arc_aware_diagnostics(sample_likelihood_mode)
+
+
+def test_image_catalog_arc_candidate_support_uses_point_one_default_threshold() -> None:
+    assert not plotting._image_catalog_arc_candidate_supported(pd.Series({"p_arc": 0.09}))
+    assert plotting._image_catalog_arc_candidate_supported(pd.Series({"p_arc": 0.10}))
+    assert not plotting._image_catalog_arc_candidate_supported(
+        pd.Series({"p_arc": 0.10, "arc_recovery_p_arc_threshold": 0.5})
+    )
+
+
+def test_image_catalog_marker_label_prefers_image_label() -> None:
+    assert plotting._format_image_catalog_marker_label(
+        pd.Series({"family_id": "10", "image_label": "10.b"})
+    ) == "10.b"
+    assert plotting._format_image_catalog_marker_label(pd.Series({"family_id": "10", "image_label": ""})) == "10"
+
+
+def test_image_catalog_cluster_overview_draws_observed_image_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    labels: list[str] = []
+    original_text = plotting.plt.Axes.text
+
+    def record_text(self: Any, x: Any, y: Any, text: str, *args: Any, **kwargs: Any) -> Any:
+        labels.append(str(text))
+        return original_text(self, x, y, text, *args, **kwargs)
+
+    monkeypatch.setattr(plotting.plt.Axes, "text", record_text)
+    monkeypatch.setattr(plotting, "_image_catalog_cluster_overview_geometry", lambda *_args, **_kwargs: (0.0, 0.0, 10.0))
+    monkeypatch.setattr(plotting, "_arcsec_to_skycoord", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(plotting, "_image_catalog_draw_rgb_cutout", lambda *args, **kwargs: np.zeros((100, 100, 3), dtype=float))
+    monkeypatch.setattr(plotting, "_draw_image_catalog_observed_row_overlays", lambda *args, **kwargs: None)
+    monkeypatch.setattr(plotting, "_add_image_catalog_axis_legend", lambda *args, **kwargs: None)
+
+    pixel_positions = iter([(20.0, 30.0), (55.0, 70.0)])
+
+    def fake_cutout_pixel_xy(*_args: Any, **_kwargs: Any) -> tuple[float, float]:
+        return next(pixel_positions)
+
+    monkeypatch.setattr(plotting, "_cutout_pixel_xy", fake_cutout_pixel_xy)
+
+    fig, ax = plotting.plt.subplots()
+    try:
+        plotting._draw_image_catalog_cluster_overview_panel(
+            ax,
+            helpers=SimpleNamespace(),
+            band_images={},
+            bands=("F435W", "F606W", "F814W"),
+            rgb_display=object(),
+            display_image=object(),
+            catalog_df=pd.DataFrame(
+                {
+                    "family_id": ["1", "10"],
+                    "image_label": ["1.a", "10.b"],
+                    "x_obs_arcsec": [0.0, 1.0],
+                    "y_obs_arcsec": [0.0, 1.0],
+                }
+            ),
+            extra_df=pd.DataFrame(),
+            reference=(0, 0.0, 0.0),
+        )
+    finally:
+        plotting.plt.close(fig)
+
+    assert "1.a" in labels
+    assert "10.b" in labels
 
 
 def test_plot_critical_arc_support_histogram_overlays_configured_sigmoid(
@@ -3804,6 +3884,53 @@ def test_plot_critical_arc_support_histogram_overlays_configured_sigmoid(
     s_values = np.power(10.0, x_values)
     expected = 0.20 + (0.70 - 0.20) / (1.0 + np.exp(-((0.08 - s_values) / 0.03)))
     np.testing.assert_allclose(y_values, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_plot_critical_arc_support_histogram_overlays_anisotropic_sigmoid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from matplotlib.axes import Axes
+
+    image_df = pd.DataFrame(
+        {
+            "arc_s_min": [0.02, 0.08, 0.3],
+            "arc_prior_probability": [0.73, 0.5, 0.001],
+            "p_arc": [0.73, 0.5, 0.001],
+            "arc_curve_distance_arcsec": [0.03, 0.2, 0.8],
+            "image_recovery_status": ["not_recovered", "recovered", "not_recovered"],
+            "arc_recovery_status": ["arc_supported", "point_recovered", "not_recovered"],
+            "arc_supported": [True, False, False],
+        }
+    )
+    sigmoid_curves: list[tuple[np.ndarray, np.ndarray]] = []
+    original_plot = Axes.plot
+
+    def record_plot(self: Axes, x: Any, y: Any, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("label") == "p_arc sigmoid":
+            sigmoid_curves.append((np.asarray(x, dtype=float), np.asarray(y, dtype=float)))
+        return original_plot(self, x, y, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "plot", record_plot)
+
+    validation._shared_plot_critical_arc_support_histogram(
+        image_df,
+        tmp_path / "critical_arc_support_histogram.pdf",
+        arc_recovery_p_arc_threshold=0.5,
+        critical_arc_base_prob=0.20,
+        critical_arc_max_prob=0.70,
+        singular_threshold=0.08,
+        singular_softness=0.03,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
+    )
+
+    assert len(sigmoid_curves) == 1
+    x_values, y_values = sigmoid_curves[0]
+    s_values = np.power(10.0, x_values)
+    expected = np.clip(1.0 / (1.0 + np.exp(-((0.08 - s_values) / 0.03))), 1.0e-6, 1.0 - 1.0e-6)
+    mixture_expected = 0.20 + (0.70 - 0.20) * expected
+    np.testing.assert_allclose(y_values, expected, rtol=1.0e-12, atol=1.0e-12)
+    assert not np.allclose(y_values, mixture_expected)
 
 
 def test_plot_critical_arc_support_phase_space_draws_support_lines(
@@ -3875,7 +4002,7 @@ def test_plot_critical_arc_support_phase_space_draws_support_lines(
     np.testing.assert_allclose(np.sort(all_x), np.sort(np.log10(np.asarray([0.04, 0.5], dtype=float))))
     np.testing.assert_allclose(np.sort(all_y), [0.31, 0.82])
     assert axvline_values == [pytest.approx(float(np.log10(0.2)))]
-    assert axhline_values == [pytest.approx(0.5)]
+    assert axhline_values == [pytest.approx(0.1)]
     assert xlabels == [r"$\log_{10} s_{\min}$"]
     assert ylabels == [r"$p_{\rm arc}$"]
 
@@ -3920,6 +4047,87 @@ def test_plot_critical_arc_support_phase_space_overlays_configured_sigmoid(
     s_values = np.power(10.0, x_values)
     expected = 0.20 + (0.70 - 0.20) / (1.0 + np.exp(-((0.08 - s_values) / 0.03)))
     np.testing.assert_allclose(y_values, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_plot_critical_arc_support_phase_space_overlays_anisotropic_sigmoid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from matplotlib.axes import Axes
+
+    image_df = pd.DataFrame(
+        {
+            "arc_s_min": [0.02, 0.08, 0.3],
+            "p_arc": [0.73, 0.5, 0.001],
+            "image_recovery_status": ["not_recovered", "recovered", "not_recovered"],
+            "arc_recovery_status": ["arc_supported", "point_recovered", "not_recovered"],
+            "arc_supported": [True, False, False],
+        }
+    )
+    sigmoid_curves: list[tuple[np.ndarray, np.ndarray]] = []
+    original_plot = Axes.plot
+
+    def record_plot(self: Axes, x: Any, y: Any, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("label") == r"$p_{\rm arc}$ sigmoid":
+            sigmoid_curves.append((np.asarray(x, dtype=float), np.asarray(y, dtype=float)))
+        return original_plot(self, x, y, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "plot", record_plot)
+
+    validation._shared_plot_critical_arc_support_phase_space(
+        image_df,
+        tmp_path / "critical_arc_support_phase_space.pdf",
+        arc_recovery_p_arc_threshold=0.5,
+        critical_arc_base_prob=0.20,
+        critical_arc_max_prob=0.70,
+        singular_threshold=0.08,
+        singular_softness=0.03,
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
+    )
+
+    assert len(sigmoid_curves) == 1
+    x_values, y_values = sigmoid_curves[0]
+    s_values = np.power(10.0, x_values)
+    expected = np.clip(1.0 / (1.0 + np.exp(-((0.08 - s_values) / 0.03))), 1.0e-6, 1.0 - 1.0e-6)
+    mixture_expected = 0.20 + (0.70 - 0.20) * expected
+    np.testing.assert_allclose(y_values, expected, rtol=1.0e-12, atol=1.0e-12)
+    assert not np.allclose(y_values, mixture_expected)
+
+
+def test_validation_critical_arc_support_plots_forward_sample_likelihood_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_df = pd.DataFrame({"arc_s_min": [0.08], "p_arc": [0.5]})
+    captured: dict[str, str] = {}
+
+    def fake_histogram(_image_df: pd.DataFrame, _path: Path, **kwargs: Any) -> None:
+        captured["histogram_mode"] = str(kwargs["sample_likelihood_mode"])
+        Path(_path).write_bytes(b"%PDF-1.4\n")
+
+    def fake_phase_space(_image_df: pd.DataFrame, _path: Path, **kwargs: Any) -> None:
+        captured["phase_space_mode"] = str(kwargs["sample_likelihood_mode"])
+        Path(_path).write_bytes(b"%PDF-1.4\n")
+
+    monkeypatch.setattr(validation, "_shared_plot_critical_arc_support_histogram", fake_histogram)
+    monkeypatch.setattr(validation, "_shared_plot_critical_arc_support_phase_space", fake_phase_space)
+
+    artifact_args = {"sample_likelihood_mode": SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE}
+    validation._plot_critical_arc_support_histogram(
+        image_df,
+        tmp_path / "critical_arc_support_histogram.pdf",
+        artifact_args=artifact_args,
+    )
+    validation._plot_critical_arc_support_phase_space(
+        image_df,
+        tmp_path / "critical_arc_support_phase_space.pdf",
+        artifact_args=artifact_args,
+    )
+
+    assert captured == {
+        "histogram_mode": SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
+        "phase_space_mode": SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
+    }
 
 
 def test_plot_critical_arc_support_placeholder_without_finite_values(tmp_path: Path) -> None:
@@ -7241,7 +7449,7 @@ def test_stage4_refreshing_surrogate_enables_with_zero_newton_steps() -> None:
     evaluator = cluster_solver.ClusterJAXEvaluator(
         state=_minimal_stage4_surrogate_state(),
         match_tolerance_arcsec=0.1,
-        sampling_engine="refreshing_surrogate",
+        sampling_engine="full_flat",
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
         image_plane_newton_steps=0,
     )
@@ -9117,7 +9325,7 @@ def test_packed_lens_state_uses_direct_e1e2_and_lenstool_sigma0() -> None:
     evaluator = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
-        sampling_engine="refreshing_surrogate",
+        sampling_engine="refreshing_surrogate_flat",
         sample_likelihood_mode=SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
         image_plane_newton_steps=0,
     )
@@ -9148,8 +9356,8 @@ def test_packed_lens_state_uses_direct_gamma1gamma2_for_shear() -> None:
     evaluator = cluster_solver.ClusterJAXEvaluator(
         state=state,
         match_tolerance_arcsec=0.1,
-        sampling_engine="refreshing_surrogate",
-        sample_likelihood_mode=SAMPLE_LIKELIHOOD_LINEARIZED_FORWARD_BETA_IMAGE_PLANE,
+        sampling_engine="full_flat",
+        sample_likelihood_mode=SAMPLE_LIKELIHOOD_SOURCE,
         image_plane_newton_steps=0,
     )
 
@@ -11339,6 +11547,15 @@ def _critical_arc_gate_value(
     return float(base_prob) + (float(max_prob) - float(base_prob)) * transition
 
 
+def _critical_arc_anisotropic_gate_value(
+    s_min: float,
+    *,
+    singular_threshold: float = cluster_solver.DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
+    singular_softness: float = cluster_solver.DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
+) -> float:
+    return 1.0 / (1.0 + math.exp(-((float(singular_threshold) - float(s_min)) / float(singular_softness))))
+
+
 def test_critical_arc_aware_support_saves_arc_candidate_for_point_recovery() -> None:
     eps = 0.03
     critical_direction_delta = 4.0
@@ -11379,6 +11596,31 @@ def test_critical_arc_aware_support_saves_arc_candidate_for_point_recovery() -> 
     assert details["arc_support_finite_mask"].tolist() == [True]
     assert json.loads(details["arc_support_curve_x_arcsec"][0])
     assert json.loads(details["arc_support_curve_y_arcsec"][0])
+
+
+def test_critical_arc_aware_support_uses_anisotropic_p_arc_for_anisotropic_mode() -> None:
+    eps = 0.03
+    details = cluster_solver._arc_aware_image_support_from_local_linearization(
+        beta_residual_x=np.asarray([-eps]),
+        beta_residual_y=np.asarray([0.0]),
+        jac_a00=np.asarray([eps]),
+        jac_a01=np.asarray([0.0]),
+        jac_a10=np.asarray([0.0]),
+        jac_a11=np.asarray([1.0]),
+        theta_obs_x=np.asarray([0.0]),
+        theta_obs_y=np.asarray([0.0]),
+        jacobian_at=_constant_arc_jacobian(eps),
+        lm_damping_relative=0.0,
+        lm_damping_absolute=0.0,
+        sample_likelihood_mode=cluster_solver.SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
+    )
+
+    anisotropic_gate = _critical_arc_anisotropic_gate_value(details["arc_s_min"][0])
+    mixture_gate = _critical_arc_gate_value(details["arc_s_min"][0])
+    assert details["p_arc"][0] == pytest.approx(anisotropic_gate)
+    assert details["arc_prior_probability"][0] == pytest.approx(anisotropic_gate)
+    assert details["p_arc"][0] != pytest.approx(mixture_gate)
+    assert details["arc_candidate_supported"].tolist() == [True]
 
 
 def test_critical_arc_aware_support_keeps_point_on_exact_tie() -> None:
@@ -11446,7 +11688,7 @@ def test_critical_arc_aware_support_tolerates_large_critical_direction_residual(
     assert details["arc_support_finite_mask"].tolist() == [True]
 
 
-def test_critical_arc_aware_support_rejects_low_p_arc() -> None:
+def test_critical_arc_aware_support_rejects_below_legacy_p_arc_threshold() -> None:
     details = cluster_solver._arc_aware_image_support_from_local_linearization(
         beta_residual_x=np.asarray([0.0]),
         beta_residual_y=np.asarray([-1.0]),
@@ -11457,6 +11699,7 @@ def test_critical_arc_aware_support_rejects_low_p_arc() -> None:
         theta_obs_x=np.asarray([0.0]),
         theta_obs_y=np.asarray([0.0]),
         jacobian_at=_constant_arc_jacobian(0.05),
+        arc_recovery_p_arc_threshold=0.5,
         lm_damping_relative=0.0,
         lm_damping_absolute=0.0,
     )
@@ -11619,7 +11862,7 @@ def test_critical_arc_aware_support_accepts_curved_support_curve() -> None:
     assert details["arc_aware_image_residual_arcsec"][0] == pytest.approx(details["arc_curve_distance_arcsec"][0])
 
 
-def test_critical_arc_aware_support_rejects_when_singular_gate_low() -> None:
+def test_critical_arc_aware_support_rejects_singular_gate_below_legacy_threshold() -> None:
     details = cluster_solver._arc_aware_image_support_from_local_linearization(
         beta_residual_x=np.asarray([-4.0]),
         beta_residual_y=np.asarray([0.0]),
@@ -11630,6 +11873,7 @@ def test_critical_arc_aware_support_rejects_when_singular_gate_low() -> None:
         theta_obs_x=np.asarray([0.0]),
         theta_obs_y=np.asarray([0.0]),
         jacobian_at=_constant_arc_jacobian(1.0),
+        arc_recovery_p_arc_threshold=0.5,
         lm_damping_relative=0.0,
         lm_damping_absolute=0.0,
     )
@@ -11693,6 +11937,7 @@ def test_critical_arc_aware_evaluator_uses_configured_validation_controls(monkey
     fake.critical_arc_max_prob = cluster_solver.DEFAULT_CRITICAL_ARC_MAX_PROB
     fake.critical_arc_singular_threshold = cluster_solver.DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD
     fake.critical_arc_singular_softness = cluster_solver.DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS
+    fake.sample_likelihood_mode = cluster_solver.SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE
     fake._build_packed_lens_state = lambda _params, _z_source: {}
 
     def fake_ray_shooting(_z_source, _x, _y, _packed_state):
@@ -11705,12 +11950,13 @@ def test_critical_arc_aware_evaluator_uses_configured_validation_controls(monkey
         jnp.asarray([0.0], dtype=jnp.float64),
         jnp.asarray([1.0], dtype=jnp.float64),
     )
-    captured: dict[str, float] = {}
+    captured: dict[str, Any] = {}
 
     def fake_arc_support(*_args, **kwargs):
         captured["arc_recovery_p_arc_threshold"] = float(kwargs["arc_recovery_p_arc_threshold"])
         captured["max_arclength_arcsec"] = float(kwargs["max_arclength_arcsec"])
         captured["curve_step_arcsec"] = float(kwargs["curve_step_arcsec"])
+        captured["sample_likelihood_mode"] = str(kwargs["sample_likelihood_mode"])
         return {"sentinel": True}
 
     monkeypatch.setattr(cluster_solver, "_arc_aware_image_support_from_local_linearization", fake_arc_support)
@@ -11727,6 +11973,59 @@ def test_critical_arc_aware_evaluator_uses_configured_validation_controls(monkey
     assert captured["arc_recovery_p_arc_threshold"] == pytest.approx(0.65)
     assert captured["max_arclength_arcsec"] == pytest.approx(12.0)
     assert captured["curve_step_arcsec"] == pytest.approx(0.2)
+    assert captured["sample_likelihood_mode"] == cluster_solver.SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE
+
+
+@pytest.mark.parametrize(
+    "sample_likelihood_mode",
+    [
+        cluster_solver.SAMPLE_LIKELIHOOD_SOURCE,
+        cluster_solver.SAMPLE_LIKELIHOOD_LOCAL_JACOBIAN,
+    ],
+)
+def test_arc_aware_evaluator_uses_point_only_recovery_for_noncritical_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    sample_likelihood_mode: str,
+) -> None:
+    family = SimpleNamespace(
+        family_id="1",
+        z_source=2.0,
+        effective_z_source=2.0,
+        n_images=2,
+        x_obs=np.asarray([0.0, 1.0], dtype=float),
+        y_obs=np.asarray([0.0, 0.0], dtype=float),
+    )
+    fake = cluster_solver.ClusterJAXEvaluator.__new__(cluster_solver.ClusterJAXEvaluator)
+    fake.sample_likelihood_mode = sample_likelihood_mode
+    match_details = {
+        "recovered_image_mask": np.asarray([True, False], dtype=bool),
+        "matched_model_x_arcsec": np.asarray([0.2, np.nan], dtype=float),
+        "matched_model_y_arcsec": np.asarray([0.0, np.nan], dtype=float),
+    }
+
+    def fail_arc_support(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("critical-arc support should not be computed for non-critical likelihoods")
+
+    monkeypatch.setattr(cluster_solver, "_arc_aware_image_support_from_local_linearization", fail_arc_support)
+
+    details = cluster_solver.ClusterJAXEvaluator._arc_aware_image_support_details(
+        fake,
+        np.asarray([], dtype=float),
+        family,
+        0.0,
+        0.0,
+        match_details,
+    )
+
+    assert details["arc_recovery_status"].tolist() == ["point_recovered", "not_recovered"]
+    assert details["preferred_recovery_status"].tolist() == ["point_recovered", "not_recovered"]
+    assert details["point_image_residual_arcsec"][0] == pytest.approx(0.2)
+    assert np.isnan(details["point_image_residual_arcsec"][1])
+    assert np.isnan(details["p_arc"]).all()
+    assert details["arc_supported"].tolist() == [False, False]
+    assert details["arc_candidate_supported"].tolist() == [False, False]
+    assert int(details["arc_supported_image_count"]) == 0
+    assert int(details["arc_candidate_supported_image_count"]) == 0
 
 
 def test_critical_arc_aware_evaluator_uses_sampled_singular_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -11767,6 +12066,7 @@ def test_critical_arc_aware_evaluator_uses_sampled_singular_threshold(monkeypatc
     fake.critical_arc_singular_threshold_param_index = 0
     fake.critical_arc_singular_softness = cluster_solver.DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS
     fake.critical_arc_singular_softness_param_index = 1
+    fake.sample_likelihood_mode = cluster_solver.SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE
     fake._build_packed_lens_state = lambda _params, _z_source: {}
     fake._ray_shooting_for_components = lambda _z_source, _x, _y, _packed_state: (
         jnp.asarray([0.0], dtype=jnp.float64),
@@ -11923,6 +12223,7 @@ def test_critical_arc_aware_support_survives_exact_solver_failure() -> None:
     fake.validation_cache = {"1": FamilyValidationCache()}
     fake.source_plane_covariance_floor = 0.0
     fake.sample_likelihood_mode = SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE
+    fake.critical_arc_source_position_policy = cluster_solver.CRITICAL_ARC_SOURCE_POSITION_POLICY_SAMPLED
     fake.models_by_effective_z = {2.0: object()}
     fake.critical_arc_lm_trust_radius_arcsec = cluster_solver.DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC
     fake.critical_arc_lm_damping_relative = cluster_solver.DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE
@@ -15821,49 +16122,27 @@ def test_cluster_solver_rejects_invalid_sampled_critical_arc_softness_prior(
         _normalize_stage_fit_controls(args)
 
 
-def test_cluster_solver_arc_recovery_p_arc_threshold_defaults_to_half(
-    monkeypatch: pytest.MonkeyPatch,
+def test_cluster_solver_arc_recovery_p_arc_threshold_defaults_to_point_one(
 ) -> None:
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "cluster_solver",
-            "--par-path",
-            "data/clustersim/input.par",
-            "--stage2-forward-mode",
-            cluster_solver.STAGE2_FORWARD_MODE_CRITICAL_ARC,
-            "--match-tolerance-arcsec",
-            "2.0",
-        ],
+    assert cluster_solver.DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD == pytest.approx(0.1)
+    assert planning.SOLVER_RUNTIME_DEFAULTS["arc_recovery_p_arc_threshold"] == pytest.approx(0.1)
+    assert ImageDiagnosticsConfig().arc_recovery_p_arc_threshold == pytest.approx(0.1)
+    assert ImageDiagnosticsConfig().critical_arc_singular_threshold == pytest.approx(0.05)
+
+
+def test_solver_config_image_diagnostics_sets_critical_arc_thresholds(
+) -> None:
+    config = LensClusterSolverConfig(
+        image_diagnostics=ImageDiagnosticsConfig(
+            arc_recovery_p_arc_threshold=0.35,
+            critical_arc_singular_threshold=0.12,
+        )
     )
 
-    args = _parse_args()
+    payload = planning._runtime_payload(config)
 
-    assert args.arc_recovery_p_arc_threshold == pytest.approx(0.5)
-
-
-@pytest.mark.parametrize("threshold", ["-0.1", "1.1"])
-def test_cluster_solver_rejects_invalid_arc_recovery_p_arc_threshold(
-    monkeypatch: pytest.MonkeyPatch,
-    threshold: str,
-) -> None:
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "cluster_solver",
-            "--par-path",
-            "data/clustersim/input.par",
-            "--image-plane-mode",
-            IMAGE_PLANE_MODE_CRITICAL_ARC_MIXTURE,
-            "--arc-recovery-p-arc-threshold",
-            threshold,
-        ],
-    )
-
-    with pytest.raises(SystemExit):
-        _parse_args()
+    assert payload["arc_recovery_p_arc_threshold"] == pytest.approx(0.35)
+    assert payload["critical_arc_singular_threshold"] == pytest.approx(0.12)
 
 
 @pytest.mark.parametrize(
@@ -20107,7 +20386,7 @@ def test_run_xsh_critical_arc_mode_selects_new_image_plane_mode() -> None:
     assert '"--scaling-scatter-fields"' not in text
     assert '"--critical-arc-lm-trust-radius-arcsec", 10.0' in text
     assert "--critical-arc-speed-mode" not in text
-    assert '"--arc-recovery-p-arc-threshold", 0.5' in text
+    assert '"--arc-recovery-p-arc-threshold", 0.1' in text
     assert '"--arc-aware-noncritical-support-radius-arcsec"' not in text
     assert '"--arc-aware-max-arclength-arcsec", 10.0' in text
     assert '"--arc-aware-curve-step-arcsec", 0.01' in text
@@ -28319,6 +28598,96 @@ def test_rerender_plots_current_default_exact_controls_override_saved_args(
     }
     assert captured["evaluator_exact_controls"] == expected
     assert captured["plot_args_exact_controls"] == expected
+
+
+def test_rerender_plots_preserves_saved_stage_likelihood_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeEvaluator:
+        def __init__(self, *args: Any, sample_likelihood_mode: str = SAMPLE_LIKELIHOOD_SOURCE, **_kwargs: Any) -> None:
+            self.sample_likelihood_mode = str(sample_likelihood_mode)
+            self.surrogate_enabled = False
+            self.timing_totals = {"plot_runtime": 0.0}
+            captured["evaluator_sample_likelihood_mode"] = self.sample_likelihood_mode
+
+        def reported_physical_to_latent_parameter_vector(self, values: np.ndarray) -> np.ndarray:
+            return np.asarray(values, dtype=float)
+
+        def refresh_scaling_scatter_cache(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def refresh_source_metric_cache(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def evaluate(self, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(loglike=0.0)
+
+    state = SimpleNamespace(parameter_specs=[], fit_mode="joint")
+    arrays = {
+        "best_fit": np.empty((0,), dtype=float),
+        "samples": np.empty((0, 0), dtype=float),
+        "log_prob": np.empty((0,), dtype=float),
+        "accept_prob": np.empty((0,), dtype=float),
+        "diverging": np.empty((0,), dtype=bool),
+        "num_steps": np.empty((0,), dtype=float),
+    }
+    saved_args = {
+        "model_config": {"workflow": {"stage2_forward_mode": "critical-arc-anisotropic"}},
+        "run_name": "fit/stage2_free_source_forward_fit",
+        "fit_mode": "joint",
+        "sample_likelihood_mode": SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE,
+        "stage2_forward_mode": "critical-arc-anisotropic",
+        "quick_diagnostics": False,
+        "warmup": 0,
+        "samples": 0,
+        "chains": 1,
+    }
+    current_args = SolverRuntime(
+        {
+            "model_config": {"workflow": {"stage2_forward_mode": "none"}},
+            "run_name": "fit",
+            "sample_likelihood_mode": SAMPLE_LIKELIHOOD_SOURCE,
+            "stage2_forward_mode": "none",
+            "quick_diagnostics": False,
+        }
+    )
+
+    monkeypatch.setattr(cluster_solver, "_configure_debug_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log_stage_banner", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_run_logged_phase", lambda _args, _phase_name, fn, **_kwargs: fn())
+    monkeypatch.setattr(cluster_solver, "_load_artifacts", lambda _artifacts_dir: (state, saved_args, arrays, {}))
+    monkeypatch.setattr(cluster_solver, "_infer_previous_stage_best_values_for_plots", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log_state_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_maybe_convert_loaded_posterior_arrays_to_physical", lambda arrays, *_args: (arrays, False))
+    monkeypatch.setattr(cluster_solver, "ClusterJAXEvaluator", FakeEvaluator)
+    monkeypatch.setattr(cluster_solver, "_log_active_approximation_table", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log_solver_active_approximation_warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cluster_solver, "_log_posterior_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cluster_solver,
+        "_generate_plots_and_tables",
+        lambda **kwargs: captured.update(
+            {
+                "plot_sample_likelihood_mode": kwargs["args"].sample_likelihood_mode,
+                "plot_stage2_forward_mode": kwargs["args"].stage2_forward_mode,
+            }
+        ),
+    )
+    monkeypatch.setattr(cluster_solver, "_regenerate_active_scaling_summary_from_diagnostics", lambda *_args, **_kwargs: False)
+
+    cluster_solver._rerender_plots(
+        current_args,
+        tmp_path / "fit" / "stage2_free_source_forward_fit",
+        exact_diagnostics_stage="stage2_free_source_forward_fit",
+    )
+
+    assert captured["evaluator_sample_likelihood_mode"] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE
+    assert captured["plot_sample_likelihood_mode"] == SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE
+    assert captured["plot_stage2_forward_mode"] == "critical-arc-anisotropic"
 
 
 def test_rerender_plots_treats_direct_stage2_as_final_without_later_siblings(

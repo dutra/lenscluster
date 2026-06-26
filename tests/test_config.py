@@ -29,6 +29,7 @@ from lenscluster.config import (
     RunPathsConfig,
     RuntimeConfig,
     ScalingModelConfig,
+    ShearHaloConfig,
     StageScheduleConfig,
     TruthRecoveryConfig,
     WorkflowConfig,
@@ -113,6 +114,25 @@ def _with_independent_members(
     independent_members: tuple[IndependentMemberHaloConfig, ...],
 ) -> LensModelConfig:
     return replace(model, independent_member_halos=independent_members)
+
+
+def _with_external_shear(model: LensModelConfig) -> LensModelConfig:
+    return replace(
+        model,
+        large_halos=(
+            *model.large_halos,
+            ShearHaloConfig(
+                id="S1",
+                gamma=0.0,
+                angle_pos=0.0,
+                z_lens=0.507,
+                priors={
+                    "gamma": PriorConfig("uniform", lower=0.0, upper=0.3, step=0.005),
+                    "angle_pos": PriorConfig("uniform", lower=-180.0, upper=180.0, step=0.5),
+                },
+            ),
+        ),
+    )
 
 
 def test_config_module_is_data_only() -> None:
@@ -275,6 +295,49 @@ def test_independent_member_halo_is_free_dpie_not_scaling_member() -> None:
     }
     for field in ("x_centre", "y_centre", "e1", "e2", "core_radius_kpc", "cut_radius_kpc", "v_disp"):
         assert specs_by_field[field].component_family == "large"
+
+
+def test_lens_model_config_accepts_sampled_external_shear() -> None:
+    model = _with_external_shear(_minimal_model_config())
+    config = LensClusterSolverConfig(model=model)
+
+    config.validate()
+    plan = compile_run_plan(config)
+    state = cluster_solver._build_state_from_inputs(plan.runtime_args, fit_mode_override="joint")
+
+    assert "SHEAR" in state.lens_model_list
+    shear_component = next(component for component in state.base_components if component["id"] == "S1")
+    assert shear_component["id"] == "S1"
+    assert int(shear_component["profil"]) == cluster_solver.SHEAR_PROFILE
+    assert float(shear_component["gamma"]) == pytest.approx(0.0)
+    assert float(shear_component["angle_pos"]) == pytest.approx(0.0)
+    assert [spec.sample_name for spec in state.parameter_specs if spec.potential_id == "S1"] == [
+        "S1_gamma1",
+        "S1_gamma2",
+    ]
+
+
+def test_lens_model_config_rejects_invalid_external_shear() -> None:
+    base_model = _minimal_model_config()
+    invalid_gamma = replace(
+        base_model,
+        large_halos=(
+            *base_model.large_halos,
+            ShearHaloConfig(id="S1", gamma=-0.1, angle_pos=0.0, z_lens=0.507),
+        ),
+    )
+    with pytest.raises(ValueError, match="non-negative gamma"):
+        LensClusterSolverConfig(model=invalid_gamma).validate()
+
+    invalid_redshift = replace(
+        base_model,
+        large_halos=(
+            *base_model.large_halos,
+            ShearHaloConfig(id="S1", gamma=0.0, angle_pos=0.0, z_lens=0.0),
+        ),
+    )
+    with pytest.raises(ValueError, match="positive z_lens"):
+        LensClusterSolverConfig(model=invalid_redshift).validate()
 
 
 def test_compile_run_plan_resolves_runtime_stages_and_outputs() -> None:

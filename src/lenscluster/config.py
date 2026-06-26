@@ -56,6 +56,16 @@ class DPIEHaloConfig:
 
 
 @dataclass(frozen=True)
+class ShearHaloConfig:
+    id: str
+    gamma: float
+    angle_pos: float
+    z_lens: float
+    profile_type: int = 14
+    priors: dict[str, PriorConfig] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class IndependentMemberHaloConfig:
     population_id: str
     catalog_id: str
@@ -93,7 +103,7 @@ class ArcConstraintsConfig:
 class LensModelConfig:
     reference: ReferenceFrameConfig = field(default_factory=ReferenceFrameConfig)
     cosmology: CosmologyConfig = field(default_factory=CosmologyConfig)
-    large_halos: tuple[DPIEHaloConfig, ...] = ()
+    large_halos: tuple[DPIEHaloConfig | ShearHaloConfig, ...] = ()
     member_populations: tuple[MemberPopulationConfig, ...] = ()
     independent_member_halos: tuple[IndependentMemberHaloConfig, ...] = ()
     image_constraints: ImageConstraintsConfig | None = None
@@ -232,6 +242,8 @@ class LikelihoodConfig:
 @dataclass(frozen=True)
 class ImageDiagnosticsConfig:
     fit_quality_draws: int = 0
+    arc_recovery_p_arc_threshold: float = 0.1
+    critical_arc_singular_threshold: float = 0.05
     exact_image_min_distance_arcsec: float = 0.1
     exact_image_precision_limit: float = 1.0e-8
     exact_image_num_iter_max: int = 200
@@ -440,6 +452,18 @@ def validate_config(config: LensClusterSolverConfig) -> None:
         "magnitude_arc_scatter_prior",
         likelihood.magnitude_arc_scatter_prior,
     )
+    image_diagnostics = config.image_diagnostics
+    if (
+        not math.isfinite(float(image_diagnostics.arc_recovery_p_arc_threshold))
+        or image_diagnostics.arc_recovery_p_arc_threshold < 0.0
+        or image_diagnostics.arc_recovery_p_arc_threshold > 1.0
+    ):
+        raise ValueError("image_diagnostics.arc_recovery_p_arc_threshold must be in [0, 1].")
+    if (
+        not math.isfinite(float(image_diagnostics.critical_arc_singular_threshold))
+        or image_diagnostics.critical_arc_singular_threshold <= 0.0
+    ):
+        raise ValueError("image_diagnostics.critical_arc_singular_threshold must be finite and positive.")
 
 
 def _validate_model_config(model: LensModelConfig | None) -> None:
@@ -459,8 +483,16 @@ def _validate_model_config(model: LensModelConfig | None) -> None:
     if ode0 < 0.0:
         raise ValueError("model.cosmology.Ode0 must be nonnegative.")
     for halo in model.large_halos:
-        if halo.core_radius_kpc <= 0.0 or halo.cut_radius_kpc <= 0.0 or halo.v_disp <= 0.0:
-            raise ValueError(f"large halo {halo.id!r} must have positive core, cut, and velocity dispersion.")
+        if isinstance(halo, ShearHaloConfig):
+            if int(halo.profile_type) != 14:
+                raise ValueError(f"shear halo {halo.id!r} must use profile_type=14.")
+            if not math.isfinite(float(halo.gamma)) or halo.gamma < 0.0:
+                raise ValueError(f"shear halo {halo.id!r} must have finite non-negative gamma.")
+            if not math.isfinite(float(halo.angle_pos)):
+                raise ValueError(f"shear halo {halo.id!r} must have finite angle_pos.")
+        else:
+            if halo.core_radius_kpc <= 0.0 or halo.cut_radius_kpc <= 0.0 or halo.v_disp <= 0.0:
+                raise ValueError(f"large halo {halo.id!r} must have positive core, cut, and velocity dispersion.")
         if halo.z_lens <= 0.0:
             raise ValueError(f"large halo {halo.id!r} must have positive z_lens.")
     populations_by_id: dict[str, MemberPopulationConfig] = {}

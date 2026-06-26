@@ -392,7 +392,7 @@ DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER = 0.20
 DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE = 1.0e-3
 DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE = 1.0e-6
 DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC = 20.0
-DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD = 0.5
+DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD = 0.1
 DEFAULT_USE_MAGNITUDE_LIKELIHOOD = False
 DEFAULT_MAGNITUDE_SIGMA_FLOOR = 0.05
 DEFAULT_MAGNITUDE_SCATTER_LOWER = 1.0e-3
@@ -7184,6 +7184,7 @@ def _arc_aware_image_support_from_local_linearization(
     max_prob: float = DEFAULT_CRITICAL_ARC_MAX_PROB,
     singular_threshold: float = DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
     singular_softness: float = DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS,
+    sample_likelihood_mode: str = SAMPLE_LIKELIHOOD_CRITICAL_ARC_MIXTURE_IMAGE_PLANE,
 ) -> dict[str, Any]:
     f_x = jnp.asarray(beta_residual_x, dtype=jnp.float64)
     f_y = jnp.asarray(beta_residual_y, dtype=jnp.float64)
@@ -7277,27 +7278,33 @@ def _arc_aware_image_support_from_local_linearization(
         a10,
         a11,
     )
-    terms = _critical_arc_mixture_image_plane_terms(
-        residual_x=delta_x,
-        residual_y=delta_y,
-        sigma_per_image=sigma_values,
-        reliability_per_image=reliability_values,
-        image_sigma_int=jnp.asarray(image_sigma_int, dtype=jnp.float64),
-        covariance_floor=float(covariance_floor),
-        outlier_sigma_arcsec=float(outlier_sigma_arcsec),
-        singular_min=singular_min,
-        critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
-        residual_loss=residual_loss,
-        student_t_nu=float(student_t_nu),
-        critical_direction_sigma_arcsec=float(critical_direction_sigma_arcsec),
-        base_prob=base_prob,
-        max_prob=max_prob,
-        singular_threshold=singular_threshold,
-        singular_softness=singular_softness,
-        scatter_cov00=_optional_scatter(scatter_cov00),
-        scatter_cov01=_optional_scatter(scatter_cov01),
-        scatter_cov11=_optional_scatter(scatter_cov11),
-    )
+    terms_kwargs = {
+        "residual_x": delta_x,
+        "residual_y": delta_y,
+        "sigma_per_image": sigma_values,
+        "reliability_per_image": reliability_values,
+        "image_sigma_int": jnp.asarray(image_sigma_int, dtype=jnp.float64),
+        "covariance_floor": float(covariance_floor),
+        "outlier_sigma_arcsec": float(outlier_sigma_arcsec),
+        "singular_min": singular_min,
+        "critical_direction_projector_entries": (critical_p00, critical_p01, critical_p11),
+        "residual_loss": residual_loss,
+        "student_t_nu": float(student_t_nu),
+        "critical_direction_sigma_arcsec": float(critical_direction_sigma_arcsec),
+        "singular_threshold": singular_threshold,
+        "singular_softness": singular_softness,
+        "scatter_cov00": _optional_scatter(scatter_cov00),
+        "scatter_cov01": _optional_scatter(scatter_cov01),
+        "scatter_cov11": _optional_scatter(scatter_cov11),
+    }
+    if str(sample_likelihood_mode) == SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE:
+        terms = _critical_arc_anisotropic_image_plane_terms(**terms_kwargs)
+    else:
+        terms = _critical_arc_mixture_image_plane_terms(
+            **terms_kwargs,
+            base_prob=base_prob,
+            max_prob=max_prob,
+        )
     responsibilities = _critical_arc_mixture_image_plane_responsibilities(terms)
     delta_critical_direction = delta_x * critical_direction_x + delta_y * critical_direction_y
     delta_noncritical_direction = delta_x * noncritical_direction_x + delta_y * noncritical_direction_y
@@ -24527,6 +24534,15 @@ class ClusterJAXEvaluator:
         n_images = int(getattr(family, "n_images", 0))
         if n_images <= 0:
             return self._empty_arc_aware_image_support_details(family)
+        sample_likelihood_mode = str(
+            getattr(
+                self,
+                "sample_likelihood_mode",
+                SAMPLE_LIKELIHOOD_SOURCE,
+            )
+        )
+        if not _sample_likelihood_uses_critical_arc_terms(sample_likelihood_mode):
+            return self._empty_arc_aware_image_support_details(family, match_details)
         point_recovered = np.zeros(n_images, dtype=bool)
         point_residual = np.full(n_images, np.nan, dtype=float)
         if isinstance(match_details, dict):
@@ -24724,6 +24740,7 @@ class ClusterJAXEvaluator:
                 max_prob=self.critical_arc_max_prob,
                 singular_threshold=singular_threshold,
                 singular_softness=singular_softness,
+                sample_likelihood_mode=sample_likelihood_mode,
             )
         except Exception:
             details = self._empty_arc_aware_image_support_details(family)
@@ -26422,18 +26439,27 @@ def _declared_model_inputs(
 
     potentials_with_priors: list[dict[str, Any]] = []
     for halo in model_config.large_halos:
-        potential = {
-            "id": str(halo.id),
-            "profil": int(halo.profile_type),
-            "x_centre": float(halo.x_centre),
-            "y_centre": float(halo.y_centre),
-            "ellipticite": float(halo.ellipticite),
-            "angle_pos": float(halo.angle_pos),
-            "core_radius_kpc": float(halo.core_radius_kpc),
-            "cut_radius_kpc": float(halo.cut_radius_kpc),
-            "v_disp": float(halo.v_disp),
-            "z_lens": float(halo.z_lens),
-        }
+        if int(halo.profile_type) == SHEAR_PROFILE:
+            potential = {
+                "id": str(halo.id),
+                "profil": int(halo.profile_type),
+                "gamma": float(halo.gamma),
+                "angle_pos": float(halo.angle_pos),
+                "z_lens": float(halo.z_lens),
+            }
+        else:
+            potential = {
+                "id": str(halo.id),
+                "profil": int(halo.profile_type),
+                "x_centre": float(halo.x_centre),
+                "y_centre": float(halo.y_centre),
+                "ellipticite": float(halo.ellipticite),
+                "angle_pos": float(halo.angle_pos),
+                "core_radius_kpc": float(halo.core_radius_kpc),
+                "cut_radius_kpc": float(halo.cut_radius_kpc),
+                "v_disp": float(halo.v_disp),
+                "z_lens": float(halo.z_lens),
+            }
         priors = {
             field_name: _prior_config_to_limit_entry(prior, default_fixed_value=float(potential.get(field_name, 0.0)))
             for field_name, prior in (halo.priors or {}).items()
@@ -28991,7 +29017,6 @@ def _rerender_plots(
         "plots_only.load_artifacts",
         lambda: _load_artifacts(run_dir / "artifacts"),
     )
-    current_runtime_args = _args_payload(args)
     if not getattr(state, "previous_stage_best_values", None):
         inferred_previous_values = _infer_previous_stage_best_values_for_plots(args, run_dir)
         if inferred_previous_values:
@@ -29010,7 +29035,7 @@ def _rerender_plots(
     )
     if force_quick_diagnostics:
         _log(args, "[plots-only] quick diagnostics forced for pre-stage4 sequential stage")
-    plot_saved_args = dict(current_runtime_args)
+    plot_saved_args = dict(saved_args)
     plot_saved_args["quick_diagnostics"] = quick_diagnostics
     plot_saved_args["exact_image_diagnostics_stage2"] = bool(getattr(args, "exact_image_diagnostics_stage2", False))
     plot_saved_args["exact_image_diagnostics_stage3"] = bool(getattr(args, "exact_image_diagnostics_stage3", False))

@@ -239,7 +239,7 @@ DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS_UPPER = 0.20
 DEFAULT_CRITICAL_ARC_LM_DAMPING_RELATIVE = 1.0e-3
 DEFAULT_CRITICAL_ARC_LM_DAMPING_ABSOLUTE = 1.0e-6
 DEFAULT_CRITICAL_ARC_LM_TRUST_RADIUS_ARCSEC = 20.0
-DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD = 0.5
+DEFAULT_ARC_RECOVERY_P_ARC_THRESHOLD = 0.1
 DEFAULT_ARC_AWARE_MAX_ARCLENGTH_ARCSEC = 5.0
 DEFAULT_ARC_AWARE_CURVE_STEP_ARCSEC = 0.1
 DEFAULT_FOLD_CURVATURE_ARCSEC_INV = 1.0
@@ -4127,6 +4127,7 @@ def _plot_critical_arc_support_histogram(
         singular_softness=float(
             _artifact_arg(artifact_args, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
         ),
+        sample_likelihood_mode=str(_artifact_arg(artifact_args, "sample_likelihood_mode", "critical-arc-mixture-image-plane")),
     )
 
 
@@ -4150,6 +4151,7 @@ def _plot_critical_arc_support_phase_space(
         singular_softness=float(
             _artifact_arg(artifact_args, "critical_arc_singular_softness", DEFAULT_CRITICAL_ARC_SINGULAR_SOFTNESS)
         ),
+        sample_likelihood_mode=str(_artifact_arg(artifact_args, "sample_likelihood_mode", "critical-arc-mixture-image-plane")),
     )
 
 
