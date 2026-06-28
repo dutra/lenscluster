@@ -25,6 +25,8 @@ from .generation import MockClusterPaths, SingleBCGMockConfig
 class MockValidationPathsConfig:
     output_dir: str | Path = "validation_runs"
     run_name: str = "single_bcg_recovery"
+    campaign_name: str | None = None
+    variant_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,8 @@ def validate_mock_validation_config(config: MockValidationConfig) -> None:
         raise ValueError("runtime.resume must be False, True, 'all', or 'fast'.")
     if not str(config.paths.run_name).strip():
         raise ValueError("paths.run_name must be nonempty.")
+    _validate_path_segment(config.paths.campaign_name, "paths.campaign_name")
+    _validate_path_segment(config.paths.variant_name, "paths.variant_name")
     if not str(config.solver.run_name).strip():
         raise ValueError("solver.run_name must be nonempty.")
     recovery = config.recovery
@@ -107,6 +111,17 @@ def validate_mock_validation_config(config: MockValidationConfig) -> None:
     ):
         raise ValueError("recovery.critical_caustic_plot_grid_scale_arcsec must be positive and finite.")
     _validate_solver_schedule_shape(config.solver.template)
+
+
+def _validate_path_segment(value: str | None, field_name: str) -> None:
+    if value is None:
+        return
+    text = str(value)
+    if not text.strip():
+        raise ValueError(f"{field_name} must be nonempty when provided.")
+    path = Path(text)
+    if text in {".", ".."} or path.name != text or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError(f"{field_name} must be a single path segment.")
 
 
 def _validate_solver_schedule_shape(template: LensClusterSolverConfig) -> None:

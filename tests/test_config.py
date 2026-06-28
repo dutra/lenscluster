@@ -21,6 +21,7 @@ from lenscluster.config import (
     IndependentMemberHaloConfig,
     LensClusterSolverConfig,
     LensModelConfig,
+    LikelihoodConfig,
     PerturbationDiscoveryConfig,
     RGBDisplayConfig,
     MemberPopulationConfig,
@@ -473,6 +474,27 @@ def test_compile_run_plan_resolves_critical_arc_anisotropic_stage_policies() -> 
         "centroid-fixed",
         "sampled",
     ]
+
+
+def test_critical_arc_anisotropic_covariance_config_propagates_to_runtime() -> None:
+    default_config = _minimal_sequential_config()
+    default_plan = compile_run_plan(default_config)
+
+    assert default_config.likelihood.critical_arc_anisotropic_covariance is True
+    assert default_plan.runtime_args.critical_arc_anisotropic_covariance is True
+
+    disabled_config = _minimal_sequential_config().with_updates(
+        likelihood=LikelihoodConfig(critical_arc_anisotropic_covariance=False)
+    )
+    disabled_plan = compile_run_plan(disabled_config)
+
+    assert disabled_plan.runtime_args.critical_arc_anisotropic_covariance is False
+
+    with pytest.raises(ValueError, match="critical_arc_anisotropic_covariance"):
+        LensClusterSolverConfig(
+            model=_minimal_model_config(),
+            likelihood=LikelihoodConfig(critical_arc_anisotropic_covariance=0),  # type: ignore[arg-type]
+        ).validate()
 
 
 def test_config_validation_rejects_old_stage1_critical_arc_mixture_name() -> None:

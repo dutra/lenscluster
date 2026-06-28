@@ -6164,6 +6164,7 @@ def _critical_arc_anisotropic_image_plane_terms(
     *,
     residual_loss: str = DEFAULT_LIKELIHOOD_STABILIZER_RESIDUAL_LOSS,
     student_t_nu: float = DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU,
+    critical_arc_anisotropic_covariance: bool = True,
     critical_direction_sigma_arcsec: float = DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
     base_prob: float = DEFAULT_CRITICAL_ARC_BASE_PROB,
     max_prob: float = DEFAULT_CRITICAL_ARC_MAX_PROB,
@@ -6207,7 +6208,10 @@ def _critical_arc_anisotropic_image_plane_terms(
     morphology_extra_var = jnp.square(
         jnp.asarray(float(critical_direction_sigma_arcsec), dtype=jnp.float64)
     )
-    extra_var = arc_gate * (lensing_extra_var + morphology_extra_var)
+    if critical_arc_anisotropic_covariance:
+        extra_var = arc_gate * (lensing_extra_var + morphology_extra_var)
+    else:
+        extra_var = jnp.zeros_like(sigma2)
     aniso_quad, aniso_logdet = _critical_arc_aniso_quad_logdet(
         residual_x,
         residual_y,
@@ -6683,6 +6687,7 @@ def _critical_arc_anisotropic_image_plane_bin_loglike(
     image_presence_count_margin: float = DEFAULT_IMAGE_PRESENCE_COUNT_MARGIN,
     residual_loss: str = DEFAULT_LIKELIHOOD_STABILIZER_RESIDUAL_LOSS,
     student_t_nu: float = DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU,
+    critical_arc_anisotropic_covariance: bool = True,
     critical_direction_sigma_arcsec: float = DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
     base_prob: float = DEFAULT_CRITICAL_ARC_BASE_PROB,
     max_prob: float = DEFAULT_CRITICAL_ARC_MAX_PROB,
@@ -6737,6 +6742,7 @@ def _critical_arc_anisotropic_image_plane_bin_loglike(
         critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
         residual_loss=residual_loss,
         student_t_nu=student_t_nu,
+        critical_arc_anisotropic_covariance=critical_arc_anisotropic_covariance,
         critical_direction_sigma_arcsec=critical_direction_sigma_arcsec,
         singular_threshold=singular_threshold,
         singular_softness=singular_softness,
@@ -7172,6 +7178,7 @@ def _arc_aware_image_support_from_local_linearization(
     residual_loss: str = DEFAULT_LIKELIHOOD_STABILIZER_RESIDUAL_LOSS,
     student_t_nu: float = DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU,
     critical_direction_sigma_arcsec: float = DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+    critical_arc_anisotropic_covariance: bool = True,
     scatter_cov00: Any | None = None,
     scatter_cov01: Any | None = None,
     scatter_cov11: Any | None = None,
@@ -7298,7 +7305,10 @@ def _arc_aware_image_support_from_local_linearization(
         "scatter_cov11": _optional_scatter(scatter_cov11),
     }
     if str(sample_likelihood_mode) == SAMPLE_LIKELIHOOD_CRITICAL_ARC_ANISOTROPIC_IMAGE_PLANE:
-        terms = _critical_arc_anisotropic_image_plane_terms(**terms_kwargs)
+        terms = _critical_arc_anisotropic_image_plane_terms(
+            **terms_kwargs,
+            critical_arc_anisotropic_covariance=critical_arc_anisotropic_covariance,
+        )
     else:
         terms = _critical_arc_mixture_image_plane_terms(
             **terms_kwargs,
@@ -17742,6 +17752,7 @@ class ClusterJAXEvaluator:
         anchored_image_plane_lm_damping_relative: float = DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_RELATIVE,
         anchored_image_plane_lm_damping_absolute: float = DEFAULT_ANCHORED_IMAGE_PLANE_LM_DAMPING_ABSOLUTE,
         critical_arc_critical_direction_sigma_arcsec: float = DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
+        critical_arc_anisotropic_covariance: bool = True,
         critical_arc_base_prob: float = DEFAULT_CRITICAL_ARC_BASE_PROB,
         critical_arc_max_prob: float = DEFAULT_CRITICAL_ARC_MAX_PROB,
         critical_arc_singular_threshold: float = DEFAULT_CRITICAL_ARC_SINGULAR_THRESHOLD,
@@ -17974,6 +17985,9 @@ class ClusterJAXEvaluator:
         ):
             raise ValueError("anchored_image_plane_lm_damping_absolute must be finite and positive.")
         self.critical_arc_critical_direction_sigma_arcsec = float(critical_arc_critical_direction_sigma_arcsec)
+        if type(critical_arc_anisotropic_covariance) is not bool:
+            raise ValueError("critical_arc_anisotropic_covariance must be a bool.")
+        self.critical_arc_anisotropic_covariance = critical_arc_anisotropic_covariance
         self.critical_arc_base_prob = float(critical_arc_base_prob)
         self.critical_arc_max_prob = float(critical_arc_max_prob)
         self.critical_arc_singular_threshold = float(critical_arc_singular_threshold)
@@ -21088,6 +21102,7 @@ class ClusterJAXEvaluator:
             image_presence_count_margin=self.image_presence_count_margin,
             residual_loss=self.likelihood_stabilizer_residual_loss,
             student_t_nu=self.likelihood_stabilizer_student_t_nu,
+            critical_arc_anisotropic_covariance=self.critical_arc_anisotropic_covariance,
             critical_direction_sigma_arcsec=self.critical_arc_critical_direction_sigma_arcsec,
             base_prob=self.critical_arc_base_prob,
             max_prob=self.critical_arc_max_prob,
@@ -21351,6 +21366,7 @@ class ClusterJAXEvaluator:
             image_presence_count_margin=self.image_presence_count_margin,
             residual_loss=self.likelihood_stabilizer_residual_loss,
             student_t_nu=self.likelihood_stabilizer_student_t_nu,
+            critical_arc_anisotropic_covariance=self.critical_arc_anisotropic_covariance,
             critical_direction_sigma_arcsec=self.critical_arc_critical_direction_sigma_arcsec,
             base_prob=self.critical_arc_base_prob,
             max_prob=self.critical_arc_max_prob,
@@ -24724,6 +24740,9 @@ class ClusterJAXEvaluator:
                         DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
                     )
                 ),
+                critical_arc_anisotropic_covariance=bool(
+                    getattr(self, "critical_arc_anisotropic_covariance", True)
+                ),
                 scatter_cov00=scatter_cov00,
                 scatter_cov01=scatter_cov01,
                 scatter_cov11=scatter_cov11,
@@ -25787,6 +25806,7 @@ def _source_position_prior_values_from_artifacts(artifacts_dir: Path) -> dict[st
                 DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
             )
         ),
+        critical_arc_anisotropic_covariance=plot_saved_args.get("critical_arc_anisotropic_covariance", True),
         critical_arc_base_prob=float(
             plot_saved_args.get("critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)
         ),
@@ -27539,6 +27559,7 @@ def _build_cluster_evaluator_from_args(
         critical_arc_critical_direction_sigma_arcsec=float(
             getattr(args, "critical_arc_critical_direction_sigma_arcsec", DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)
         ),
+        critical_arc_anisotropic_covariance=getattr(args, "critical_arc_anisotropic_covariance", True),
         critical_arc_base_prob=float(
             getattr(args, "critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)
         ),
@@ -29209,6 +29230,7 @@ def _rerender_plots(
                 DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC,
             )
         ),
+        critical_arc_anisotropic_covariance=plot_saved_args.get("critical_arc_anisotropic_covariance", True),
         critical_arc_base_prob=float(
             plot_saved_args.get("critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)
         ),
@@ -30453,6 +30475,9 @@ def _run_sequential(args: argparse.Namespace) -> None:
         ),
         "critical_arc_critical_direction_sigma_arcsec": float(
             getattr(args, "critical_arc_critical_direction_sigma_arcsec", DEFAULT_CRITICAL_ARC_CRITICAL_DIRECTION_SIGMA_ARCSEC)
+        ),
+        "critical_arc_anisotropic_covariance": bool(
+            getattr(args, "critical_arc_anisotropic_covariance", True)
         ),
         "critical_arc_base_prob": float(getattr(args, "critical_arc_base_prob", DEFAULT_CRITICAL_ARC_BASE_PROB)),
         "critical_arc_max_prob": float(getattr(args, "critical_arc_max_prob", DEFAULT_CRITICAL_ARC_MAX_PROB)),

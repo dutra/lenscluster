@@ -5065,10 +5065,10 @@ def write_validation_results_json(
     recovery_payload: dict[str, Any],
 ) -> Path:
     root = _validation_root(config)
-    output_path = root / f"seed_{int(seed)}_results.json"
+    output_path = Path(realization_dir) / "results.json"
     solver_run_path = Path(solver_run_dir)
     solver_root = _stage_root_from_run_dir(solver_run_path)
-    debug_log_path = root / "run_debug.log"
+    debug_log_path = Path(realization_dir) / "run_debug.log"
     sequential_summary_path = solver_root / "sequential_summary.json"
     all_output_paths = dict(output_paths)
     all_output_paths["results_json"] = output_path
@@ -5123,7 +5123,19 @@ def write_validation_results_json(
 
 
 def _validation_root(config: MockValidationConfig) -> Path:
-    return Path(config.paths.output_dir) / "single_bcg" / str(config.paths.run_name)
+    root = Path(config.paths.output_dir)
+    if config.paths.campaign_name is not None:
+        root = root / str(config.paths.campaign_name)
+    return root / str(config.paths.run_name)
+
+
+def _validation_seed_dir(root: str | Path, seed: int) -> Path:
+    return Path(root) / f"seed_{int(seed):08d}"
+
+
+def _validation_run_dir(seed_dir: str | Path, variant_name: str | None) -> Path:
+    root = Path(seed_dir)
+    return root / str(variant_name) if variant_name is not None else root
 
 
 def _resume_enabled(config: MockValidationConfig) -> bool:
@@ -5149,7 +5161,8 @@ def _log_validation_runtime_summary(config: MockValidationConfig) -> None:
         config,
         (
             f"[runtime] python={sys.executable} output_dir={config.paths.output_dir} "
-            f"run_name={config.paths.run_name} realizations={config.runtime.realizations} seed={config.runtime.seed}"
+            f"campaign={config.paths.campaign_name} run_name={config.paths.run_name} "
+            f"variant={config.paths.variant_name} realizations={config.runtime.realizations} seed={config.runtime.seed}"
         ),
     )
     _log(
@@ -5173,14 +5186,15 @@ def run_single_bcg_validation(
 ) -> list[dict[str, Path]]:
     config.validate()
     root = _validation_root(config)
-    _configure_debug_log(config, str(config.paths.run_name), root)
-    _log_validation_runtime_summary(config)
     outputs: list[dict[str, Path]] = []
     total_start = time.time()
     for realization in range(int(config.runtime.realizations)):
         seed = int(config.runtime.seed) + realization
         mock_config = replace(config.mock, seed=seed)
-        realization_dir = root / f"seed_{seed}"
+        seed_dir = _validation_seed_dir(root, seed)
+        realization_dir = _validation_run_dir(seed_dir, config.paths.variant_name)
+        _configure_debug_log(config, str(config.paths.run_name), realization_dir)
+        _log_validation_runtime_summary(config)
         realization_start = time.time()
         _log_stage_banner(
             config,
@@ -5205,7 +5219,7 @@ def run_single_bcg_validation(
                 f"bcg_position_prior_half_width={mock_config.bcg_position_prior_half_width_arcsec:.4g}"
             ),
         )
-        mock_dir = realization_dir / "mock"
+        mock_dir = seed_dir / "mock"
         resume_mock_paths = _validation_mock_paths(mock_dir)
         if _resume_enabled(config) and _validation_mock_complete(resume_mock_paths):
             paths, images, truth_payload = _run_logged_phase(
@@ -5233,11 +5247,12 @@ def run_single_bcg_validation(
         )
         if _resume_enabled(config):
             _log(config, f"[resume] refreshing validation outputs seed={seed} dir={realization_dir}")
-        _log(config, f"[output] writing pre-fit diagnostics to {realization_dir}")
+        prefit_dir = seed_dir / "prefit"
+        _log(config, f"[output] writing pre-fit diagnostics to {prefit_dir}")
         prefit_output_paths = _run_logged_phase(
             config,
             "validation.write_prefit_diagnostics",
-            lambda: write_prefit_validation_diagnostics(truth_payload, images, realization_dir),
+            lambda: write_prefit_validation_diagnostics(truth_payload, images, prefit_dir),
             detail=f"seed={seed}",
         )
         solver_output_dir = realization_dir / "solver"

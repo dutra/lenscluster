@@ -123,7 +123,9 @@ config = MockValidationConfig(
     ),
     paths=MockValidationPathsConfig(
         output_dir="validation_runs",
+        campaign_name="covariance_test",
         run_name="single_bcg_recovery",
+        variant_name="anisotropic",
     ),
     runtime=MockValidationRuntimeConfig(realizations=1, seed=12345),
     solver=MockValidationSolverConfig(
@@ -166,25 +168,32 @@ The generated member catalog is used only when subhalos are requested.
 Validation outputs are written to:
 
 ```text
-validation_runs/single_bcg/<run-name>/seed_<seed>/
+validation_runs/<campaign-name>/<run-name>/seed_<seed>/<variant-name>/
 ```
 
 The default run name and seed produce:
 
 ```text
-validation_runs/single_bcg/single_bcg_recovery/seed_12345/
+validation_runs/covariance_test/single_bcg_recovery/seed_00012345/anisotropic/
 ```
 
 Solver outputs are written under the realization directory using the current
 compiled stage names:
 
 ```text
-validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage0_fast_initializer/
-validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage1_backprojected_centroid_fit/
-validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage2_free_source_forward_fit/  # when stage2_forward_mode != "none"
+validation_runs/<campaign-name>/<run-name>/seed_<seed>/<variant-name>/solver/fit/stage0_fast_initializer/
+validation_runs/<campaign-name>/<run-name>/seed_<seed>/<variant-name>/solver/fit/stage1_backprojected_centroid_fit/
+validation_runs/<campaign-name>/<run-name>/seed_<seed>/<variant-name>/solver/fit/stage2_free_source_forward_fit/  # when stage2_forward_mode != "none"
 ```
 
-Mock-truth recovery PDFs are additionally written at the seed directory level:
+Mock inputs and pre-fit diagnostics are shared by seed:
+
+```text
+validation_runs/<campaign-name>/<run-name>/seed_<seed>/mock/
+validation_runs/<campaign-name>/<run-name>/seed_<seed>/prefit/
+```
+
+Mock-truth recovery PDFs are additionally written at the variant directory level:
 
 - `parameter_recovery.pdf`
 - `mass_profile_recovery.pdf`
@@ -211,7 +220,7 @@ The posterior artifacts used to make these PDFs are saved under the final
 solver stage, for example:
 
 ```text
-validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage2_free_source_forward_fit/artifacts/plot_bundle.h5
+validation_runs/<campaign-name>/<run-name>/seed_<seed>/<variant-name>/solver/fit/stage2_free_source_forward_fit/artifacts/plot_bundle.h5
 ```
 
 All figures are saved as PDFs. Standard solver diagnostic tables remain under

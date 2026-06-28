@@ -8878,6 +8878,71 @@ def _critical_arc_anisotropic_gate_value(
     return 1.0 / (1.0 + math.exp(-((float(singular_threshold) - float(s_min)) / float(singular_softness))))
 
 
+def test_critical_arc_anisotropic_covariance_false_matches_isotropic_terms() -> None:
+    residual_x = jnp.asarray([0.08, -0.05], dtype=jnp.float64)
+    residual_y = jnp.asarray([0.03, 0.04], dtype=jnp.float64)
+    sigma_per_image = jnp.asarray([0.04, 0.05], dtype=jnp.float64)
+    reliability = jnp.asarray([0.99, 0.98], dtype=jnp.float64)
+    image_sigma_int = jnp.asarray(0.0, dtype=jnp.float64)
+    singular_min = jnp.asarray([1.0e-3, 0.02], dtype=jnp.float64)
+    critical_p00 = jnp.asarray([0.7, 0.2], dtype=jnp.float64)
+    critical_p01 = jnp.asarray([0.1, -0.05], dtype=jnp.float64)
+    critical_p11 = jnp.asarray([0.3, 0.8], dtype=jnp.float64)
+
+    enabled = cluster_solver._critical_arc_anisotropic_image_plane_terms(
+        residual_x=residual_x,
+        residual_y=residual_y,
+        sigma_per_image=sigma_per_image,
+        reliability_per_image=reliability,
+        image_sigma_int=image_sigma_int,
+        covariance_floor=0.0,
+        outlier_sigma_arcsec=10.0,
+        singular_min=singular_min,
+        critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+        critical_arc_anisotropic_covariance=True,
+        critical_direction_sigma_arcsec=5.0,
+    )
+    disabled = cluster_solver._critical_arc_anisotropic_image_plane_terms(
+        residual_x=residual_x,
+        residual_y=residual_y,
+        sigma_per_image=sigma_per_image,
+        reliability_per_image=reliability,
+        image_sigma_int=image_sigma_int,
+        covariance_floor=0.0,
+        outlier_sigma_arcsec=10.0,
+        singular_min=singular_min,
+        critical_direction_projector_entries=(critical_p00, critical_p01, critical_p11),
+        critical_arc_anisotropic_covariance=False,
+        critical_direction_sigma_arcsec=5.0,
+    )
+    sigma2 = cluster_solver._image_plane_effective_sigma2(sigma_per_image, image_sigma_int, 0.0)
+    projector_det = jnp.maximum(critical_p00 * critical_p11 - jnp.square(critical_p01), 0.0)
+    isotropic_quad, isotropic_logdet = cluster_solver._critical_arc_aniso_quad_logdet(
+        residual_x,
+        residual_y,
+        sigma2,
+        jnp.zeros_like(sigma2),
+        critical_p00,
+        critical_p01,
+        critical_p11,
+        projector_det,
+    )
+    expected_inlier_ll = -0.5 * (isotropic_quad + 2.0 * jnp.log(2.0 * jnp.pi) + isotropic_logdet)
+    outlier_sigma2 = jnp.square(jnp.asarray(10.0, dtype=jnp.float64))
+    expected_outlier_ll = -0.5 * (
+        (jnp.square(residual_x) + jnp.square(residual_y)) / outlier_sigma2
+        + 2.0 * jnp.log(2.0 * jnp.pi * outlier_sigma2)
+    )
+    expected_mixture_ll = jnp.logaddexp(
+        jnp.log(reliability) + expected_inlier_ll,
+        jnp.log1p(-reliability) + expected_outlier_ll,
+    )
+
+    np.testing.assert_allclose(np.asarray(disabled.inlier_ll), np.asarray(expected_inlier_ll), rtol=1.0e-12)
+    np.testing.assert_allclose(np.asarray(disabled.mixture_ll), np.asarray(expected_mixture_ll), rtol=1.0e-12)
+    assert not np.allclose(np.asarray(enabled.mixture_ll), np.asarray(disabled.mixture_ll))
+
+
 def test_critical_arc_aware_support_saves_arc_candidate_for_point_recovery() -> None:
     eps = 0.03
     critical_direction_delta = 4.0
@@ -12256,6 +12321,8 @@ def test_mock_validation_config_defaults_validate(tmp_path: Path) -> None:
     assert config.validate() is config
     payload = config.to_json_dict()
     assert payload["paths"]["run_name"] == "validation_log"
+    assert payload["paths"]["campaign_name"] is None
+    assert payload["paths"]["variant_name"] is None
     assert payload["solver"]["template"]["workflow"]["sampling_engine"] == "refreshing_surrogate_flat"
 
 
@@ -12283,6 +12350,27 @@ def test_mock_validation_config_defaults_validate(tmp_path: Path) -> None:
                 ),
             ),
             "svi_steps",
+        ),
+        (
+            lambda base: replace(
+                base,
+                paths=replace(base.paths, campaign_name=""),
+            ),
+            "paths.campaign_name",
+        ),
+        (
+            lambda base: replace(
+                base,
+                paths=replace(base.paths, campaign_name="../bad"),
+            ),
+            "paths.campaign_name",
+        ),
+        (
+            lambda base: replace(
+                base,
+                paths=replace(base.paths, variant_name="bad/name"),
+            ),
+            "paths.variant_name",
         ),
     ],
 )
@@ -12385,10 +12473,19 @@ def test_validation_jsonable_sanitizes_structured_values(tmp_path: Path) -> None
 
 
 def test_write_validation_results_json_embeds_stage_table_artifacts(tmp_path: Path) -> None:
-    config = _mock_validation_config(tmp_path)
-    root = tmp_path / "single_bcg" / "validation_log"
-    realization_dir = root / "seed_12345"
-    paths, images, truth = _write_minimal_mock_files(realization_dir / "mock", with_members=True)
+    config = replace(
+        _mock_validation_config(tmp_path),
+        paths=mock_validation_api.MockValidationPathsConfig(
+            output_dir=tmp_path,
+            campaign_name="campaign_a",
+            run_name="validation_log",
+            variant_name="anisotropic",
+        ),
+    )
+    root = tmp_path / "campaign_a" / "validation_log"
+    seed_dir = root / "seed_00012345"
+    realization_dir = seed_dir / "anisotropic"
+    paths, images, truth = _write_minimal_mock_files(seed_dir / "mock", with_members=True)
     solver_run_dir = realization_dir / "solver" / "fit" / "stage1_backprojected_centroid_fit"
     tables_dir = solver_run_dir / "tables"
     tables_dir.mkdir(parents=True)
@@ -12400,7 +12497,7 @@ def test_write_validation_results_json_embeds_stage_table_artifacts(tmp_path: Pa
     (tables_dir / "notes.txt").write_text("table notes", encoding="utf-8")
     summary_path = realization_dir / "run_summary.txt"
     summary_path.write_text("summary text", encoding="utf-8")
-    (root / "run_debug.log").write_text("debug text", encoding="utf-8")
+    (realization_dir / "run_debug.log").write_text("debug text", encoding="utf-8")
 
     path = validation.write_validation_results_json(
         config=config,
@@ -12421,8 +12518,10 @@ def test_write_validation_results_json_embeds_stage_table_artifacts(tmp_path: Pa
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     stage = payload["solver"]["stage_manifests"][0]
-    assert path == root / "seed_12345_results.json"
+    assert path == realization_dir / "results.json"
     assert payload["run"]["config"]["paths"]["run_name"] == "validation_log"
+    assert payload["run"]["config"]["paths"]["campaign_name"] == "campaign_a"
+    assert payload["run"]["config"]["paths"]["variant_name"] == "anisotropic"
     assert payload["mock_cluster"]["files"]["member_catalog_text"] == "1 0.0 0.0 22.0\n"
     assert payload["mock_cluster"]["truth"]["sources"][0]["family_id"] == "1"
     assert payload["validation"]["run_summary"]["text"] == "summary text"
@@ -12525,7 +12624,9 @@ def test_run_single_bcg_validation_uses_config_runner_and_final_compiled_stage(
     outputs = validation.run_single_bcg_validation(config, runner=fake_runner)
     validation._close_debug_log()
 
-    realization_dir = tmp_path / "single_bcg" / "validation_log" / "seed_12345"
+    root = tmp_path / "validation_log"
+    seed_dir = root / "seed_00012345"
+    realization_dir = seed_dir
     final_dir = realization_dir / "solver" / "fit" / "stage2_free_source_forward_fit"
     assert [stage.name for stage in fake_runner.plans[0].stages] == [
         "stage0_fast_initializer",
@@ -12541,9 +12642,9 @@ def test_run_single_bcg_validation_uses_config_runner_and_final_compiled_stage(
     assert recovery_calls[0]["progress_args"] is config
     assert outputs == [
         {
-            **_expected_prefit_output_paths(realization_dir),
+            **_expected_prefit_output_paths(seed_dir / "prefit"),
             "summary_plot": realization_dir / "validation_summary.pdf",
-            "results_json": tmp_path / "single_bcg" / "validation_log" / "seed_12345_results.json",
+            "results_json": realization_dir / "results.json",
         }
     ]
 
@@ -12552,9 +12653,20 @@ def test_run_single_bcg_validation_resume_reuses_existing_mock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    root = tmp_path / "single_bcg" / "validation_log"
-    realization_dir = root / "seed_12345"
-    mock_dir = realization_dir / "mock"
+    config = replace(
+        _mock_validation_config(tmp_path),
+        paths=mock_validation_api.MockValidationPathsConfig(
+            output_dir=tmp_path,
+            campaign_name="campaign_a",
+            run_name="validation_log",
+            variant_name="isotropic",
+        ),
+        runtime=mock_validation_api.MockValidationRuntimeConfig(realizations=1, seed=12345, resume="all"),
+    )
+    root = tmp_path / "campaign_a" / "validation_log"
+    seed_dir = root / "seed_00012345"
+    realization_dir = seed_dir / "isotropic"
+    mock_dir = seed_dir / "mock"
     _write_minimal_mock_files(mock_dir)
     calls: list[str] = []
 
@@ -12578,16 +12690,13 @@ def test_run_single_bcg_validation_resume_reuses_existing_mock(
         "write_validation_run_summary",
         lambda _solver_run_dir, _truth_path, output_dir, run_name, seed: Path(output_dir) / "run_summary.txt",
     )
-    config = _mock_validation_config(
-        tmp_path,
-        runtime=mock_validation_api.MockValidationRuntimeConfig(realizations=1, seed=12345, resume="all"),
-    )
-
     outputs = validation.run_single_bcg_validation(config, runner=_FakeLensClusterRunner())
     validation._close_debug_log()
 
     assert calls == ["recovery"]
-    assert outputs[0]["results_json"] == root / "seed_12345_results.json"
+    assert outputs[0]["results_json"] == realization_dir / "results.json"
+
+
 def _touch_complete_stage(stage_dir: Path) -> None:
     (stage_dir / "artifacts").mkdir(parents=True, exist_ok=True)
     (stage_dir / "artifacts" / "plot_bundle.h5").write_bytes(b"")

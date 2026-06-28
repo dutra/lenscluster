@@ -7,6 +7,7 @@ from pathlib import Path
 
 cores = 4  # Fixed to match JAX CPU devices and NUTS chains.
 seed_default = 12345
+output_dir_default = "validation_runs/mock_recovery"
 
 $JAX_NUM_CPU_DEVICES = str(cores)
 $MPLCONFIGDIR = "/tmp/matplotlib-lenscluster-mock"
@@ -16,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from lenscluster.config import (
     LensClusterSolverConfig,
+    LikelihoodConfig,
     PerturbationDiscoveryConfig,
     RuntimeConfig,
     StageScheduleConfig,
@@ -32,34 +34,71 @@ from lenscluster.mock_validation import (
 )
 
 VALID_PRESETS = ("smoke", "production")
+VALID_COVARIANCE_MODES = ("anisotropic", "isotropic")
 
 
 def _usage() -> str:
-    return "Usage: xonsh run_mock.xsh [smoke|production] [seed]"
+    return (
+        "Usage: xonsh run_mock.xsh --campaign NAME "
+        "[--preset smoke|production] [--seed INT] "
+        "[--covariance anisotropic|isotropic] [--output-dir PATH]"
+    )
 
 
-def _parse_args(argv: list[str]) -> tuple[str, int]:
-    if len(argv) > 3:
-        print(_usage())
+def _parse_args(argv: list[str]) -> tuple[str, int, str, str, str]:
+    values = {
+        "campaign": None,
+        "preset": "smoke",
+        "seed": str(seed_default),
+        "covariance": "anisotropic",
+        "output_dir": output_dir_default,
+    }
+    flag_to_key = {
+        "--campaign": "campaign",
+        "--preset": "preset",
+        "--seed": "seed",
+        "--covariance": "covariance",
+        "--output-dir": "output_dir",
+    }
+    index = 1
+    while index < len(argv):
+        flag = argv[index]
+        if flag in {"--help", "-h"}:
+            print(_usage())
+            raise SystemExit(0)
+        if flag not in flag_to_key:
+            print(f"Unknown argument: {flag!r}\n{_usage()}")
+            raise SystemExit(2)
+        if index + 1 >= len(argv):
+            print(f"Missing value for {flag}.\n{_usage()}")
+            raise SystemExit(2)
+        values[flag_to_key[flag]] = argv[index + 1]
+        index += 2
+    if values["campaign"] is None:
+        print(f"Missing required --campaign.\n{_usage()}")
         raise SystemExit(2)
-    preset = argv[1].strip().lower() if len(argv) >= 2 else "smoke"
+    preset = str(values["preset"]).strip().lower()
     if preset not in VALID_PRESETS:
-        print(f"Unknown preset: {argv[1]!r}\n{_usage()}")
+        print(f"Preset must be 'smoke' or 'production'; got {values['preset']!r}.\n{_usage()}")
         raise SystemExit(2)
-    if len(argv) >= 3:
-        try:
-            seed = int(argv[2])
-        except ValueError:
-            print(f"Seed must be an integer; got {argv[2]!r}.\n{_usage()}")
-            raise SystemExit(2)
-        if seed < 0:
-            print(f"Seed must be nonnegative; got {seed}.\n{_usage()}")
-            raise SystemExit(2)
-        return preset, seed
-    return preset, seed_default
+    try:
+        seed = int(str(values["seed"]))
+    except ValueError:
+        print(f"Seed must be an integer; got {values['seed']!r}.\n{_usage()}")
+        raise SystemExit(2)
+    if seed < 0:
+        print(f"Seed must be nonnegative; got {seed}.\n{_usage()}")
+        raise SystemExit(2)
+    covariance_mode = str(values["covariance"]).strip().lower()
+    if covariance_mode not in VALID_COVARIANCE_MODES:
+        print(f"Covariance mode must be 'anisotropic' or 'isotropic'; got {values['covariance']!r}.\n{_usage()}")
+        raise SystemExit(2)
+    campaign = str(values["campaign"]).strip()
+    output_dir = str(values["output_dir"])
+    return preset, seed, covariance_mode, campaign, output_dir
 
 
-def _solver_template(*, production: bool, seed: int) -> LensClusterSolverConfig:
+def _solver_template(*, production: bool, seed: int, critical_arc_anisotropic_covariance: bool) -> LensClusterSolverConfig:
     if production:
         warmup = 3000, 3000
         samples = 500, 500
@@ -102,6 +141,9 @@ def _solver_template(*, production: bool, seed: int) -> LensClusterSolverConfig:
                 z_bin_efficiency_tol=0.0,
                 svi_learning_rate=0.0005,
             ),
+            likelihood=LikelihoodConfig(
+                critical_arc_anisotropic_covariance=critical_arc_anisotropic_covariance,
+            ),
             perturbation=PerturbationDiscoveryConfig(perturbation_discovery_top_k=None),
         )
 
@@ -143,17 +185,28 @@ def _solver_template(*, production: bool, seed: int) -> LensClusterSolverConfig:
             z_bin_efficiency_tol=0.0,
             svi_learning_rate=0.001,
         ),
+        likelihood=LikelihoodConfig(
+            critical_arc_anisotropic_covariance=critical_arc_anisotropic_covariance,
+        ),
         perturbation=PerturbationDiscoveryConfig(perturbation_discovery_top_k=None),
     )
 
 
-def build_config(preset: str, *, seed: int) -> MockValidationConfig:
+def build_config(
+    preset: str,
+    *,
+    seed: int,
+    covariance_mode: str,
+    campaign_name: str,
+    output_dir: str,
+) -> MockValidationConfig:
     production = preset == "production"
+    critical_arc_anisotropic_covariance = covariance_mode == "anisotropic"
     mock = SingleBCGMockConfig(
         seed=seed,
         n_primary_families=20 if production else 5,
         n_subhalo_families=0,
-        n_subhalos=10 if production else 0,
+        n_subhalos=50 if production else 0,
         min_images_per_family=3,
         max_images_per_family=None,
         primary_source_redshifts=(1.5, 2.0, 3.0),
@@ -168,8 +221,10 @@ def build_config(preset: str, *, seed: int) -> MockValidationConfig:
     return MockValidationConfig(
         mock=mock,
         paths=MockValidationPathsConfig(
-            output_dir="validation_runs/mock_recovery",
+            output_dir=output_dir,
             run_name=f"single_bcg_{preset}_source",
+            campaign_name=campaign_name,
+            variant_name=covariance_mode,
         ),
         runtime=MockValidationRuntimeConfig(
             realizations=1,
@@ -178,19 +233,32 @@ def build_config(preset: str, *, seed: int) -> MockValidationConfig:
             quiet=False,
         ),
         solver=MockValidationSolverConfig(
-            template=_solver_template(production=production, seed=seed),
+            template=_solver_template(
+                production=production,
+                seed=seed,
+                critical_arc_anisotropic_covariance=critical_arc_anisotropic_covariance,
+            ),
             run_name="fit",
         ),
         recovery=recovery,
     )
 
 
-preset, seed = _parse_args(sys.argv)
-config = build_config(preset, seed=seed).validate()
+preset, seed, covariance_mode, campaign_name, output_dir = _parse_args(sys.argv)
+config = build_config(
+    preset,
+    seed=seed,
+    covariance_mode=covariance_mode,
+    campaign_name=campaign_name,
+    output_dir=output_dir,
+).validate()
 
 print(
     f"[config] preset={preset} seed={seed} "
-    f"output_dir={config.paths.output_dir} run_name={config.paths.run_name} chains={cores}"
+    f"covariance={covariance_mode} "
+    f"critical_arc_anisotropic_covariance={config.solver.template.likelihood.critical_arc_anisotropic_covariance} "
+    f"output_dir={config.paths.output_dir} campaign={config.paths.campaign_name} "
+    f"run_name={config.paths.run_name} variant={config.paths.variant_name} chains={cores}"
 )
 
 start = time.monotonic()

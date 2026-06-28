@@ -206,6 +206,7 @@ class LikelihoodConfig:
     pos_sigma_arcsec: float | None = None
     source_plane_covariance_floor: float = 1.0e-6
     source_plane_covariance_mode: str = "magnification"
+    critical_arc_anisotropic_covariance: bool = True
     image_presence_penalty_weight: float | None = None
     image_presence_match_radius_arcsec: float = 0.30
     image_presence_temperature_arcsec: float = 0.10
@@ -432,6 +433,8 @@ def validate_config(config: LensClusterSolverConfig) -> None:
     if config.truth.truth_grid_size < 0:
         raise ValueError("truth_grid_size must be nonnegative.")
     likelihood = config.likelihood
+    if type(likelihood.critical_arc_anisotropic_covariance) is not bool:
+        raise ValueError("critical_arc_anisotropic_covariance must be a bool.")
     for value, name, allow_zero in (
         (likelihood.magnitude_sigma_floor, "magnitude_sigma_floor", False),
         (likelihood.magnitude_mu_floor, "magnitude_mu_floor", True),
