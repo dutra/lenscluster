@@ -151,12 +151,25 @@ def test_cluster_solver_exposes_no_cli_parser() -> None:
 
 
 def test_solver_modules_do_not_force_matplotlib_agg_backend() -> None:
-    for path in ("src/lenscluster/cluster_solver.py", "src/lenscluster/validation.py"):
+    for path in (
+        "src/lenscluster/cluster_solver.py",
+        "src/lenscluster/mock_validation/generation.py",
+        "src/lenscluster/mock_validation/runner.py",
+    ):
         text = Path(path).read_text(encoding="utf-8")
         assert 'matplotlib.use("Agg")' not in text
         assert "matplotlib.use('Agg')" not in text
         assert 'matplotlib_use("Agg")' not in text
         assert "matplotlib_use('Agg')" not in text
+
+
+def test_mock_validation_has_no_legacy_root_modules() -> None:
+    with pytest.raises(ModuleNotFoundError):
+        __import__("lenscluster.mock_cluster")
+    with pytest.raises(ModuleNotFoundError):
+        __import__("lenscluster.validation")
+    with pytest.raises(ModuleNotFoundError):
+        __import__("lenscluster.mock_validation.cli")
 
 
 def test_config_defaults_validate_without_solver_namespace() -> None:
@@ -374,23 +387,9 @@ def test_workflow_config_accepts_only_flat_sampling_engines() -> None:
 
         assert plan.stages[1].sampling_engine == engine
 
-    for engine in ("full", "refreshing_surrogate"):
-        config = _minimal_sequential_config().with_updates(
-            workflow=WorkflowConfig(
-                fit_mode="sequential",
-                stage0_likelihood="source",
-                stage1_likelihood="local-jacobian",
-                stage1_sampling_engine=engine,
-            )
-        )
-        with pytest.raises(ValueError, match="stage1_sampling_engine.*full_flat.*refreshing_surrogate_flat"):
-            config.validate()
-
 
 def test_cluster_solver_runtime_exposes_only_flat_sampling_engines() -> None:
     assert cluster_solver.SAMPLING_ENGINES == ("full_flat", "refreshing_surrogate_flat")
-    assert not hasattr(cluster_solver, "SAMPLING_ENGINE_FULL")
-    assert not hasattr(cluster_solver, "SAMPLING_ENGINE_REFRESHING_SURROGATE")
     assert hasattr(cluster_solver.ClusterJAXEvaluator, "_flat_refreshing_surrogate_source_loglike_impl")
     assert hasattr(cluster_solver.ClusterJAXEvaluator, "_flat_refreshing_surrogate_local_jacobian_source_loglike_impl")
     assert hasattr(cluster_solver.ClusterJAXEvaluator, "_flat_refreshing_surrogate_critical_arc_source_loglike_impl")

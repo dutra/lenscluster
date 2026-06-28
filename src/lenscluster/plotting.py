@@ -4151,22 +4151,12 @@ def _run_summary(
         "sampling_engine": args.sampling_engine,
         "fit_sampling_engine": init_diagnostics.get(
             "fit_sampling_engine",
-            str(getattr(args, "sampling_engine", getattr(evaluator, "sampling_engine", "full"))),
+            str(getattr(args, "sampling_engine", getattr(evaluator, "sampling_engine", "full_flat"))),
         ),
         "final_validation_sampling_engine": init_diagnostics.get(
             "final_validation_sampling_engine",
-            str(getattr(evaluator, "final_validation_sampling_engine", getattr(evaluator, "sampling_engine", "full"))),
+            str(getattr(evaluator, "final_validation_sampling_engine", getattr(evaluator, "sampling_engine", "full_flat"))),
         ),
-        "fit_active_subset_loglike": init_diagnostics.get("fit_active_subset_loglike"),
-        "full_model_validation_loglike": best_loglike
-        if str(
-            init_diagnostics.get(
-                "fit_sampling_engine",
-                getattr(args, "sampling_engine", getattr(evaluator, "sampling_engine", "full")),
-            )
-        )
-        == "active_subset"
-        else None,
         "active_scaling_galaxies": list(evaluator.active_scaling_galaxies_by_potfile),
         "active_scaling_components": int(len(evaluator.active_scaling_component_indices)),
         "inactive_scaling_components": int(len(evaluator.inactive_scaling_component_indices)),
@@ -4642,8 +4632,6 @@ def _format_run_summary_text(summary: dict[str, Any]) -> str:
                     ("likelihood max residual arcsec", summary.get("likelihood_stabilizer_max_residual_arcsec")),
                     ("likelihood residual loss", summary.get("likelihood_stabilizer_residual_loss")),
                     ("likelihood Student-t nu", summary.get("likelihood_stabilizer_student_t_nu")),
-                    ("fit active-subset log likelihood", summary.get("fit_active_subset_loglike")),
-                    ("full-model validation log likelihood", summary.get("full_model_validation_loglike")),
                     ("best log likelihood", summary.get("best_loglike")),
                 ]
             )
@@ -6937,7 +6925,7 @@ def _clone_fit_quality_evaluator(evaluator: Any, args: argparse.Namespace) -> An
         exact_image_lm_max_iter=exact_image_lm_max_iter,
         exact_image_lm_trust_radius_arcsec=exact_image_lm_trust_radius_arcsec,
         exact_image_adaptive_max_levels=exact_image_adaptive_max_levels,
-        sampling_engine=str(getattr(args, "sampling_engine", getattr(evaluator, "sampling_engine", "full"))),
+        sampling_engine=str(getattr(args, "sampling_engine", getattr(evaluator, "sampling_engine", "full_flat"))),
         active_scaling_galaxies=getattr(args, "active_scaling_galaxies", None),
         active_scaling_selection=str(
             getattr(args, "active_scaling_selection", getattr(evaluator, "active_scaling_selection", "adaptive"))

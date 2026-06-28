@@ -3831,7 +3831,7 @@ def _write_truth_validation_outputs(args: argparse.Namespace, run_dir: Path) -> 
     truth_path = getattr(args, "truth", None)
     if truth_path is None:
         return
-    from .validation import write_recovery_outputs
+    from .mock_validation import write_recovery_outputs
 
     truth_path = Path(truth_path)
     output_dir = Path(run_dir) / "validation"
@@ -29411,6 +29411,7 @@ def _clone_args(args: argparse.Namespace, **updates: Any) -> argparse.Namespace:
 
 
 INPUT_ARCHIVE_VERSION = 1
+CONFIG_NATIVE_PAR_SENTINEL = "<config>"
 _INPUT_ARCHIVE_SUBDIRS = {
     "par": "par",
     "potfile": "potfiles",
@@ -29447,7 +29448,9 @@ def _input_archive_iter_blocks(parsed: dict[str, Any], key: str) -> Iterable[dic
 
 
 def _discover_input_archive_files(state: BuildState) -> list[tuple[str, Path]]:
-    base_dir = Path.cwd()
+    raw_par_path = str(getattr(state, "par_path", "")).strip()
+    par_path = Path(raw_par_path).expanduser()
+    base_dir = par_path.parent if raw_par_path and raw_par_path != CONFIG_NATIVE_PAR_SENTINEL else Path.cwd()
     discovered: list[tuple[str, Path]] = []
     seen: set[Path] = set()
 
@@ -29456,6 +29459,9 @@ def _discover_input_archive_files(state: BuildState) -> list[tuple[str, Path]]:
             return
         seen.add(path)
         discovered.append((kind, path))
+
+    if raw_par_path and raw_par_path != CONFIG_NATIVE_PAR_SENTINEL:
+        add("par", _input_archive_resolve_path(par_path, Path.cwd()))
 
     for potfile in getattr(state, "potfiles", []) or []:
         if not isinstance(potfile, dict):

@@ -6,7 +6,7 @@ import os
 import threading
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -23,12 +23,12 @@ from matplotlib.path import Path as MplPath
 from scipy.special import gammainc, gammaincinv
 from skimage.measure import find_contours
 
-from .jax_cosmology import (
+from ..jax_cosmology import (
     dpie_sigma0_from_vel_disp as _jax_dpie_sigma0_from_vel_disp,
     flat_wcdm_config,
     kpc_per_arcsec_from_config,
 )
-from .utils import jax_cpu_worker_count
+from ..utils import jax_cpu_worker_count
 
 ORIGINAL_DPIE_PROFILE_NAME = "DPIE_NIE"
 DEFAULT_CAUSTIC_COMPUTE_WINDOW_ARCSEC = 160.0
@@ -150,6 +150,16 @@ class SingleBCGMockConfig:
     def n_families(self) -> int:
         return int(self.n_primary_families) + int(self.n_subhalo_families)
 
+    def with_updates(self, **updates: Any) -> "SingleBCGMockConfig":
+        return replace(self, **updates)
+
+    def validate(self) -> "SingleBCGMockConfig":
+        validate_single_bcg_mock_config(self)
+        return self
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return _jsonable(asdict(self))
+
 
 @dataclass(frozen=True)
 class MockClusterPaths:
@@ -158,6 +168,58 @@ class MockClusterPaths:
     image_catalog_path: Path
     truth_path: Path
     mock_images_path: Path
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def validate_single_bcg_mock_config(config: SingleBCGMockConfig) -> None:
+    if isinstance(config.seed, bool) or int(config.seed) < 0:
+        raise ValueError("seed must be a nonnegative integer.")
+    if not math.isfinite(float(config.z_lens)) or float(config.z_lens) <= 0.0:
+        raise ValueError("z_lens must be positive and finite.")
+    if int(config.n_primary_families) < 0 or int(config.n_subhalo_families) < 0:
+        raise ValueError("source-family counts must be nonnegative.")
+    if config.n_families <= 0:
+        raise ValueError("at least one source family is required.")
+    if int(config.min_images_per_family) < 2:
+        raise ValueError("min_images_per_family must be at least 2.")
+    if config.max_images_per_family is not None and int(config.max_images_per_family) < int(config.min_images_per_family):
+        raise ValueError("max_images_per_family must be at least min_images_per_family.")
+    if not math.isfinite(float(config.pos_sigma_arcsec)) or float(config.pos_sigma_arcsec) < 0.0:
+        raise ValueError("pos_sigma_arcsec must be finite and nonnegative.")
+    for name in (
+        "source_redshift",
+        "source_sigma_int_arcsec",
+        "primary_image_min_distance_arcsec",
+        "subhalo_image_min_distance_arcsec",
+        "bcg_position_prior_half_width_arcsec",
+        "caustic_compute_window_arcsec",
+        "caustic_grid_scale_arcsec",
+        "caustic_min_area_arcsec2",
+    ):
+        value = float(getattr(config, name))
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be positive and finite.")
+    if float(config.caustic_boundary_margin_arcsec) < 0.0:
+        raise ValueError("caustic_boundary_margin_arcsec must be nonnegative.")
+    if int(config.n_subhalos) < 0:
+        raise ValueError("n_subhalos must be nonnegative.")
+    if int(config.subhalo_parent_factor) <= 0:
+        raise ValueError("subhalo_parent_factor must be positive.")
+    if not math.isfinite(float(config.subhalo_schechter_alpha)) or float(config.subhalo_schechter_alpha) <= -1.0:
+        raise ValueError("subhalo_schechter_alpha must be greater than -1.")
+    if float(config.subhalo_mass_min) <= 0.0 or float(config.subhalo_mass_max) <= float(config.subhalo_mass_min):
+        raise ValueError("subhalo_mass bounds must be positive and ordered.")
+    if float(config.subhalo_mass_ref) <= 0.0:
+        raise ValueError("subhalo_mass_ref must be positive.")
 
 
 def _lenstool_ellipticite_to_axis_ratio(ellipticite: float) -> float:
@@ -1012,6 +1074,37 @@ def _mock_model_and_kwargs(
     return model, kwargs_lens
 
 
+def _zero_dpie_kwargs_like(kwargs: dict[str, float]) -> dict[str, float]:
+    return {
+        "sigma0": 0.0,
+        "Ra": float(kwargs["Ra"]),
+        "Rs": float(kwargs["Rs"]),
+        "e1": float(kwargs["e1"]),
+        "e2": float(kwargs["e2"]),
+        "center_x": float(kwargs["center_x"]),
+        "center_y": float(kwargs["center_y"]),
+    }
+
+
+def _current_packed_truth_model_and_kwargs(
+    config: SingleBCGMockConfig,
+    subhalo_components: list[DPIETruth],
+    z_source: float,
+    cosmo_config: dict[str, Any],
+) -> tuple[list[str], list[dict[str, float]]]:
+    large_kwargs = [
+        _component_kwargs(config.halo, config, float(z_source), cosmo_config),
+        _component_kwargs(config.bcg, config, float(z_source), cosmo_config),
+    ]
+    lens_model_list = [ORIGINAL_DPIE_PROFILE_NAME, ORIGINAL_DPIE_PROFILE_NAME]
+    kwargs_lens = list(large_kwargs)
+    for component in subhalo_components:
+        subhalo_kwargs = _component_kwargs(component, config, float(z_source), cosmo_config)
+        lens_model_list.extend((ORIGINAL_DPIE_PROFILE_NAME, ORIGINAL_DPIE_PROFILE_NAME))
+        kwargs_lens.extend((_zero_dpie_kwargs_like(subhalo_kwargs), subhalo_kwargs))
+    return lens_model_list, kwargs_lens
+
+
 def generate_single_bcg_mock(
     output_dir: str | Path,
     config: SingleBCGMockConfig | None = None,
@@ -1021,6 +1114,7 @@ def generate_single_bcg_mock(
 ) -> tuple[MockClusterPaths, pd.DataFrame, dict[str, Any]]:
     """Generate a deterministic single-BCG mock cluster on disk."""
     config = config or SingleBCGMockConfig()
+    config.validate()
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
     par_path = root / "single_bcg_mock.par"
@@ -1078,6 +1172,7 @@ def generate_single_bcg_mock(
     needed_source_redshifts = _ordered_unique_source_redshifts(
         primary_family_redshifts,
         subhalo_family_redshifts,
+        (float(config.source_redshift),),
     )
     redshift_index_by_value = {float(z): index + 1 for index, z in enumerate(needed_source_redshifts)}
     caustic_num_pix = 0
@@ -1460,6 +1555,16 @@ def generate_single_bcg_mock(
         family_id = str(source_row["family_id"])
         parameter_truth[f"source.{family_id}.beta_x"] = float(source_row["beta_x"])
         parameter_truth[f"source.{family_id}.beta_y"] = float(source_row["beta_y"])
+    truth_lens_model_list, truth_kwargs_lens = _current_packed_truth_model_and_kwargs(
+        config,
+        subhalo_components,
+        float(config.source_redshift),
+        cosmo_config,
+    )
+    truth_kwargs_lens_by_z = {
+        f"{z:.8f}": _current_packed_truth_model_and_kwargs(config, subhalo_components, float(z), cosmo_config)[1]
+        for z in needed_source_redshifts
+    }
 
     truth_payload = {
         "mock": "single-bcg-subhalos" if subhalos else "single-bcg",
@@ -1475,10 +1580,9 @@ def generate_single_bcg_mock(
             f"{z:.8f}": [_caustic_contour_to_json(contour) for contour in get_caustics(float(z))]
             for z in needed_source_redshifts
         },
-        "lens_model_list": [ORIGINAL_DPIE_PROFILE_NAME, ORIGINAL_DPIE_PROFILE_NAME]
-        + [ORIGINAL_DPIE_PROFILE_NAME for _ in subhalo_components],
-        "kwargs_lens": get_model(float(config.source_redshift))[2],
-        "kwargs_lens_by_source_redshift": {f"{z:.8f}": get_model(float(z))[2] for z in needed_source_redshifts},
+        "lens_model_list": truth_lens_model_list,
+        "kwargs_lens": truth_kwargs_lens,
+        "kwargs_lens_by_source_redshift": truth_kwargs_lens_by_z,
     }
     if subhalo_selection is not None:
         truth_payload["subhalo_selection"] = subhalo_selection

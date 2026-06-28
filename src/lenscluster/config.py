@@ -471,8 +471,6 @@ def _validate_model_config(model: LensModelConfig | None) -> None:
         raise ValueError("LensClusterSolverConfig.model is required; Lenstool par files are no longer supported.")
     if not model.large_halos:
         raise ValueError("model.large_halos must contain at least one halo.")
-    if not model.member_populations:
-        raise ValueError("model.member_populations must contain at least one member population.")
     if model.image_constraints is None and not model.arc_constraints:
         raise ValueError("model must declare image_constraints or arc_constraints.")
     if model.cosmology.H0 <= 0.0:

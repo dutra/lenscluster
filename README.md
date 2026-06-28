@@ -8,7 +8,7 @@ This repository now has two public fitting workflows: the sequential optimizer/s
 4. Optionally run an image-plane refinement stage with `--image-plane-mode local-jacobian`.
 5. Optionally run a final image-plane stage using `--image-plane-mode linearized-forward-beta-image-plane`, `--image-plane-mode forward-metric-image-plane`, `--image-plane-mode critical-arc-mixture-image-plane`, or `--image-plane-mode fold-regularized-forward-beta-image-plane`.
 
-Use `--fit-method svi` for a fast variational result, `--fit-method svi+nuts` for SVI initialization followed by joint posterior sampling, or `--fit-method mchmc` / `--fit-method mclmc` for direct BlackJAX microcanonical sampling in the model's latent parameter space. In the optional sequential image-plane workflow, `--fit-method`, `--svi-steps`, `--warmup`, `--samples`, and `--max-tree-depth` may each take one value for all sampled stages, two values mapping to `stage2_joint` and `stage3_image_plane`, or three values when both stage 3 and a final stage-4 image-plane mode are enabled. Nested sampling is reserved for the one-shot evidence workflow: use `--fit-mode evidence-ns` with an explicit `--evidence-source-prior-sigma-arcsec`; `--fit-method`, `--svi-steps`, `--warmup`, and `--samples` are ignored in that mode.
+Use `--fit-method svi` for a fast variational result, `--fit-method svi+nuts` for SVI initialization followed by posterior sampling, or `--fit-method mchmc` / `--fit-method mclmc` for direct BlackJAX microcanonical sampling in the model's latent parameter space. In the current sequential workflow, `--fit-method`, `--warmup`, `--samples`, and `--max-tree-depth` configure the sampled production stages, while `--svi-steps` and `--refresh-every` configure the initializer, backprojected-centroid fit, and optional free-source forward fit. Nested sampling is reserved for the one-shot evidence workflow: use `--fit-mode evidence-ns` with an explicit `--evidence-source-prior-sigma-arcsec`; `--fit-method`, `--svi-steps`, `--warmup`, and `--samples` are ignored in that mode.
 
 For `mchmc` and `mclmc`, `--warmup` controls BlackJAX tuning/adaptation and `--samples` controls production transitions per chain. Prefer `mchmc` when asymptotic Metropolis correction is required. Unadjusted `mclmc` can be faster, but each saved draw is one integration transition and the run should be checked by increasing samples or reducing the tuned step size in a sensitivity run.
 
@@ -26,7 +26,7 @@ python -m cluster_solver \
   --warmup 100 \
   --samples 50 \
   --chains 1 \
-  --sampling-engine refreshing_surrogate \
+  --sampling-engine refreshing_surrogate_flat \
   --active-scaling-galaxies 32 \
   --target-accept 0.75 \
   --max-tree-depth 5 \
@@ -48,7 +48,7 @@ python -m cluster_solver \
   --svi-steps 2000 2000 500 \
   --samples 250 250 100 \
   --chains 4 \
-  --sampling-engine refreshing_surrogate \
+  --sampling-engine refreshing_surrogate_flat \
   --active-scaling-galaxies -1 \
   --refresh-param-drift-frac 0.08 \
   --target-accept 0.9 \
@@ -72,7 +72,7 @@ python -m cluster_solver \
   --ns-num-live-points 2000 \
   --ns-max-samples 200000 \
   --ns-dlogz 1e-3 \
-  --sampling-engine refreshing_surrogate \
+  --sampling-engine refreshing_surrogate_flat \
   --active-scaling-galaxies -1
 ```
 
@@ -91,133 +91,77 @@ When `--truth` is provided, recovery validation PDFs are written under the run's
 
 ## Mock-Cluster Validation
 
-The validation runner builds a synthetic single-BCG cluster, runs the normal
-parser/build/inference workflow, and writes PDF-only recovery figures. By
-default it uses a mildly realistic mock: 20 primary source families are sampled
-inside the largest tangential caustic, accepted only when they produce at least
-three images, the BCG is slightly offset from the cluster halo, the image
-position uncertainty is `0.15"` and the reported source-scatter truth is
-`0.05"`. It uses SVI initialization followed by NumPyro NUTS:
+Mock validation is configured from Python dataclasses, matching the main
+`lenscluster.config` API. There is no mock-validation CLI. The runner generates
+the mock inputs, converts them directly to a `LensModelConfig`, compiles a
+`LensClusterSolverConfig` with `compile_run_plan`, runs `LensClusterRunner`, and
+writes recovery diagnostics from the final compiled solver stage.
 
-```bash
-python -m lenscluster.validation \
-  --n-primary-families 20 \
-  --n-subhalo-families 0 \
-  --n-subhalos 50
+A minimal single-BCG validation run looks like:
+
+```python
+from lenscluster.config import LensClusterSolverConfig, RuntimeConfig, StageScheduleConfig
+from lenscluster.mock_validation import (
+    MockValidationConfig,
+    MockValidationPathsConfig,
+    MockValidationRecoveryConfig,
+    MockValidationRuntimeConfig,
+    MockValidationSolverConfig,
+    SingleBCGMockConfig,
+    run_single_bcg_validation,
+)
+
+config = MockValidationConfig(
+    mock=SingleBCGMockConfig(
+        n_primary_families=20,
+        n_subhalo_families=0,
+        n_subhalos=50,
+        min_images_per_family=3,
+        primary_source_redshifts=(1.5, 2.0, 3.0),
+        subhalo_source_redshifts=(1.5, 2.0, 3.0),
+        pos_sigma_arcsec=0.15,
+    ),
+    paths=MockValidationPathsConfig(
+        output_dir="validation_runs",
+        run_name="single_bcg_recovery",
+    ),
+    runtime=MockValidationRuntimeConfig(realizations=1, seed=12345),
+    solver=MockValidationSolverConfig(
+        template=LensClusterSolverConfig(
+            runtime=RuntimeConfig(skip_plots=True),
+            schedule=StageScheduleConfig(
+                fit_method=("svi+nuts",),
+                svi_steps=(2000, 2000),
+                refresh_every=(250, 250),
+                warmup=(300,),
+                samples=(500,),
+                sampling_refresh_runs=(1,),
+                max_tree_depth=(10,),
+            ),
+        ),
+        run_name="fit",
+    ),
+    recovery=MockValidationRecoveryConfig(
+        posterior_diagnostic_draws=8,
+        posterior_diagnostic_mode="exact",
+        recovery_profile_draws=128,
+    ),
+)
+
+outputs = run_single_bcg_validation(config)
 ```
 
-Useful explicit configuration for the current subhalo validation setup:
-
-```bash
-python -m lenscluster.validation \
-  --n-primary-families 20 \
-  --n-subhalo-families 0 \
-  --min-images-per-family 3 \
-  --n-subhalos 50 \
-  --primary-source-redshifts 1.5,2.0,3.0 \
-  --subhalo-source-redshifts 1.5,2.0,3.0 \
-  --pos-sigma-arcsec 0.15 \
-  --sampling-engine refreshing_surrogate \
-  --active-scaling-selection adaptive \
-  --active-scaling-cumulative-fraction 0.995 \
-  --active-scaling-min 4
-```
-
-Use `--max-images-per-family N` to reject sampled mock sources with more than
-`N` images; omit it, or pass `--max-images-per-family none`, to keep the
-default unlimited upper multiplicity.
-
-The adaptive subhalo selection ranks potfile galaxies by brightness and
-proximity to the observed multiple images, then chooses the active exact
-subhalo cutoff from the cumulative-importance curve. The default keeps enough
-ranked subhalos to capture 99.5% of the ranking importance, with at least four
-active subhalos per potfile. The remaining subhalos are retained through the
-refreshing surrogate rather than removed from the model.
-
-`--n-subhalo-families` requests additional sources inside the non-primary
-closed caustics found at each source redshift. These are local caustic-driven
-mock families, not a fit-time likelihood option.
+The default mock samples primary source families inside the largest tangential
+caustic, accepts sources only when they satisfy the configured image-count
+bounds, offsets the BCG slightly from the cluster halo, and records mock truth
+for the halo, BCG, sources, and optional subhalo population. `max_images_per_family=None`
+keeps the upper multiplicity unbounded.
 
 When subhalos are enabled, the mock draws a Natarajan-style count-matched
-Schechter cluster-member luminosity function by default. It samples a parent
-population with `dN/dL proportional to L^alpha exp(-L)` using
-`--subhalo-schechter-alpha -0.7`, maps luminosity to the dPIE mass proxy through
-the configured scaling relation, applies a faint member limit
-`--subhalo-mag-faint-limit 24.0`, and randomly selects `--n-subhalos`
-members from candidates brighter than that limit. The default dPIE slopes
-`vdslope=4` and `slope=4` imply constant M/L scaling, so `L*` maps to
-`--subhalo-mass-ref 1e12` and the log-space peak is near `3e11 Msun`.
-The mass controls are:
-
-- `--subhalo-mass-min 1e9`
-- `--subhalo-mass-max 1e13`
-- `--subhalo-mass-ref 1e12`
-- `--subhalo-parent-factor 1000`
-
-The mock also injects intrinsic log-normal scatter around the member-galaxy
-scaling relations by default:
-
-- `--subhalo-sigma-scatter-dex 0.07`
-- `--subhalo-cut-scatter-dex 0.20`
-
-Member-galaxy core radii remain fixed at the tiny configured value. The
-validation runner also fits matching scaling-scatter hyperparameters by default
-for the injected fields; disable that with `--no-fit-scaling-scatter`.
-
-For a faster variational-only validation run:
-
-```bash
-python -m lenscluster.validation \
-  --n-subhalos 50 \
-  --fit-method svi \
-  --svi-steps 1000 \
-  --samples 500
-```
-
-Validation accepts the same sampled-stage controls as the sequential solver. Two values
-require an image-plane mode and map to the sampled stages after stage 1; three
-values additionally control the selected stage-4 image-plane directory:
-
-```bash
-python -m lenscluster.validation \
-  --n-subhalos 50 \
-  --image-plane-mode linearized-forward-beta-image-plane \
-  --image-plane-newton-steps 0 \
-  --fit-method svi+nuts svi+nuts svi \
-  --svi-steps 2000 1000 500 \
-  --warmup 1000 1000 0 \
-  --samples 250 100 500 \
-  --max-tree-depth 8 8 6
-```
-
-For validation evidence runs, select the one-shot solver mode and provide the
-fixed source prior. The staged fit controls are not required:
-
-```bash
-python -m lenscluster.validation \
-  --n-subhalos 50 \
-  --solver-fit-mode evidence-ns \
-  --evidence-source-prior-sigma-arcsec 20.0 \
-  --ns-num-live-points 1000 \
-  --ns-max-samples 100000 \
-  --ns-dlogz 1e-3
-```
-
-To run the sampled-source image-plane evidence target instead, add
-`--evidence-likelihood-mode linearized-forward-beta-image-plane`; optional
-`--source-position-parameterization` and `--image-plane-newton-steps` controls
-then apply to that one-shot evidence likelihood.
-
-For a smaller NUTS test:
-
-```bash
-python -m lenscluster.validation \
-  --n-subhalos 50 \
-  --fit-method svi+nuts \
-  --svi-steps 500 \
-  --warmup 100 \
-  --samples 200
-```
+Schechter cluster-member luminosity function. It samples a parent population,
+maps luminosity to the dPIE mass proxy through the configured scaling relation,
+applies the faint member limit, and selects the requested number of members.
+The generated member catalog is used only when subhalos are requested.
 
 Validation outputs are written to:
 
@@ -231,13 +175,13 @@ The default run name and seed produce:
 validation_runs/single_bcg/single_bcg_recovery/seed_12345/
 ```
 
-The validation runner first runs the normal `lenscluster.cluster_solver`
-pipeline on the mock `.par` file, so the standard real-data stage outputs are
-also present under:
+Solver outputs are written under the realization directory using the current
+compiled stage names:
 
 ```text
-validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage1_large_only/
-validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage2_joint/
+validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage0_fast_initializer/
+validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage1_backprojected_centroid_fit/
+validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage2_free_source_forward_fit/  # when stage2_forward_mode != "none"
 ```
 
 Mock-truth recovery PDFs are additionally written at the seed directory level:
@@ -260,20 +204,20 @@ Mock-truth recovery PDFs are additionally written at the seed directory level:
 
 The mass-profile validation figures decompose the recovered deflection profile
 and annular projected surface density into total, halo, BCG, subhalos, and
-BCG+subhalos. This is important because strong-lensing image positions mostly
-constrain the total deflection field; the halo, BCG, and subhalo components can
-trade mass unless the priors and image configuration break that degeneracy.
+BCG+subhalos. Strong-lensing image positions mostly constrain the total
+deflection field, so these component-level plots help expose degeneracies.
 
-The posterior artifacts used to make these PDFs are saved under:
+The posterior artifacts used to make these PDFs are saved under the final
+solver stage, for example:
 
 ```text
-validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage2_joint/artifacts/plot_bundle.h5
+validation_runs/single_bcg/<run-name>/seed_<seed>/solver/fit/stage2_free_source_forward_fit/artifacts/plot_bundle.h5
 ```
 
-All figures are saved as PDFs. The standard solver stage still writes its usual
-diagnostic tables under each stage's `tables/` directory. Use `--skip-plots` on
-the validation command only when you want to suppress the standard solver plot
-suite; the mock-truth recovery PDFs are still generated.
+All figures are saved as PDFs. Standard solver diagnostic tables remain under
+each stage's `tables/` directory. Set `RuntimeConfig(skip_plots=True)` on the
+solver template to suppress standard solver plots; mock-truth recovery PDFs are
+still generated.
 
 ## Model
 
@@ -375,7 +319,7 @@ When `--image-plane-mode linearized-forward-beta-image-plane` is selected, the
 workflow adds `stage4_linearized_image_plane`. By default it also runs
 `stage3_image_plane` first; pass `--skip-stage3-image-plane-local-jacobian` or
 `--stage3-image-plane-mode none` to initialize stage 4 directly from
-`stage2_joint`. This final stage samples the lens
+`stage2_free_source_forward_fit`. This final stage samples the lens
 parameters plus explicit 2D source positions for each multiply imaged family,
 initialized from the previous sampled stage's source centroids. The sampled likelihood computes one
 local image-plane correction at each observed image even when
@@ -407,7 +351,7 @@ component uses the linear image-plane displacement, while the critical component
 uses the minimum real root distance of
 `0.5 kappa_eff theta_crit^2 + s_min theta_crit + r_crit = 0`. `kappa_eff` is
 estimated by finite-differencing the lensing Jacobian along the observed
-critical image-plane direction; with `--sampling-engine refreshing_surrogate`,
+critical image-plane direction; with `--sampling-engine refreshing_surrogate_flat`,
 the curvature and near-critical row mask are refreshed with the surrogate cache
 and reused between refreshes. `--fold-curvature-arcsec-inv` remains only as a
 fallback scale for direct helper use. Away from criticality, or when no local
@@ -483,8 +427,9 @@ JAXNS evidence diagnostics `ns_log_z_mean` and `ns_log_z_uncert`.
 
 For `--run-name joint_workflow`, outputs are written to:
 
-- `plots/m0416_original/joint_workflow/stage1_large_only/`
-- `plots/m0416_original/joint_workflow/stage2_joint/`
+- `plots/m0416_original/joint_workflow/stage0_fast_initializer/`
+- `plots/m0416_original/joint_workflow/stage1_backprojected_centroid_fit/`
+- `plots/m0416_original/joint_workflow/stage2_free_source_forward_fit/` when `--stage2-forward-mode` is enabled
 - `plots/m0416_original/joint_workflow/stage3_image_plane/` when `--image-plane-mode local-jacobian`, when `--stage3-image-plane-mode critical-arc-mixture-image-plane`, or before stage 4 unless skipped
 - `plots/m0416_original/joint_workflow/stage4_linearized_image_plane/` when `--image-plane-mode linearized-forward-beta-image-plane`
 - `plots/m0416_original/joint_workflow/stage4_forward_metric_image_plane/` when `--image-plane-mode forward-metric-image-plane`
