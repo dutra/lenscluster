@@ -40,15 +40,8 @@ class MockValidationRuntimeConfig:
 @dataclass(frozen=True)
 class MockValidationSolverConfig:
     template: LensClusterSolverConfig = field(default_factory=LensClusterSolverConfig)
-    run_name: str = "fit"
-
-
-@dataclass(frozen=True)
-class MockValidationRecoveryConfig:
-    posterior_diagnostic_draws: int = 8
-    posterior_diagnostic_mode: str = "exact"
-    critical_caustic_plot_grid_scale_arcsec: float = 0.2
-    recovery_profile_draws: int = 128
+    run_name: str = "solver"
+    recovery_stages: tuple[str, ...] = ("stage2",)
 
 
 @dataclass(frozen=True)
@@ -57,7 +50,6 @@ class MockValidationConfig:
     paths: MockValidationPathsConfig = field(default_factory=MockValidationPathsConfig)
     runtime: MockValidationRuntimeConfig = field(default_factory=MockValidationRuntimeConfig)
     solver: MockValidationSolverConfig = field(default_factory=MockValidationSolverConfig)
-    recovery: MockValidationRecoveryConfig = field(default_factory=MockValidationRecoveryConfig)
 
     @property
     def quiet(self) -> bool:
@@ -99,18 +91,38 @@ def validate_mock_validation_config(config: MockValidationConfig) -> None:
     _validate_path_segment(config.paths.variant_name, "paths.variant_name")
     if not str(config.solver.run_name).strip():
         raise ValueError("solver.run_name must be nonempty.")
-    recovery = config.recovery
-    if int(recovery.posterior_diagnostic_draws) <= 0:
-        raise ValueError("recovery.posterior_diagnostic_draws must be positive.")
-    if int(recovery.recovery_profile_draws) <= 0:
-        raise ValueError("recovery.recovery_profile_draws must be positive.")
-    if recovery.posterior_diagnostic_mode not in {"exact", "approximate"}:
-        raise ValueError("recovery.posterior_diagnostic_mode must be 'exact' or 'approximate'.")
-    if not math.isfinite(float(recovery.critical_caustic_plot_grid_scale_arcsec)) or (
-        float(recovery.critical_caustic_plot_grid_scale_arcsec) <= 0.0
+    _validate_recovery_stages(config.solver.recovery_stages)
+    template = config.solver.template
+    if int(template.image_diagnostics.posterior_image_diagnostic_draws) < 0:
+        raise ValueError("solver.template.image_diagnostics.posterior_image_diagnostic_draws must be nonnegative.")
+    if template.image_diagnostics.posterior_image_diagnostic_mode not in {"exact", "approximate"}:
+        raise ValueError(
+            "solver.template.image_diagnostics.posterior_image_diagnostic_mode must be 'exact' or 'approximate'."
+        )
+    if (
+        template.truth.posterior_truth_recovery_draws is not None
+        and int(template.truth.posterior_truth_recovery_draws) <= 0
     ):
-        raise ValueError("recovery.critical_caustic_plot_grid_scale_arcsec must be positive and finite.")
+        raise ValueError("solver.template.truth.posterior_truth_recovery_draws must be positive or None.")
+    if template.truth.caustic_plot_grid_scale_arcsec is not None and (
+        not math.isfinite(float(template.truth.caustic_plot_grid_scale_arcsec))
+        or float(template.truth.caustic_plot_grid_scale_arcsec) <= 0.0
+    ):
+        raise ValueError("solver.template.truth.caustic_plot_grid_scale_arcsec must be positive and finite when provided.")
     _validate_solver_schedule_shape(config.solver.template)
+
+
+def _validate_recovery_stages(stages: tuple[str, ...]) -> None:
+    if not isinstance(stages, tuple) or not stages:
+        raise ValueError("solver.recovery_stages must be a nonempty tuple.")
+    allowed = {"stage1", "stage2"}
+    seen: set[str] = set()
+    for stage in stages:
+        if not isinstance(stage, str) or stage not in allowed:
+            raise ValueError("solver.recovery_stages entries must be 'stage1' or 'stage2'.")
+        if stage in seen:
+            raise ValueError("solver.recovery_stages must not contain duplicates.")
+        seen.add(stage)
 
 
 def _validate_path_segment(value: str | None, field_name: str) -> None:

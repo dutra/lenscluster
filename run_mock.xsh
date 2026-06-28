@@ -16,17 +16,18 @@ os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib-lenscluster-mock"
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from lenscluster.config import (
+    ImageDiagnosticsConfig,
     LensClusterSolverConfig,
     LikelihoodConfig,
     PerturbationDiscoveryConfig,
     RuntimeConfig,
     StageScheduleConfig,
+    TruthRecoveryConfig,
     WorkflowConfig,
 )
 from lenscluster.mock_validation import (
     MockValidationConfig,
     MockValidationPathsConfig,
-    MockValidationRecoveryConfig,
     MockValidationRuntimeConfig,
     MockValidationSolverConfig,
     SingleBCGMockConfig,
@@ -100,72 +101,35 @@ def _parse_args(argv: list[str]) -> tuple[str, int, str, str, str]:
 
 def _solver_template(*, production: bool, seed: int, critical_arc_anisotropic_covariance: bool) -> LensClusterSolverConfig:
     if production:
-        warmup = 3000, 3000
-        samples = 500, 500
+        svi_steps = 10_000, 20_000, 20_000
+        warmup = 5000, 5000
+        samples = 250, 250
         max_tree_depth = 8, 8
-        return LensClusterSolverConfig(
-            runtime=RuntimeConfig(
-                seed=seed,
-                chains=cores,
-                resume="all",
-                quick_diagnostics=False,
-                debug_sampler_diagnostics=True,
-                numpyro_print_summary=True,
-                nuts_chain_method="parallel",
-                dense_mass="structured",
-                jax_clear_caches_after_svi_refresh=False,
-            ),
-            workflow=WorkflowConfig(
-                fit_mode="sequential",
-                stage0_likelihood="source",
-                stage1_likelihood="source",
-                stage2_forward_mode="critical-arc-anisotropic",
-                stage1_sampling_engine="full_flat",
-                stage2_sampling_engine="full_flat",
-                stage2_fresh_process=True,
-                exact_image_diagnostics_stage2=True,
-                best_value="maximum-likelihood",
-                image_plane_newton_steps=0,
-                linearized_beta_prior_sigma_arcsec=3.0,
-                source_position_parameterization="prior-whitened",
-            ),
-            schedule=StageScheduleConfig(
-                fit_method=("svi+nuts", "svi+nuts"),
-                refresh_every=(None, None, None),
-                svi_steps=(10_000, 20_000, 20_000),
-                warmup=warmup,
-                samples=samples,
-                sampling_refresh_runs=(1, 1),
-                max_tree_depth=max_tree_depth,
-                target_accept=0.8,
-                z_bin_efficiency_tol=0.0,
-                svi_learning_rate=0.0005,
-            ),
-            likelihood=LikelihoodConfig(
-                critical_arc_anisotropic_covariance=critical_arc_anisotropic_covariance,
-            ),
-            perturbation=PerturbationDiscoveryConfig(perturbation_discovery_top_k=None),
-        )
+    else:
+        svi_steps = 500, 20_000, 20_000
+        warmup = 100, 100
+        samples = 100, 100
+        max_tree_depth = 6, 6
 
     return LensClusterSolverConfig(
         runtime=RuntimeConfig(
             seed=seed,
             chains=cores,
             resume="all",
-            skip_plots=True,
             quick_diagnostics=False,
             debug_sampler_diagnostics=True,
-            numpyro_print_summary=False,
+            numpyro_print_summary=True,
             nuts_chain_method="parallel",
             dense_mass="structured",
+            jax_clear_caches_after_svi_refresh=False,
         ),
         workflow=WorkflowConfig(
             fit_mode="sequential",
-            stage0_likelihood="local-jacobian",
-            stage1_likelihood="local-jacobian",
+            stage0_likelihood="source",
+            stage1_likelihood="source",
             stage2_forward_mode="critical-arc-anisotropic",
-            stage1_sampling_engine="full_flat",
-            stage2_sampling_engine="full_flat",
+            stage1_sampling_engine="refreshing_surrogate_flat",
+            stage2_sampling_engine="refreshing_surrogate_flat",
             stage2_fresh_process=True,
             exact_image_diagnostics_stage2=True,
             best_value="maximum-likelihood",
@@ -176,21 +140,40 @@ def _solver_template(*, production: bool, seed: int, critical_arc_anisotropic_co
         schedule=StageScheduleConfig(
             fit_method=("svi+nuts", "svi+nuts"),
             refresh_every=(None, None, None),
-            svi_steps=(250, 500, 500),
-            warmup=(100, 100),
-            samples=(100, 100),
+            svi_steps=svi_steps,
+            warmup=warmup,
+            samples=samples,
             sampling_refresh_runs=(1, 1),
-            max_tree_depth=(6, 6),
+            max_tree_depth=max_tree_depth,
             target_accept=0.8,
             z_bin_efficiency_tol=0.0,
-            svi_learning_rate=0.001,
+            svi_learning_rate=0.0005,
         ),
         likelihood=LikelihoodConfig(
             critical_arc_anisotropic_covariance=critical_arc_anisotropic_covariance,
         ),
-        perturbation=PerturbationDiscoveryConfig(perturbation_discovery_top_k=None),
+        image_diagnostics=ImageDiagnosticsConfig(
+            posterior_image_diagnostic_draws=32,
+            posterior_image_diagnostic_mode="exact",
+            exact_image_finder="local-lm-adaptive",
+            exact_image_min_distance_arcsec=0.5,
+            exact_image_precision_limit=1.0e-2,
+            exact_image_num_iter_max=100,
+            exact_image_displacement_tol_arcsec=1.0e-4,
+            exact_image_identification_tol_arcsec=1.0e-3,
+            match_tolerance_arcsec=2.0,
+        ),
+        truth=TruthRecoveryConfig(
+            posterior_truth_recovery_draws=64,
+            caustic_plot_grid_scale_arcsec=0.2,
+        ),
+        perturbation=PerturbationDiscoveryConfig(
+            perturbation_discovery_alpha_tol_arcsec=0.001,
+            perturbation_discovery_jacobian_tol=0.001,
+            perturbation_discovery_jacobian_weight=1.0,
+            perturbation_discovery_top_k=3,
+        ),
     )
-
 
 def build_config(
     preset: str,
@@ -204,19 +187,14 @@ def build_config(
     critical_arc_anisotropic_covariance = covariance_mode == "anisotropic"
     mock = SingleBCGMockConfig(
         seed=seed,
-        n_primary_families=20 if production else 5,
+        n_primary_families=25 if production else 5,
         n_subhalo_families=0,
         n_subhalos=50 if production else 0,
         min_images_per_family=3,
         max_images_per_family=None,
         primary_source_redshifts=(1.5, 2.0, 3.0),
         subhalo_source_redshifts=(1.5, 2.0, 3.0),
-        pos_sigma_arcsec=0.05,
-    )
-    recovery = MockValidationRecoveryConfig(
-        posterior_diagnostic_draws=8 if production else 2,
-        posterior_diagnostic_mode="exact",
-        recovery_profile_draws=128 if production else 8,
+        pos_sigma_arcsec=0.1,
     )
     return MockValidationConfig(
         mock=mock,
@@ -238,9 +216,9 @@ def build_config(
                 seed=seed,
                 critical_arc_anisotropic_covariance=critical_arc_anisotropic_covariance,
             ),
-            run_name="fit",
+            run_name="solver",
+            recovery_stages=("stage1", "stage2"),
         ),
-        recovery=recovery,
     )
 
 

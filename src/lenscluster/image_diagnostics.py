@@ -15,6 +15,238 @@ def finite_or(value: Any, default: float = np.nan) -> float:
     return result if np.isfinite(result) else float(default)
 
 
+def image_sigma_int_for_params(evaluator: Any, params_latent: np.ndarray) -> float:
+    if not hasattr(evaluator, "_image_sigma_int_numpy"):
+        return 0.0
+    try:
+        value = float(evaluator._image_sigma_int_numpy(params_latent))
+    except Exception:
+        return 0.0
+    return value if np.isfinite(value) else 0.0
+
+
+def image_sigma_eff_arcsec(
+    measurement_sigma_arcsec: float,
+    image_sigma_int_arcsec: float,
+    covariance_floor: float,
+) -> float:
+    variance = (
+        float(measurement_sigma_arcsec) ** 2
+        + float(image_sigma_int_arcsec) ** 2
+        + max(float(covariance_floor), 0.0)
+    )
+    if not np.isfinite(variance) or variance < 0.0:
+        return np.nan
+    return float(np.sqrt(variance))
+
+
+def _strict_arc_supported(row: dict[str, Any]) -> bool:
+    return bool(row.get("arc_supported", False)) or str(row.get("arc_recovery_status", "")).strip().lower() == "arc_supported"
+
+
+def image_catalog_point_recovered(row: Any) -> bool:
+    try:
+        arc_status = str(row.get("arc_recovery_status", "")).strip().lower()
+        status = str(row.get("image_recovery_status", "")).strip().lower()
+    except AttributeError:
+        arc_status = ""
+        status = ""
+    if arc_status == "point_recovered":
+        return True
+    if status == "recovered" and arc_status not in {"arc_supported", "not_recovered"}:
+        return True
+    return False
+
+
+def image_prediction_for_family_latent(
+    evaluator: Any,
+    family: Any,
+    params_latent: np.ndarray,
+    image_sigma_int_arcsec: float,
+    covariance_floor: float,
+    *,
+    quick_diagnostics: bool = False,
+    source_prediction: dict[str, Any] | None = None,
+    magnification_column: str = "magnification_model",
+) -> dict[str, Any]:
+    import jax.numpy as jnp
+
+    params_latent = np.asarray(params_latent, dtype=float)
+    n_images = int(getattr(family, "n_images", 0))
+    source_prediction = dict(source_prediction or {})
+    exact_details: dict[str, Any] | None = None
+    unavailable_reason = "quick_diagnostics" if quick_diagnostics else "not_run"
+    unavailable_status = "unknown"
+    exact_failed = bool(quick_diagnostics)
+    if not quick_diagnostics:
+        try:
+            if hasattr(evaluator, "_exact_family_prediction_details"):
+                exact_details = evaluator._exact_family_prediction_details(params_latent, family)
+                exact_failed = exact_details_hard_failed(exact_details)
+            else:
+                exact_prediction = evaluator._exact_family_prediction(params_latent, family)
+                if exact_prediction is not None:
+                    x_exact, y_exact, exact_rms = exact_prediction
+                    x_exact = np.asarray(x_exact, dtype=float)
+                    y_exact = np.asarray(y_exact, dtype=float)
+                    if x_exact.shape == (n_images,) and y_exact.shape == (n_images,):
+                        exact_details = {
+                            **successful_image_count_info(family),
+                            "failed": False,
+                            "x_pred": x_exact,
+                            "y_pred": y_exact,
+                            "exact_image_rms": exact_rms,
+                        }
+                        exact_failed = False
+                else:
+                    unavailable_reason = "exact_prediction_failed"
+                    unavailable_status = "not_recovered"
+                    exact_failed = True
+        except Exception:
+            unavailable_reason = "exact_prediction_exception"
+            unavailable_status = "unknown"
+            exact_failed = True
+
+    mu = np.full(n_images, np.nan, dtype=float)
+    magnification_failed = True
+    try:
+        model, _solver = evaluator._get_exact_model_solver(family.z_source)
+        packed_state = evaluator._build_packed_lens_state(jnp.asarray(params_latent, dtype=jnp.float64), family.z_source)
+        kwargs_lens = evaluator._packed_to_kwargs_lens(packed_state)
+        mu_values = np.asarray(
+            model.magnification(
+                jnp.asarray(getattr(family, "x_obs", []), dtype=jnp.float64),
+                jnp.asarray(getattr(family, "y_obs", []), dtype=jnp.float64),
+                kwargs_lens,
+            ),
+            dtype=float,
+        )
+        if mu_values.shape == (n_images,):
+            mu = mu_values
+            magnification_failed = False
+    except Exception:
+        magnification_failed = True
+
+    sigma_arcsec = finite_or(getattr(family, "sigma_arcsec", np.nan))
+    sigma_eff = image_sigma_eff_arcsec(sigma_arcsec, image_sigma_int_arcsec, covariance_floor)
+    image_rows, extra_image_rows, count_info = family_image_recovery_rows(
+        family,
+        exact_details,
+        sigma_arcsec=sigma_arcsec,
+        image_sigma_int_arcsec=image_sigma_int_arcsec,
+        image_sigma_eff_arcsec=sigma_eff,
+        unavailable_reason=unavailable_reason,
+        unavailable_status=unavailable_status,
+    )
+    magnification_common_keys = [
+        "family_id",
+        "image_label",
+        "x_obs_arcsec",
+        "y_obs_arcsec",
+        "z_source",
+        "effective_z_source",
+        "sigma_arcsec",
+        "image_sigma_int_arcsec",
+        "image_sigma_eff_arcsec",
+        "radius_arcsec",
+        "angle_deg",
+        "image_recovery_status",
+        "model_produced_image_count",
+        "model_recovered_image_count",
+        "model_missing_image_count",
+        "model_extra_image_count",
+        "model_multiplicity_failed",
+        "model_multiplicity_failure_reason",
+    ]
+    magnification_rows: list[dict[str, Any]] = []
+    for image_row, mu_value in zip(image_rows, mu):
+        common = {key: image_row[key] for key in magnification_common_keys if key in image_row}
+        magnification_rows.append(
+            {
+                **common,
+                magnification_column: float(mu_value),
+                "magnification_prediction_failed": bool(magnification_failed),
+            }
+        )
+
+    x_pred = np.asarray([row.get("x_model_arcsec", np.nan) for row in image_rows], dtype=float)
+    y_pred = np.asarray([row.get("y_model_arcsec", np.nan) for row in image_rows], dtype=float)
+    residuals = np.asarray([row.get("image_residual_arcsec", np.nan) for row in image_rows], dtype=float)
+    arc_residuals = np.asarray([row.get("arc_aware_image_residual_arcsec", np.nan) for row in image_rows], dtype=float)
+    point_recovered_mask = np.asarray([image_catalog_point_recovered(row) for row in image_rows], dtype=bool)
+    arc_supported_mask = np.asarray([_strict_arc_supported(row) for row in image_rows], dtype=bool)
+    if exact_failed:
+        point_recovered_mask = np.zeros(n_images, dtype=bool)
+        arc_supported_mask = np.zeros(n_images, dtype=bool)
+    family_result = {
+        "family_id": str(getattr(family, "family_id", "")),
+        "image_labels": [str(label) for label in getattr(family, "image_labels", [])],
+        "magnification_labels": [str(label) for label in getattr(family, "image_labels", [])],
+        "magnification": mu,
+        "x_pred": x_pred,
+        "y_pred": y_pred,
+        "residuals": residuals,
+        "arc_aware_residuals": arc_residuals,
+        "point_recovered_mask": point_recovered_mask,
+        "arc_supported_mask": arc_supported_mask,
+        "source_x": float(source_prediction.get("source_x", np.nan)),
+        "source_y": float(source_prediction.get("source_y", np.nan)),
+        "source_plane_rms": float(source_prediction.get("source_plane_rms", np.nan)),
+        "exact_image_rms": float(exact_details.get("exact_image_rms", np.nan)) if isinstance(exact_details, dict) else np.nan,
+        "arc_aware_image_rms": float(exact_details.get("arc_aware_image_rms_arcsec", np.nan)) if isinstance(exact_details, dict) else np.nan,
+        "exact_failed": bool(exact_failed),
+    }
+    return {
+        "image_rows": image_rows,
+        "magnification_rows": magnification_rows,
+        "image_count_rows": [image_count_recovery_row(family, count_info)],
+        "extra_image_rows": extra_image_rows,
+        "family_result": family_result,
+    }
+
+
+def posterior_image_rms_row(draw_index: int, family_results: list[dict[str, Any]]) -> dict[str, Any]:
+    point_values: list[float] = []
+    arc_values: list[float] = []
+    point_count = 0
+    arc_aware_count = 0
+    arc_supported_count = 0
+    total_count = 0
+    failed_count = 0
+    for result in family_results:
+        residuals = np.asarray(result["residuals"], dtype=float).reshape(-1)
+        arc_residuals = np.asarray(result["arc_aware_residuals"], dtype=float).reshape(-1)
+        point_mask = np.asarray(result["point_recovered_mask"], dtype=bool).reshape(-1)
+        arc_mask = np.asarray(result["arc_supported_mask"], dtype=bool).reshape(-1)
+        n = int(min(residuals.size, arc_residuals.size, point_mask.size, arc_mask.size))
+        residuals = residuals[:n]
+        arc_residuals = arc_residuals[:n]
+        point_mask = point_mask[:n]
+        arc_mask = arc_mask[:n]
+        total_count += n
+        point_finite = point_mask & np.isfinite(residuals)
+        arc_finite = arc_mask & np.isfinite(arc_residuals)
+        point_values.extend(float(value) for value in residuals[point_finite])
+        arc_values.extend(float(value) for value in residuals[point_finite])
+        arc_values.extend(float(value) for value in arc_residuals[arc_finite])
+        point_count += int(np.sum(point_finite))
+        arc_aware_count += int(np.sum(point_finite) + np.sum(arc_finite))
+        arc_supported_count += int(np.sum(arc_finite))
+        failed_count += int(bool(result.get("exact_failed", False)))
+    point_array = np.asarray(point_values, dtype=float)
+    arc_array = np.asarray(arc_values, dtype=float)
+    return {
+        "draw_index": int(draw_index),
+        "point_image_rms_arcsec": float(np.sqrt(np.mean(np.square(point_array)))) if point_array.size else np.nan,
+        "point_recovered_image_count": int(point_count),
+        "arc_aware_image_rms_arcsec": float(np.sqrt(np.mean(np.square(arc_array)))) if arc_array.size else np.nan,
+        "arc_aware_recovered_image_count": int(arc_aware_count),
+        "arc_supported_image_count": int(arc_supported_count),
+        "total_image_count": int(total_count),
+        "exact_failed_family_count": int(failed_count),
+    }
+
+
 def unavailable_image_count_info(family: Any, reason: str) -> dict[str, Any]:
     return {
         "produced_image_count": np.nan,

@@ -242,7 +242,8 @@ class LikelihoodConfig:
 
 @dataclass(frozen=True)
 class ImageDiagnosticsConfig:
-    fit_quality_draws: int = 0
+    posterior_image_diagnostic_draws: int = 0
+    posterior_image_diagnostic_mode: str = "exact"
     arc_recovery_p_arc_threshold: float = 0.1
     critical_arc_singular_threshold: float = 0.05
     exact_image_min_distance_arcsec: float = 0.1
@@ -263,7 +264,7 @@ class TruthRecoveryConfig:
     gammax_true_fits: str | Path | None = None
     gammay_true_fits: str | Path | None = None
     truth_grid_mode: str = "median"
-    truth_grid_draws: int | None = 64
+    posterior_truth_recovery_draws: int | None = 64
     truth_grid_size: int = 256
     caustic_source_redshift: float = 9.0
     caustic_plot_grid_scale_arcsec: float | None = None
@@ -428,8 +429,8 @@ def validate_config(config: LensClusterSolverConfig) -> None:
         raise ValueError("independent_scaling_free_log_tau_prior_sigma must be positive.")
     if config.truth.truth_grid_mode not in {"median", "posterior"}:
         raise ValueError("truth_grid_mode must be 'median' or 'posterior'.")
-    if config.truth.truth_grid_draws is not None and int(config.truth.truth_grid_draws) <= 0:
-        raise ValueError("truth_grid_draws must be a positive integer or None.")
+    if config.truth.posterior_truth_recovery_draws is not None and int(config.truth.posterior_truth_recovery_draws) <= 0:
+        raise ValueError("posterior_truth_recovery_draws must be a positive integer or None.")
     if config.truth.truth_grid_size < 0:
         raise ValueError("truth_grid_size must be nonnegative.")
     likelihood = config.likelihood
@@ -456,6 +457,10 @@ def validate_config(config: LensClusterSolverConfig) -> None:
         likelihood.magnitude_arc_scatter_prior,
     )
     image_diagnostics = config.image_diagnostics
+    if int(image_diagnostics.posterior_image_diagnostic_draws) < 0:
+        raise ValueError("image_diagnostics.posterior_image_diagnostic_draws must be nonnegative.")
+    if image_diagnostics.posterior_image_diagnostic_mode not in {"exact", "approximate"}:
+        raise ValueError("image_diagnostics.posterior_image_diagnostic_mode must be 'exact' or 'approximate'.")
     if (
         not math.isfinite(float(image_diagnostics.arc_recovery_p_arc_threshold))
         or image_diagnostics.arc_recovery_p_arc_threshold < 0.0

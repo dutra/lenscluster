@@ -47,6 +47,9 @@ from .image_diagnostics import (
     diagnostic_detail_array as _shared_diagnostic_detail_array,
     extra_image_rows as _shared_extra_image_rows,
     family_image_recovery_rows as _shared_family_image_recovery_rows,
+    image_prediction_for_family_latent as _shared_image_prediction_for_family_latent,
+    image_sigma_eff_arcsec as _shared_image_sigma_eff_arcsec,
+    image_sigma_int_for_params as _shared_image_sigma_int_for_params,
     image_count_info_from_exact_details as _shared_image_count_info_from_exact_details,
     image_count_recovery_row as _shared_image_count_recovery_row,
     image_count_recovery_summary as _shared_image_count_recovery_summary,
@@ -6654,13 +6657,7 @@ def _reported_physical_to_latent_vector(evaluator: Any, theta: np.ndarray) -> np
 
 
 def _fit_quality_image_sigma_int(evaluator: Any, params_latent: np.ndarray) -> float:
-    if not hasattr(evaluator, "_image_sigma_int_numpy"):
-        return 0.0
-    try:
-        value = float(evaluator._image_sigma_int_numpy(params_latent))
-    except Exception:
-        return 0.0
-    return value if np.isfinite(value) else 0.0
+    return _shared_image_sigma_int_for_params(evaluator, params_latent)
 
 
 def _fit_quality_critical_arc_singular_threshold(evaluator: Any, params_latent: np.ndarray) -> float:
@@ -6698,14 +6695,7 @@ def _fit_quality_image_sigma_eff(
     image_sigma_int_arcsec: float,
     covariance_floor: float,
 ) -> float:
-    variance = (
-        float(measurement_sigma_arcsec) ** 2
-        + float(image_sigma_int_arcsec) ** 2
-        + max(float(covariance_floor), 0.0)
-    )
-    if not np.isfinite(variance) or variance < 0.0:
-        return np.nan
-    return float(np.sqrt(variance))
+    return _shared_image_sigma_eff_arcsec(measurement_sigma_arcsec, image_sigma_int_arcsec, covariance_floor)
 
 
 def _finite_or(value: Any, default: float = np.nan) -> float:
@@ -7135,102 +7125,20 @@ def _fit_quality_prediction_for_family_latent(
     covariance_floor: float,
     quick_diagnostics: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
-    magnification_rows: list[dict[str, Any]] = []
-    params_latent = np.asarray(params_latent, dtype=float)
-    n_images = int(family.n_images)
-    exact_details: dict[str, Any] | None = None
-    unavailable_reason = "quick_diagnostics" if quick_diagnostics else "not_run"
-    unavailable_status = "unknown"
-    if not quick_diagnostics:
-        try:
-            if hasattr(evaluator, "_exact_family_prediction_details"):
-                exact_details = evaluator._exact_family_prediction_details(params_latent, family)
-            else:
-                exact_prediction = evaluator._exact_family_prediction(params_latent, family)
-                if exact_prediction is not None:
-                    x_exact, y_exact, _exact_rms = exact_prediction
-                    x_exact = np.asarray(x_exact, dtype=float)
-                    y_exact = np.asarray(y_exact, dtype=float)
-                    if x_exact.shape == (n_images,) and y_exact.shape == (n_images,):
-                        exact_details = {
-                            **_successful_image_count_info(family),
-                            "failed": False,
-                            "x_pred": x_exact,
-                            "y_pred": y_exact,
-                            "exact_image_rms": _exact_rms,
-                        }
-                else:
-                    unavailable_reason = "exact_prediction_failed"
-                    unavailable_status = "not_recovered"
-        except Exception:
-            unavailable_reason = "exact_prediction_exception"
-            unavailable_status = "unknown"
-
-    mu = np.full(n_images, np.nan, dtype=float)
-    magnification_failed = True
-    try:
-        model, _solver = evaluator._get_exact_model_solver(family.z_source)
-        packed_state = evaluator._build_packed_lens_state(jnp.asarray(params_latent, dtype=jnp.float64), family.z_source)
-        kwargs_lens = evaluator._packed_to_kwargs_lens(packed_state)
-        mu_values = np.asarray(
-            model.magnification(
-                jnp.asarray(family.x_obs, dtype=jnp.float64),
-                jnp.asarray(family.y_obs, dtype=jnp.float64),
-                kwargs_lens,
-            ),
-            dtype=float,
-        )
-        if mu_values.shape == (n_images,):
-            mu = mu_values
-            magnification_failed = False
-    except Exception:
-        magnification_failed = True
-
-    sigma_arcsec = _finite_or(getattr(family, "sigma_arcsec", np.nan))
-    sigma_eff = _fit_quality_image_sigma_eff(sigma_arcsec, image_sigma_int, covariance_floor)
-    image_rows, extra_image_rows, count_info = _shared_family_image_recovery_rows(
+    prediction = _shared_image_prediction_for_family_latent(
+        evaluator,
         family,
-        exact_details,
-        sigma_arcsec=sigma_arcsec,
-        image_sigma_int_arcsec=image_sigma_int,
-        image_sigma_eff_arcsec=sigma_eff,
-        unavailable_reason=unavailable_reason,
-        unavailable_status=unavailable_status,
+        params_latent,
+        image_sigma_int,
+        covariance_floor,
+        quick_diagnostics=quick_diagnostics,
+        magnification_column="magnification_model",
     )
-    magnification_common_keys = [
-        "family_id",
-        "image_label",
-        "x_obs_arcsec",
-        "y_obs_arcsec",
-        "z_source",
-        "effective_z_source",
-        "sigma_arcsec",
-        "image_sigma_int_arcsec",
-        "image_sigma_eff_arcsec",
-        "radius_arcsec",
-        "angle_deg",
-        "image_recovery_status",
-        "model_produced_image_count",
-        "model_recovered_image_count",
-        "model_missing_image_count",
-        "model_extra_image_count",
-        "model_multiplicity_failed",
-        "model_multiplicity_failure_reason",
-    ]
-    for image_row, mu_value in zip(image_rows, mu):
-        common = {key: image_row[key] for key in magnification_common_keys if key in image_row}
-        magnification_rows.append(
-            {
-                **common,
-                "magnification_model": float(mu_value),
-                "magnification_prediction_failed": bool(magnification_failed),
-            }
-        )
     return {
-        "image_rows": image_rows,
-        "magnification_rows": magnification_rows,
-        "image_count_rows": [_image_count_recovery_row(family, count_info)],
-        "extra_image_rows": extra_image_rows,
+        "image_rows": prediction["image_rows"],
+        "magnification_rows": prediction["magnification_rows"],
+        "image_count_rows": prediction["image_count_rows"],
+        "extra_image_rows": prediction["extra_image_rows"],
     }
 
 
@@ -7542,7 +7450,7 @@ def _fit_quality_tables(
     quick_diagnostics = bool(getattr(args, "quick_diagnostics", getattr(evaluator, "quick_diagnostics", False)))
     summary_fn = _fit_quality_median_std if quick_diagnostics else _fit_quality_quantiles
 
-    max_draws = max(0, int(getattr(args, "fit_quality_draws", 0)))
+    max_draws = max(0, int(getattr(args, "posterior_image_diagnostic_draws", 0)))
     posterior_samples = _capped_fit_quality_samples(results.samples, max_draws)
     sample_latents = [
         _reported_physical_to_latent_vector(evaluator, np.asarray(sample, dtype=float))
@@ -9502,7 +9410,7 @@ def _truth_grid_flat_selection(
     if max_draws is not None:
         max_draws_int = int(max_draws)
         if max_draws_int <= 0:
-            raise ValueError("--truth-grid-draws must be 'all' or a positive integer.")
+            raise ValueError("--posterior-truth-recovery-draws must be 'all' or a positive integer.")
         if finite_indices.size > max_draws_int:
             selection_mode = TRUTH_GRID_DRAW_SELECTION_FLAT_RANDOM
             rng = np.random.default_rng(seed)
@@ -9542,7 +9450,7 @@ def _truth_grid_grouped_selection(
     else:
         max_draws_int = int(max_draws)
         if max_draws_int <= 0:
-            raise ValueError("--truth-grid-draws must be 'all' or a positive integer.")
+            raise ValueError("--posterior-truth-recovery-draws must be 'all' or a positive integer.")
         selection_mode = TRUTH_GRID_DRAW_SELECTION_GROUPED_RANDOM
         quotas = np.zeros_like(available_counts)
         for _ in range(max_draws_int):
@@ -11354,7 +11262,7 @@ def _plot_kappa_truth_diagnostics(
     caustic_source_redshift: float,
     image_df: pd.DataFrame | None = None,
     *,
-    truth_grid_draws: int | None = None,
+    posterior_truth_recovery_draws: int | None = None,
     truth_grid_mode: str = TRUTH_GRID_MODE_MEDIAN,
     truth_grid_size: int = DEFAULT_TRUTH_GRID_SIZE,
     truth_grid_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
@@ -11396,7 +11304,7 @@ def _plot_kappa_truth_diagnostics(
         z_source,
         source_truth_fits=source_truth_fits,
         quantities=quantities,
-        max_draws=truth_grid_draws,
+        max_draws=posterior_truth_recovery_draws,
         truth_grid_mode=truth_grid_mode,
         cache=truth_grid_cache,
         require_cache=require_precomputed_truth_grid,
@@ -11707,7 +11615,7 @@ def _plot_abs_mu_truth_diagnostics(
     *,
     cap: float = ABSOLUTE_MAGNIFICATION_PLOT_CAP,
     image_df: pd.DataFrame | None = None,
-    truth_grid_draws: int | None = None,
+    posterior_truth_recovery_draws: int | None = None,
     truth_grid_mode: str = TRUTH_GRID_MODE_MEDIAN,
     truth_grid_size: int = DEFAULT_TRUTH_GRID_SIZE,
     truth_grid_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
@@ -11775,7 +11683,7 @@ def _plot_abs_mu_truth_diagnostics(
             "abs_mu": kappa_true_fits,
         },
         quantities=("kappa", "gamma1", "gamma2", "detA", "mu", "abs_mu"),
-        max_draws=truth_grid_draws,
+        max_draws=posterior_truth_recovery_draws,
         truth_grid_mode=truth_grid_mode,
         cache=truth_grid_cache,
         require_cache=require_precomputed_truth_grid,
@@ -11890,7 +11798,7 @@ def _precompute_truth_recovery_grids(
         z_source,
         source_truth_fits=source_truth_fits,
         quantities=quantities,
-        max_draws=getattr(args, "truth_grid_draws", None),
+        max_draws=getattr(args, "posterior_truth_recovery_draws", None),
         truth_grid_mode=str(getattr(args, "truth_grid_mode", TRUTH_GRID_MODE_MEDIAN)),
         cache=truth_grid_cache,
         aperture_center=None,
@@ -15206,13 +15114,13 @@ def _generate_plots_and_tables(
             lambda: _plot_residual_geometry_trends(context["image_fit_quality_df"], _plot_path(run_dir, "residual_geometry_trends.pdf")),
         ),
     ]
-    image_recovery_tasks.extend(
-        [
-            (
-                "critical_arc_support_histogram",
-                "plots.critical_arc_support_histogram",
-                lambda: (
-                    _plot_critical_arc_support_histogram(
+    if _critical_arc_support_plots_enabled():
+        image_recovery_tasks.extend(
+            [
+                (
+                    "critical_arc_support_histogram",
+                    "plots.critical_arc_support_histogram",
+                    lambda: _plot_critical_arc_support_histogram(
                         context["image_fit_quality_df"],
                         _plot_path(run_dir, "critical_arc_support_histogram.pdf"),
                         arc_recovery_p_arc_threshold=float(
@@ -15223,16 +15131,12 @@ def _generate_plots_and_tables(
                         singular_threshold=float(critical_arc_singular_threshold_best_fit),
                         singular_softness=float(critical_arc_singular_softness_best_fit),
                         sample_likelihood_mode=_critical_arc_support_plot_mode(),
-                    )
-                    if _critical_arc_support_plots_enabled()
-                    else None
+                    ),
                 ),
-            ),
-            (
-                "critical_arc_support_phase_space",
-                "plots.critical_arc_support_phase_space",
-                lambda: (
-                    _plot_critical_arc_support_phase_space(
+                (
+                    "critical_arc_support_phase_space",
+                    "plots.critical_arc_support_phase_space",
+                    lambda: _plot_critical_arc_support_phase_space(
                         context["image_fit_quality_df"],
                         _plot_path(run_dir, "critical_arc_support_phase_space.pdf"),
                         arc_recovery_p_arc_threshold=float(
@@ -15243,25 +15147,18 @@ def _generate_plots_and_tables(
                         singular_threshold=float(critical_arc_singular_threshold_best_fit),
                         singular_softness=float(critical_arc_singular_softness_best_fit),
                         sample_likelihood_mode=_critical_arc_support_plot_mode(),
-                    )
-                    if _critical_arc_support_plots_enabled()
-                    else None
+                    ),
                 ),
-            ),
-            (
-                "critical_arc_recovery_by_family",
-                "plots.critical_arc_recovery_by_family",
-                lambda: (
-                    _plot_critical_arc_recovery_by_family(
+                (
+                    "critical_arc_recovery_by_family",
+                    "plots.critical_arc_recovery_by_family",
+                    lambda: _plot_critical_arc_recovery_by_family(
                         context["image_count_recovery_df"],
                         _plot_path(run_dir, "critical_arc_recovery_by_family.pdf"),
-                    )
-                    if _critical_arc_support_plots_enabled()
-                    else None
+                    ),
                 ),
-            ),
-        ]
-    )
+            ]
+        )
 
     truth_recovery_tasks: list[PlotTask] = []
     skip_grid_diagnostics = bool(getattr(args, "skip_grid_diagnostics", False))
@@ -15270,7 +15167,7 @@ def _generate_plots_and_tables(
     kappa_true_fits = getattr(args, "kappa_true_fits", None)
     gammax_true_fits = getattr(args, "gammax_true_fits", None)
     gammay_true_fits = getattr(args, "gammay_true_fits", None)
-    truth_grid_draws = getattr(args, "truth_grid_draws", None)
+    posterior_truth_recovery_draws = getattr(args, "posterior_truth_recovery_draws", None)
     truth_grid_mode = str(getattr(args, "truth_grid_mode", TRUTH_GRID_MODE_MEDIAN))
     truth_grid_size = int(getattr(args, "truth_grid_size", DEFAULT_TRUTH_GRID_SIZE))
     truth_grid_draw_seed = _truth_grid_draw_seed(getattr(args, "seed", DEFAULT_RUNTIME_SEED))
@@ -15318,7 +15215,7 @@ def _generate_plots_and_tables(
                         str(gammay_true_fits),
                         getattr(args, "caustic_source_redshift", 9.0),
                         image_df=context["image_fit_quality_df"],
-                        truth_grid_draws=truth_grid_draws,
+                        posterior_truth_recovery_draws=posterior_truth_recovery_draws,
                         truth_grid_mode=truth_grid_mode,
                         truth_grid_size=truth_grid_size,
                         truth_grid_cache=context["truth_grid_cache"],
@@ -15353,7 +15250,7 @@ def _generate_plots_and_tables(
                     str(kappa_true_fits),
                     getattr(args, "caustic_source_redshift", 9.0),
                     image_df=context["image_fit_quality_df"],
-                    truth_grid_draws=truth_grid_draws,
+                    posterior_truth_recovery_draws=posterior_truth_recovery_draws,
                     truth_grid_mode=truth_grid_mode,
                     truth_grid_size=truth_grid_size,
                     truth_grid_cache=context["truth_grid_cache"],

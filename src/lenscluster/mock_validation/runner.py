@@ -61,7 +61,7 @@ from ..jax_cosmology import (
 )
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.path import Path as MplPath
-from matplotlib.ticker import AutoMinorLocator
+from matplotlib.ticker import AutoMinorLocator, MaxNLocator
 from matplotlib import pyplot as plt
 
 from ..plot_style import apply_lenscluster_plot_style
@@ -91,9 +91,10 @@ from .generation import (
     generate_single_bcg_mock,
 )
 from ..image_diagnostics import (
-    exact_details_hard_failed as _exact_details_hard_failed,
-    family_image_recovery_rows as _family_image_recovery_rows,
+    image_prediction_for_family_latent as _shared_image_prediction_for_family_latent,
+    image_sigma_int_for_params as _shared_image_sigma_int_for_params,
     image_count_recovery_table as _image_count_recovery_table,
+    posterior_image_rms_row as _shared_posterior_image_rms_row,
 )
 from ..config import LensClusterSolverConfig
 from ..planning import compile_run_plan
@@ -123,8 +124,15 @@ from ..utils import (
     progress_context as _progress_context,
     run_logged_phase as _run_logged_phase,
 )
+
 from ..runner import LensClusterRunner
 from .config import MockValidationConfig, solver_config_for_single_bcg_mock
+
+
+def _limit_recovery_axis_ticks(ax: Any, *, nbins: int = 8) -> None:
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=int(nbins)))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=int(nbins)))
+
 
 FIT_METHOD_SVI = "svi"
 FIT_METHOD_SVI_NUTS = "svi+nuts"
@@ -727,8 +735,6 @@ def _recovered_model_tables(
     progress: _ValidationRecoveryProgress | None = None,
     artifact_args: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    import jax.numpy as jnp
-
     from ..cluster_solver import (
         DEFAULT_ACTIVE_SCALING_GALAXIES,
         DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
@@ -934,14 +940,7 @@ def _recovered_model_tables(
     image_rows: list[dict[str, Any]] = []
     source_rows: list[dict[str, Any]] = []
     best_predictions = evaluator.evaluate(best_fit_latent).family_predictions
-    image_sigma_int = 0.0
-    if hasattr(evaluator, "_image_sigma_int_numpy"):
-        try:
-            image_sigma_int = float(evaluator._image_sigma_int_numpy(best_fit_latent))
-        except Exception:
-            image_sigma_int = 0.0
-    if not np.isfinite(image_sigma_int):
-        image_sigma_int = 0.0
+    image_sigma_int = _shared_image_sigma_int_for_params(evaluator, best_fit_latent)
     covariance_floor = max(float(getattr(evaluator, "source_plane_covariance_floor", 0.0)), 0.0)
     progress_task = progress.add_subtask("recovered models: families", total=len(state.family_data)) if progress else None
     for family in state.family_data:
@@ -950,54 +949,36 @@ def _recovered_model_tables(
                 progress_task,
                 f"recovered models: family={family.family_id} z={float(family.z_source):.4f}",
             )
-        model, _solver = evaluator._get_exact_model_solver(family.z_source)
-        packed_state = evaluator._build_packed_lens_state(jnp.asarray(best_fit_latent, dtype=jnp.float64), family.z_source)
-        kwargs_lens = evaluator._packed_to_kwargs_lens(packed_state)
-        family_images = images[images["family_id"].astype(str) == str(family.family_id)].copy()
-        mu = np.asarray(
-            model.magnification(
-                family_images["x_obs_arcsec"].to_numpy(dtype=float),
-                family_images["y_obs_arcsec"].to_numpy(dtype=float),
-                kwargs_lens,
-            ),
-            dtype=float,
-        )
-        for label, value in zip(family_images["image_label"].astype(str), mu):
-            magnification_rows.append({"image_label": label, "magnification_recovered": float(value)})
         prediction = best_predictions.get(str(family.family_id), {})
-        exact_details: dict[str, Any] | None = None
-        unavailable_reason = "quick_diagnostics" if quick_diagnostics else "exact_prediction_failed"
-        unavailable_status = "unknown" if quick_diagnostics else "not_recovered"
-        if not quick_diagnostics:
-            try:
-                exact_details = evaluator._exact_family_prediction_details(best_fit_latent, family)
-            except Exception:
-                unavailable_reason = "exact_prediction_exception"
-                unavailable_status = "unknown"
-        sigma_arcsec = float(getattr(family, "sigma_arcsec", np.nan))
-        sigma_eff = np.sqrt(sigma_arcsec**2 + image_sigma_int**2 + covariance_floor) if np.isfinite(sigma_arcsec) else np.nan
-        family_image_rows, _extra_rows, _count_info = _family_image_recovery_rows(
+        family_prediction = _shared_image_prediction_for_family_latent(
+            evaluator,
             family,
-            exact_details,
-            sigma_arcsec=sigma_arcsec,
-            image_sigma_int_arcsec=image_sigma_int,
-            image_sigma_eff_arcsec=float(sigma_eff),
-            unavailable_reason=unavailable_reason,
-            unavailable_status=unavailable_status,
+            best_fit_latent,
+            image_sigma_int,
+            covariance_floor,
+            quick_diagnostics=quick_diagnostics,
+            source_prediction=prediction,
+            magnification_column="magnification_recovered",
         )
-        image_rows.extend(family_image_rows)
+        family_result = family_prediction["family_result"]
+        magnification_rows.extend(family_prediction["magnification_rows"])
+        image_rows.extend(family_prediction["image_rows"])
         source_rows.append(
             {
                 "family_id": str(family.family_id),
-                "source_x_recovered": float(prediction.get("source_x", np.nan)),
-                "source_y_recovered": float(prediction.get("source_y", np.nan)),
-                "source_plane_rms_arcsec": float(prediction.get("source_plane_rms", np.nan)),
-                "exact_image_rms_arcsec": float(exact_details.get("exact_image_rms", np.nan)) if isinstance(exact_details, dict) else np.nan,
-                "arc_aware_image_rms_arcsec": float(exact_details.get("arc_aware_image_rms_arcsec", np.nan)) if isinstance(exact_details, dict) else np.nan,
-                "arc_aware_recovered_image_count": int(exact_details.get("arc_aware_recovered_image_count", 0)) if isinstance(exact_details, dict) else 0,
-                "arc_aware_missing_image_count": int(exact_details.get("arc_aware_missing_image_count", family.n_images)) if isinstance(exact_details, dict) else int(family.n_images),
-                "arc_supported_image_count": int(exact_details.get("arc_supported_image_count", 0)) if isinstance(exact_details, dict) else 0,
-                "failed": bool(prediction.get("failed", False) or (exact_details.get("failed", False) if isinstance(exact_details, dict) else True)),
+                "source_x_recovered": float(family_result["source_x"]),
+                "source_y_recovered": float(family_result["source_y"]),
+                "source_plane_rms_arcsec": float(family_result["source_plane_rms"]),
+                "exact_image_rms_arcsec": float(family_result["exact_image_rms"]),
+                "arc_aware_image_rms_arcsec": float(family_result["arc_aware_image_rms"]),
+                "arc_aware_recovered_image_count": int(
+                    np.sum(family_result["point_recovered_mask"]) + np.sum(family_result["arc_supported_mask"])
+                ),
+                "arc_aware_missing_image_count": int(
+                    max(0, int(family.n_images) - int(np.sum(family_result["point_recovered_mask"]) + np.sum(family_result["arc_supported_mask"])))
+                ),
+                "arc_supported_image_count": int(np.sum(family_result["arc_supported_mask"])),
+                "failed": bool(prediction.get("failed", False) or family_result["exact_failed"]),
             }
         )
         if progress:
@@ -1047,6 +1028,88 @@ def _nanmedian_no_warning(values: Any) -> float:
     if array.size == 0:
         return np.nan
     return float(np.median(array))
+
+
+def _finite_std_no_warning(values: Any) -> float:
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    if array.size == 0:
+        return np.nan
+    return float(np.std(array))
+
+
+def _finite_quantile_no_warning(values: Any, q: float) -> float:
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    if array.size == 0:
+        return np.nan
+    return float(np.quantile(array, float(q)))
+
+
+def _posterior_image_rms_summary(posterior_image_rms_df: pd.DataFrame) -> dict[str, float]:
+    if posterior_image_rms_df.empty:
+        return {}
+    summary: dict[str, float] = {}
+    specs = {
+        "point_image_rms_arcsec": "posterior_point_image_rms_arcsec",
+        "arc_aware_image_rms_arcsec": "posterior_arc_aware_image_rms_arcsec",
+    }
+    for column, prefix in specs.items():
+        if column not in posterior_image_rms_df:
+            continue
+        values = pd.to_numeric(posterior_image_rms_df[column], errors="coerce").to_numpy(dtype=float)
+        summary[f"{prefix}_q16"] = _finite_quantile_no_warning(values, 0.16)
+        summary[f"{prefix}_median"] = _nanmedian_no_warning(values)
+        summary[f"{prefix}_q84"] = _finite_quantile_no_warning(values, 0.84)
+        summary[f"{prefix}_std"] = _finite_std_no_warning(values)
+    count_specs = {
+        "point_recovered_image_count": "posterior_point_recovered_image_count",
+        "arc_aware_recovered_image_count": "posterior_arc_aware_recovered_image_count",
+        "arc_supported_image_count": "posterior_arc_supported_image_count",
+        "total_image_count": "posterior_total_image_count",
+        "exact_failed_family_count": "posterior_exact_failed_family_count",
+    }
+    for column, prefix in count_specs.items():
+        if column not in posterior_image_rms_df:
+            continue
+        values = pd.to_numeric(posterior_image_rms_df[column], errors="coerce").to_numpy(dtype=float)
+        summary[f"{prefix}_median"] = _nanmedian_no_warning(values)
+        summary[f"{prefix}_std"] = _finite_std_no_warning(values)
+    return summary
+
+
+def _posterior_image_residual_draw_rows(draw_index: int, family_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in family_results:
+        family_id = str(result.get("family_id", ""))
+        image_labels = [str(label) for label in result.get("image_labels", [])]
+        residuals = np.asarray(result.get("residuals", []), dtype=float).reshape(-1)
+        arc_residuals = np.asarray(result.get("arc_aware_residuals", []), dtype=float).reshape(-1)
+        point_mask = np.asarray(result.get("point_recovered_mask", []), dtype=bool).reshape(-1)
+        arc_mask = np.asarray(result.get("arc_supported_mask", []), dtype=bool).reshape(-1)
+        n = int(min(len(image_labels), residuals.size, arc_residuals.size, point_mask.size, arc_mask.size))
+        exact_failed = bool(result.get("exact_failed", False))
+        for index in range(n):
+            point_recovered = bool(point_mask[index]) and np.isfinite(float(residuals[index]))
+            arc_supported = bool(arc_mask[index]) and np.isfinite(float(arc_residuals[index]))
+            rows.append(
+                {
+                    "draw_index": int(draw_index),
+                    "image_label": image_labels[index],
+                    "family_id": family_id,
+                    "point_image_residual_arcsec": float(residuals[index]) if point_recovered else np.nan,
+                    "arc_aware_image_residual_arcsec": (
+                        float(arc_residuals[index])
+                        if arc_supported
+                        else (float(residuals[index]) if point_recovered else np.nan)
+                    ),
+                    "point_recovered": bool(point_recovered),
+                    "arc_aware_recovered": bool(point_recovered or arc_supported),
+                    "arc_supported": bool(arc_supported),
+                    "exact_failed": bool(exact_failed),
+                }
+            )
+    return rows
 
 
 _VALIDATION_STAGE_ORDER = (
@@ -1351,9 +1414,7 @@ def _posterior_prediction_uncertainty_tables(
     posterior_diagnostic_mode: str = POSTERIOR_DIAGNOSTIC_MODE_EXACT,
     progress: _ValidationRecoveryProgress | None = None,
     artifact_args: dict[str, Any] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    import jax.numpy as jnp
-
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     from ..cluster_solver import (
         DEFAULT_ACTIVE_SCALING_GALAXIES,
         DEFAULT_ACTIVE_SCALING_CUMULATIVE_FRACTION,
@@ -1405,7 +1466,7 @@ def _posterior_prediction_uncertainty_tables(
 
     sample_array = np.asarray(samples_physical, dtype=float)
     if sample_array.ndim != 2 or sample_array.shape[0] == 0:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     if sample_array.shape[0] > max_draws:
         indices = np.linspace(0, sample_array.shape[0] - 1, max_draws, dtype=int)
         sample_array = sample_array[indices]
@@ -1588,16 +1649,6 @@ def _posterior_prediction_uncertainty_tables(
         return local_evaluator
 
     family_ids = [str(family.family_id) for family in state.family_data]
-    empty_family_images = images.iloc[0:0].copy()
-    if "family_id" in images:
-        image_family_ids = images["family_id"].astype(str)
-        images_by_family = {
-            family_id: images.loc[image_family_ids == family_id].copy()
-            for family_id in family_ids
-        }
-    else:
-        images_by_family = {family_id: empty_family_images for family_id in family_ids}
-
     mag_by_label: dict[str, list[float]] = {}
     x_by_label: dict[str, list[float]] = {}
     y_by_label: dict[str, list[float]] = {}
@@ -1609,6 +1660,8 @@ def _posterior_prediction_uncertainty_tables(
     exact_rms_by_family: dict[str, list[float]] = {}
     arc_rms_by_family: dict[str, list[float]] = {}
     exact_failed_families: set[str] = set()
+    posterior_rms_rows: list[dict[str, Any]] = []
+    posterior_residual_rows: list[dict[str, Any]] = []
 
     n_draws = int(sample_array.shape[0])
     n_families = len(state.family_data)
@@ -1626,88 +1679,31 @@ def _posterior_prediction_uncertainty_tables(
         skip_exact: bool,
     ) -> dict[str, Any]:
         task_evaluator = family_task_evaluator()
-        family_id = str(family.family_id)
-        model, _solver = task_evaluator._get_exact_model_solver(family.z_source)
-        packed_state = task_evaluator._build_packed_lens_state(jnp.asarray(sample_latent, dtype=jnp.float64), family.z_source)
-        kwargs_lens = task_evaluator._packed_to_kwargs_lens(packed_state)
-        family_images = images_by_family.get(family_id, empty_family_images)
-        mu = np.asarray(
-            model.magnification(
-                family_images["x_obs_arcsec"].to_numpy(dtype=float),
-                family_images["y_obs_arcsec"].to_numpy(dtype=float),
-                kwargs_lens,
-            ),
-            dtype=float,
+        if skip_exact and use_exact_predictions:
+            family_prediction = _shared_image_prediction_for_family_latent(
+                task_evaluator,
+                family,
+                sample_latent,
+                _shared_image_sigma_int_for_params(task_evaluator, sample_latent),
+                max(float(getattr(task_evaluator, "source_plane_covariance_floor", 0.0)), 0.0),
+                quick_diagnostics=True,
+                source_prediction=prediction,
+                magnification_column="magnification",
+            )
+            result = dict(family_prediction["family_result"])
+            result["exact_failed"] = True
+            return result
+        family_prediction = _shared_image_prediction_for_family_latent(
+            task_evaluator,
+            family,
+            sample_latent,
+            _shared_image_sigma_int_for_params(task_evaluator, sample_latent),
+            max(float(getattr(task_evaluator, "source_plane_covariance_floor", 0.0)), 0.0),
+            quick_diagnostics=not use_exact_predictions,
+            source_prediction=prediction,
+            magnification_column="magnification",
         )
-        task_prediction = dict(prediction)
-        exact_failed = False
-        if use_exact_predictions and not skip_exact:
-            if hasattr(task_evaluator, "_exact_family_prediction_details"):
-                try:
-                    exact_details = task_evaluator._exact_family_prediction_details(sample_latent, family)
-                except Exception:
-                    exact_details = None
-                if exact_details is None:
-                    exact_failed = True
-                else:
-                    exact_failed = _exact_details_hard_failed(exact_details)
-                    image_rows, _extra_rows, _count_info = _family_image_recovery_rows(family, exact_details)
-                    task_prediction["x_pred"] = np.asarray(
-                        [row["x_model_arcsec"] for row in image_rows],
-                        dtype=float,
-                    )
-                    task_prediction["y_pred"] = np.asarray(
-                        [row["y_model_arcsec"] for row in image_rows],
-                        dtype=float,
-                    )
-                    task_prediction["arc_aware_residuals"] = np.asarray(
-                        [row.get("arc_aware_image_residual_arcsec", np.nan) for row in image_rows],
-                        dtype=float,
-                    )
-                    task_prediction["exact_image_rms"] = float(exact_details.get("exact_image_rms", np.nan))
-                    task_prediction["arc_aware_image_rms"] = float(exact_details.get("arc_aware_image_rms_arcsec", np.nan))
-            else:
-                exact_prediction = task_evaluator._exact_family_prediction(sample_latent, family)
-                if exact_prediction is None:
-                    exact_failed = True
-                else:
-                    x_pred_exact, y_pred_exact, exact_rms = exact_prediction
-                    task_prediction["x_pred"] = x_pred_exact
-                    task_prediction["y_pred"] = y_pred_exact
-                    task_prediction["exact_image_rms"] = exact_rms
-        x_pred = np.asarray(task_prediction.get("x_pred", np.full(family.n_images, np.nan)), dtype=float)
-        y_pred = np.asarray(task_prediction.get("y_pred", np.full(family.n_images, np.nan)), dtype=float)
-        residuals = np.asarray(
-            [
-                math.hypot(float(x_model - x_obs), float(y_model - y_obs))
-                if np.isfinite(float(x_model) + float(y_model))
-                else np.nan
-                for x_obs, y_obs, x_model, y_model in zip(family.x_obs, family.y_obs, x_pred, y_pred)
-            ],
-            dtype=float,
-        )
-        arc_aware_residuals = np.asarray(
-            task_prediction.get("arc_aware_residuals", np.full(family.n_images, np.nan)),
-            dtype=float,
-        ).reshape(-1)
-        if arc_aware_residuals.shape != (family.n_images,):
-            arc_aware_residuals = np.full(family.n_images, np.nan, dtype=float)
-        return {
-            "family_id": family_id,
-            "image_labels": [str(label) for label in family.image_labels],
-            "magnification_labels": [str(label) for label in family_images["image_label"].astype(str)],
-            "magnification": mu,
-            "x_pred": x_pred,
-            "y_pred": y_pred,
-            "residuals": residuals,
-            "arc_aware_residuals": arc_aware_residuals,
-            "source_x": float(task_prediction.get("source_x", np.nan)),
-            "source_y": float(task_prediction.get("source_y", np.nan)),
-            "source_plane_rms": float(task_prediction.get("source_plane_rms", np.nan)),
-            "exact_image_rms": float(task_prediction.get("exact_image_rms", np.nan)),
-            "arc_aware_image_rms": float(task_prediction.get("arc_aware_image_rms", np.nan)),
-            "exact_failed": exact_failed,
-        }
+        return dict(family_prediction["family_result"])
 
     def merge_family_result(result: dict[str, Any]) -> None:
         family_id = str(result["family_id"])
@@ -1742,6 +1738,7 @@ def _posterior_prediction_uncertainty_tables(
                 sample_latent = _convert_theta_to_latent(sample, state.parameter_specs)
             family_predictions = evaluator._family_source_summary(sample_latent)
             if worker_count <= 1:
+                draw_results: list[dict[str, Any]] = []
                 for family in state.family_data:
                     family_id = str(family.family_id)
                     if progress:
@@ -1762,8 +1759,12 @@ def _posterior_prediction_uncertainty_tables(
                     if result["exact_failed"]:
                         exact_failed_families.add(family_id)
                     merge_family_result(result)
+                    draw_results.append(result)
                     if progress:
                         progress.advance_subtask(progress_task)
+                if use_exact_predictions:
+                    posterior_rms_rows.append(_shared_posterior_image_rms_row(draw_index, draw_results))
+                    posterior_residual_rows.extend(_posterior_image_residual_draw_rows(draw_index, draw_results))
                 continue
 
             if executor is None:  # pragma: no cover - defensive guard
@@ -1802,6 +1803,15 @@ def _posterior_prediction_uncertainty_tables(
                     progress.advance_subtask(progress_task)
             for family_index in range(len(state.family_data)):
                 merge_family_result(results_by_index[family_index])
+            if use_exact_predictions:
+                draw_results = [results_by_index[index] for index in range(len(state.family_data))]
+                posterior_rms_rows.append(
+                    _shared_posterior_image_rms_row(
+                        draw_index,
+                        draw_results,
+                    )
+                )
+                posterior_residual_rows.extend(_posterior_image_residual_draw_rows(draw_index, draw_results))
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
@@ -1874,7 +1884,9 @@ def _posterior_prediction_uncertainty_tables(
                 "arc_aware_image_rms_q84": ar84,
             }
         )
-    return pd.DataFrame(mag_rows), pd.DataFrame(image_rows), pd.DataFrame(source_rows)
+    posterior_rms_df = pd.DataFrame(posterior_rms_rows)
+    posterior_residual_df = pd.DataFrame(posterior_residual_rows)
+    return pd.DataFrame(mag_rows), pd.DataFrame(image_rows), pd.DataFrame(source_rows), posterior_rms_df, posterior_residual_df
 
 
 def _magnifications_for_images(state: Any, best_fit_physical: np.ndarray, images: pd.DataFrame) -> pd.DataFrame:
@@ -1883,13 +1895,18 @@ def _magnifications_for_images(state: Any, best_fit_physical: np.ndarray, images
 
 
 def _mass_profile_component_groups(state: Any) -> tuple[dict[str, list[int]], dict[str, str]]:
+    from ..cluster_solver import COMPONENT_FAMILY_LARGE, COMPONENT_FAMILY_SCALING
+
     component_family = np.asarray(state.packed_lens_spec.component_family, dtype=int)
     n_components = len(state.lens_model_list)
+    physical_indices = np.where(
+        (component_family == COMPONENT_FAMILY_LARGE) | (component_family == COMPONENT_FAMILY_SCALING)
+    )[0].astype(int).tolist()
     group_indices: dict[str, list[int]] = {
-        "total": list(range(n_components)),
+        "total": physical_indices,
         "halo": [0] if n_components > 0 else [],
         "bcg": [1] if n_components > 1 else [],
-        "subhalos": np.where(component_family == 1)[0].astype(int).tolist(),
+        "subhalos": np.where(component_family == COMPONENT_FAMILY_SCALING)[0].astype(int).tolist(),
     }
     group_indices["bcg_plus_subhalos"] = group_indices["bcg"] + group_indices["subhalos"]
     display_names = {
@@ -1927,29 +1944,108 @@ def _validate_profile_component_indices(state: Any, group: str, indices: list[in
         )
 
 
-def _truth_kwargs_for_profile_redshift(truth: dict[str, Any], z_source: float) -> list[dict[str, float]]:
-    truth_kwargs_by_z = truth.get("kwargs_lens_by_source_redshift")
-    if not isinstance(truth_kwargs_by_z, dict):
-        raise ValueError("Current mock truth payload must contain kwargs_lens_by_source_redshift.")
-    key = f"{float(z_source):.8f}"
-    if key not in truth_kwargs_by_z:
-        raise ValueError(f"Current mock truth payload is missing kwargs_lens_by_source_redshift[{key!r}].")
-    kwargs_lens = truth_kwargs_by_z[key]
-    if not isinstance(kwargs_lens, list):
-        raise ValueError(f"kwargs_lens_by_source_redshift[{key!r}] must be a list.")
-    return [dict(item) for item in kwargs_lens]
+def _current_truth_component_records(truth: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    records = truth.get("lens_components")
+    if not isinstance(records, list):
+        if "kwargs_lens" in truth or "kwargs_lens_by_source_redshift" in truth:
+            raise ValueError(
+                "Current mock truth schema requires lens_components records; positional kwargs_lens truth is legacy. "
+                "Regenerate the mock."
+            )
+        raise ValueError("Current mock truth schema requires lens_components records.")
+
+    by_id: dict[str, dict[str, Any]] = {}
+    subhalo_catalog_ids: set[str] = set()
+    for index, raw_record in enumerate(records):
+        if not isinstance(raw_record, dict):
+            raise ValueError(f"lens_components[{index}] must be a record.")
+        record = dict(raw_record)
+        role = str(record.get("component_role", "")).strip()
+        if role in {"subhalo_placeholder", "placeholder"} or record.get("physical") is False:
+            raise ValueError("Mock truth contains placeholder/nonphysical subhalo component records. Regenerate the mock.")
+        component_id = str(record.get("component_id", "")).strip()
+        if not component_id:
+            raise ValueError(f"lens_components[{index}] is missing component_id.")
+        if component_id in by_id:
+            raise ValueError(f"Duplicate truth component_id {component_id!r}.")
+        if role == "subhalo":
+            catalog_id = str(record.get("catalog_id", component_id)).strip()
+            if not catalog_id:
+                raise ValueError(f"Subhalo truth component {component_id!r} is missing catalog_id.")
+            if catalog_id in subhalo_catalog_ids:
+                raise ValueError(f"Duplicate subhalo truth catalog_id {catalog_id!r}.")
+            subhalo_catalog_ids.add(catalog_id)
+            record["catalog_id"] = catalog_id
+        by_id[component_id] = record
+    return by_id
 
 
-def _packed_lens_state_from_current_truth_kwargs(state: Any, kwargs_lens: list[dict[str, Any]]) -> Any:
-    from ..cluster_solver import DP_IE_PROFILE, SHEAR_PROFILE, PackedLensState
+def _truth_record_kwargs_for_redshift(record: dict[str, Any], z_source: float, component_label: str) -> dict[str, Any]:
+    kwargs_by_z = record.get("kwargs_by_source_redshift")
+    if not isinstance(kwargs_by_z, dict):
+        raise ValueError(f"Truth component {component_label!r} is missing kwargs_by_source_redshift.")
+    exact_key = f"{float(z_source):.8f}"
+    if exact_key in kwargs_by_z:
+        kwargs = kwargs_by_z[exact_key]
+    else:
+        matches: list[Any] = []
+        for key, value in kwargs_by_z.items():
+            try:
+                key_z = float(key)
+            except (TypeError, ValueError):
+                continue
+            if abs(key_z - float(z_source)) <= 1.0e-8:
+                matches.append(value)
+        if len(matches) != 1:
+            raise ValueError(f"Truth component {component_label!r} is missing source redshift {exact_key}.")
+        kwargs = matches[0]
+    if not isinstance(kwargs, dict):
+        raise ValueError(f"Truth component {component_label!r} kwargs for z={exact_key} must be a record.")
+    return dict(kwargs)
+
+
+def _scaling_component_records_by_index(state: Any) -> dict[int, dict[str, Any]]:
+    records = getattr(state, "scaling_component_records", None)
+    if records is None:
+        records = []
+    result: dict[int, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        try:
+            component_index = int(record["component_index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        result[component_index] = dict(record)
+    return result
+
+
+def _packed_lens_state_from_current_truth_components(state: Any, truth: dict[str, Any], z_source: float) -> Any:
+    from ..cluster_solver import (
+        COMPONENT_FAMILY_INDEPENDENT_FREE,
+        COMPONENT_FAMILY_LARGE,
+        COMPONENT_FAMILY_SCALING,
+        DP_IE_PROFILE,
+        SHEAR_PROFILE,
+        PackedLensState,
+    )
 
     profile_type = np.asarray(state.packed_lens_spec.profile_type, dtype=np.int32)
+    component_family = np.asarray(state.packed_lens_spec.component_family, dtype=int)
     n_components = int(profile_type.size)
-    if len(kwargs_lens) != n_components:
+    if int(component_family.size) != n_components:
         raise ValueError(
-            "Current mock truth kwargs_lens length mismatch: "
-            f"got {len(kwargs_lens)} entries for {n_components} packed components."
+            "Packed component metadata mismatch: "
+            f"component_family has {int(component_family.size)} entries for {n_components} profile entries."
         )
+    truth_by_id = _current_truth_component_records(truth)
+    scaling_records = _scaling_component_records_by_index(state)
+    subhalo_truth_by_catalog = {
+        str(record["catalog_id"]): record
+        for record in truth_by_id.values()
+        if str(record.get("component_role", "")) == "subhalo"
+    }
+    matched_truth_ids: set[str] = set()
 
     sigma0 = np.zeros(n_components, dtype=float)
     Ra = np.zeros(n_components, dtype=float)
@@ -1961,11 +2057,45 @@ def _packed_lens_state_from_current_truth_kwargs(state: Any, kwargs_lens: list[d
     gamma1 = np.zeros(n_components, dtype=float)
     gamma2 = np.zeros(n_components, dtype=float)
 
-    for index, (profile, kwargs) in enumerate(zip(profile_type.tolist(), kwargs_lens)):
+    for index, profile in enumerate(profile_type.tolist()):
+        family = int(component_family[index])
+        if family == COMPONENT_FAMILY_INDEPENDENT_FREE:
+            continue
+        if family == COMPONENT_FAMILY_LARGE:
+            if index == 0:
+                truth_id = "halo"
+            elif index == 1:
+                truth_id = "bcg"
+            else:
+                raise ValueError(
+                    "Packed large component "
+                    f"index {index} has no current mock truth identity metadata."
+                )
+            record = truth_by_id.get(truth_id)
+            if record is None:
+                raise ValueError(f"Packed physical component {truth_id!r} has no matching truth component.")
+            component_label = truth_id
+            matched_truth_ids.add(truth_id)
+        elif family == COMPONENT_FAMILY_SCALING:
+            scaling_record = scaling_records.get(index)
+            if scaling_record is None:
+                raise ValueError(f"Packed scaling component index {index} is missing scaling_component_records metadata.")
+            catalog_id = str(scaling_record.get("catalog_id", "")).strip()
+            if not catalog_id:
+                raise ValueError(f"Packed scaling component index {index} is missing catalog_id metadata.")
+            record = subhalo_truth_by_catalog.get(catalog_id)
+            if record is None:
+                raise ValueError(f"Packed scaling component catalog_id {catalog_id!r} has no matching truth component.")
+            component_label = f"subhalo catalog_id={catalog_id}"
+            matched_truth_ids.add(str(record["component_id"]))
+        else:
+            raise ValueError(f"Packed component index {index} has unsupported component_family={family}.")
+
+        kwargs = _truth_record_kwargs_for_redshift(record, z_source, component_label)
         if int(profile) == DP_IE_PROFILE:
             missing = [field for field in ("sigma0", "Ra", "Rs", "e1", "e2", "center_x", "center_y") if field not in kwargs]
             if missing:
-                raise ValueError(f"Truth kwargs_lens[{index}] missing DPIE fields: {missing}.")
+                raise ValueError(f"Truth component {component_label!r} missing DPIE fields: {missing}.")
             sigma0[index] = float(kwargs["sigma0"])
             Ra[index] = float(kwargs["Ra"])
             Rs[index] = float(kwargs["Rs"])
@@ -1976,11 +2106,23 @@ def _packed_lens_state_from_current_truth_kwargs(state: Any, kwargs_lens: list[d
         elif int(profile) == SHEAR_PROFILE:
             missing = [field for field in ("gamma1", "gamma2") if field not in kwargs]
             if missing:
-                raise ValueError(f"Truth kwargs_lens[{index}] missing SHEAR fields: {missing}.")
+                raise ValueError(f"Truth component {component_label!r} missing SHEAR fields: {missing}.")
             gamma1[index] = float(kwargs["gamma1"])
             gamma2[index] = float(kwargs["gamma2"])
         else:
-            raise ValueError(f"Unsupported profile_type={int(profile)} in current mock truth packed layout.")
+            raise ValueError(f"Unsupported profile_type={int(profile)} in current mock truth component layout.")
+
+    physical_truth_ids = {
+        str(record["component_id"])
+        for record in truth_by_id.values()
+        if str(record.get("component_role", "")) in {"halo", "bcg", "subhalo"}
+    }
+    unmatched_truth_ids = sorted(physical_truth_ids - matched_truth_ids)
+    if unmatched_truth_ids:
+        raise ValueError(
+            "Current mock truth contains physical components with no matching packed solver component: "
+            f"{unmatched_truth_ids}."
+        )
 
     import jax.numpy as jnp
 
@@ -2123,8 +2265,7 @@ def _mass_and_surface_density_profiles_for_samples(
     group_indices, display_names = _mass_profile_component_groups(state)
     for group, indices in group_indices.items():
         _validate_profile_component_indices(state, group, indices)
-    truth_kwargs = _truth_kwargs_for_profile_redshift(truth, z_source)
-    truth_packed_state = _packed_lens_state_from_current_truth_kwargs(state, truth_kwargs)
+    truth_packed_state = _packed_lens_state_from_current_truth_components(state, truth, z_source)
 
     def empty_group_radius_values() -> dict[tuple[str, float], list[float]]:
         return {(group, float(radius)): [] for group in group_indices for radius in radii_arcsec}
@@ -2442,10 +2583,10 @@ def _recovery_payload_from_tables(
     *,
     run_dir: Path,
     output_dir: Path,
-    posterior_diagnostic_draws: int,
-    recovery_profile_draws: int,
-    recovery_profile_draws_effective: int,
-    recovery_profile_mode: str,
+    posterior_image_diagnostic_draws: int,
+    posterior_truth_recovery_draws: int,
+    posterior_truth_recovery_draws_effective: int,
+    posterior_truth_recovery_mode: str,
     diagnostic_worker_count: int,
     posterior_diagnostic_mode: str,
     quick_diagnostics: bool,
@@ -2457,6 +2598,8 @@ def _recovery_payload_from_tables(
     image_df: pd.DataFrame,
     source_df: pd.DataFrame,
     magnification_df: pd.DataFrame,
+    posterior_image_rms_df: pd.DataFrame,
+    posterior_image_residual_draws_df: pd.DataFrame,
     mass_profile_df: pd.DataFrame,
     surface_density_df: pd.DataFrame,
     summary: dict[str, float],
@@ -2469,10 +2612,10 @@ def _recovery_payload_from_tables(
         "run_dir": run_dir,
         "output_dir": output_dir,
         "posterior_diagnostics": {
-            "draws": int(posterior_diagnostic_draws),
-            "recovery_profile_draws": int(recovery_profile_draws),
-            "recovery_profile_draws_effective": int(recovery_profile_draws_effective),
-            "recovery_profile_mode": str(recovery_profile_mode),
+            "posterior_image_diagnostic_draws": int(posterior_image_diagnostic_draws),
+            "posterior_truth_recovery_draws": int(posterior_truth_recovery_draws),
+            "posterior_truth_recovery_draws_effective": int(posterior_truth_recovery_draws_effective),
+            "posterior_truth_recovery_mode": str(posterior_truth_recovery_mode),
             "workers": int(diagnostic_worker_count),
             "mode": str(posterior_diagnostic_mode),
             "quick_diagnostics": bool(quick_diagnostics),
@@ -2488,6 +2631,8 @@ def _recovery_payload_from_tables(
             "images": _validation_dataframe_payload(image_df),
             "sources": _validation_dataframe_payload(source_df),
             "magnification": _validation_dataframe_payload(magnification_df),
+            "posterior_image_rms": _validation_dataframe_payload(posterior_image_rms_df),
+            "posterior_image_residual_draws": _validation_dataframe_payload(posterior_image_residual_draws_df),
             "mass_profile": _validation_dataframe_payload(mass_profile_df),
             "surface_density": _validation_dataframe_payload(surface_density_df),
         },
@@ -2510,8 +2655,8 @@ def write_recovery_outputs(
     mock_images_path: str | Path | None = None,
     *,
     output_dir: str | Path | None = None,
-    posterior_diagnostic_draws: int = 8,
-    recovery_profile_draws: int = RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
+    posterior_image_diagnostic_draws: int = 8,
+    posterior_truth_recovery_draws: int = RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
     posterior_diagnostic_mode: str = POSTERIOR_DIAGNOSTIC_MODE_EXACT,
     critical_caustic_plot_grid_scale_arcsec: float = DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC,
     quick_diagnostics: bool = False,
@@ -2523,7 +2668,7 @@ def write_recovery_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
     phase_args: Any | None = None
     posterior_diagnostic_mode = str(posterior_diagnostic_mode)
-    recovery_profile_draws = int(recovery_profile_draws)
+    posterior_truth_recovery_draws = int(posterior_truth_recovery_draws)
     if quick_diagnostics:
         posterior_diagnostic_mode = POSTERIOR_DIAGNOSTIC_MODE_APPROXIMATE
         _log_validation_approximation_items(
@@ -2571,12 +2716,12 @@ def write_recovery_outputs(
         )
         samples = np.asarray(arrays["samples"], dtype=float)
         best_fit = np.asarray(arrays["best_fit"], dtype=float)
-        if recovery_profile_draws <= 0:
-            recovery_profile_mode = "best_fit"
-            recovery_profile_draws_effective = 1
+        if posterior_truth_recovery_draws <= 0:
+            posterior_truth_recovery_mode = "best_fit"
+            posterior_truth_recovery_draws_effective = 1
         else:
-            recovery_profile_mode = "posterior"
-            recovery_profile_draws_effective = min(int(samples.shape[0]), int(recovery_profile_draws))
+            posterior_truth_recovery_mode = "posterior"
+            posterior_truth_recovery_draws_effective = min(int(samples.shape[0]), int(posterior_truth_recovery_draws))
         parameter_names = _artifact_parameter_names(state)
         truth_values = _parameter_truth_with_source_positions(truth)
         best_fit_values = _best_fit_values_for_specs(state.parameter_specs, best_fit)
@@ -2603,14 +2748,20 @@ def write_recovery_outputs(
                 artifact_args=_saved_args,
             ),
         )
-        mag_uncertainty_df, image_uncertainty_df, source_uncertainty_df = run_recovery_phase(
+        (
+            mag_uncertainty_df,
+            image_uncertainty_df,
+            source_uncertainty_df,
+            posterior_image_rms_df,
+            posterior_image_residual_draws_df,
+        ) = run_recovery_phase(
             "posterior uncertainty",
             "validation.recovery.posterior_uncertainty_tables",
             lambda: _posterior_prediction_uncertainty_tables(
                 state,
                 samples,
                 images,
-                max_draws=int(posterior_diagnostic_draws),
+                max_draws=int(posterior_image_diagnostic_draws),
                 posterior_diagnostic_mode=posterior_diagnostic_mode,
                 progress=recovery_progress,
                 artifact_args=_saved_args,
@@ -2669,10 +2820,10 @@ def write_recovery_outputs(
         )
         if has_mass_profile_truth:
             profile_radii_arcsec = np.asarray([2.0, 5.0, 10.0, 20.0, 40.0], dtype=float)
-            if recovery_profile_draws <= 0:
+            if posterior_truth_recovery_draws <= 0:
                 profile_samples = best_fit.reshape(1, -1)
             else:
-                profile_samples = _capped_evenly_spaced_posterior_draws(samples, max_draws=recovery_profile_draws)
+                profile_samples = _capped_evenly_spaced_posterior_draws(samples, max_draws=posterior_truth_recovery_draws)
             mass_profile_df, surface_density_df = run_recovery_phase(
                 "mass/surface profile bands",
                 "validation.recovery.mass_surface_density_profiles",
@@ -2734,7 +2885,14 @@ def write_recovery_outputs(
                 ),
                 "parity_match_fraction": float(np.nanmean(magnification_df["parity_match"].astype(float))),
             }
-            return summary_payload, _summary_uncertainty(parameter_df, image_df, source_df, magnification_df)
+            posterior_rms_summary = _posterior_image_rms_summary(posterior_image_rms_df)
+            summary_payload.update(posterior_rms_summary)
+            summary_uncertainty_payload = _summary_uncertainty(parameter_df, image_df, source_df, magnification_df)
+            for prefix in ("posterior_point_image_rms_arcsec", "posterior_arc_aware_image_rms_arcsec"):
+                q16 = posterior_rms_summary.get(f"{prefix}_q16", np.nan)
+                q84 = posterior_rms_summary.get(f"{prefix}_q84", np.nan)
+                summary_uncertainty_payload[f"{prefix}_median"] = (q16, q84)
+            return summary_payload, summary_uncertainty_payload
 
         summary, summary_uncertainty = run_recovery_phase(
             "summary",
@@ -2760,7 +2918,25 @@ def write_recovery_outputs(
             "critical_arc_support_histogram_plot": output_dir / "critical_arc_support_histogram.pdf",
             "critical_arc_support_phase_space_plot": output_dir / "critical_arc_support_phase_space.pdf",
             "critical_arc_recovery_by_family_plot": output_dir / "critical_arc_recovery_by_family.pdf",
+            "posterior_image_rms_table": output_dir / "posterior_image_rms.csv",
+            "posterior_image_residual_draws_table": output_dir / "posterior_image_residual_draws.csv",
         }
+        if not posterior_image_rms_df.empty:
+            run_recovery_phase(
+                "posterior image RMS table",
+                "validation.recovery.write_posterior_image_rms_table",
+                lambda: posterior_image_rms_df.to_csv(paths["posterior_image_rms_table"], index=False),
+            )
+        else:
+            paths.pop("posterior_image_rms_table", None)
+        if not posterior_image_residual_draws_df.empty:
+            run_recovery_phase(
+                "posterior image residual draws table",
+                "validation.recovery.write_posterior_image_residual_draws_table",
+                lambda: posterior_image_residual_draws_df.to_csv(paths["posterior_image_residual_draws_table"], index=False),
+            )
+        else:
+            paths.pop("posterior_image_residual_draws_table", None)
         run_recovery_phase(
             "corner plot",
             "validation.recovery.plot_corner",
@@ -2901,6 +3077,8 @@ def write_recovery_outputs(
             lambda: _plot_image_residual_histogram(
                 image_df,
                 paths["image_residual_histogram_plot"],
+                posterior_image_rms_df=posterior_image_rms_df,
+                posterior_image_residual_draws_df=posterior_image_residual_draws_df,
             ),
         )
         critical_arc_image_count_df = _image_count_recovery_table(state, image_df)
@@ -2970,10 +3148,10 @@ def write_recovery_outputs(
                     _recovery_payload_from_tables(
                         run_dir=run_dir,
                         output_dir=output_dir,
-                        posterior_diagnostic_draws=int(posterior_diagnostic_draws),
-                        recovery_profile_draws=int(recovery_profile_draws),
-                        recovery_profile_draws_effective=int(recovery_profile_draws_effective),
-                        recovery_profile_mode=recovery_profile_mode,
+                        posterior_image_diagnostic_draws=int(posterior_image_diagnostic_draws),
+                        posterior_truth_recovery_draws=int(posterior_truth_recovery_draws),
+                        posterior_truth_recovery_draws_effective=int(posterior_truth_recovery_draws_effective),
+                        posterior_truth_recovery_mode=posterior_truth_recovery_mode,
                         diagnostic_worker_count=int(diagnostic_worker_count),
                         posterior_diagnostic_mode=posterior_diagnostic_mode,
                         quick_diagnostics=bool(quick_diagnostics),
@@ -2985,6 +3163,8 @@ def write_recovery_outputs(
                         image_df=image_df,
                         source_df=source_df,
                         magnification_df=magnification_df,
+                        posterior_image_rms_df=posterior_image_rms_df,
+                        posterior_image_residual_draws_df=posterior_image_residual_draws_df,
                         mass_profile_df=mass_profile_df,
                         surface_density_df=surface_density_df,
                         summary=summary,
@@ -3684,6 +3864,7 @@ def _plot_absolute_magnification_recovery(
     for ax in axes:
         ax.invert_xaxis()
         ax.set_ylabel("y [arcsec]")
+        _limit_recovery_axis_ticks(ax)
     axes[0].tick_params(axis="x", labelbottom=False)
     axes[1].set_xlabel("x [arcsec]")
     fig.tight_layout()
@@ -3691,12 +3872,14 @@ def _plot_absolute_magnification_recovery(
     plt.close(fig)
 
 
-def _plot_value_with_fallback(df: pd.DataFrame, column: str, fallback_column: str | None = None) -> np.ndarray:
+def _plot_value_with_fallback(df: pd.DataFrame, column: str, *fallback_columns: str | None) -> np.ndarray:
     if column in df.columns:
         values = pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
     else:
         values = np.full(len(df), np.nan, dtype=float)
-    if fallback_column is not None and fallback_column in df.columns:
+    for fallback_column in fallback_columns:
+        if fallback_column is None or fallback_column not in df.columns:
+            continue
         fallback = pd.to_numeric(df[fallback_column], errors="coerce").to_numpy(dtype=float)
         values = np.where(np.isfinite(values), values, fallback)
     return values
@@ -3803,8 +3986,87 @@ def _plot_image_recovery(image_df: pd.DataFrame, path: Path) -> None:
     plt.close(fig)
 
 
-def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
-    point_residual_all = _plot_value_with_fallback(image_df, "point_image_residual_arcsec", "image_residual_arcsec")
+def _posterior_residual_histogram_summaries(
+    posterior_image_residual_draws_df: pd.DataFrame,
+    *,
+    bin_count: int = 30,
+) -> dict[str, dict[str, np.ndarray]]:
+    if posterior_image_residual_draws_df.empty or "draw_index" not in posterior_image_residual_draws_df:
+        return {}
+    draw_index = pd.to_numeric(posterior_image_residual_draws_df["draw_index"], errors="coerce").to_numpy(dtype=float)
+    finite_draws = np.asarray(sorted({int(value) for value in draw_index if np.isfinite(value)}), dtype=int)
+    if finite_draws.size == 0:
+        return {}
+
+    series_specs = {
+        "point": ("point_image_residual_arcsec", "point_recovered"),
+        "arc_aware": ("arc_aware_image_residual_arcsec", "arc_aware_recovered"),
+    }
+    arrays: dict[str, np.ndarray] = {}
+    masks: dict[str, np.ndarray] = {}
+    finite_values: list[np.ndarray] = []
+    for name, (value_column, mask_column) in series_specs.items():
+        if value_column not in posterior_image_residual_draws_df:
+            arrays[name] = np.asarray([], dtype=float)
+            masks[name] = np.zeros(len(posterior_image_residual_draws_df), dtype=bool)
+            continue
+        values = pd.to_numeric(posterior_image_residual_draws_df[value_column], errors="coerce").to_numpy(dtype=float)
+        if mask_column in posterior_image_residual_draws_df:
+            recovered_mask = posterior_image_residual_draws_df[mask_column].astype(bool).to_numpy(dtype=bool)
+        else:
+            recovered_mask = np.isfinite(values)
+        finite_mask = recovered_mask & np.isfinite(values)
+        arrays[name] = values
+        masks[name] = finite_mask
+        if np.any(finite_mask):
+            finite_values.append(values[finite_mask])
+    if not finite_values:
+        return {}
+
+    all_values = np.concatenate(finite_values)
+    max_residual = float(np.nanmax(all_values))
+    bins = np.linspace(0.0, max(max_residual * 1.04, 1.0e-6), int(bin_count) + 1)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    widths = np.diff(bins)
+    summaries: dict[str, dict[str, np.ndarray]] = {}
+    for name in series_specs:
+        values = arrays[name]
+        finite_mask = masks[name]
+        if not np.any(finite_mask):
+            continue
+        counts_by_draw = []
+        for draw in finite_draws:
+            draw_mask = (draw_index == float(draw)) & finite_mask
+            counts, _edges = np.histogram(values[draw_mask], bins=bins)
+            counts_by_draw.append(counts.astype(float))
+        counts_array = np.asarray(counts_by_draw, dtype=float)
+        if counts_array.size == 0:
+            continue
+        q16, median, q84 = np.quantile(counts_array, [0.16, 0.5, 0.84], axis=0)
+        summaries[name] = {
+            "bins": bins,
+            "centers": centers,
+            "widths": widths,
+            "q16": q16,
+            "median": median,
+            "q84": q84,
+        }
+    return summaries
+
+
+def _plot_image_residual_histogram(
+    image_df: pd.DataFrame,
+    path: Path,
+    *,
+    posterior_image_rms_df: pd.DataFrame | None = None,
+    posterior_image_residual_draws_df: pd.DataFrame | None = None,
+) -> None:
+    point_residual_all = _plot_value_with_fallback(
+        image_df,
+        "image_residual_q50",
+        "point_image_residual_arcsec",
+        "image_residual_arcsec",
+    )
     if any(column in image_df.columns for column in ("image_recovery_status", "arc_recovery_status", "exact_image_prediction_failed")):
         status = _image_catalog_effective_recovery_statuses(image_df)
         point_mask = np.asarray([_image_catalog_point_recovered(row) for _, row in image_df.iterrows()], dtype=bool)
@@ -3815,6 +4077,7 @@ def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
         arc_mask = np.zeros(len(image_df), dtype=bool)
     arc_candidate_residual_all = _plot_value_with_fallback(
         image_df,
+        "arc_aware_image_residual_q50",
         "arc_candidate_image_residual_arcsec",
         "arc_aware_image_residual_arcsec",
     )
@@ -3825,7 +4088,12 @@ def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
     arc_residual_all = np.where(arc_mask, arc_candidate_residual_all, np.where(point_mask, point_residual_all, np.nan))
     residual = point_residual_all[point_mask & np.isfinite(point_residual_all)]
     arc_residual = arc_residual_all[arc_aware_mask & np.isfinite(arc_residual_all)]
-    if residual.size == 0 and arc_residual.size == 0:
+    posterior_histograms = _posterior_residual_histogram_summaries(
+        posterior_image_residual_draws_df if posterior_image_residual_draws_df is not None else pd.DataFrame(),
+        bin_count=30,
+    )
+    has_posterior_histogram = bool(posterior_histograms)
+    if residual.size == 0 and arc_residual.size == 0 and not has_posterior_histogram:
         _write_placeholder_plot(
             path,
             "Image residual histogram",
@@ -3838,7 +4106,90 @@ def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
     total_count = int(len(image_df))
     total_rms = float(np.sqrt(np.mean(np.square(residual)))) if residual.size else np.nan
     arc_total_rms = float(np.sqrt(np.mean(np.square(arc_residual)))) if arc_residual.size else np.nan
-    if residual.size:
+    posterior_summary = _posterior_image_rms_summary(
+        posterior_image_rms_df if posterior_image_rms_df is not None else pd.DataFrame()
+    )
+    point_rms_plot = posterior_summary.get("posterior_point_image_rms_arcsec_median", total_rms)
+    point_rms_std = posterior_summary.get("posterior_point_image_rms_arcsec_std", np.nan)
+    point_rms_q16 = posterior_summary.get("posterior_point_image_rms_arcsec_q16", np.nan)
+    point_rms_q84 = posterior_summary.get("posterior_point_image_rms_arcsec_q84", np.nan)
+    arc_rms_plot = posterior_summary.get("posterior_arc_aware_image_rms_arcsec_median", arc_total_rms)
+    arc_rms_std = posterior_summary.get("posterior_arc_aware_image_rms_arcsec_std", np.nan)
+    arc_rms_q16 = posterior_summary.get("posterior_arc_aware_image_rms_arcsec_q16", np.nan)
+    arc_rms_q84 = posterior_summary.get("posterior_arc_aware_image_rms_arcsec_q84", np.nan)
+    if not np.isfinite(point_rms_plot):
+        point_rms_plot = total_rms
+    if not np.isfinite(arc_rms_plot):
+        arc_rms_plot = arc_total_rms
+    if has_posterior_histogram:
+        point_hist = posterior_histograms.get("point")
+        if point_hist is not None:
+            ax.bar(
+                point_hist["centers"],
+                point_hist["median"],
+                width=point_hist["widths"],
+                align="center",
+                color="tab:blue",
+                alpha=0.45,
+                edgecolor="#1d4ed8",
+                linewidth=0.85,
+                label="point recovery posterior median",
+            )
+            ax.errorbar(
+                point_hist["centers"],
+                point_hist["median"],
+                yerr=[
+                    np.maximum(0.0, point_hist["median"] - point_hist["q16"]),
+                    np.maximum(0.0, point_hist["q84"] - point_hist["median"]),
+                ],
+                fmt="none",
+                ecolor="#1d4ed8",
+                elinewidth=0.8,
+                capsize=2.0,
+                alpha=0.9,
+            )
+            ax.axvline(
+                point_rms_plot,
+                color="tab:red",
+                linestyle="-.",
+                linewidth=1.2,
+                label="point RMS",
+            )
+            if np.isfinite(point_rms_q16 + point_rms_q84):
+                ax.axvspan(point_rms_q16, point_rms_q84, color="tab:red", alpha=0.12, linewidth=0.0)
+        arc_hist = posterior_histograms.get("arc_aware")
+        if arc_hist is not None:
+            ax.step(
+                arc_hist["centers"],
+                arc_hist["median"],
+                where="mid",
+                color="#ffd54f",
+                linewidth=2.0,
+                label="arc-aware posterior median",
+            )
+            ax.errorbar(
+                arc_hist["centers"],
+                arc_hist["median"],
+                yerr=[
+                    np.maximum(0.0, arc_hist["median"] - arc_hist["q16"]),
+                    np.maximum(0.0, arc_hist["q84"] - arc_hist["median"]),
+                ],
+                fmt="none",
+                ecolor="#b7791f",
+                elinewidth=0.8,
+                capsize=2.0,
+                alpha=0.9,
+            )
+            ax.axvline(
+                arc_rms_plot,
+                color="tab:green",
+                linestyle="-.",
+                linewidth=1.2,
+                label="arc-aware RMS",
+            )
+            if np.isfinite(arc_rms_q16 + arc_rms_q84):
+                ax.axvspan(arc_rms_q16, arc_rms_q84, color="tab:green", alpha=0.12, linewidth=0.0)
+    elif residual.size:
         ax.hist(
             residual,
             bins=bin_count,
@@ -3849,13 +4200,15 @@ def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
             label=f"point recovery {residual.size}/{total_count}",
         )
         ax.axvline(
-            total_rms,
+            point_rms_plot,
             color="tab:red",
             linestyle="-.",
             linewidth=1.2,
             label="point RMS",
         )
-    if arc_residual.size:
+        if np.isfinite(point_rms_q16 + point_rms_q84):
+            ax.axvspan(point_rms_q16, point_rms_q84, color="tab:red", alpha=0.12, linewidth=0.0)
+    if not has_posterior_histogram and arc_residual.size:
         ax.hist(
             arc_residual,
             bins=bin_count,
@@ -3865,19 +4218,34 @@ def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
             label=f"arc-aware {arc_residual.size}/{total_count}",
         )
         ax.axvline(
-            arc_total_rms,
+            arc_rms_plot,
             color="tab:green",
             linestyle="-.",
             linewidth=1.2,
             label="arc-aware RMS",
         )
+        if np.isfinite(arc_rms_q16 + arc_rms_q84):
+            ax.axvspan(arc_rms_q16, arc_rms_q84, color="tab:green", alpha=0.12, linewidth=0.0)
     arc_supported_count = int(np.sum(arc_mask))
     missed_count = int(np.sum(status == "MISSED"))
+    point_count_label = posterior_summary.get("posterior_point_recovered_image_count_median", float(residual.size))
+    arc_count_label = posterior_summary.get("posterior_arc_aware_recovered_image_count_median", float(arc_residual.size))
+    arc_supported_label = posterior_summary.get("posterior_arc_supported_image_count_median", float(arc_supported_count))
+    point_rms_label = (
+        f"{point_rms_plot:.3g} +/- {point_rms_std:.3g}"
+        if np.isfinite(point_rms_plot) and np.isfinite(point_rms_std)
+        else f"{point_rms_plot:.3g}"
+    )
+    arc_rms_label = (
+        f"{arc_rms_plot:.3g} +/- {arc_rms_std:.3g}"
+        if np.isfinite(arc_rms_plot) and np.isfinite(arc_rms_std)
+        else f"{arc_rms_plot:.3g}"
+    )
     rms_annotation = "\n".join(
         [
-            f"Point RMS = {total_rms:.3g} arcsec ({residual.size}/{total_count})",
-            f"Arc-aware RMS = {arc_total_rms:.3g} arcsec ({arc_residual.size}/{total_count})",
-            f"arc-supported = {arc_supported_count}/{total_count}",
+            f"Point RMS = {point_rms_label} arcsec ({point_count_label:.3g}/{total_count})",
+            f"Arc-aware RMS = {arc_rms_label} arcsec ({arc_count_label:.3g}/{total_count})",
+            f"arc-supported = {arc_supported_label:.3g}/{total_count}",
             f"missed = {missed_count}/{total_count}",
         ]
     )
@@ -3897,7 +4265,7 @@ def _plot_image_residual_histogram(image_df: pd.DataFrame, path: Path) -> None:
         },
     )
     ax.set_xlabel("image residual [arcsec]")
-    ax.set_ylabel("N images")
+    ax.set_ylabel("posterior median N images" if has_posterior_histogram else "N images")
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=180)
@@ -4696,6 +5064,8 @@ def _plot_prefit_critical_lines(truth: dict[str, Any], path: Path) -> None:
     source_ax.set_ylabel(r"$\beta_y$ [arcsec]")
     source_ax.set_title(fr"Truth source plane, $z_s={z_display}$")
     source_ax.legend(loc="best", fontsize=7)
+    for ax in axes:
+        _limit_recovery_axis_ticks(ax)
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -4797,6 +5167,8 @@ def _plot_critical_caustic_recovery(
     source_ax.set_ylabel(r"$\beta_y$ [arcsec]")
     source_ax.set_title(r"Source plane, $z_s=7$")
     source_ax.legend(loc="best", fontsize=7)
+    for ax in axes:
+        _limit_recovery_axis_ticks(ax)
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -5055,6 +5427,7 @@ def write_validation_results_json(
     config: MockValidationConfig,
     seed: int,
     realization_dir: str | Path,
+    result_output_dir: str | Path | None = None,
     mock_config: SingleBCGMockConfig,
     paths: MockClusterPaths,
     images: pd.DataFrame,
@@ -5063,15 +5436,19 @@ def write_validation_results_json(
     summary_path: str | Path,
     output_paths: dict[str, Path],
     recovery_payload: dict[str, Any],
+    recovery_stage: str = "stage2",
+    recovery_payloads: dict[str, dict[str, Any]] | None = None,
 ) -> Path:
     root = _validation_root(config)
-    output_path = Path(realization_dir) / "results.json"
+    output_root = Path(result_output_dir) if result_output_dir is not None else Path(realization_dir)
+    output_path = output_root / "results.json"
     solver_run_path = Path(solver_run_dir)
     solver_root = _stage_root_from_run_dir(solver_run_path)
     debug_log_path = Path(realization_dir) / "run_debug.log"
     sequential_summary_path = solver_root / "sequential_summary.json"
     all_output_paths = dict(output_paths)
     all_output_paths["results_json"] = output_path
+    recovery_by_stage = dict(recovery_payloads) if recovery_payloads is not None else {str(recovery_stage): recovery_payload}
     try:
         stage_recovery_metrics: Any = _collect_validation_stage_recovery_metrics(solver_run_path, paths.truth_path)
     except Exception as exc:  # pragma: no cover - defensive bundle fallback
@@ -5105,14 +5482,13 @@ def write_validation_results_json(
         },
         "validation": {
             "output_paths": all_output_paths,
+            "recovery_stage": str(recovery_stage),
             "run_summary": {
                 "path": Path(summary_path),
                 "text": _read_text_file_optional(summary_path),
             },
             "stage_recovery_metrics": stage_recovery_metrics,
-            "recovery": {
-                "final": recovery_payload,
-            },
+            "recovery": recovery_by_stage,
         },
         "debug_log": {
             "path": debug_log_path,
@@ -5149,11 +5525,34 @@ def _solver_final_stage_dir(plan: Any) -> Path:
     return root / plan.stages[-1].name
 
 
-def _run_solver_config(solver_config: LensClusterSolverConfig, *, runner: LensClusterRunner | None = None) -> Path:
-    plan = compile_run_plan(solver_config)
+def _run_solver_plan(plan: Any, *, runner: LensClusterRunner | None = None) -> Path:
     active_runner = runner or LensClusterRunner()
     active_runner.run(plan)
     return _solver_final_stage_dir(plan)
+
+
+def _run_solver_config(solver_config: LensClusterSolverConfig, *, runner: LensClusterRunner | None = None) -> Path:
+    return _run_solver_plan(compile_run_plan(solver_config), runner=runner)
+
+
+_RECOVERY_STAGE_ALIASES = {
+    "stage1": "stage1_backprojected_centroid_fit",
+    "stage2": "stage2_free_source_forward_fit",
+}
+
+
+def _solver_stage_dirs_by_recovery_alias(plan: Any) -> dict[str, Path]:
+    root = Path(plan.output.output_dir) / str(plan.output.run_name)
+    by_name = {stage.name: root / stage.name for stage in plan.stages}
+    return {
+        alias: by_name[stage_name]
+        for alias, stage_name in _RECOVERY_STAGE_ALIASES.items()
+        if stage_name in by_name
+    }
+
+
+def _recovery_stage_output_dir(realization_dir: str | Path, solver_stage_dir: str | Path) -> Path:
+    return Path(realization_dir) / "recovery" / Path(solver_stage_dir).name
 
 
 def _log_validation_runtime_summary(config: MockValidationConfig) -> None:
@@ -5174,7 +5573,7 @@ def _log_validation_runtime_summary(config: MockValidationConfig) -> None:
             f"subhalo_source_redshifts={','.join(f'{value:.4g}' for value in config.mock.subhalo_source_redshifts)} "
             f"pos_sigma={config.mock.pos_sigma_arcsec} "
             f"solver_run_name={config.solver.run_name} "
-            f"posterior_diagnostic_mode={config.recovery.posterior_diagnostic_mode}"
+            f"posterior_image_diagnostic_mode={config.solver.template.image_diagnostics.posterior_image_diagnostic_mode}"
         ),
     )
 
@@ -5255,7 +5654,7 @@ def run_single_bcg_validation(
             lambda: write_prefit_validation_diagnostics(truth_payload, images, prefit_dir),
             detail=f"seed={seed}",
         )
-        solver_output_dir = realization_dir / "solver"
+        solver_output_dir = realization_dir
         solver_config = solver_config_for_single_bcg_mock(
             replace(config, mock=mock_config),
             paths=paths,
@@ -5263,64 +5662,114 @@ def run_single_bcg_validation(
             output_dir=solver_output_dir,
         )
         _log(config, f"[validation] launching solver run_name={solver_config.paths.run_name} output_dir={solver_output_dir}")
+        solver_plan = compile_run_plan(solver_config)
         solver_run_dir = _run_logged_phase(
             config,
             "validation.cluster_solver",
-            lambda: _run_solver_config(solver_config, runner=runner),
+            lambda: _run_solver_plan(solver_plan, runner=runner),
             detail=f"run_name={solver_config.paths.run_name}",
         )
         _log(config, f"[validation] solver complete final_run_dir={solver_run_dir}")
-        _log(config, f"[output] writing recovery outputs from {solver_run_dir} to {realization_dir}")
-        recovery_payload: dict[str, Any] = {}
-        output_paths = _run_logged_phase(
-            config,
-            "validation.write_recovery_outputs",
-            lambda: write_recovery_outputs(
-                solver_run_dir,
-                paths.truth_path,
-                paths.mock_images_path,
-                output_dir=realization_dir,
-                posterior_diagnostic_draws=int(config.recovery.posterior_diagnostic_draws),
-                posterior_diagnostic_mode=str(config.recovery.posterior_diagnostic_mode),
-                critical_caustic_plot_grid_scale_arcsec=float(
-                    config.recovery.critical_caustic_plot_grid_scale_arcsec
-                ),
-                recovery_profile_draws=int(config.recovery.recovery_profile_draws),
-                quick_diagnostics=bool(config.solver.template.runtime.quick_diagnostics),
-                progress_args=config,
-                recovery_payload=recovery_payload,
-            ),
-            detail=f"seed={seed}",
-        )
-        output_paths.update(prefit_output_paths)
+        solver_stage_dirs = _solver_stage_dirs_by_recovery_alias(solver_plan)
+        missing_recovery_stages = [stage for stage in config.solver.recovery_stages if stage not in solver_stage_dirs]
+        if missing_recovery_stages:
+            available = ",".join(sorted(solver_stage_dirs)) or "none"
+            requested = ",".join(missing_recovery_stages)
+            raise ValueError(f"Requested recovery stage(s) unavailable: {requested}. Available recovery stages: {available}.")
+        recovery_root = realization_dir / "recovery"
         summary_path = _run_logged_phase(
             config,
             "validation.write_run_summary_txt",
             lambda: write_validation_run_summary(
                 solver_run_dir,
                 paths.truth_path,
-                realization_dir,
+                recovery_root,
                 run_name=str(config.paths.run_name),
                 seed=seed,
             ),
             detail=f"seed={seed}",
         )
         _log(config, f"[output] validation run summary written to {summary_path}")
+        recovery_payloads: dict[str, dict[str, Any]] = {}
+        output_paths: dict[str, Path] = {}
+        stage_results: dict[str, Path] = {}
+        for recovery_stage in config.solver.recovery_stages:
+            stage_solver_run_dir = solver_stage_dirs[recovery_stage]
+            stage_recovery_dir = _recovery_stage_output_dir(realization_dir, stage_solver_run_dir)
+            _log(
+                config,
+                f"[output] writing {recovery_stage} recovery outputs from {stage_solver_run_dir} to {stage_recovery_dir}",
+            )
+            recovery_payload: dict[str, Any] = {}
+            stage_output_paths = _run_logged_phase(
+                config,
+                f"validation.write_recovery_outputs.{recovery_stage}",
+                lambda stage_solver_run_dir=stage_solver_run_dir, stage_recovery_dir=stage_recovery_dir, recovery_payload=recovery_payload: write_recovery_outputs(
+                    stage_solver_run_dir,
+                    paths.truth_path,
+                    paths.mock_images_path,
+                    output_dir=stage_recovery_dir,
+                    posterior_image_diagnostic_draws=int(
+                        config.solver.template.image_diagnostics.posterior_image_diagnostic_draws
+                    ),
+                    posterior_diagnostic_mode=str(
+                        config.solver.template.image_diagnostics.posterior_image_diagnostic_mode
+                    ),
+                    critical_caustic_plot_grid_scale_arcsec=float(
+                        config.solver.template.truth.caustic_plot_grid_scale_arcsec
+                        if config.solver.template.truth.caustic_plot_grid_scale_arcsec is not None
+                        else DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC
+                    ),
+                    posterior_truth_recovery_draws=int(config.solver.template.truth.posterior_truth_recovery_draws or 0),
+                    quick_diagnostics=bool(config.solver.template.runtime.quick_diagnostics),
+                    progress_args=config,
+                    recovery_payload=recovery_payload,
+                ),
+                detail=f"seed={seed} stage={recovery_stage}",
+            )
+            recovery_payloads[recovery_stage] = recovery_payload
+            output_paths.update({f"{recovery_stage}_{name}": path for name, path in stage_output_paths.items()})
+            stage_results_path = _run_logged_phase(
+                config,
+                f"validation.write_results_json.{recovery_stage}",
+                lambda recovery_stage=recovery_stage, stage_solver_run_dir=stage_solver_run_dir, stage_recovery_dir=stage_recovery_dir, stage_output_paths=stage_output_paths, recovery_payload=recovery_payload: write_validation_results_json(
+                    config=config,
+                    seed=seed,
+                    realization_dir=realization_dir,
+                    result_output_dir=stage_recovery_dir,
+                    mock_config=mock_config,
+                    paths=paths,
+                    images=images,
+                    truth_payload=truth_payload,
+                    solver_run_dir=stage_solver_run_dir,
+                    summary_path=summary_path,
+                    output_paths=stage_output_paths,
+                    recovery_payload=recovery_payload,
+                    recovery_stage=recovery_stage,
+                ),
+                detail=f"seed={seed} stage={recovery_stage}",
+            )
+            stage_results[recovery_stage] = stage_results_path
+            output_paths[f"{recovery_stage}_results_json"] = stage_results_path
+        output_paths.update(prefit_output_paths)
         results_json_path = _run_logged_phase(
             config,
-            "validation.write_results_json",
+            "validation.write_recovery_index_json",
             lambda: write_validation_results_json(
                 config=config,
                 seed=seed,
                 realization_dir=realization_dir,
+                result_output_dir=recovery_root,
                 mock_config=mock_config,
                 paths=paths,
                 images=images,
                 truth_payload=truth_payload,
                 solver_run_dir=solver_run_dir,
                 summary_path=summary_path,
-                output_paths=output_paths,
-                recovery_payload=recovery_payload,
+                output_paths={**output_paths, **{f"{stage}_results_json": path for stage, path in stage_results.items()}},
+                recovery_payload=recovery_payloads.get(config.solver.recovery_stages[-1], {}),
+                recovery_stage=str(config.solver.recovery_stages[-1]),
+                recovery_payloads=recovery_payloads,
             ),
             detail=f"seed={seed}",
         )

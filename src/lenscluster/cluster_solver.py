@@ -14012,8 +14012,8 @@ def _normalize_stage_fit_controls(args: argparse.Namespace) -> dict[str, StageFi
         or float(getattr(args, "likelihood_stabilizer_student_t_nu", DEFAULT_LIKELIHOOD_STABILIZER_STUDENT_T_NU)) <= 0.0
     ):
         _fail("--likelihood-stabilizer-student-t-nu must be positive.")
-    if int(getattr(args, "fit_quality_draws", 0)) < 0:
-        _fail("--fit-quality-draws must be non-negative.")
+    if int(getattr(args, "posterior_image_diagnostic_draws", 0)) < 0:
+        _fail("--posterior-image-diagnostic-draws must be non-negative.")
     exact_image_min_distance_arcsec = float(
         getattr(args, "exact_image_min_distance_arcsec", DEFAULT_EXACT_IMAGE_MIN_DISTANCE_ARCSEC)
     )
@@ -29100,7 +29100,7 @@ def _rerender_plots(
     if current_gammay_true_fits is not None and str(current_gammay_true_fits).strip():
         plot_saved_args["gammay_true_fits"] = str(current_gammay_true_fits)
     plot_saved_args["truth_grid_mode"] = str(getattr(args, "truth_grid_mode", TRUTH_GRID_MODE_MEDIAN))
-    plot_saved_args["truth_grid_draws"] = getattr(args, "truth_grid_draws", None)
+    plot_saved_args["posterior_truth_recovery_draws"] = getattr(args, "posterior_truth_recovery_draws", None)
     plot_saved_args["truth_grid_size"] = int(getattr(args, "truth_grid_size", DEFAULT_TRUTH_GRID_SIZE))
     current_cutout_dir = getattr(args, "image_catalog_family_cutout_image_dir", None)
     if current_cutout_dir is not None and str(current_cutout_dir).strip():

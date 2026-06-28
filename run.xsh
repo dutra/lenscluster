@@ -295,13 +295,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             z_bin_efficiency_tol=0.0,
             svi_learning_rate=0.0005,
         ),
-        members=MemberSelectionConfig(potfile_member_mag_max=(24.0,)),
-        perturbation=PerturbationDiscoveryConfig(
-            perturbation_discovery_alpha_tol_arcsec=perturbation_alpha_tol,
-            perturbation_discovery_jacobian_tol=perturbation_jacobian_tol,
-            perturbation_discovery_jacobian_weight=1.0,
-            perturbation_discovery_top_k=perturbation_top_k,
-        ),
+cczz
         scaling=ScalingModelConfig(
             independent_scaling_free_log_sigma_tau_prior_median=0.45,
             independent_scaling_free_log_mass_tau_prior_median=0.55,
@@ -346,7 +340,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
         image_diagnostics=ImageDiagnosticsConfig(
             critical_arc_singular_threshold=0.1,
             arc_recovery_p_arc_threshold=0.1,
-            fit_quality_draws=0,
+            posterior_image_diagnostic_draws=0,
             exact_image_min_distance_arcsec=0.5,
             exact_image_precision_limit=1.0e-2,
             exact_image_num_iter_max=100,
@@ -360,7 +354,7 @@ def build_config(cluster: str, *, cores: int) -> LensClusterSolverConfig:
             gammax_true_fits=cluster_config["gammax_true_fits"],
             gammay_true_fits=cluster_config["gammay_true_fits"],
             truth_grid_mode="posterior",
-            truth_grid_draws=128,
+            posterior_truth_recovery_draws=128,
             truth_grid_size=256,
             caustic_source_redshift=9.0,
         ),

@@ -186,7 +186,7 @@ def test_config_defaults_validate_without_solver_namespace() -> None:
     assert config.schedule.svi_steps == (2000, 2000)
     assert config.schedule.refresh_every == (250, 250)
     assert config.truth.truth_grid_mode == "median"
-    assert config.truth.truth_grid_draws == 64
+    assert config.truth.posterior_truth_recovery_draws == 64
     assert config.truth.truth_grid_size == 256
     config.validate()
     plan = compile_run_plan(config)
@@ -201,6 +201,16 @@ def test_runtime_seed_validation() -> None:
     for bad_seed in (None, True, -1, 1.2, "123"):
         with pytest.raises(ValueError, match="seed"):
             LensClusterSolverConfig(model=_minimal_model_config(), runtime=RuntimeConfig(seed=bad_seed)).validate()  # type: ignore[arg-type]
+
+
+def test_image_diagnostics_rejects_invalid_posterior_mode() -> None:
+    config = LensClusterSolverConfig(
+        model=_minimal_model_config(),
+        image_diagnostics=ImageDiagnosticsConfig(posterior_image_diagnostic_mode="fast"),
+    )
+
+    with pytest.raises(ValueError, match="posterior_image_diagnostic_mode"):
+        config.validate()
 
 
 def test_solver_runtime_pickle_roundtrip_supports_attribute_access() -> None:
@@ -977,7 +987,7 @@ def test_dataset_specific_runs_are_composed_from_generic_config_groups() -> None
             gammax_true_fits=f"{cluster_config['truth_dir']}/gammax_z9_0.fits",
             gammay_true_fits=f"{cluster_config['truth_dir']}/gammay_z9_0.fits",
             truth_grid_mode="posterior",
-            truth_grid_draws=64,
+            posterior_truth_recovery_draws=64,
         ),
         image_catalog=ImageCatalogCutoutConfig(
             image_dir="data/ff_sims",

@@ -1074,35 +1074,59 @@ def _mock_model_and_kwargs(
     return model, kwargs_lens
 
 
-def _zero_dpie_kwargs_like(kwargs: dict[str, float]) -> dict[str, float]:
-    return {
-        "sigma0": 0.0,
-        "Ra": float(kwargs["Ra"]),
-        "Rs": float(kwargs["Rs"]),
-        "e1": float(kwargs["e1"]),
-        "e2": float(kwargs["e2"]),
-        "center_x": float(kwargs["center_x"]),
-        "center_y": float(kwargs["center_y"]),
-    }
-
-
-def _current_packed_truth_model_and_kwargs(
+def _current_truth_model_and_kwargs(
     config: SingleBCGMockConfig,
     subhalo_components: list[DPIETruth],
     z_source: float,
     cosmo_config: dict[str, Any],
 ) -> tuple[list[str], list[dict[str, float]]]:
-    large_kwargs = [
+    lens_model_list = [ORIGINAL_DPIE_PROFILE_NAME, ORIGINAL_DPIE_PROFILE_NAME] + [
+        ORIGINAL_DPIE_PROFILE_NAME for _ in subhalo_components
+    ]
+    kwargs_lens = [
         _component_kwargs(config.halo, config, float(z_source), cosmo_config),
         _component_kwargs(config.bcg, config, float(z_source), cosmo_config),
-    ]
-    lens_model_list = [ORIGINAL_DPIE_PROFILE_NAME, ORIGINAL_DPIE_PROFILE_NAME]
-    kwargs_lens = list(large_kwargs)
-    for component in subhalo_components:
-        subhalo_kwargs = _component_kwargs(component, config, float(z_source), cosmo_config)
-        lens_model_list.extend((ORIGINAL_DPIE_PROFILE_NAME, ORIGINAL_DPIE_PROFILE_NAME))
-        kwargs_lens.extend((_zero_dpie_kwargs_like(subhalo_kwargs), subhalo_kwargs))
+    ] + [_component_kwargs(component, config, float(z_source), cosmo_config) for component in subhalo_components]
     return lens_model_list, kwargs_lens
+
+
+def _current_truth_component_records(
+    config: SingleBCGMockConfig,
+    subhalo_components: list[DPIETruth],
+    source_redshifts: list[float],
+    cosmo_config: dict[str, Any],
+) -> list[dict[str, Any]]:
+    def kwargs_by_z(component: DPIETruth) -> dict[str, dict[str, float]]:
+        return {
+            f"{float(z_source):.8f}": _component_kwargs(component, config, float(z_source), cosmo_config)
+            for z_source in source_redshifts
+        }
+
+    records: list[dict[str, Any]] = [
+        {
+            "component_id": "halo",
+            "component_role": "halo",
+            "profile_name": ORIGINAL_DPIE_PROFILE_NAME,
+            "kwargs_by_source_redshift": kwargs_by_z(config.halo),
+        },
+        {
+            "component_id": "bcg",
+            "component_role": "bcg",
+            "profile_name": ORIGINAL_DPIE_PROFILE_NAME,
+            "kwargs_by_source_redshift": kwargs_by_z(config.bcg),
+        },
+    ]
+    for component in subhalo_components:
+        records.append(
+            {
+                "component_id": str(component.potential_id),
+                "component_role": "subhalo",
+                "catalog_id": str(component.potential_id),
+                "profile_name": ORIGINAL_DPIE_PROFILE_NAME,
+                "kwargs_by_source_redshift": kwargs_by_z(component),
+            }
+        )
+    return records
 
 
 def generate_single_bcg_mock(
@@ -1555,16 +1579,22 @@ def generate_single_bcg_mock(
         family_id = str(source_row["family_id"])
         parameter_truth[f"source.{family_id}.beta_x"] = float(source_row["beta_x"])
         parameter_truth[f"source.{family_id}.beta_y"] = float(source_row["beta_y"])
-    truth_lens_model_list, truth_kwargs_lens = _current_packed_truth_model_and_kwargs(
+    truth_lens_model_list, truth_kwargs_lens = _current_truth_model_and_kwargs(
         config,
         subhalo_components,
         float(config.source_redshift),
         cosmo_config,
     )
     truth_kwargs_lens_by_z = {
-        f"{z:.8f}": _current_packed_truth_model_and_kwargs(config, subhalo_components, float(z), cosmo_config)[1]
+        f"{z:.8f}": _current_truth_model_and_kwargs(config, subhalo_components, float(z), cosmo_config)[1]
         for z in needed_source_redshifts
     }
+    truth_lens_components = _current_truth_component_records(
+        config,
+        subhalo_components,
+        needed_source_redshifts,
+        cosmo_config,
+    )
 
     truth_payload = {
         "mock": "single-bcg-subhalos" if subhalos else "single-bcg",
@@ -1583,6 +1613,7 @@ def generate_single_bcg_mock(
         "lens_model_list": truth_lens_model_list,
         "kwargs_lens": truth_kwargs_lens,
         "kwargs_lens_by_source_redshift": truth_kwargs_lens_by_z,
+        "lens_components": truth_lens_components,
     }
     if subhalo_selection is not None:
         truth_payload["subhalo_selection"] = subhalo_selection

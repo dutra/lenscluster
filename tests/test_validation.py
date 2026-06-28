@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import inspect
 import json
+import logging
 import math
 import os
 import sys
@@ -27,7 +28,7 @@ import lenscluster.planning as planning
 import lenscluster.plotting as plotting
 import lenscluster.mock_validation as mock_validation_api
 import lenscluster.mock_validation.runner as validation
-from lenscluster.config import ImageDiagnosticsConfig, LensClusterSolverConfig, RuntimeConfig, StageScheduleConfig, WorkflowConfig
+from lenscluster.config import ImageDiagnosticsConfig, LensClusterSolverConfig, RuntimeConfig, StageScheduleConfig, TruthRecoveryConfig, WorkflowConfig
 from lenscluster.planning import SolverRuntime
 from lenscluster.jax_cosmology import (
     ARCSEC_TO_RAD,
@@ -126,6 +127,14 @@ from lenscluster.mock_validation.runner import (
     parameter_recovery_table,
 )
 from lenscluster.utils import _rich_log_text, _should_log_to_console, format_stage_banner
+
+
+def _locator_max_tick_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "Locator attempting to generate" in record.getMessage()
+    ]
 
 
 def _fresh_process_solver_runtime_echo_worker(
@@ -2325,11 +2334,17 @@ def test_generate_single_bcg_mock_with_subhalos_uses_potfile(tmp_path: Path) -> 
     assert images_df["family_id"].nunique() == 1
     assert len(truth["subhalos"]) == config.n_subhalos
     assert len(truth["subhalo_components"]) == config.n_subhalos
-    assert len(truth["lens_model_list"]) == 2 + 2 * config.n_subhalos
+    assert len(truth["lens_model_list"]) == 2 + config.n_subhalos
     truth_kwargs = truth["kwargs_lens_by_source_redshift"]["2.00000000"]
     assert len(truth_kwargs) == len(truth["lens_model_list"])
-    assert [row["sigma0"] for row in truth_kwargs[2::2]] == [pytest.approx(0.0)] * config.n_subhalos
-    assert all(float(row["sigma0"]) > 0.0 for row in truth_kwargs[3::2])
+    assert all(float(row["sigma0"]) > 0.0 for row in truth_kwargs[2:])
+    truth_components = truth["lens_components"]
+    assert len(truth_components) == 2 + config.n_subhalos
+    assert [row["component_id"] for row in truth_components[:2]] == ["halo", "bcg"]
+    subhalo_truth_components = truth_components[2:]
+    assert [row["component_role"] for row in subhalo_truth_components] == ["subhalo"] * config.n_subhalos
+    assert {row["catalog_id"] for row in subhalo_truth_components} == {row["id"] for row in truth["subhalos"]}
+    assert all(row.get("component_role") != "subhalo_placeholder" for row in truth_components)
     assert all(float(row["catalog_mag"]) <= config.subhalo_mag_faint_limit for row in truth["subhalos"])
     assert all("subhalo_mass_msun" in row for row in truth["subhalos"])
     assert all("subhalo_parent_rank" in row for row in truth["subhalos"])
@@ -2586,6 +2601,58 @@ def test_plot_absolute_magnification_recovery_writes_pdf(tmp_path: Path) -> None
     assert path.stat().st_size > 0
 
 
+def test_limit_recovery_axis_ticks_replaces_dense_locators(caplog: pytest.LogCaptureFixture) -> None:
+    from matplotlib import pyplot as plt
+    from matplotlib.ticker import MaxNLocator, MultipleLocator
+
+    fig, ax = plt.subplots()
+    try:
+        ax.set_xlim(-13.0, 274.0)
+        ax.set_ylim(-13.0, 274.0)
+        ax.xaxis.set_major_locator(MultipleLocator(0.2))
+        ax.yaxis.set_major_locator(MultipleLocator(0.2))
+
+        validation._limit_recovery_axis_ticks(ax)
+
+        assert isinstance(ax.xaxis.get_major_locator(), MaxNLocator)
+        assert isinstance(ax.yaxis.get_major_locator(), MaxNLocator)
+        with caplog.at_level(logging.WARNING, logger="matplotlib.ticker"):
+            fig.canvas.draw()
+    finally:
+        plt.close(fig)
+
+    assert _locator_max_tick_messages(caplog) == []
+
+
+def test_plot_absolute_magnification_recovery_limits_ticks_for_large_ranges(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    truth_abs_mu_raw = np.abs(np.asarray([[1.0, 8.0, 120.0], [3.0, 12.0, 25.0], [2.0, 45.0, 70.0]]))
+    recovered_abs_mu_raw = np.abs(np.asarray([[2.0, 10.0, 100.0], [5.0, 8.0, 20.0], [4.0, 30.0, 60.0]]))
+    truth_abs_mu = np.minimum(truth_abs_mu_raw, 25.0)
+    recovered_abs_mu = np.minimum(recovered_abs_mu_raw, 25.0)
+    grid = validation._AbsoluteMagnificationRecoveryGrid(
+        x_axis_arcsec=np.asarray([-13.0, 130.5, 274.0]),
+        y_axis_arcsec=np.asarray([-13.0, 130.5, 274.0]),
+        truth_abs_mu_raw=truth_abs_mu_raw,
+        recovered_abs_mu_raw=recovered_abs_mu_raw,
+        truth_abs_mu=truth_abs_mu,
+        recovered_abs_mu=recovered_abs_mu,
+        residual_abs_mu=recovered_abs_mu_raw - truth_abs_mu_raw,
+        z_source=7.0,
+        cap=25.0,
+    )
+    path = tmp_path / "absolute_magnification_recovery_large_range.pdf"
+
+    with caplog.at_level(logging.WARNING, logger="matplotlib.ticker"):
+        validation._plot_absolute_magnification_recovery(grid, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+    assert _locator_max_tick_messages(caplog) == []
+
+
 def test_plot_absolute_magnification_recovery_uses_capped_viridis_and_centered_residual(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2796,6 +2863,164 @@ def test_plot_image_residual_histogram_reports_point_and_arc_aware_counts(
     assert any("arc-supported = 1/4" in text and "missed = 1/4" in text for text in texts)
     assert xlabels == ["image residual [arcsec]"]
     assert ylabels == ["N images"]
+
+
+def test_plot_image_residual_histogram_uses_posterior_rms_markers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from matplotlib.axes import Axes
+
+    image_df = pd.DataFrame(
+        {
+            "image_recovery_status": ["recovered", "recovered"],
+            "arc_recovery_status": ["point_recovered", "point_recovered"],
+            "image_residual_arcsec": [8.0, 8.0],
+            "image_residual_q50": [0.1, 0.2],
+        }
+    )
+    posterior_rms_df = pd.DataFrame(
+        {
+            "draw_index": [1, 2, 3],
+            "point_image_rms_arcsec": [0.3, 0.5, 0.7],
+            "point_recovered_image_count": [2, 2, 2],
+            "arc_aware_image_rms_arcsec": [0.25, 0.45, 0.65],
+            "arc_aware_recovered_image_count": [2, 2, 2],
+            "arc_supported_image_count": [0, 0, 0],
+            "total_image_count": [2, 2, 2],
+            "exact_failed_family_count": [0, 0, 0],
+        }
+    )
+    axvline_values: list[float] = []
+    axvspan_values: list[tuple[float, float]] = []
+    texts: list[str] = []
+    original_axvline = Axes.axvline
+    original_axvspan = Axes.axvspan
+    original_text = Axes.text
+
+    def record_axvline(self: Axes, x: Any = 0, *args: Any, **kwargs: Any) -> Any:
+        axvline_values.append(float(x))
+        return original_axvline(self, x, *args, **kwargs)
+
+    def record_axvspan(self: Axes, xmin: Any, xmax: Any, *args: Any, **kwargs: Any) -> Any:
+        axvspan_values.append((float(xmin), float(xmax)))
+        return original_axvspan(self, xmin, xmax, *args, **kwargs)
+
+    def record_text(self: Axes, *args: Any, **kwargs: Any) -> Any:
+        if len(args) >= 3:
+            texts.append(str(args[2]))
+        return original_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "axvline", record_axvline)
+    monkeypatch.setattr(Axes, "axvspan", record_axvspan)
+    monkeypatch.setattr(Axes, "text", record_text)
+
+    validation._plot_image_residual_histogram(
+        image_df,
+        tmp_path / "image_residual_histogram.pdf",
+        posterior_image_rms_df=posterior_rms_df,
+    )
+
+    assert axvline_values[0] == pytest.approx(0.5)
+    assert axvline_values[1] == pytest.approx(0.45)
+    assert axvspan_values[0] == pytest.approx((0.364, 0.636))
+    assert axvspan_values[1] == pytest.approx((0.314, 0.586))
+    assert any("0.5 +/-" in text and "0.45 +/-" in text for text in texts)
+
+
+def test_posterior_residual_histogram_summaries_compute_bin_count_quantiles() -> None:
+    posterior_residual_draws_df = pd.DataFrame(
+        {
+            "draw_index": [1, 1, 2, 2, 3, 3],
+            "image_label": ["1.1", "1.2", "1.1", "1.2", "1.1", "1.2"],
+            "family_id": ["1", "1", "1", "1", "1", "1"],
+            "point_image_residual_arcsec": [0.1, np.nan, 0.1, 0.6, np.nan, 0.6],
+            "arc_aware_image_residual_arcsec": [0.1, 0.6, 0.1, 0.6, np.nan, 0.6],
+            "point_recovered": [True, False, True, True, False, True],
+            "arc_aware_recovered": [True, True, True, True, False, True],
+            "arc_supported": [False, True, False, False, False, False],
+            "exact_failed": [False, False, False, False, False, False],
+        }
+    )
+
+    summaries = validation._posterior_residual_histogram_summaries(posterior_residual_draws_df, bin_count=2)
+
+    np.testing.assert_allclose(summaries["point"]["median"], [1.0, 1.0])
+    np.testing.assert_allclose(summaries["point"]["q16"], [0.32, 0.32])
+    np.testing.assert_allclose(summaries["point"]["q84"], [1.0, 1.0])
+    np.testing.assert_allclose(summaries["arc_aware"]["median"], [1.0, 1.0])
+    np.testing.assert_allclose(summaries["arc_aware"]["q16"], [0.32, 1.0])
+    np.testing.assert_allclose(summaries["arc_aware"]["q84"], [1.0, 1.0])
+
+
+def test_plot_image_residual_histogram_uses_posterior_bin_count_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from matplotlib.axes import Axes
+
+    image_df = pd.DataFrame(
+        {
+            "image_recovery_status": ["recovered", "not_recovered"],
+            "arc_recovery_status": ["point_recovered", "arc_supported"],
+            "image_residual_arcsec": [0.1, np.nan],
+            "arc_aware_image_residual_arcsec": [0.1, 0.6],
+        }
+    )
+    posterior_residual_draws_df = pd.DataFrame(
+        {
+            "draw_index": [1, 1, 2, 2, 3, 3],
+            "image_label": ["1.1", "1.2", "1.1", "1.2", "1.1", "1.2"],
+            "family_id": ["1", "1", "1", "1", "1", "1"],
+            "point_image_residual_arcsec": [0.1, np.nan, 0.1, 0.6, np.nan, 0.6],
+            "arc_aware_image_residual_arcsec": [0.1, 0.6, 0.1, 0.6, np.nan, 0.6],
+            "point_recovered": [True, False, True, True, False, True],
+            "arc_aware_recovered": [True, True, True, True, False, True],
+            "arc_supported": [False, True, False, False, False, False],
+            "exact_failed": [False, False, False, False, False, False],
+        }
+    )
+    bars: list[np.ndarray] = []
+    errorbars: list[tuple[np.ndarray, Any]] = []
+    ylabels: list[str] = []
+    hist_calls: list[Any] = []
+    original_bar = Axes.bar
+    original_errorbar = Axes.errorbar
+    original_set_ylabel = Axes.set_ylabel
+    original_hist = Axes.hist
+
+    def record_bar(self: Axes, x: Any, height: Any, *args: Any, **kwargs: Any) -> Any:
+        bars.append(np.asarray(height, dtype=float))
+        return original_bar(self, x, height, *args, **kwargs)
+
+    def record_errorbar(self: Axes, x: Any, y: Any, *args: Any, **kwargs: Any) -> Any:
+        errorbars.append((np.asarray(y, dtype=float), kwargs.get("yerr")))
+        return original_errorbar(self, x, y, *args, **kwargs)
+
+    def record_set_ylabel(self: Axes, label: str, *args: Any, **kwargs: Any) -> Any:
+        ylabels.append(str(label))
+        return original_set_ylabel(self, label, *args, **kwargs)
+
+    def record_hist(self: Axes, *args: Any, **kwargs: Any) -> Any:
+        hist_calls.append(args)
+        return original_hist(self, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "bar", record_bar)
+    monkeypatch.setattr(Axes, "errorbar", record_errorbar)
+    monkeypatch.setattr(Axes, "set_ylabel", record_set_ylabel)
+    monkeypatch.setattr(Axes, "hist", record_hist)
+
+    validation._plot_image_residual_histogram(
+        image_df,
+        tmp_path / "image_residual_histogram.pdf",
+        posterior_image_residual_draws_df=posterior_residual_draws_df,
+    )
+
+    assert not hist_calls
+    assert bars
+    np.testing.assert_allclose(bars[0], validation._posterior_residual_histogram_summaries(posterior_residual_draws_df)["point"]["median"])
+    assert len(errorbars) == 2
+    assert ylabels == ["posterior median N images"]
 
 
 def test_plot_image_recovery_value_fallback_uses_best_fit_for_nan_q50() -> None:
@@ -3584,6 +3809,30 @@ def test_plot_prefit_critical_lines_writes_pdf(tmp_path: Path) -> None:
 
     assert path.exists()
     assert path.stat().st_size > 0
+
+
+def test_plot_prefit_critical_lines_limits_ticks_for_large_ranges(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    contour_payload = {
+        "caustic_index": 0,
+        "caustic_class": "primary",
+        "critical_x": [-13.0, 130.5, 274.0, -13.0],
+        "critical_y": [-13.0, 274.0, -13.0, -13.0],
+        "caustic_beta_x": [-13.0, 130.5, 274.0, -13.0],
+        "caustic_beta_y": [-13.0, 274.0, -13.0, -13.0],
+        "caustic_area_arcsec2": 0.04,
+        "critical_area_arcsec2": 4.0,
+    }
+    path = tmp_path / "prefit_critical_lines_large_range.pdf"
+
+    with caplog.at_level(logging.WARNING, logger="matplotlib.ticker"):
+        validation._plot_prefit_critical_lines({"caustics_by_source_redshift": {"9.00000000": [contour_payload]}}, path)
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+    assert _locator_max_tick_messages(caplog) == []
 
 
 def test_write_prefit_validation_diagnostics_writes_all_outputs(tmp_path: Path) -> None:
@@ -12243,6 +12492,10 @@ def _fast_solver_template(
         runtime=RuntimeConfig(skip_plots=True, quick_diagnostics=quick_diagnostics),
         workflow=WorkflowConfig(stage2_forward_mode=stage2_forward_mode),
         schedule=schedule,
+        truth=TruthRecoveryConfig(
+            posterior_truth_recovery_draws=4,
+            caustic_plot_grid_scale_arcsec=0.2,
+        ),
     )
 
 
@@ -12264,7 +12517,6 @@ def _mock_validation_config(
     mock: SingleBCGMockConfig | None = None,
     runtime: mock_validation_api.MockValidationRuntimeConfig | None = None,
     solver_template: LensClusterSolverConfig | None = None,
-    recovery: mock_validation_api.MockValidationRecoveryConfig | None = None,
 ) -> mock_validation_api.MockValidationConfig:
     return mock_validation_api.MockValidationConfig(
         mock=mock or _small_mock_config(),
@@ -12272,12 +12524,7 @@ def _mock_validation_config(
         runtime=runtime or mock_validation_api.MockValidationRuntimeConfig(realizations=1, seed=12345),
         solver=mock_validation_api.MockValidationSolverConfig(
             template=solver_template or _fast_solver_template(),
-            run_name="fit",
-        ),
-        recovery=recovery
-        or mock_validation_api.MockValidationRecoveryConfig(
-            posterior_diagnostic_draws=2,
-            recovery_profile_draws=4,
+            run_name="solver",
         ),
     )
 
@@ -12323,6 +12570,9 @@ def test_mock_validation_config_defaults_validate(tmp_path: Path) -> None:
     assert payload["paths"]["run_name"] == "validation_log"
     assert payload["paths"]["campaign_name"] is None
     assert payload["paths"]["variant_name"] is None
+    assert "recovery" not in payload
+    assert payload["solver"]["run_name"] == "solver"
+    assert payload["solver"]["recovery_stages"] == ["stage2"]
     assert payload["solver"]["template"]["workflow"]["sampling_engine"] == "refreshing_surrogate_flat"
 
 
@@ -12371,6 +12621,60 @@ def test_mock_validation_config_defaults_validate(tmp_path: Path) -> None:
                 paths=replace(base.paths, variant_name="bad/name"),
             ),
             "paths.variant_name",
+        ),
+        (
+            lambda base: replace(
+                base,
+                solver=replace(
+                    base.solver,
+                    template=replace(
+                        base.solver.template,
+                        image_diagnostics=replace(
+                            base.solver.template.image_diagnostics,
+                            posterior_image_diagnostic_mode="fast",
+                        ),
+                    ),
+                ),
+            ),
+            "posterior_image_diagnostic_mode",
+        ),
+        (
+            lambda base: replace(
+                base,
+                solver=replace(
+                    base.solver,
+                    template=replace(
+                        base.solver.template,
+                        truth=replace(base.solver.template.truth, posterior_truth_recovery_draws=0),
+                    ),
+                ),
+            ),
+            "posterior_truth_recovery_draws",
+        ),
+        (
+            lambda base: replace(
+                base,
+                solver=replace(
+                    base.solver,
+                    template=replace(
+                        base.solver.template,
+                        truth=replace(base.solver.template.truth, caustic_plot_grid_scale_arcsec=0.0),
+                    ),
+                ),
+            ),
+            "caustic_plot_grid_scale_arcsec",
+        ),
+        (
+            lambda base: replace(base, solver=replace(base.solver, recovery_stages=())),
+            "solver.recovery_stages",
+        ),
+        (
+            lambda base: replace(base, solver=replace(base.solver, recovery_stages=("stage1", "stage1"))),
+            "solver.recovery_stages",
+        ),
+        (
+            lambda base: replace(base, solver=replace(base.solver, recovery_stages=("final",))),
+            "solver.recovery_stages",
         ),
     ],
 )
@@ -12425,7 +12729,7 @@ def test_solver_config_for_single_bcg_mock_sets_paths_seed_model_and_recovery_in
     )
 
     assert Path(solver_config.paths.output_dir) == tmp_path / "solver"
-    assert solver_config.paths.run_name == "fit"
+    assert solver_config.paths.run_name == "solver"
     assert solver_config.runtime.seed == 77
     assert solver_config.runtime.resume == "fast"
     assert solver_config.runtime.quiet is True
@@ -12486,7 +12790,7 @@ def test_write_validation_results_json_embeds_stage_table_artifacts(tmp_path: Pa
     seed_dir = root / "seed_00012345"
     realization_dir = seed_dir / "anisotropic"
     paths, images, truth = _write_minimal_mock_files(seed_dir / "mock", with_members=True)
-    solver_run_dir = realization_dir / "solver" / "fit" / "stage1_backprojected_centroid_fit"
+    solver_run_dir = realization_dir / "solver" / "stage1_backprojected_centroid_fit"
     tables_dir = solver_run_dir / "tables"
     tables_dir.mkdir(parents=True)
     (tables_dir / "run_summary.json").write_text(json.dumps({"fit_method": "svi", "n_images": 1}), encoding="utf-8")
@@ -12514,6 +12818,7 @@ def test_write_validation_results_json_embeds_stage_table_artifacts(tmp_path: Pa
             "summary": {"median_abs_parameter_bias": np.nan},
             "tables": {"parameters": {"records": [{"parameter": "halo.v_disp", "bias": np.inf}]}},
         },
+        recovery_stage="stage1",
     )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -12526,8 +12831,8 @@ def test_write_validation_results_json_embeds_stage_table_artifacts(tmp_path: Pa
     assert payload["mock_cluster"]["truth"]["sources"][0]["family_id"] == "1"
     assert payload["validation"]["run_summary"]["text"] == "summary text"
     assert payload["validation"]["output_paths"]["results_json"] == str(path)
-    assert payload["validation"]["recovery"]["final"]["summary"]["median_abs_parameter_bias"] is None
-    assert payload["validation"]["recovery"]["final"]["tables"]["parameters"]["records"][0]["bias"] is None
+    assert payload["validation"]["recovery"]["stage1"]["summary"]["median_abs_parameter_bias"] is None
+    assert payload["validation"]["recovery"]["stage1"]["tables"]["parameters"]["records"][0]["bias"] is None
     assert payload["debug_log"]["text"] == "debug text"
     assert stage["stage"] == "stage1_backprojected_centroid_fit"
     assert stage["table_artifacts"]["run_summary.json"]["data"]["fit_method"] == "svi"
@@ -12541,17 +12846,19 @@ class _FakeLensClusterRunner:
 
     def run(self, plan: Any) -> None:
         self.plans.append(plan)
-        final_dir = Path(plan.output.output_dir) / str(plan.output.run_name) / plan.stages[-1].name
-        tables_dir = final_dir / "tables"
-        tables_dir.mkdir(parents=True, exist_ok=True)
-        (tables_dir / "run_summary.json").write_text(
-            json.dumps({"fit_method": plan.stages[-1].fit_method, "n_images": 1}),
-            encoding="utf-8",
-        )
-        (tables_dir / "family_diagnostics.csv").write_text(
-            "family_id,exact_image_rms_arcsec\n1,0.03\n",
-            encoding="utf-8",
-        )
+        root = Path(plan.output.output_dir) / str(plan.output.run_name)
+        for stage in plan.stages:
+            stage_dir = root / stage.name
+            tables_dir = stage_dir / "tables"
+            tables_dir.mkdir(parents=True, exist_ok=True)
+            (tables_dir / "run_summary.json").write_text(
+                json.dumps({"fit_method": stage.fit_method, "n_images": 1}),
+                encoding="utf-8",
+            )
+            (tables_dir / "family_diagnostics.csv").write_text(
+                "family_id,exact_image_rms_arcsec\n1,0.03\n",
+                encoding="utf-8",
+            )
 
 
 def test_run_single_bcg_validation_uses_config_runner_and_final_compiled_stage(
@@ -12571,10 +12878,10 @@ def test_run_single_bcg_validation_uses_config_runner_and_final_compiled_stage(
         truth_path,
         mock_images_path,
         output_dir,
-        posterior_diagnostic_draws,
+        posterior_image_diagnostic_draws,
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
         critical_caustic_plot_grid_scale_arcsec=validation.DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC,
-        recovery_profile_draws=validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
+        posterior_truth_recovery_draws=validation.RECOVERY_PROFILE_POSTERIOR_DRAW_CAP,
         quick_diagnostics=False,
         progress_args=None,
         recovery_payload=None,
@@ -12585,10 +12892,10 @@ def test_run_single_bcg_validation_uses_config_runner_and_final_compiled_stage(
                 "truth_path": Path(truth_path),
                 "mock_images_path": Path(mock_images_path),
                 "output_dir": Path(output_dir),
-                "posterior_diagnostic_draws": posterior_diagnostic_draws,
+                "posterior_image_diagnostic_draws": posterior_image_diagnostic_draws,
                 "posterior_diagnostic_mode": posterior_diagnostic_mode,
                 "critical_caustic_plot_grid_scale_arcsec": critical_caustic_plot_grid_scale_arcsec,
-                "recovery_profile_draws": recovery_profile_draws,
+                "posterior_truth_recovery_draws": posterior_truth_recovery_draws,
                 "quick_diagnostics": quick_diagnostics,
                 "progress_args": progress_args,
             }
@@ -12609,15 +12916,24 @@ def test_run_single_bcg_validation_uses_config_runner_and_final_compiled_stage(
         "write_validation_run_summary",
         lambda _solver_run_dir, _truth_path, output_dir, run_name, seed: Path(output_dir) / "run_summary.txt",
     )
+    solver_template = replace(
+        _fast_solver_template(stage2_forward_mode="linearized", quick_diagnostics=True),
+        image_diagnostics=ImageDiagnosticsConfig(
+            posterior_image_diagnostic_draws=3,
+            posterior_image_diagnostic_mode="approximate",
+        ),
+        truth=TruthRecoveryConfig(
+            posterior_truth_recovery_draws=5,
+            caustic_plot_grid_scale_arcsec=0.4,
+        ),
+    )
     config = _mock_validation_config(
         tmp_path,
-        solver_template=_fast_solver_template(stage2_forward_mode="linearized", quick_diagnostics=True),
-        recovery=mock_validation_api.MockValidationRecoveryConfig(
-            posterior_diagnostic_draws=3,
-            posterior_diagnostic_mode="approximate",
-            critical_caustic_plot_grid_scale_arcsec=0.4,
-            recovery_profile_draws=5,
-        ),
+        solver_template=solver_template,
+    )
+    config = replace(
+        config,
+        solver=replace(config.solver, recovery_stages=("stage1", "stage2")),
     )
     fake_runner = _FakeLensClusterRunner()
 
@@ -12627,26 +12943,35 @@ def test_run_single_bcg_validation_uses_config_runner_and_final_compiled_stage(
     root = tmp_path / "validation_log"
     seed_dir = root / "seed_00012345"
     realization_dir = seed_dir
-    final_dir = realization_dir / "solver" / "fit" / "stage2_free_source_forward_fit"
+    stage1_dir = realization_dir / "solver" / "stage1_backprojected_centroid_fit"
+    stage2_dir = realization_dir / "solver" / "stage2_free_source_forward_fit"
     assert [stage.name for stage in fake_runner.plans[0].stages] == [
         "stage0_fast_initializer",
         "stage1_backprojected_centroid_fit",
         "stage2_free_source_forward_fit",
     ]
-    assert recovery_calls[0]["run_dir"] == final_dir
-    assert recovery_calls[0]["posterior_diagnostic_draws"] == 3
+    assert [call["run_dir"] for call in recovery_calls] == [stage1_dir, stage2_dir]
+    assert [call["output_dir"] for call in recovery_calls] == [
+        realization_dir / "recovery" / "stage1_backprojected_centroid_fit",
+        realization_dir / "recovery" / "stage2_free_source_forward_fit",
+    ]
+    assert recovery_calls[0]["posterior_image_diagnostic_draws"] == 3
     assert recovery_calls[0]["posterior_diagnostic_mode"] == "approximate"
     assert recovery_calls[0]["critical_caustic_plot_grid_scale_arcsec"] == pytest.approx(0.4)
-    assert recovery_calls[0]["recovery_profile_draws"] == 5
+    assert recovery_calls[0]["posterior_truth_recovery_draws"] == 5
     assert recovery_calls[0]["quick_diagnostics"] is True
     assert recovery_calls[0]["progress_args"] is config
     assert outputs == [
         {
             **_expected_prefit_output_paths(seed_dir / "prefit"),
-            "summary_plot": realization_dir / "validation_summary.pdf",
-            "results_json": realization_dir / "results.json",
+            "stage1_summary_plot": realization_dir / "recovery" / "stage1_backprojected_centroid_fit" / "validation_summary.pdf",
+            "stage1_results_json": realization_dir / "recovery" / "stage1_backprojected_centroid_fit" / "results.json",
+            "stage2_summary_plot": realization_dir / "recovery" / "stage2_free_source_forward_fit" / "validation_summary.pdf",
+            "stage2_results_json": realization_dir / "recovery" / "stage2_free_source_forward_fit" / "results.json",
+            "results_json": realization_dir / "recovery" / "results.json",
         }
     ]
+    assert not any("/fit/" in path.as_posix() for output in outputs for path in output.values())
 
 
 def test_run_single_bcg_validation_resume_reuses_existing_mock(
@@ -12662,6 +12987,7 @@ def test_run_single_bcg_validation_resume_reuses_existing_mock(
             variant_name="isotropic",
         ),
         runtime=mock_validation_api.MockValidationRuntimeConfig(realizations=1, seed=12345, resume="all"),
+        solver=replace(_mock_validation_config(tmp_path).solver, recovery_stages=("stage1",)),
     )
     root = tmp_path / "campaign_a" / "validation_log"
     seed_dir = root / "seed_00012345"
@@ -12694,7 +13020,7 @@ def test_run_single_bcg_validation_resume_reuses_existing_mock(
     validation._close_debug_log()
 
     assert calls == ["recovery"]
-    assert outputs[0]["results_json"] == realization_dir / "results.json"
+    assert outputs[0]["results_json"] == realization_dir / "recovery" / "results.json"
 
 
 def _touch_complete_stage(stage_dir: Path) -> None:
@@ -16710,7 +17036,7 @@ def test_posterior_prediction_uncertainty_tables_threaded_matches_serial(
         max_draws=3,
     )
 
-    for serial_df, threaded_df, key in zip(serial, threaded, ["image_label", "image_label", "family_id"]):
+    for serial_df, threaded_df, key in zip(serial, threaded, ["image_label", "image_label", "family_id", "draw_index", "draw_index"]):
         pd.testing.assert_frame_equal(
             serial_df.sort_values(key).reset_index(drop=True),
             threaded_df.sort_values(key).reset_index(drop=True),
@@ -16796,7 +17122,7 @@ def test_posterior_prediction_uncertainty_tables_threaded_skips_failed_exact_fam
         }
     )
 
-    _mag_df, _image_df, source_df = validation._posterior_prediction_uncertainty_tables(
+    _mag_df, _image_df, source_df, posterior_rms_df, posterior_residual_draws_df = validation._posterior_prediction_uncertainty_tables(
         state,
         np.asarray([[0.0], [1.0], [2.0]], dtype=float),
         images,
@@ -16807,6 +17133,10 @@ def test_posterior_prediction_uncertainty_tables_threaded_skips_failed_exact_fam
     assert exact_calls.count("2") == 1
     family2 = source_df[source_df["family_id"] == "2"].iloc[0]
     assert np.isnan(family2["exact_image_rms_q50"])
+    assert posterior_rms_df["exact_failed_family_count"].tolist() == [1, 1, 1]
+    assert posterior_rms_df["point_recovered_image_count"].tolist() == [1, 1, 1]
+    assert posterior_residual_draws_df["draw_index"].nunique() == 3
+    assert posterior_residual_draws_df["point_recovered"].sum() == 3
 
 
 def test_posterior_prediction_uncertainty_tables_keeps_partial_exact_recovery(
@@ -16899,7 +17229,7 @@ def test_posterior_prediction_uncertainty_tables_keeps_partial_exact_recovery(
         }
     )
 
-    _mag_df, image_df, source_df = validation._posterior_prediction_uncertainty_tables(
+    _mag_df, image_df, source_df, posterior_rms_df, posterior_residual_draws_df = validation._posterior_prediction_uncertainty_tables(
         state,
         np.asarray([[0.0], [1.0], [2.0]], dtype=float),
         images,
@@ -16914,6 +17244,36 @@ def test_posterior_prediction_uncertainty_tables_keeps_partial_exact_recovery(
     assert indexed.loc["1.3", "image_residual_q50"] == pytest.approx(1.1)
     assert indexed.loc["1.2", "arc_aware_image_residual_q50"] == pytest.approx(1.05)
     assert source_df.set_index("family_id").loc["1", "arc_aware_image_rms_q50"] == pytest.approx(1.25)
+    expected_point_rms = [
+        math.sqrt((0.1**2 + 0.1**2) / 2.0),
+        math.sqrt((1.1**2 + 1.1**2) / 2.0),
+        math.sqrt((2.1**2 + 2.1**2) / 2.0),
+    ]
+    expected_arc_rms = [
+        math.sqrt((0.1**2 + 0.1**2 + 0.05**2) / 3.0),
+        math.sqrt((1.1**2 + 1.1**2 + 1.05**2) / 3.0),
+        math.sqrt((2.1**2 + 2.1**2 + 2.05**2) / 3.0),
+    ]
+    np.testing.assert_allclose(posterior_rms_df["point_image_rms_arcsec"].to_numpy(dtype=float), expected_point_rms)
+    np.testing.assert_allclose(posterior_rms_df["arc_aware_image_rms_arcsec"].to_numpy(dtype=float), expected_arc_rms)
+    assert posterior_rms_df["point_recovered_image_count"].tolist() == [2, 2, 2]
+    assert posterior_rms_df["arc_aware_recovered_image_count"].tolist() == [3, 3, 3]
+    assert posterior_rms_df["arc_supported_image_count"].tolist() == [1, 1, 1]
+    assert set(posterior_residual_draws_df.columns) >= {
+        "draw_index",
+        "image_label",
+        "family_id",
+        "point_image_residual_arcsec",
+        "arc_aware_image_residual_arcsec",
+        "point_recovered",
+        "arc_aware_recovered",
+        "arc_supported",
+        "exact_failed",
+    }
+    assert len(posterior_residual_draws_df) == 9
+    assert posterior_residual_draws_df["point_recovered"].sum() == 6
+    assert posterior_residual_draws_df["arc_aware_recovered"].sum() == 9
+    assert posterior_residual_draws_df["arc_supported"].sum() == 3
 
 
 def test_posterior_prediction_uncertainty_tables_approximate_uses_median_std_without_exact(
@@ -16984,7 +17344,7 @@ def test_posterior_prediction_uncertainty_tables_approximate_uses_median_std_wit
         }
     )
 
-    mag_df, image_df, source_df = validation._posterior_prediction_uncertainty_tables(
+    mag_df, image_df, source_df, posterior_rms_df, posterior_residual_draws_df = validation._posterior_prediction_uncertainty_tables(
         state,
         np.asarray([[0.0], [1.0], [3.0]], dtype=float),
         images,
@@ -16994,6 +17354,8 @@ def test_posterior_prediction_uncertainty_tables_approximate_uses_median_std_wit
 
     assert exact_calls == []
     assert image_df.empty
+    assert posterior_rms_df.empty
+    assert posterior_residual_draws_df.empty
     mag_row = mag_df.set_index("image_label").loc["1.1"]
     source_row = source_df.set_index("family_id").loc["1"]
 
@@ -17047,7 +17409,7 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
     output_dir = tmp_path / "out"
     all_samples = np.arange(200, dtype=float).reshape(200, 1)
     best_fit = np.asarray([123.0], dtype=float)
-    recovery_profile_draws = 32
+    posterior_truth_recovery_draws = 32
     captured_profile_samples: list[np.ndarray] = []
     captured_posterior_modes: list[str | None] = []
     captured_recovered_quick: list[bool] = []
@@ -17066,8 +17428,48 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
         return pd.DataFrame(), pd.DataFrame()
 
     def fake_posterior_uncertainty(*_args, **kwargs):
-        captured_posterior_modes.append(kwargs.get("posterior_diagnostic_mode"))
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        mode = kwargs.get("posterior_diagnostic_mode")
+        captured_posterior_modes.append(mode)
+        posterior_rms = (
+            pd.DataFrame()
+            if mode == validation.POSTERIOR_DIAGNOSTIC_MODE_APPROXIMATE
+            else pd.DataFrame(
+                {
+                    "draw_index": [1, 2, 3],
+                    "point_image_rms_arcsec": [0.1, 0.2, 0.4],
+                    "point_recovered_image_count": [1, 1, 1],
+                    "arc_aware_image_rms_arcsec": [0.08, 0.15, 0.3],
+                    "arc_aware_recovered_image_count": [1, 2, 2],
+                    "arc_supported_image_count": [0, 1, 1],
+                    "total_image_count": [1, 1, 1],
+                    "exact_failed_family_count": [0, 0, 0],
+                }
+            )
+        )
+        posterior_residual_draws = (
+            pd.DataFrame()
+            if mode == validation.POSTERIOR_DIAGNOSTIC_MODE_APPROXIMATE
+            else pd.DataFrame(
+                {
+                    "draw_index": [1, 1, 2, 2],
+                    "image_label": ["1.1", "1.2", "1.1", "1.2"],
+                    "family_id": ["1", "1", "1", "1"],
+                    "point_image_residual_arcsec": [0.1, np.nan, 0.2, np.nan],
+                    "arc_aware_image_residual_arcsec": [0.1, 0.4, 0.2, 0.5],
+                    "point_recovered": [True, False, True, False],
+                    "arc_aware_recovered": [True, True, True, True],
+                    "arc_supported": [False, True, False, True],
+                    "exact_failed": [False, False, False, False],
+                }
+            )
+        )
+        return (
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            posterior_rms,
+            posterior_residual_draws,
+        )
 
     def fake_recovered_model_tables(*_args, **kwargs):
         captured_recovered_quick.append(bool(kwargs.get("quick_diagnostics", False)))
@@ -17135,7 +17537,7 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
     monkeypatch.setattr(validation, "_absolute_magnification_recovery_grid", lambda *_args, **_kwargs: SimpleNamespace())
     monkeypatch.setattr(validation, "_plot_absolute_magnification_recovery", lambda _grid, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_image_recovery", lambda _df, path: touch(Path(path)))
-    monkeypatch.setattr(validation, "_plot_image_residual_histogram", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_image_residual_histogram", lambda _df, path, **_kwargs: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_source_recovery", lambda _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_subhalo_recovery_shmf", lambda _truth, _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_subhalo_recovery_radial", lambda _truth, _df, path: touch(Path(path)))
@@ -17147,7 +17549,7 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
         mock_images_path,
         output_dir=output_dir,
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_APPROXIMATE,
-        recovery_profile_draws=recovery_profile_draws,
+        posterior_truth_recovery_draws=posterior_truth_recovery_draws,
         recovery_payload=approximate_recovery_payload,
     )
 
@@ -17161,21 +17563,34 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
     assert "median+/-std" in approximate_warnings[0]
     assert "exact per-draw image validation skipped" in approximate_warnings[0]
     assert approximate_recovery_payload["posterior_diagnostics"]["workers"] == 5
-    assert approximate_recovery_payload["posterior_diagnostics"]["recovery_profile_draws"] == recovery_profile_draws
-    assert approximate_recovery_payload["posterior_diagnostics"]["recovery_profile_draws_effective"] == recovery_profile_draws
-    assert approximate_recovery_payload["posterior_diagnostics"]["recovery_profile_mode"] == "posterior"
+    assert approximate_recovery_payload["posterior_diagnostics"]["posterior_truth_recovery_draws"] == posterior_truth_recovery_draws
+    assert approximate_recovery_payload["posterior_diagnostics"]["posterior_truth_recovery_draws_effective"] == posterior_truth_recovery_draws
+    assert approximate_recovery_payload["posterior_diagnostics"]["posterior_truth_recovery_mode"] == "posterior"
+    assert not (output_dir / "posterior_image_rms.csv").exists()
+    assert not (output_dir / "posterior_image_residual_draws.csv").exists()
+    assert "posterior_image_rms" in approximate_recovery_payload["tables"]
+    assert "posterior_image_residual_draws" in approximate_recovery_payload["tables"]
 
     captured_logs.clear()
+    exact_recovery_payload: dict[str, Any] = {}
+    exact_output_dir = tmp_path / "out_exact"
     validation.write_recovery_outputs(
         run_dir,
         truth_path,
         mock_images_path,
-        output_dir=tmp_path / "out_exact",
+        output_dir=exact_output_dir,
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
-        recovery_profile_draws=recovery_profile_draws,
+        posterior_truth_recovery_draws=posterior_truth_recovery_draws,
+        recovery_payload=exact_recovery_payload,
     )
 
     assert not any("posterior_diagnostic_mode=approximate" in message for message in captured_logs)
+    assert (exact_output_dir / "posterior_image_rms.csv").exists()
+    assert (exact_output_dir / "posterior_image_residual_draws.csv").exists()
+    assert "posterior_image_rms" in exact_recovery_payload["tables"]
+    assert "posterior_image_residual_draws" in exact_recovery_payload["tables"]
+    assert exact_recovery_payload["summary"]["posterior_point_image_rms_arcsec_median"] == pytest.approx(0.2)
+    assert exact_recovery_payload["summary"]["posterior_arc_aware_image_rms_arcsec_median"] == pytest.approx(0.15)
 
     captured_logs.clear()
     validation.write_recovery_outputs(
@@ -17184,7 +17599,7 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
         mock_images_path,
         output_dir=tmp_path / "out_quick",
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
-        recovery_profile_draws=recovery_profile_draws,
+        posterior_truth_recovery_draws=posterior_truth_recovery_draws,
         quick_diagnostics=True,
     )
 
@@ -17199,11 +17614,11 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
     expected_indices = np.linspace(
         0,
         all_samples.shape[0] - 1,
-        recovery_profile_draws,
+        posterior_truth_recovery_draws,
         dtype=int,
     )
     for profile_samples in captured_profile_samples:
-        assert profile_samples.shape == (recovery_profile_draws, 1)
+        assert profile_samples.shape == (posterior_truth_recovery_draws, 1)
         np.testing.assert_array_equal(profile_samples, all_samples[expected_indices])
 
     best_fit_only_recovery_payload: dict[str, Any] = {}
@@ -17213,15 +17628,15 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
         mock_images_path,
         output_dir=tmp_path / "out_best_fit_only",
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
-        recovery_profile_draws=0,
+        posterior_truth_recovery_draws=0,
         recovery_payload=best_fit_only_recovery_payload,
     )
 
     assert captured_profile_samples[-1].shape == (1, 1)
     np.testing.assert_array_equal(captured_profile_samples[-1], best_fit.reshape(1, -1))
-    assert best_fit_only_recovery_payload["posterior_diagnostics"]["recovery_profile_draws"] == 0
-    assert best_fit_only_recovery_payload["posterior_diagnostics"]["recovery_profile_draws_effective"] == 1
-    assert best_fit_only_recovery_payload["posterior_diagnostics"]["recovery_profile_mode"] == "best_fit"
+    assert best_fit_only_recovery_payload["posterior_diagnostics"]["posterior_truth_recovery_draws"] == 0
+    assert best_fit_only_recovery_payload["posterior_diagnostics"]["posterior_truth_recovery_draws_effective"] == 1
+    assert best_fit_only_recovery_payload["posterior_diagnostics"]["posterior_truth_recovery_mode"] == "best_fit"
 
     negative_draws_recovery_payload: dict[str, Any] = {}
     validation.write_recovery_outputs(
@@ -17230,15 +17645,15 @@ def test_write_recovery_outputs_caps_mass_profile_posterior_draws(
         mock_images_path,
         output_dir=tmp_path / "out_negative_draws",
         posterior_diagnostic_mode=validation.POSTERIOR_DIAGNOSTIC_MODE_EXACT,
-        recovery_profile_draws=-4,
+        posterior_truth_recovery_draws=-4,
         recovery_payload=negative_draws_recovery_payload,
     )
 
     assert captured_profile_samples[-1].shape == (1, 1)
     np.testing.assert_array_equal(captured_profile_samples[-1], best_fit.reshape(1, -1))
-    assert negative_draws_recovery_payload["posterior_diagnostics"]["recovery_profile_draws"] == -4
-    assert negative_draws_recovery_payload["posterior_diagnostics"]["recovery_profile_draws_effective"] == 1
-    assert negative_draws_recovery_payload["posterior_diagnostics"]["recovery_profile_mode"] == "best_fit"
+    assert negative_draws_recovery_payload["posterior_diagnostics"]["posterior_truth_recovery_draws"] == -4
+    assert negative_draws_recovery_payload["posterior_diagnostics"]["posterior_truth_recovery_draws_effective"] == 1
+    assert negative_draws_recovery_payload["posterior_diagnostics"]["posterior_truth_recovery_mode"] == "best_fit"
 
 
 def test_write_recovery_outputs_always_includes_critical_arc_support_plots(
@@ -17346,7 +17761,7 @@ def test_write_recovery_outputs_always_includes_critical_arc_support_plots(
             pd.DataFrame({"family_id": ["1"]}),
         ),
     )
-    monkeypatch.setattr(validation, "_posterior_prediction_uncertainty_tables", lambda *_args, **_kwargs: (pd.DataFrame(), pd.DataFrame(), pd.DataFrame()))
+    monkeypatch.setattr(validation, "_posterior_prediction_uncertainty_tables", lambda *_args, **_kwargs: (pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()))
     monkeypatch.setattr(validation, "_mass_and_surface_density_profiles_for_samples", lambda *_args, **_kwargs: (pd.DataFrame(), pd.DataFrame()))
     monkeypatch.setattr(validation, "_potfile_corner_parameter_subset", lambda *_args, **_kwargs: ([], np.zeros((3, 0), dtype=float), np.zeros((0,), dtype=float)))
     monkeypatch.setattr(validation, "_plot_corner_pdf", lambda output_dir, _samples, _specs, filename="corner.pdf", **_kwargs: touch(Path(output_dir) / filename))
@@ -17355,7 +17770,7 @@ def test_write_recovery_outputs_always_includes_critical_arc_support_plots(
     monkeypatch.setattr(validation, "_absolute_magnification_recovery_grid", lambda *_args, **_kwargs: SimpleNamespace())
     monkeypatch.setattr(validation, "_plot_absolute_magnification_recovery", lambda _grid, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_image_recovery", lambda _df, path: touch(Path(path)))
-    monkeypatch.setattr(validation, "_plot_image_residual_histogram", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_image_residual_histogram", lambda _df, path, **_kwargs: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_critical_arc_support_histogram", lambda _df, path, **_kwargs: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_critical_arc_support_phase_space", lambda _df, path, **_kwargs: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_critical_arc_recovery_by_family", lambda _df, path: touch(Path(path)))
@@ -17490,14 +17905,14 @@ def test_write_recovery_outputs_includes_cosmology_corner_for_cosmology_specs(
             pd.DataFrame({"family_id": ["1"]}),
         ),
     )
-    monkeypatch.setattr(validation, "_posterior_prediction_uncertainty_tables", lambda *_args, **_kwargs: (pd.DataFrame(), pd.DataFrame(), pd.DataFrame()))
+    monkeypatch.setattr(validation, "_posterior_prediction_uncertainty_tables", lambda *_args, **_kwargs: (pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()))
     monkeypatch.setattr(validation, "_plot_corner_pdf", fake_plot_corner_pdf)
     monkeypatch.setattr(validation, "_plot_parameter_recovery", lambda _df, path, scale="log_abs": touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_magnification_recovery", lambda _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_absolute_magnification_recovery_grid", lambda *_args, **_kwargs: SimpleNamespace())
     monkeypatch.setattr(validation, "_plot_absolute_magnification_recovery", lambda _grid, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_image_recovery", lambda _df, path: touch(Path(path)))
-    monkeypatch.setattr(validation, "_plot_image_residual_histogram", lambda _df, path: touch(Path(path)))
+    monkeypatch.setattr(validation, "_plot_image_residual_histogram", lambda _df, path, **_kwargs: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_source_recovery", lambda _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_subhalo_recovery_shmf", lambda _truth, _df, path: touch(Path(path)))
     monkeypatch.setattr(validation, "_plot_subhalo_recovery_radial", lambda _truth, _df, path: touch(Path(path)))
@@ -17518,6 +17933,34 @@ def test_write_recovery_outputs_includes_cosmology_corner_for_cosmology_specs(
     np.testing.assert_allclose(cosmology_calls[0][2], samples)
 
 
+def _truth_component_record(
+    component_id: str,
+    role: str,
+    sigma0: float,
+    *,
+    catalog_id: str | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "component_id": component_id,
+        "component_role": role,
+        "profile_name": "DPIE_NIE",
+        "kwargs_by_source_redshift": {
+            "2.00000000": {
+                "sigma0": sigma0,
+                "Ra": 0.1,
+                "Rs": 1.0,
+                "e1": 0.0,
+                "e2": 0.0,
+                "center_x": 0.0,
+                "center_y": 0.0,
+            }
+        },
+    }
+    if catalog_id is not None:
+        record["catalog_id"] = catalog_id
+    return record
+
+
 def test_combined_mass_surface_density_profiles_match_separate_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeEvaluator:
         def __init__(self, *args, **kwargs) -> None:
@@ -17525,7 +17968,7 @@ def test_combined_mass_surface_density_profiles_match_separate_helpers(monkeypat
 
         def _build_packed_lens_state(self, sample_latent, z_source):
             scale = float(np.asarray(sample_latent, dtype=float).reshape(-1)[0])
-            return SimpleNamespace(sigma0=jnp.asarray([scale, 2.0 * scale], dtype=jnp.float64))
+            return SimpleNamespace(sigma0=jnp.asarray([scale, 2.0 * scale, 3.0 * scale], dtype=jnp.float64))
 
         def _grouped_alpha_and_hessian_for_components(self, x, y, packed_state, component_indices):
             indices = np.asarray(component_indices, dtype=int).reshape(-1)
@@ -17541,22 +17984,24 @@ def test_combined_mass_surface_density_profiles_match_separate_helpers(monkeypat
     monkeypatch.setattr(validation, "jax_cpu_worker_count", lambda: 1)
 
     state = SimpleNamespace(
-        lens_model_list=["fake_halo", "fake_subhalo"],
+        lens_model_list=["fake_halo", "fake_bcg", "fake_subhalo"],
         parameter_specs=[],
+        scaling_component_records=[
+            {"component_index": 2, "catalog_id": "member001"},
+        ],
         packed_lens_spec=SimpleNamespace(
-            component_family=np.asarray([0, 1], dtype=int),
-            profile_type=np.asarray([cluster_solver.DP_IE_PROFILE, cluster_solver.DP_IE_PROFILE], dtype=np.int32),
+            component_family=np.asarray([0, 0, 1], dtype=int),
+            profile_type=np.asarray([cluster_solver.DP_IE_PROFILE] * 3, dtype=np.int32),
         ),
     )
     samples = np.asarray([[1.0], [3.0]], dtype=float)
     truth = {
         "config": {"z_lens": 0.4, "source_redshift": 2.0},
-        "kwargs_lens_by_source_redshift": {
-            "2.00000000": [
-                {"sigma0": 10.0, "Ra": 0.1, "Rs": 1.0, "e1": 0.0, "e2": 0.0, "center_x": 0.0, "center_y": 0.0},
-                {"sigma0": 20.0, "Ra": 0.1, "Rs": 1.0, "e1": 0.0, "e2": 0.0, "center_x": 0.0, "center_y": 0.0},
-            ]
-        },
+        "lens_components": [
+            _truth_component_record("halo", "halo", 10.0),
+            _truth_component_record("bcg", "bcg", 20.0),
+            _truth_component_record("member001", "subhalo", 30.0, catalog_id="member001"),
+        ],
     }
     radii = np.asarray([2.0, 5.0], dtype=float)
 
@@ -17612,7 +18057,9 @@ def test_mass_surface_density_profiles_handle_subhalo_component_indices(monkeypa
         def _build_packed_lens_state(self, sample_latent, z_source):
             del z_source
             scale = float(np.asarray(sample_latent, dtype=float).reshape(-1)[0])
-            return SimpleNamespace(sigma0=jnp.asarray([scale, 2.0 * scale, 3.0 * scale, 4.0 * scale], dtype=jnp.float64))
+            return SimpleNamespace(
+                sigma0=jnp.asarray([scale, 2.0 * scale, 3.0 * scale, 100.0 * scale, 4.0 * scale], dtype=jnp.float64)
+            )
 
         def _grouped_alpha_and_hessian_for_components(self, x, y, packed_state, component_indices):
             indices = np.asarray(component_indices, dtype=int).reshape(-1)
@@ -17628,22 +18075,25 @@ def test_mass_surface_density_profiles_handle_subhalo_component_indices(monkeypa
     monkeypatch.setattr(validation, "jax_cpu_worker_count", lambda: 1)
 
     state = SimpleNamespace(
-        lens_model_list=["DPIE_NIE", "DPIE_NIE", "DPIE_NIE", "DPIE_NIE"],
+        lens_model_list=["DPIE_NIE", "DPIE_NIE", "DPIE_NIE", "DPIE_NIE", "DPIE_NIE"],
         parameter_specs=[],
+        scaling_component_records=[
+            {"component_index": 2, "catalog_id": "member001", "free_component_index": 3},
+            {"component_index": 4, "catalog_id": "member002", "free_component_index": -1},
+        ],
         packed_lens_spec=SimpleNamespace(
-            component_family=np.asarray([0, 0, 1, 1], dtype=int),
-            profile_type=np.asarray([cluster_solver.DP_IE_PROFILE] * 4, dtype=np.int32),
+            component_family=np.asarray([0, 0, 1, 2, 1], dtype=int),
+            profile_type=np.asarray([cluster_solver.DP_IE_PROFILE] * 5, dtype=np.int32),
         ),
     )
-    truth_kwargs = [
-        {"sigma0": 10.0, "Ra": 0.1, "Rs": 1.0, "e1": 0.0, "e2": 0.0, "center_x": 0.0, "center_y": 0.0},
-        {"sigma0": 20.0, "Ra": 0.1, "Rs": 1.0, "e1": 0.0, "e2": 0.0, "center_x": 0.0, "center_y": 0.0},
-        {"sigma0": 30.0, "Ra": 0.1, "Rs": 1.0, "e1": 0.0, "e2": 0.0, "center_x": 0.0, "center_y": 0.0},
-        {"sigma0": 40.0, "Ra": 0.1, "Rs": 1.0, "e1": 0.0, "e2": 0.0, "center_x": 0.0, "center_y": 0.0},
-    ]
     truth = {
         "config": {"z_lens": 0.4, "source_redshift": 2.0},
-        "kwargs_lens_by_source_redshift": {"2.00000000": truth_kwargs},
+        "lens_components": [
+            _truth_component_record("halo", "halo", 10.0),
+            _truth_component_record("bcg", "bcg", 20.0),
+            _truth_component_record("member001", "subhalo", 30.0, catalog_id="member001"),
+            _truth_component_record("member002", "subhalo", 40.0, catalog_id="member002"),
+        ],
     }
 
     mass_df, surface_df = validation._mass_and_surface_density_profiles_for_samples(
@@ -17655,11 +18105,13 @@ def test_mass_surface_density_profiles_handle_subhalo_component_indices(monkeypa
 
     assert {"total", "halo", "bcg", "subhalos", "bcg_plus_subhalos"}.issubset(set(mass_df["component"]))
     assert {"total", "halo", "bcg", "subhalos", "bcg_plus_subhalos"}.issubset(set(surface_df["component"]))
+    assert "auxiliary" not in set(mass_df["component"])
+    assert "auxiliary" not in set(surface_df["component"])
     assert np.all(np.isfinite(mass_df["median"]))
     assert np.all(np.isfinite(surface_df["median"]))
 
 
-def test_mass_surface_density_profiles_reject_truth_kwargs_layout_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mass_surface_density_profiles_reject_legacy_positional_truth(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeEvaluator:
         def __init__(self, *args, **kwargs) -> None:
             pass
@@ -17682,7 +18134,100 @@ def test_mass_surface_density_profiles_reject_truth_kwargs_layout_mismatch(monke
         },
     }
 
-    with pytest.raises(ValueError, match="kwargs_lens length mismatch"):
+    with pytest.raises(ValueError, match="lens_components.*legacy.*Regenerate"):
+        validation._mass_and_surface_density_profiles_for_samples(
+            state,
+            np.asarray([[1.0]], dtype=float),
+            truth,
+            np.asarray([2.0], dtype=float),
+        )
+
+
+@pytest.mark.parametrize(
+    ("lens_components", "message"),
+    [
+        (
+            [
+                _truth_component_record("halo", "halo", 10.0),
+                _truth_component_record("bcg", "bcg", 20.0),
+                _truth_component_record("member001", "subhalo_placeholder", 0.0, catalog_id="member001"),
+            ],
+            "placeholder.*Regenerate",
+        ),
+        (
+            [
+                _truth_component_record("halo", "halo", 10.0),
+                _truth_component_record("halo", "halo", 11.0),
+            ],
+            "Duplicate truth component_id",
+        ),
+        (
+            [
+                _truth_component_record("halo", "halo", 10.0),
+                _truth_component_record("bcg", "bcg", 20.0),
+                _truth_component_record("member001", "subhalo", 30.0, catalog_id="member001"),
+                _truth_component_record("member002", "subhalo", 40.0, catalog_id="member001"),
+            ],
+            "Duplicate subhalo truth catalog_id",
+        ),
+    ],
+)
+def test_mass_surface_density_profiles_reject_invalid_current_truth_components(
+    monkeypatch: pytest.MonkeyPatch,
+    lens_components: list[dict[str, Any]],
+    message: str,
+) -> None:
+    class FakeEvaluator:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    monkeypatch.setattr(cluster_solver, "ClusterJAXEvaluator", FakeEvaluator)
+    state = SimpleNamespace(
+        lens_model_list=["DPIE_NIE", "DPIE_NIE"],
+        parameter_specs=[],
+        packed_lens_spec=SimpleNamespace(
+            component_family=np.asarray([0, 0], dtype=int),
+            profile_type=np.asarray([cluster_solver.DP_IE_PROFILE, cluster_solver.DP_IE_PROFILE], dtype=np.int32),
+        ),
+    )
+    truth = {"config": {"z_lens": 0.4, "source_redshift": 2.0}, "lens_components": lens_components}
+
+    with pytest.raises(ValueError, match=message):
+        validation._mass_and_surface_density_profiles_for_samples(
+            state,
+            np.asarray([[1.0]], dtype=float),
+            truth,
+            np.asarray([2.0], dtype=float),
+        )
+
+
+def test_mass_surface_density_profiles_reject_unmatched_packed_physical_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeEvaluator:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    monkeypatch.setattr(cluster_solver, "ClusterJAXEvaluator", FakeEvaluator)
+    state = SimpleNamespace(
+        lens_model_list=["DPIE_NIE", "DPIE_NIE", "DPIE_NIE"],
+        parameter_specs=[],
+        scaling_component_records=[{"component_index": 2, "catalog_id": "missing-member"}],
+        packed_lens_spec=SimpleNamespace(
+            component_family=np.asarray([0, 0, 1], dtype=int),
+            profile_type=np.asarray([cluster_solver.DP_IE_PROFILE] * 3, dtype=np.int32),
+        ),
+    )
+    truth = {
+        "config": {"z_lens": 0.4, "source_redshift": 2.0},
+        "lens_components": [
+            _truth_component_record("halo", "halo", 10.0),
+            _truth_component_record("bcg", "bcg", 20.0),
+            _truth_component_record("member001", "subhalo", 30.0, catalog_id="member001"),
+        ],
+    }
+
+    with pytest.raises(ValueError, match="missing-member.*no matching truth component"):
         validation._mass_and_surface_density_profiles_for_samples(
             state,
             np.asarray([[1.0]], dtype=float),
@@ -17799,6 +18344,62 @@ def test_plot_critical_caustic_recovery_writes_pdf(tmp_path: Path) -> None:
 
     assert path.exists()
     assert path.stat().st_size > 0
+
+
+def test_plot_critical_caustic_recovery_limits_ticks_for_large_ranges(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    truth_contour = validation.CausticContour(
+        caustic_index=0,
+        caustic_class="primary",
+        beta_x=np.asarray([-13.0, 130.5, 274.0, -13.0]),
+        beta_y=np.asarray([-13.0, 274.0, -13.0, -13.0]),
+        critical_x=np.asarray([-13.0, 130.5, 274.0, -13.0]),
+        critical_y=np.asarray([-13.0, 274.0, -13.0, -13.0]),
+        caustic_area_arcsec2=0.18,
+        critical_area_arcsec2=18.0,
+    )
+    recovered_contour = validation.CausticContour(
+        caustic_index=0,
+        caustic_class="primary",
+        beta_x=np.asarray([-12.0, 131.0, 273.0, -12.0]),
+        beta_y=np.asarray([-12.0, 273.0, -12.0, -12.0]),
+        critical_x=np.asarray([-12.0, 131.0, 273.0, -12.0]),
+        critical_y=np.asarray([-12.0, 273.0, -12.0, -12.0]),
+        caustic_area_arcsec2=0.18,
+        critical_area_arcsec2=18.0,
+    )
+    path = tmp_path / "critical_caustic_recovery_large_range.pdf"
+
+    with caplog.at_level(logging.WARNING, logger="matplotlib.ticker"):
+        validation._plot_critical_caustic_recovery(
+            {"9.00000000": [truth_contour]},
+            {"9.00000000": [recovered_contour]},
+            pd.DataFrame({"x_obs_arcsec": [-1.0], "y_obs_arcsec": [0.0]}),
+            pd.DataFrame(
+                {
+                    "x_obs_arcsec": [-1.0],
+                    "y_obs_arcsec": [0.0],
+                    "x_model_arcsec": [-0.9],
+                    "y_model_arcsec": [0.1],
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "beta_x": [0.0],
+                    "beta_y": [0.0],
+                    "source_x_recovered": [0.02],
+                    "source_y_recovered": [0.01],
+                }
+            ),
+            pd.DataFrame({"x_arcsec": [2.5], "y_arcsec": [-1.0], "luminosity_ratio": [1.0]}),
+            path,
+        )
+
+    assert path.exists()
+    assert path.stat().st_size > 0
+    assert _locator_max_tick_messages(caplog) == []
 
 
 def test_select_critical_caustic_plot_contours_keeps_z9_only() -> None:

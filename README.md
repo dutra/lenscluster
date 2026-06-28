@@ -100,11 +100,16 @@ writes recovery diagnostics from the final compiled solver stage.
 A minimal single-BCG validation run looks like:
 
 ```python
-from lenscluster.config import LensClusterSolverConfig, RuntimeConfig, StageScheduleConfig
+from lenscluster.config import (
+    ImageDiagnosticsConfig,
+    LensClusterSolverConfig,
+    RuntimeConfig,
+    StageScheduleConfig,
+    TruthRecoveryConfig,
+)
 from lenscluster.mock_validation import (
     MockValidationConfig,
     MockValidationPathsConfig,
-    MockValidationRecoveryConfig,
     MockValidationRuntimeConfig,
     MockValidationSolverConfig,
     SingleBCGMockConfig,
@@ -131,6 +136,14 @@ config = MockValidationConfig(
     solver=MockValidationSolverConfig(
         template=LensClusterSolverConfig(
             runtime=RuntimeConfig(skip_plots=True),
+            image_diagnostics=ImageDiagnosticsConfig(
+                posterior_image_diagnostic_draws=8,
+                posterior_image_diagnostic_mode="exact",
+            ),
+            truth=TruthRecoveryConfig(
+                posterior_truth_recovery_draws=128,
+                caustic_plot_grid_scale_arcsec=0.2,
+            ),
             schedule=StageScheduleConfig(
                 fit_method=("svi+nuts",),
                 svi_steps=(2000, 2000),
@@ -142,11 +155,6 @@ config = MockValidationConfig(
             ),
         ),
         run_name="fit",
-    ),
-    recovery=MockValidationRecoveryConfig(
-        posterior_diagnostic_draws=8,
-        posterior_diagnostic_mode="exact",
-        recovery_profile_draws=128,
     ),
 )
 

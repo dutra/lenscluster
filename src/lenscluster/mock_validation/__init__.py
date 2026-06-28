@@ -11,7 +11,6 @@ from .generation import (
 from .config import (
     MockValidationConfig,
     MockValidationPathsConfig,
-    MockValidationRecoveryConfig,
     MockValidationRuntimeConfig,
     MockValidationSolverConfig,
     single_bcg_mock_lens_model_config,
@@ -38,7 +37,6 @@ __all__ = [
     "MockClusterPaths",
     "MockValidationConfig",
     "MockValidationPathsConfig",
-    "MockValidationRecoveryConfig",
     "MockValidationRuntimeConfig",
     "MockValidationSolverConfig",
     "SingleBCGMockConfig",
