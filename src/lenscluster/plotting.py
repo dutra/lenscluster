@@ -293,6 +293,7 @@ NUMPYRO_MODEL_ROLE_STYLE = {
 }
 SUBHALO_PROPERTIES_COLUMNS = [
     "component_index",
+    "model_component_index",
     "potfile_id",
     "potfile_order",
     "catalog_id",
@@ -11823,6 +11824,8 @@ def _finite_float_or_nan(value: Any) -> float:
 
 
 def _subhalo_component_records(state: BuildState) -> list[dict[str, Any]]:
+    from .cluster_solver import COMPONENT_FAMILY_INDEPENDENT_FREE, COMPONENT_FAMILY_SCALING
+
     packed = getattr(state, "packed_lens_spec", None)
     if packed is None:
         return []
@@ -11839,10 +11842,20 @@ def _subhalo_component_records(state: BuildState) -> list[dict[str, Any]]:
             continue
         if component_index < 0 or component_index >= component_family.size:
             continue
-        if int(component_family[component_index]) != 1:
+        if int(component_family[component_index]) != COMPONENT_FAMILY_SCALING:
             continue
+        free_component_index = _finite_float_or_nan(raw_record.get("free_component_index", -1))
+        model_component_index = int(free_component_index) if np.isfinite(free_component_index) else -1
+        if model_component_index >= 0:
+            if model_component_index >= component_family.size:
+                continue
+            if int(component_family[model_component_index]) != COMPONENT_FAMILY_INDEPENDENT_FREE:
+                continue
+        else:
+            model_component_index = component_index
         record = dict(raw_record)
         record["component_index"] = component_index
+        record["model_component_index"] = model_component_index
         records.append(record)
     return records
 
@@ -11889,14 +11902,15 @@ def _subhalo_properties_table(
     rows: list[dict[str, Any]] = []
     for record in records:
         component_index = int(record["component_index"])
-        if component_index >= len(kwargs_lens):
+        model_component_index = int(record.get("model_component_index", component_index))
+        if model_component_index >= len(kwargs_lens):
             continue
-        kwargs = dict(kwargs_lens[component_index])
+        kwargs = dict(kwargs_lens[model_component_index])
         rs = _finite_float_or_nan(kwargs.get("Rs"))
         mass_within_rs = float("nan")
         mass_within_total = float("nan")
         if np.isfinite(rs) and rs > 0.0 and hasattr(model, "mass_3d"):
-            bool_list = [idx == component_index for idx in range(len(kwargs_lens))]
+            bool_list = [idx == model_component_index for idx in range(len(kwargs_lens))]
             try:
                 mass_within_rs = _lens_mass_to_msun(
                     model.mass_3d(rs, kwargs_lens, bool_list=bool_list),
@@ -11918,6 +11932,7 @@ def _subhalo_properties_table(
         rows.append(
             {
                 "component_index": component_index,
+                "model_component_index": model_component_index,
                 "potfile_id": str(record.get("potfile_id", "")),
                 "potfile_order": int(record.get("potfile_order", -1)),
                 "catalog_id": str(record.get("catalog_id", f"component{component_index}")),

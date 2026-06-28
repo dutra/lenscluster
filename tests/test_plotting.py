@@ -2093,7 +2093,7 @@ def test_fit_quality_tables_cap_draws_convert_physical_and_quantile(monkeypatch:
         evaluator,
         np.asarray([5.0], dtype=float),
         results,
-        argparse.Namespace(fit_quality_draws=2),
+        argparse.Namespace(posterior_image_diagnostic_draws=2),
     )
 
     assert [float(item[0]) for item in evaluator.converted] == [5.0, 0.0, 30.0]
@@ -2259,7 +2259,7 @@ def test_fit_quality_tables_quick_diagnostics_skips_exact_and_uses_median_std(mo
         evaluator,
         np.asarray([10.0], dtype=float),
         results,
-        argparse.Namespace(fit_quality_draws=3, quick_diagnostics=True),
+        argparse.Namespace(posterior_image_diagnostic_draws=3, quick_diagnostics=True),
     )
 
     assert evaluator.exact_calls == 0
@@ -2337,7 +2337,7 @@ def test_fit_quality_tables_tracks_partial_recovery_and_extra_images(monkeypatch
         FakeEvaluator(),
         np.asarray([0.0], dtype=float),
         SimpleNamespace(samples=np.empty((0, 1), dtype=float)),
-        argparse.Namespace(fit_quality_draws=0),
+        argparse.Namespace(posterior_image_diagnostic_draws=0),
     )
 
     indexed = image_df.set_index("image_label")
@@ -3405,15 +3405,16 @@ def test_subhalo_properties_table_uses_all_potfile_members_and_mass_radii(monkey
         cosmo_config={},
         parameter_specs=[],
         packed_lens_spec=SimpleNamespace(
-            component_family=np.asarray([0, 1, 1], dtype=int),
-            x_center_base=np.asarray([0.0, 3.0, 6.0], dtype=float),
-            y_center_base=np.asarray([0.0, 4.0, 8.0], dtype=float),
+            component_family=np.asarray([0, 1, 2, 1], dtype=int),
+            x_center_base=np.asarray([0.0, 3.0, 30.0, 6.0], dtype=float),
+            y_center_base=np.asarray([0.0, 4.0, 40.0, 8.0], dtype=float),
         ),
         scaling_component_records=[
             {
                 "potfile_id": "members",
                 "potfile_order": 0,
                 "component_index": 1,
+                "free_component_index": 2,
                 "catalog_id": "member001",
                 "catalog_mag": 20.0,
                 "x_centre": 3.0,
@@ -3422,7 +3423,8 @@ def test_subhalo_properties_table_uses_all_potfile_members_and_mass_radii(monkey
             {
                 "potfile_id": "members",
                 "potfile_order": 0,
-                "component_index": 2,
+                "component_index": 3,
+                "free_component_index": -1,
                 "catalog_id": "member002",
                 "catalog_mag": 21.0,
                 "x_centre": 6.0,
@@ -3466,8 +3468,9 @@ def test_subhalo_properties_table_uses_all_potfile_members_and_mass_radii(monkey
             assert packed_state == {"latent": 5.0}
             return [
                 {"sigma0": 1.0, "Ra": 0.1, "Rs": 1.0},
-                {"sigma0": 3.0, "Ra": 0.2, "Rs": 2.0},
+                {"sigma0": 0.0, "Ra": 0.2, "Rs": 2.0},
                 {"sigma0": 5.0, "Ra": 0.3, "Rs": 4.0},
+                {"sigma0": 7.0, "Ra": 0.4, "Rs": 8.0},
             ]
 
     monkeypatch.setattr(plotting, "critical_surface_density_angle_from_config", lambda *_args, **_kwargs: 10.0)
@@ -3480,20 +3483,22 @@ def test_subhalo_properties_table_uses_all_potfile_members_and_mass_radii(monkey
         caustic_source_redshift=9.0,
     )
 
-    assert table["component_index"].tolist() == [1, 2]
+    assert table["component_index"].tolist() == [1, 3]
+    assert table["model_component_index"].tolist() == [2, 3]
     assert table["catalog_id"].tolist() == ["member001", "member002"]
     assert table["radius_arcsec"].tolist() == pytest.approx([5.0, 10.0])
-    assert table["Rs"].tolist() == pytest.approx([2.0, 4.0])
-    assert table["mass_within_Rs_msun"].tolist() == pytest.approx([60.0, 200.0])
-    assert table["mass_within_1e6_Rs_msun"].tolist() == pytest.approx([60.0e6, 200.0e6])
+    assert table["Rs"].tolist() == pytest.approx([4.0, 8.0])
+    assert table["sigma0"].tolist() == pytest.approx([5.0, 7.0])
+    assert table["mass_within_Rs_msun"].tolist() == pytest.approx([200.0, 560.0])
+    assert table["mass_within_1e6_Rs_msun"].tolist() == pytest.approx([200.0e6, 560.0e6])
     assert [float(item[0]) for item in evaluator.converted] == [4.0]
     assert evaluator.model_z == [9.0]
     assert evaluator.packed_z == [9.0]
     assert evaluator.model.calls == [
-        (2.0, 1),
-        (2.0e6, 1),
         (4.0, 2),
         (4.0e6, 2),
+        (8.0, 3),
+        (8.0e6, 3),
     ]
 
 

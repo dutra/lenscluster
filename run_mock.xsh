@@ -1,6 +1,8 @@
 $XONSH_SHOW_TRACEBACK = True
+$MPLBACKEND = "Agg"
 
 import os
+os.environ["MPLBACKEND"] = "Agg"
 import sys
 import time
 from pathlib import Path
@@ -24,6 +26,7 @@ from lenscluster.config import (
     StageScheduleConfig,
     TruthRecoveryConfig,
     WorkflowConfig,
+    ScalingModelConfig
 )
 from lenscluster.mock_validation import (
     MockValidationConfig,
@@ -102,8 +105,8 @@ def _parse_args(argv: list[str]) -> tuple[str, int, str, str, str]:
 def _solver_template(*, production: bool, seed: int, critical_arc_anisotropic_covariance: bool) -> LensClusterSolverConfig:
     if production:
         svi_steps = 10_000, 20_000, 20_000
-        warmup = 5000, 5000
-        samples = 250, 250
+        warmup = 10000, 10000
+        samples = 500, 500
         max_tree_depth = 8, 8
     else:
         svi_steps = 500, 20_000, 20_000
@@ -139,13 +142,13 @@ def _solver_template(*, production: bool, seed: int, critical_arc_anisotropic_co
         ),
         schedule=StageScheduleConfig(
             fit_method=("svi+nuts", "svi+nuts"),
-            refresh_every=(None, None, None),
+            refresh_every=(None, 2000, 2000),
             svi_steps=svi_steps,
             warmup=warmup,
             samples=samples,
             sampling_refresh_runs=(1, 1),
             max_tree_depth=max_tree_depth,
-            target_accept=0.8,
+            target_accept=0.9,
             z_bin_efficiency_tol=0.0,
             svi_learning_rate=0.0005,
         ),
@@ -153,7 +156,7 @@ def _solver_template(*, production: bool, seed: int, critical_arc_anisotropic_co
             critical_arc_anisotropic_covariance=critical_arc_anisotropic_covariance,
         ),
         image_diagnostics=ImageDiagnosticsConfig(
-            posterior_image_diagnostic_draws=32,
+            posterior_image_diagnostic_draws=8,
             posterior_image_diagnostic_mode="exact",
             exact_image_finder="local-lm-adaptive",
             exact_image_min_distance_arcsec=0.5,
@@ -171,7 +174,10 @@ def _solver_template(*, production: bool, seed: int, critical_arc_anisotropic_co
             perturbation_discovery_alpha_tol_arcsec=0.001,
             perturbation_discovery_jacobian_tol=0.001,
             perturbation_discovery_jacobian_weight=1.0,
-            perturbation_discovery_top_k=3,
+            perturbation_discovery_top_k=5,
+        ),
+        scaling=ScalingModelConfig(
+            scaling_scatter=True,
         ),
     )
 
@@ -188,7 +194,7 @@ def build_config(
     mock = SingleBCGMockConfig(
         seed=seed,
         n_primary_families=25 if production else 5,
-        n_subhalo_families=0,
+        n_subhalo_families=50 if production else 0,
         n_subhalos=50 if production else 0,
         min_images_per_family=3,
         max_images_per_family=None,

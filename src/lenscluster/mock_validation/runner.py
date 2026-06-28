@@ -819,7 +819,7 @@ def _recovered_model_tables(
                 DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
             )
         ),
-        sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full_flat")),
+        sampling_engine="full_flat",
         active_scaling_galaxies=_artifact_arg(artifact_args, "active_scaling_galaxies", DEFAULT_ACTIVE_SCALING_GALAXIES),
         active_scaling_selection=str(_artifact_arg(artifact_args, "active_scaling_selection", "adaptive")),
         active_scaling_cumulative_fraction=float(
@@ -1518,7 +1518,7 @@ def _posterior_prediction_uncertainty_tables(
                     DEFAULT_EXACT_IMAGE_ADAPTIVE_MAX_LEVELS,
                 )
             ),
-            sampling_engine=str(_artifact_arg(artifact_args, "sampling_engine", "full_flat")),
+            sampling_engine="full_flat",
             active_scaling_galaxies=_artifact_arg(artifact_args, "active_scaling_galaxies", DEFAULT_ACTIVE_SCALING_GALAXIES),
             active_scaling_selection=str(_artifact_arg(artifact_args, "active_scaling_selection", "adaptive")),
             active_scaling_cumulative_fraction=float(
@@ -1894,19 +1894,81 @@ def _magnifications_for_images(state: Any, best_fit_physical: np.ndarray, images
     return magnification
 
 
+def _effective_scaling_component_index(
+    record: dict[str, Any],
+    component_family: np.ndarray,
+    *,
+    context: str,
+) -> int:
+    from ..cluster_solver import COMPONENT_FAMILY_INDEPENDENT_FREE, COMPONENT_FAMILY_SCALING
+
+    n_components = int(component_family.size)
+    try:
+        component_index = int(record["component_index"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{context} scaling record is missing a valid component_index.") from exc
+    if component_index < 0 or component_index >= n_components:
+        raise ValueError(
+            f"{context} scaling record component_index={component_index} is outside packed component count {n_components}."
+        )
+    if int(component_family[component_index]) != COMPONENT_FAMILY_SCALING:
+        raise ValueError(f"{context} component_index={component_index} is not a scaling component.")
+
+    raw_free_component_index = record.get("free_component_index", -1)
+    try:
+        free_component_index = int(raw_free_component_index)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{context} scaling record component_index={component_index} has invalid "
+            f"free_component_index={raw_free_component_index!r}."
+        ) from exc
+    if free_component_index < 0:
+        return component_index
+    if free_component_index >= n_components:
+        raise ValueError(
+            f"{context} scaling record component_index={component_index} has free_component_index="
+            f"{free_component_index} outside packed component count {n_components}."
+        )
+    if int(component_family[free_component_index]) != COMPONENT_FAMILY_INDEPENDENT_FREE:
+        raise ValueError(
+            f"{context} scaling record component_index={component_index} has free_component_index="
+            f"{free_component_index}, but that component is not an independent-free component."
+        )
+    return free_component_index
+
+
+def _effective_scaling_component_records(state: Any, *, context: str) -> list[dict[str, Any]]:
+    component_family = np.asarray(state.packed_lens_spec.component_family, dtype=int)
+    records: list[dict[str, Any]] = []
+    for raw_record in getattr(state, "scaling_component_records", []) or []:
+        if not isinstance(raw_record, dict):
+            continue
+        record = dict(raw_record)
+        record["model_component_index"] = _effective_scaling_component_index(
+            record,
+            component_family,
+            context=context,
+        )
+        records.append(record)
+    return records
+
+
 def _mass_profile_component_groups(state: Any) -> tuple[dict[str, list[int]], dict[str, str]]:
-    from ..cluster_solver import COMPONENT_FAMILY_LARGE, COMPONENT_FAMILY_SCALING
+    from ..cluster_solver import COMPONENT_FAMILY_LARGE
 
     component_family = np.asarray(state.packed_lens_spec.component_family, dtype=int)
     n_components = len(state.lens_model_list)
-    physical_indices = np.where(
-        (component_family == COMPONENT_FAMILY_LARGE) | (component_family == COMPONENT_FAMILY_SCALING)
-    )[0].astype(int).tolist()
+    large_indices = np.where(component_family == COMPONENT_FAMILY_LARGE)[0].astype(int).tolist()
+    subhalo_indices = [
+        int(record["model_component_index"])
+        for record in _effective_scaling_component_records(state, context="mass/profile")
+    ]
+    physical_indices = large_indices + subhalo_indices
     group_indices: dict[str, list[int]] = {
         "total": physical_indices,
         "halo": [0] if n_components > 0 else [],
         "bcg": [1] if n_components > 1 else [],
-        "subhalos": np.where(component_family == COMPONENT_FAMILY_SCALING)[0].astype(int).tolist(),
+        "subhalos": subhalo_indices,
     }
     group_indices["bcg_plus_subhalos"] = group_indices["bcg"] + group_indices["subhalos"]
     display_names = {
@@ -2059,6 +2121,7 @@ def _packed_lens_state_from_current_truth_components(state: Any, truth: dict[str
 
     for index, profile in enumerate(profile_type.tolist()):
         family = int(component_family[index])
+        target_index = int(index)
         if family == COMPONENT_FAMILY_INDEPENDENT_FREE:
             continue
         if family == COMPONENT_FAMILY_LARGE:
@@ -2080,6 +2143,11 @@ def _packed_lens_state_from_current_truth_components(state: Any, truth: dict[str
             scaling_record = scaling_records.get(index)
             if scaling_record is None:
                 raise ValueError(f"Packed scaling component index {index} is missing scaling_component_records metadata.")
+            target_index = _effective_scaling_component_index(
+                scaling_record,
+                component_family,
+                context="truth profile",
+            )
             catalog_id = str(scaling_record.get("catalog_id", "")).strip()
             if not catalog_id:
                 raise ValueError(f"Packed scaling component index {index} is missing catalog_id metadata.")
@@ -2092,25 +2160,26 @@ def _packed_lens_state_from_current_truth_components(state: Any, truth: dict[str
             raise ValueError(f"Packed component index {index} has unsupported component_family={family}.")
 
         kwargs = _truth_record_kwargs_for_redshift(record, z_source, component_label)
-        if int(profile) == DP_IE_PROFILE:
+        target_profile = int(profile_type[target_index])
+        if target_profile == DP_IE_PROFILE:
             missing = [field for field in ("sigma0", "Ra", "Rs", "e1", "e2", "center_x", "center_y") if field not in kwargs]
             if missing:
                 raise ValueError(f"Truth component {component_label!r} missing DPIE fields: {missing}.")
-            sigma0[index] = float(kwargs["sigma0"])
-            Ra[index] = float(kwargs["Ra"])
-            Rs[index] = float(kwargs["Rs"])
-            e1[index] = float(kwargs["e1"])
-            e2[index] = float(kwargs["e2"])
-            center_x[index] = float(kwargs["center_x"])
-            center_y[index] = float(kwargs["center_y"])
-        elif int(profile) == SHEAR_PROFILE:
+            sigma0[target_index] = float(kwargs["sigma0"])
+            Ra[target_index] = float(kwargs["Ra"])
+            Rs[target_index] = float(kwargs["Rs"])
+            e1[target_index] = float(kwargs["e1"])
+            e2[target_index] = float(kwargs["e2"])
+            center_x[target_index] = float(kwargs["center_x"])
+            center_y[target_index] = float(kwargs["center_y"])
+        elif target_profile == SHEAR_PROFILE:
             missing = [field for field in ("gamma1", "gamma2") if field not in kwargs]
             if missing:
                 raise ValueError(f"Truth component {component_label!r} missing SHEAR fields: {missing}.")
-            gamma1[index] = float(kwargs["gamma1"])
-            gamma2[index] = float(kwargs["gamma2"])
+            gamma1[target_index] = float(kwargs["gamma1"])
+            gamma2[target_index] = float(kwargs["gamma2"])
         else:
-            raise ValueError(f"Unsupported profile_type={int(profile)} in current mock truth component layout.")
+            raise ValueError(f"Unsupported profile_type={target_profile} in current mock truth component layout.")
 
     physical_truth_ids = {
         str(record["component_id"])

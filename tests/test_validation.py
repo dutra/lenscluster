@@ -16722,6 +16722,7 @@ def test_validation_mock_progress_quiet_suppresses_rich_and_logs(monkeypatch: py
 
 
 def test_recovered_model_tables_reports_partial_image_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    constructed_sampling_engines: list[str] = []
     families = [
         SimpleNamespace(
             family_id="1",
@@ -16764,6 +16765,9 @@ def test_recovered_model_tables_reports_partial_image_recovery(monkeypatch: pyte
 
         def __init__(self, *args, **kwargs) -> None:
             self.state = kwargs["state"]
+            constructed_sampling_engines.append(str(kwargs["sampling_engine"]))
+            if str(kwargs["sampling_engine"]) != "full_flat":
+                raise AssertionError("recovery diagnostics must not reuse surrogate sampling engines")
 
         def reported_physical_to_latent_parameter_vector(self, sample):
             return np.asarray(sample, dtype=float)
@@ -16824,8 +16828,10 @@ def test_recovered_model_tables_reports_partial_image_recovery(monkeypatch: pyte
         state,
         np.asarray([0.0], dtype=float),
         images,
+        artifact_args={"sampling_engine": "refreshing_surrogate_flat"},
     )
 
+    assert constructed_sampling_engines == ["full_flat"]
     assert len(image_df) == 5
     indexed = image_df.set_index("image_label")
     assert indexed["image_recovery_status"].tolist() == ["recovered", "recovered", "recovered", "not_recovered", "recovered"]
@@ -16843,6 +16849,8 @@ def test_recovered_model_tables_reports_partial_image_recovery(monkeypatch: pyte
 def test_posterior_prediction_uncertainty_tables_advances_progress_per_draw_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    constructed_sampling_engines: list[str] = []
+
     class FakeExactModel:
         def magnification(self, x, y, kwargs_lens):
             return np.ones_like(np.asarray(x, dtype=float))
@@ -16850,6 +16858,9 @@ def test_posterior_prediction_uncertainty_tables_advances_progress_per_draw_fami
     class FakeEvaluator:
         def __init__(self, *args, **kwargs) -> None:
             self.state = kwargs["state"]
+            constructed_sampling_engines.append(str(kwargs["sampling_engine"]))
+            if str(kwargs["sampling_engine"]) != "full_flat":
+                raise AssertionError("recovery diagnostics must not reuse surrogate sampling engines")
 
         def reported_physical_to_latent_parameter_vector(self, sample):
             return np.asarray(sample, dtype=float)
@@ -16934,8 +16945,10 @@ def test_posterior_prediction_uncertainty_tables_advances_progress_per_draw_fami
         images,
         max_draws=3,
         progress=progress,
+        artifact_args={"sampling_engine": "refreshing_surrogate_flat"},
     )
 
+    assert constructed_sampling_engines == ["full_flat"]
     assert progress.added == [("posterior uncertainty: draws x families", 6)]
     assert progress.advanced == [17] * 6
     assert len(progress.updated) == 6
@@ -18109,6 +18122,16 @@ def test_mass_surface_density_profiles_handle_subhalo_component_indices(monkeypa
     assert "auxiliary" not in set(surface_df["component"])
     assert np.all(np.isfinite(mass_df["median"]))
     assert np.all(np.isfinite(surface_df["median"]))
+    mass_by_component_radius = {
+        (str(row["component"]), float(row["radius_arcsec"])): row
+        for row in mass_df.to_dict("records")
+    }
+    assert mass_by_component_radius[("subhalos", 2.0)]["median"] == pytest.approx(312.0)
+    assert mass_by_component_radius[("subhalos", 2.0)]["truth"] == pytest.approx(140.0)
+    assert mass_by_component_radius[("bcg_plus_subhalos", 2.0)]["median"] == pytest.approx(318.0)
+    assert mass_by_component_radius[("bcg_plus_subhalos", 2.0)]["truth"] == pytest.approx(180.0)
+    assert mass_by_component_radius[("total", 2.0)]["median"] == pytest.approx(321.0)
+    assert mass_by_component_radius[("total", 2.0)]["truth"] == pytest.approx(200.0)
 
 
 def test_mass_surface_density_profiles_reject_legacy_positional_truth(monkeypatch: pytest.MonkeyPatch) -> None:
