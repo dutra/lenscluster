@@ -6,10 +6,12 @@ os.environ["MPLBACKEND"] = "Agg"
 import sys
 import time
 from pathlib import Path
+import numpy as np
 
-cores = 4  # Fixed to match JAX CPU devices and NUTS chains.
+cores = 30  # Fixed to match JAX CPU devices and NUTS chains.
 seed_default = 12345
 output_dir_default = "validation_runs/mock_recovery"
+mock_caustic_grid_chunk_memory_gb = 8.0
 
 $JAX_NUM_CPU_DEVICES = str(cores)
 $MPLCONFIGDIR = "/tmp/matplotlib-lenscluster-mock"
@@ -107,7 +109,7 @@ def _solver_template(*, production: bool, seed: int, critical_arc_anisotropic_co
         svi_steps = 10_000, 20_000, 20_000
         warmup = 10000, 10000
         samples = 500, 500
-        max_tree_depth = 8, 8
+        max_tree_depth = 9, 9
     else:
         svi_steps = 500, 20_000, 20_000
         warmup = 100, 100
@@ -117,7 +119,7 @@ def _solver_template(*, production: bool, seed: int, critical_arc_anisotropic_co
     return LensClusterSolverConfig(
         runtime=RuntimeConfig(
             seed=seed,
-            chains=cores,
+            chains=4,
             resume="all",
             quick_diagnostics=False,
             debug_sampler_diagnostics=True,
@@ -153,10 +155,11 @@ def _solver_template(*, production: bool, seed: int, critical_arc_anisotropic_co
             svi_learning_rate=0.0005,
         ),
         likelihood=LikelihoodConfig(
+            pos_sigma_arcsec=0.05,
             critical_arc_anisotropic_covariance=critical_arc_anisotropic_covariance,
         ),
         image_diagnostics=ImageDiagnosticsConfig(
-            posterior_image_diagnostic_draws=8,
+            posterior_image_diagnostic_draws=64,
             posterior_image_diagnostic_mode="exact",
             exact_image_finder="local-lm-adaptive",
             exact_image_min_distance_arcsec=0.5,
@@ -164,7 +167,7 @@ def _solver_template(*, production: bool, seed: int, critical_arc_anisotropic_co
             exact_image_num_iter_max=100,
             exact_image_displacement_tol_arcsec=1.0e-4,
             exact_image_identification_tol_arcsec=1.0e-3,
-            match_tolerance_arcsec=2.0,
+            match_tolerance_arcsec=3.0,
         ),
         truth=TruthRecoveryConfig(
             posterior_truth_recovery_draws=64,
@@ -174,7 +177,7 @@ def _solver_template(*, production: bool, seed: int, critical_arc_anisotropic_co
             perturbation_discovery_alpha_tol_arcsec=0.001,
             perturbation_discovery_jacobian_tol=0.001,
             perturbation_discovery_jacobian_weight=1.0,
-            perturbation_discovery_top_k=5,
+            perturbation_discovery_top_k=20,
         ),
         scaling=ScalingModelConfig(
             scaling_scatter=True,
@@ -194,13 +197,27 @@ def build_config(
     mock = SingleBCGMockConfig(
         seed=seed,
         n_primary_families=25 if production else 5,
-        n_subhalo_families=50 if production else 0,
-        n_subhalos=50 if production else 0,
+        n_subhalo_families=5 if production else 0,
+        n_subhalos=100 if production else 0,
+        subhalo_spatial_distribution="dpie",
+        subhalo_spatial_core_radius_arcsec=25.0,
+        subhalo_spatial_cut_radius_arcsec=180.0,
+        subhalo_field_radius_arcsec=250.0,
+        subhalo_force_core_count=0,
         min_images_per_family=3,
         max_images_per_family=None,
-        primary_source_redshifts=(1.5, 2.0, 3.0),
-        subhalo_source_redshifts=(1.5, 2.0, 3.0),
-        pos_sigma_arcsec=0.1,
+        primary_source_redshifts=np.linspace(1.5, 9.0, 25) if production else np.linspace(1.5, 9.0, 3),
+        subhalo_source_redshifts=np.linspace(1.5, 9.0, 5) if production else np.linspace(1.5, 9.0, 3),
+        pos_sigma_arcsec=0.0,
+        mock_caustic_grid_chunk_memory_gb=mock_caustic_grid_chunk_memory_gb,
+        # Production caustics and image finding are the expensive generation
+        # step; denser seeds avoid high-redshift family failures with 0 images.
+        mock_image_candidate_batch_size=1024 if production else 256,
+        mock_image_seed_cap=64 if production else 32,
+        mock_image_search_window_arcsec=80.0 if production else 80.0,
+        primary_image_min_distance_arcsec=2.0 if production else 3.0,
+        max_sources_to_try=400,
+        mock_generation_workers=min(cores, 16) if production else 1,
     )
     return MockValidationConfig(
         mock=mock,
@@ -241,8 +258,15 @@ print(
     f"[config] preset={preset} seed={seed} "
     f"covariance={covariance_mode} "
     f"critical_arc_anisotropic_covariance={config.solver.template.likelihood.critical_arc_anisotropic_covariance} "
+    f"mock_caustic_grid_chunk_memory_gb={config.mock.mock_caustic_grid_chunk_memory_gb} "
+    f"mock_generation_workers={config.mock.mock_generation_workers} "
+    f"mock_image_candidate_batch_size={config.mock.mock_image_candidate_batch_size} "
+    f"mock_image_seed_cap={config.mock.mock_image_seed_cap} "
+    f"mock_image_search_window_arcsec={config.mock.mock_image_search_window_arcsec} "
+    f"primary_image_min_distance_arcsec={config.mock.primary_image_min_distance_arcsec} "
+    f"max_sources_to_try={config.mock.max_sources_to_try} "
     f"output_dir={config.paths.output_dir} campaign={config.paths.campaign_name} "
-    f"run_name={config.paths.run_name} variant={config.paths.variant_name} chains={cores}"
+    f"run_name={config.paths.run_name} variant={config.paths.variant_name} chains=4"
 )
 
 start = time.monotonic()

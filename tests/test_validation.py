@@ -28,7 +28,7 @@ import lenscluster.planning as planning
 import lenscluster.plotting as plotting
 import lenscluster.mock_validation as mock_validation_api
 import lenscluster.mock_validation.runner as validation
-from lenscluster.config import ImageDiagnosticsConfig, LensClusterSolverConfig, RuntimeConfig, StageScheduleConfig, TruthRecoveryConfig, WorkflowConfig
+from lenscluster.config import ImageDiagnosticsConfig, LensClusterSolverConfig, LikelihoodConfig, RuntimeConfig, StageScheduleConfig, TruthRecoveryConfig, WorkflowConfig
 from lenscluster.planning import SolverRuntime
 from lenscluster.jax_cosmology import (
     ARCSEC_TO_RAD,
@@ -262,7 +262,14 @@ def test_stage_banner_title_falls_back_to_run_name() -> None:
 
 
 def test_generate_single_bcg_mock_parses_and_has_finite_magnifications(tmp_path: Path) -> None:
-    config = SingleBCGMockConfig(seed=7, n_primary_families=2, pos_sigma_arcsec=0.0)
+    config = SingleBCGMockConfig(
+        seed=7,
+        n_primary_families=2,
+        pos_sigma_arcsec=0.0,
+        caustic_compute_window_arcsec=40.0,
+        caustic_grid_scale_arcsec=2.0,
+        mock_image_candidate_batch_size=8,
+    )
 
     paths, images, truth = generate_single_bcg_mock(tmp_path, config)
     _parsed, _potentials_df, images_df, _arcs_df, potentials_with_priors = load_best_par(paths.par_path)
@@ -341,6 +348,9 @@ def test_generate_single_bcg_mock_respects_max_images_per_family(tmp_path: Path)
         min_images_per_family=2,
         max_images_per_family=3,
         pos_sigma_arcsec=0.0,
+        caustic_compute_window_arcsec=40.0,
+        caustic_grid_scale_arcsec=2.0,
+        mock_image_candidate_batch_size=8,
     )
 
     _paths, images, truth = generate_single_bcg_mock(tmp_path, config)
@@ -357,77 +367,51 @@ def test_generate_single_bcg_mock_respects_max_images_per_family(tmp_path: Path)
     assert restored_config.max_images_per_family == config.max_images_per_family
 
 
-def test_caustic_config_from_truth_restores_mock_image_min_distances() -> None:
+def test_caustic_config_from_truth_restores_mock_image_grid_settings() -> None:
     restored_config = validation._caustic_config_from_truth(
         {
             "config": {
                 "primary_image_min_distance_arcsec": 2.5,
                 "subhalo_image_min_distance_arcsec": 0.75,
+                "mock_image_search_window_arcsec": 123.0,
             }
         }
     )
 
     assert restored_config.primary_image_min_distance_arcsec == pytest.approx(2.5)
     assert restored_config.subhalo_image_min_distance_arcsec == pytest.approx(0.75)
+    assert restored_config.mock_image_search_window_arcsec == pytest.approx(123.0)
 
 
-def test_generate_single_bcg_mock_emits_progress_events(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    captured_min_distances: list[float] = []
 
-    class FakeModel:
-        def magnification(self, x, _y, _kwargs_lens):
-            return np.ones_like(np.asarray(x, dtype=float))
-
-    class FakeSolver:
-        def __init__(self, _model) -> None:
-            pass
-
-        def image_position_from_source(self, _source_x, _source_y, _kwargs_lens, **kwargs):
-            captured_min_distances.append(float(kwargs["min_distance"]))
-            return np.asarray([0.0, 1.0, 2.0], dtype=float), np.asarray([0.0, 0.1, 0.0], dtype=float)
-
-    contour = mock_generation.CausticContour(
-        caustic_index=0,
-        caustic_class="primary",
-        beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
-        beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
-        critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
-        critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
-        caustic_area_arcsec2=0.01,
-        critical_area_arcsec2=1.0,
-    )
-
-    monkeypatch.setattr(
-        mock_generation,
-        "_mock_model_and_kwargs",
-        lambda _config, _subhalo_components, _z_source, _cosmo, _cosmo_config: (FakeModel(), []),
-    )
-    monkeypatch.setattr(mock_generation, "LensEquationSolver", FakeSolver)
-    monkeypatch.setattr(
-        mock_generation,
-        "_compute_tangential_caustic_contours",
-        lambda _model, _kwargs_lens, _config: [contour],
-    )
-    monkeypatch.setattr(
-        mock_generation,
-        "_sample_caustic_source_candidate",
-        lambda contours, _caustic_class, _rng, *, inside_caustic=True: (0.01, 0.02, contours[0]),
-    )
-    events: list[tuple[str, dict[str, Any]]] = []
-
-    config = SingleBCGMockConfig(
+def _jax_mock_test_config(**updates: Any) -> SingleBCGMockConfig:
+    values = dict(
         seed=7,
         n_primary_families=1,
-        source_redshift=2.0,
+        n_subhalo_families=0,
         primary_source_redshifts=(2.0,),
-        pos_sigma_arcsec=0.0,
+        subhalo_source_redshifts=(2.0,),
         n_subhalos=0,
+        pos_sigma_arcsec=0.0,
+        max_sources_to_try=60,
+        mock_image_candidate_batch_size=8,
+        mock_image_seed_cap=16,
+        caustic_compute_window_arcsec=40.0,
+        caustic_grid_scale_arcsec=2.0,
     )
+    values.update(updates)
+    return SingleBCGMockConfig(**values)
 
-    generate_single_bcg_mock(tmp_path, config, progress_callback=lambda event, payload: events.append((event, payload)))
+
+def test_generate_single_bcg_mock_emits_progress_events(tmp_path: Path) -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    config = _jax_mock_test_config()
+
+    _paths, images, truth = generate_single_bcg_mock(
+        tmp_path,
+        config,
+        progress_callback=lambda event, payload: events.append((event, payload)),
+    )
 
     event_names = [event for event, _payload in events]
     assert event_names[:2] == ["subhalos_start", "subhalos_complete"]
@@ -436,483 +420,201 @@ def test_generate_single_bcg_mock_emits_progress_events(
     assert "family_attempt" in event_names
     assert "family_accept" in event_names
     assert event_names[-1] == "outputs_complete"
-    assert next(payload for event, payload in events if event == "redshift_complete")["caustic_count"] == 1
     accepted_payload = next(payload for event, payload in events if event == "family_accept")
     assert accepted_payload["family_index"] == 1
-    assert accepted_payload["image_count"] == 3
-    assert accepted_payload["image_min_distance_arcsec"] == pytest.approx(
-        mock_generation.DEFAULT_PRIMARY_IMAGE_MIN_DISTANCE_ARCSEC
-    )
-    assert captured_min_distances == [pytest.approx(mock_generation.DEFAULT_PRIMARY_IMAGE_MIN_DISTANCE_ARCSEC)]
+    assert accepted_payload["image_count"] >= config.min_images_per_family
+    assert accepted_payload["image_candidate_batch_size"] == config.mock_image_candidate_batch_size
+    assert accepted_payload["mock_image_seed_cap"] == config.mock_image_seed_cap
+    assert accepted_payload["mock_image_search_window_arcsec"] == pytest.approx(config.mock_image_search_window_arcsec)
+    queue_payload = next(payload for event, payload in events if event == "family_queue_start")
+    assert queue_payload["image_solver_workers"] == min(config.mock_generation_workers, config.n_families)
+    mapped_grid_payload = next(payload for event, payload in events if event == "mapped_grid_complete")
+    assert mapped_grid_payload["mock_image_search_window_arcsec"] == pytest.approx(config.mock_image_search_window_arcsec)
+    redshift_payload = next(payload for event, payload in events if event == "redshift_start")
+    assert redshift_payload["caustic_grid_chunk_memory_gb"] == pytest.approx(config.mock_caustic_grid_chunk_memory_gb)
+    assert redshift_payload["caustic_grid_chunk_points"] > 0
+    assert redshift_payload["caustic_grid_chunk_count"] > 0
+    assert images["family_id"].nunique() == 1
+    assert truth["sources"][0]["n_images"] == len(images)
 
 
-def test_generate_single_bcg_mock_uses_family_class_image_min_distances(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    captured_min_distances: list[tuple[float, float]] = []
-
-    class FakeModel:
-        def magnification(self, x, _y, _kwargs_lens):
-            return np.ones_like(np.asarray(x, dtype=float))
-
-    class FakeSolver:
-        def __init__(self, _model) -> None:
-            pass
-
-        def image_position_from_source(self, source_x, _source_y, _kwargs_lens, **kwargs):
-            captured_min_distances.append((float(source_x), float(kwargs["min_distance"])))
-            return np.asarray([0.0, 1.0, 2.0], dtype=float), np.asarray([0.0, 0.1, 0.0], dtype=float)
-
-    primary_contour = mock_generation.CausticContour(
-        caustic_index=0,
-        caustic_class="primary",
-        beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
-        beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
-        critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
-        critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
-        caustic_area_arcsec2=0.02,
-        critical_area_arcsec2=1.0,
-    )
-    subhalo_contour = mock_generation.CausticContour(
-        caustic_index=1,
-        caustic_class="subhalo",
-        beta_x=np.asarray([0.2, 0.3, 0.2, 0.2], dtype=float),
-        beta_y=np.asarray([0.2, 0.2, 0.3, 0.2], dtype=float),
-        critical_x=np.asarray([2.0, 3.0, 2.0, 2.0], dtype=float),
-        critical_y=np.asarray([2.0, 2.0, 3.0, 2.0], dtype=float),
-        caustic_area_arcsec2=0.01,
-        critical_area_arcsec2=0.5,
+def test_mock_family_source_redshifts_excludes_unused_default_source_redshift() -> None:
+    config = _jax_mock_test_config(
+        source_redshift=7.0,
+        n_primary_families=2,
+        n_subhalo_families=0,
+        primary_source_redshifts=(2.0, 3.0),
     )
 
-    monkeypatch.setattr(
-        mock_generation,
-        "_mock_model_and_kwargs",
-        lambda _config, _subhalo_components, _z_source, _cosmo, _cosmo_config: (FakeModel(), []),
-    )
-    monkeypatch.setattr(mock_generation, "LensEquationSolver", FakeSolver)
-    monkeypatch.setattr(
-        mock_generation,
-        "_compute_tangential_caustic_contours",
-        lambda _model, _kwargs_lens, _config: [primary_contour, subhalo_contour],
+    _primary_family_redshifts, _subhalo_family_redshifts, needed = mock_generation._mock_family_source_redshifts(config)
+
+    assert needed == (2.0, 3.0)
+
+
+def test_generate_single_bcg_mock_worker_count_is_deterministic(tmp_path: Path) -> None:
+    base = _jax_mock_test_config(
+        seed=19,
+        n_primary_families=2,
+        primary_source_redshifts=(2.0, 3.0),
+        max_sources_to_try=80,
     )
 
-    def sample_candidate(contours, caustic_class, _rng, *, inside_caustic=True):
-        del inside_caustic
-        contour = next(contour for contour in contours if contour.caustic_class == caustic_class)
-        beta_x = 0.01 if caustic_class == "primary" else 0.02
-        return beta_x, 0.03, contour
+    _paths_one, images_one, truth_one = generate_single_bcg_mock(
+        tmp_path / "workers1",
+        replace(base, mock_generation_workers=1),
+    )
+    _paths_two, images_two, truth_two = generate_single_bcg_mock(
+        tmp_path / "workers2",
+        replace(base, mock_generation_workers=2),
+    )
 
-    monkeypatch.setattr(mock_generation, "_sample_caustic_source_candidate", sample_candidate)
-    config = SingleBCGMockConfig(
-        seed=7,
+    pd.testing.assert_frame_equal(images_one.reset_index(drop=True), images_two.reset_index(drop=True))
+    assert truth_one["sources"] == truth_two["sources"]
+    assert truth_one["caustics_by_source_redshift"] == truth_two["caustics_by_source_redshift"]
+
+
+def test_jax_lensing_tiled_alpha_hessian_matches_canonical_helper() -> None:
+    lens_state = mock_generation.jax_lensing.static_lens_state_from_kwargs(
+        [mock_generation.ORIGINAL_DPIE_PROFILE_NAME, mock_generation.ORIGINAL_DPIE_PROFILE_NAME],
+        [
+            {
+                "sigma0": 2.3,
+                "Ra": 0.2,
+                "Rs": 8.0,
+                "e1": 0.05,
+                "e2": -0.02,
+                "center_x": 0.1,
+                "center_y": -0.2,
+            },
+            {
+                "sigma0": 0.8,
+                "Ra": 0.1,
+                "Rs": 4.0,
+                "e1": -0.03,
+                "e2": 0.04,
+                "center_x": -0.5,
+                "center_y": 0.3,
+            },
+        ],
+    )
+    x = jnp.asarray(np.linspace(-2.0, 2.0, 11), dtype=jnp.float64)
+    y = jnp.asarray(np.linspace(1.5, -1.5, 11), dtype=jnp.float64)
+
+    expected = mock_generation.jax_lensing.alpha_and_hessian(x, y, lens_state)
+    actual = mock_generation.jax_lensing.alpha_and_hessian_tiled(x, y, lens_state, chunk_size=4)
+
+    for expected_values, actual_values in zip(expected, actual):
+        np.testing.assert_allclose(np.asarray(actual_values), np.asarray(expected_values), rtol=1.0e-10, atol=1.0e-10)
+
+
+def test_compute_tangential_caustics_stable_across_memory_budgets() -> None:
+    base = _jax_mock_test_config(
+        caustic_compute_window_arcsec=40.0,
+        caustic_grid_scale_arcsec=2.0,
+    )
+    cosmo_config = mock_generation.flat_wcdm_config(h0=70.0, om0=0.3)
+    lens_state = mock_generation._mock_static_lens_state(base, [], 2.0, cosmo_config)
+    small_chunks = replace(base, mock_caustic_grid_chunk_memory_gb=1.0e-5)
+    large_chunks = replace(base, mock_caustic_grid_chunk_memory_gb=0.01)
+
+    small_contours = mock_generation._compute_tangential_caustic_contours(lens_state, small_chunks)
+    large_contours = mock_generation._compute_tangential_caustic_contours(lens_state, large_chunks)
+
+    assert len(small_contours) == len(large_contours)
+    np.testing.assert_allclose(
+        [contour.caustic_area_arcsec2 for contour in small_contours],
+        [contour.caustic_area_arcsec2 for contour in large_contours],
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+
+
+def test_generate_single_bcg_mock_uses_family_class_image_min_distances(tmp_path: Path) -> None:
+    config = _jax_mock_test_config(
+        seed=11,
         n_primary_families=1,
         n_subhalo_families=1,
+        n_subhalos=8,
         primary_source_redshifts=(2.0,),
-        subhalo_source_redshifts=(5.0,),
+        subhalo_source_redshifts=(2.0,),
         primary_image_min_distance_arcsec=2.5,
         subhalo_image_min_distance_arcsec=0.75,
-        pos_sigma_arcsec=0.0,
+        mock_image_search_window_arcsec=90.0,
+        max_sources_to_try=100,
+        caustic_compute_window_arcsec=60.0,
+        caustic_grid_scale_arcsec=2.0,
     )
 
-    _paths, _images, truth = generate_single_bcg_mock(tmp_path, config)
+    _paths, images, truth = generate_single_bcg_mock(tmp_path, config)
 
-    distances_by_source_x = {round(source_x, 2): min_distance for source_x, min_distance in captured_min_distances}
-    assert distances_by_source_x[0.01] == pytest.approx(2.5)
-    assert distances_by_source_x[0.02] == pytest.approx(0.75)
+    family_sizes = images.groupby("family_id").size().to_dict()
+    assert family_sizes == {source["family_id"]: source["n_images"] for source in truth["sources"]}
     assert truth["config"]["primary_image_min_distance_arcsec"] == pytest.approx(2.5)
     assert truth["config"]["subhalo_image_min_distance_arcsec"] == pytest.approx(0.75)
+    assert truth["config"]["mock_image_search_window_arcsec"] == pytest.approx(90.0)
+    assert {source["caustic_class"] for source in truth["sources"]} == {"primary", "subhalo"}
 
 
-def test_generate_single_bcg_mock_caps_workers_and_accepts_first_valid_attempt(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    class FakeModel:
-        def magnification(self, x, _y, _kwargs_lens):
-            return np.ones_like(np.asarray(x, dtype=float))
+def test_generate_single_bcg_mock_batch_size_does_not_change_seeded_output(tmp_path: Path) -> None:
+    base = _jax_mock_test_config(seed=17, n_primary_families=2, primary_source_redshifts=(2.0, 3.0), max_sources_to_try=80)
+    small_batch = replace(base, mock_image_candidate_batch_size=4)
+    large_batch = replace(base, mock_image_candidate_batch_size=16)
 
-    class FakeSolver:
-        def __init__(self, _model) -> None:
-            pass
-
-        def image_position_from_source(self, source_x, _source_y, _kwargs_lens, **_kwargs):
-            image_count_by_source = {0.01: 2, 0.02: 4, 0.03: 3, 0.04: 3}
-            n_images = image_count_by_source[round(float(source_x), 2)]
-            return np.arange(n_images, dtype=float), np.zeros(n_images, dtype=float)
-
-    executor_worker_counts: list[int] = []
-    submitted_sources: list[float] = []
-
-    class InlineExecutor:
-        def __init__(self, *, max_workers: int) -> None:
-            executor_worker_counts.append(int(max_workers))
-
-        def __enter__(self) -> "InlineExecutor":
-            return self
-
-        def __exit__(self, *_exc: Any) -> bool:
-            return False
-
-        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
-            pass
-
-        def submit(
-            self,
-            fn: Any,
-            z_source: float,
-            attempt_index: int,
-            beta_x: float,
-            beta_y: float,
-            contour: Any,
-            image_min_distance_arcsec: float,
-        ) -> Future[Any]:
-            submitted_sources.append(float(beta_x))
-            future: Future[Any] = Future()
-            try:
-                future.set_result(fn(z_source, attempt_index, beta_x, beta_y, contour, image_min_distance_arcsec))
-            except BaseException as exc:
-                future.set_exception(exc)
-            return future
-
-    contour = mock_generation.CausticContour(
-        caustic_index=0,
-        caustic_class="primary",
-        beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
-        beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
-        critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
-        critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
-        caustic_area_arcsec2=0.01,
-        critical_area_arcsec2=1.0,
-    )
-    candidates = iter((0.01, 0.02, 0.03, 0.04))
-
-    monkeypatch.setattr(mock_generation, "jax_cpu_worker_count", lambda: 3)
-    monkeypatch.setattr(mock_generation, "ThreadPoolExecutor", InlineExecutor)
-    monkeypatch.setattr(
-        mock_generation,
-        "_mock_model_and_kwargs",
-        lambda _config, _subhalo_components, _z_source, _cosmo, _cosmo_config: (FakeModel(), []),
-    )
-    monkeypatch.setattr(mock_generation, "LensEquationSolver", FakeSolver)
-    monkeypatch.setattr(
-        mock_generation,
-        "_compute_tangential_caustic_contours",
-        lambda _model, _kwargs_lens, _config: [contour],
-    )
-    monkeypatch.setattr(
-        mock_generation,
-        "_sample_caustic_source_candidate",
-        lambda contours, _caustic_class, _rng, *, inside_caustic=True: (next(candidates), 0.02, contours[0]),
-    )
-
-    config = SingleBCGMockConfig(
-        seed=7,
-        n_primary_families=1,
-        primary_source_redshifts=(2.0,),
-        pos_sigma_arcsec=0.0,
-        max_sources_to_try=4,
-    )
-
-    _paths, _images, truth = generate_single_bcg_mock(tmp_path, config)
-
-    assert executor_worker_counts == [1]
-    assert submitted_sources == [0.01, 0.02]
-    assert truth["sources"][0]["beta_x"] == pytest.approx(0.02)
-    assert truth["sources"][0]["n_images"] == 4
-
-
-def test_generate_single_bcg_mock_queues_first_attempts_across_families(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    class FakeModel:
-        def __init__(self, z_source: float) -> None:
-            self.z_source = float(z_source)
-
-        def magnification(self, x, _y, _kwargs_lens):
-            return np.ones_like(np.asarray(x, dtype=float))
-
-    class FakeSolver:
-        def __init__(self, _model) -> None:
-            pass
-
-        def image_position_from_source(self, source_x, _source_y, _kwargs_lens, **_kwargs):
-            marker = int(float(source_x))
-            attempt = int(round((float(source_x) - marker) * 100.0))
-            n_images = 2 if marker == 20 and attempt == 1 else 3
-            return np.arange(n_images, dtype=float), np.zeros(n_images, dtype=float)
-
-    executor_worker_counts: list[int] = []
-    submitted: list[tuple[float, int]] = []
-
-    class InlineExecutor:
-        def __init__(self, *, max_workers: int) -> None:
-            executor_worker_counts.append(int(max_workers))
-
-        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
-            pass
-
-        def submit(
-            self,
-            fn: Any,
-            z_source: float,
-            attempt_index: int,
-            beta_x: float,
-            beta_y: float,
-            contour: Any,
-            image_min_distance_arcsec: float,
-        ) -> Future[Any]:
-            submitted.append((float(z_source), int(attempt_index)))
-            future: Future[Any] = Future()
-            try:
-                future.set_result(fn(z_source, attempt_index, beta_x, beta_y, contour, image_min_distance_arcsec))
-            except BaseException as exc:
-                future.set_exception(exc)
-            return future
-
-    def fake_model_and_kwargs(_config, _subhalo_components, z_source, _cosmo, _cosmo_config):
-        return FakeModel(float(z_source)), []
-
-    def fake_contours(model, _kwargs_lens, _config):
-        marker = int(round(float(model.z_source) * 10.0))
-        return [
-            mock_generation.CausticContour(
-                caustic_index=marker,
-                caustic_class="primary",
-                beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
-                beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
-                critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
-                critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
-                caustic_area_arcsec2=0.01,
-                critical_area_arcsec2=1.0,
-            )
-        ]
-
-    attempt_by_marker: dict[int, int] = {}
-
-    def fake_sample(contours, _caustic_class, _rng, *, inside_caustic=True):
-        marker = int(contours[0].caustic_index)
-        attempt_by_marker[marker] = attempt_by_marker.get(marker, 0) + 1
-        return float(marker) + 0.01 * attempt_by_marker[marker], 0.02, contours[0]
-
-    monkeypatch.setattr(mock_generation, "jax_cpu_worker_count", lambda: 2)
-    monkeypatch.setattr(mock_generation, "ThreadPoolExecutor", InlineExecutor)
-    monkeypatch.setattr(mock_generation, "_mock_model_and_kwargs", fake_model_and_kwargs)
-    monkeypatch.setattr(mock_generation, "LensEquationSolver", FakeSolver)
-    monkeypatch.setattr(mock_generation, "_compute_tangential_caustic_contours", fake_contours)
-    monkeypatch.setattr(mock_generation, "_sample_caustic_source_candidate", fake_sample)
-
-    config = SingleBCGMockConfig(
-        seed=7,
-        n_primary_families=3,
-        primary_source_redshifts=(2.0, 3.0, 4.0),
-        pos_sigma_arcsec=0.0,
-        n_subhalos=0,
-        max_sources_to_try=2,
-    )
-
-    _paths, _images, truth = generate_single_bcg_mock(tmp_path, config)
-
-    assert executor_worker_counts == [2]
-    assert submitted == [(2.0, 1), (3.0, 1), (4.0, 1), (2.0, 2)]
-    assert [source["family_id"] for source in truth["sources"]] == ["1", "2", "3"]
-    assert [source["n_images"] for source in truth["sources"]] == [3, 3, 3]
-
-
-def test_generate_single_bcg_mock_queue_is_deterministic(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    class FakeModel:
-        def magnification(self, x, _y, _kwargs_lens):
-            return np.ones_like(np.asarray(x, dtype=float))
-
-    class FakeSolver:
-        def __init__(self, _model) -> None:
-            pass
-
-        def image_position_from_source(self, _source_x, _source_y, _kwargs_lens, **_kwargs):
-            return np.asarray([0.0, 1.0, 2.0], dtype=float), np.asarray([0.0, 0.1, 0.0], dtype=float)
-
-    contour = mock_generation.CausticContour(
-        caustic_index=0,
-        caustic_class="primary",
-        beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
-        beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
-        critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
-        critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
-        caustic_area_arcsec2=0.01,
-        critical_area_arcsec2=1.0,
-    )
-
-    monkeypatch.setattr(mock_generation, "jax_cpu_worker_count", lambda: 3)
-    monkeypatch.setattr(
-        mock_generation,
-        "_mock_model_and_kwargs",
-        lambda _config, _subhalo_components, _z_source, _cosmo, _cosmo_config: (FakeModel(), []),
-    )
-    monkeypatch.setattr(mock_generation, "LensEquationSolver", FakeSolver)
-    monkeypatch.setattr(
-        mock_generation,
-        "_compute_tangential_caustic_contours",
-        lambda _model, _kwargs_lens, _config: [contour],
-    )
-    monkeypatch.setattr(
-        mock_generation,
-        "_sample_caustic_source_candidate",
-        lambda contours, _caustic_class, rng, *, inside_caustic=True: (
-            float(rng.uniform(-0.1, 0.1)),
-            float(rng.uniform(-0.1, 0.1)),
-            contours[0],
-        ),
-    )
-
-    config = SingleBCGMockConfig(
-        seed=17,
-        n_primary_families=4,
-        primary_source_redshifts=(2.0, 3.0),
-        pos_sigma_arcsec=0.05,
-        n_subhalos=0,
-    )
-
-    _paths_a, images_a, truth_a = generate_single_bcg_mock(tmp_path / "a", config)
-    _paths_b, images_b, truth_b = generate_single_bcg_mock(tmp_path / "b", config)
+    _paths_a, images_a, truth_a = generate_single_bcg_mock(tmp_path / "a", small_batch)
+    _paths_b, images_b, truth_b = generate_single_bcg_mock(tmp_path / "b", large_batch)
 
     assert images_a.to_dict("records") == images_b.to_dict("records")
     assert truth_a["sources"] == truth_b["sources"]
     assert truth_a["images"] == truth_b["images"]
 
 
-def test_generate_single_bcg_mock_queue_raises_when_family_exhausts_attempts(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    class FakeModel:
-        def magnification(self, x, _y, _kwargs_lens):
-            return np.ones_like(np.asarray(x, dtype=float))
+def test_generate_single_bcg_mock_refined_images_ray_shoot_to_source(tmp_path: Path) -> None:
+    config = _jax_mock_test_config(mock_image_precision_limit=1.0e-7)
+    _paths, images, truth = generate_single_bcg_mock(tmp_path, config)
+    cosmo_config = mock_generation.flat_wcdm_config(h0=70.0, om0=0.3)
+    lens_state = mock_generation._mock_static_lens_state(config, [], 2.0, cosmo_config)
 
-    class FakeSolver:
-        def __init__(self, _model) -> None:
-            pass
+    beta_x, beta_y = mock_generation.jax_lensing.ray_shooting(
+        mock_generation.jnp.asarray(images["x_true_arcsec"].to_numpy(dtype=float), dtype=mock_generation.jnp.float64),
+        mock_generation.jnp.asarray(images["y_true_arcsec"].to_numpy(dtype=float), dtype=mock_generation.jnp.float64),
+        lens_state,
+    )
+    source = truth["sources"][0]
+    residual = np.hypot(np.asarray(beta_x) - source["beta_x"], np.asarray(beta_y) - source["beta_y"])
+    assert float(np.max(residual)) <= 5.0 * config.mock_image_precision_limit
 
-        def image_position_from_source(self, _source_x, _source_y, _kwargs_lens, **_kwargs):
-            return np.asarray([0.0, 1.0], dtype=float), np.asarray([0.0, 0.1], dtype=float)
 
-    contour = mock_generation.CausticContour(
-        caustic_index=0,
-        caustic_class="primary",
-        beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
-        beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
-        critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
-        critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
-        caustic_area_arcsec2=0.01,
-        critical_area_arcsec2=1.0,
+def test_generate_single_bcg_mock_with_subhalos_current_truth_schema(tmp_path: Path) -> None:
+    config = _jax_mock_test_config(
+        n_subhalos=6,
+        n_primary_families=1,
+        max_sources_to_try=80,
+        caustic_compute_window_arcsec=60.0,
+        caustic_grid_scale_arcsec=2.0,
     )
 
-    monkeypatch.setattr(mock_generation, "jax_cpu_worker_count", lambda: 2)
-    monkeypatch.setattr(
-        mock_generation,
-        "_mock_model_and_kwargs",
-        lambda _config, _subhalo_components, _z_source, _cosmo, _cosmo_config: (FakeModel(), []),
-    )
-    monkeypatch.setattr(mock_generation, "LensEquationSolver", FakeSolver)
-    monkeypatch.setattr(
-        mock_generation,
-        "_compute_tangential_caustic_contours",
-        lambda _model, _kwargs_lens, _config: [contour],
-    )
-    monkeypatch.setattr(
-        mock_generation,
-        "_sample_caustic_source_candidate",
-        lambda contours, _caustic_class, rng, *, inside_caustic=True: (
-            float(rng.uniform(-0.1, 0.1)),
-            float(rng.uniform(-0.1, 0.1)),
-            contours[0],
-        ),
-    )
-    config = SingleBCGMockConfig(
-        seed=19,
-        n_primary_families=2,
-        primary_source_redshifts=(2.0,),
-        n_subhalos=0,
-        max_sources_to_try=2,
-    )
+    _paths, _images, truth = generate_single_bcg_mock(tmp_path, config)
+
+    components = truth["lens_components"]
+    assert [component["component_role"] for component in components[:2]] == ["halo", "bcg"]
+    assert sum(component["component_role"] == "subhalo" for component in components) == len(truth["subhalos"])
+    assert all(component["profile_name"] == mock_generation.ORIGINAL_DPIE_PROFILE_NAME for component in components)
+
+
+def test_generate_single_bcg_mock_raises_when_family_exhausts_attempts(tmp_path: Path) -> None:
+    config = _jax_mock_test_config(max_sources_to_try=1, min_images_per_family=5, mock_generation_workers=2)
 
     with pytest.raises(RuntimeError, match="Failed to generate a primary source"):
         generate_single_bcg_mock(tmp_path, config)
 
 
-def test_generate_single_bcg_mock_cycles_primary_and_subhalo_redshifts_independently(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    class FakeModel:
-        def magnification(self, x, _y, _kwargs_lens):
-            return np.ones_like(np.asarray(x, dtype=float))
-
-    class FakeSolver:
-        def __init__(self, _model) -> None:
-            pass
-
-        def image_position_from_source(self, _source_x, _source_y, _kwargs_lens, **_kwargs):
-            return np.asarray([0.0, 1.0, 2.0], dtype=float), np.asarray([0.0, 0.1, 0.0], dtype=float)
-
-    primary_contour = mock_generation.CausticContour(
-        caustic_index=0,
-        caustic_class="primary",
-        beta_x=np.asarray([0.0, 0.1, 0.0, 0.0], dtype=float),
-        beta_y=np.asarray([0.0, 0.0, 0.1, 0.0], dtype=float),
-        critical_x=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=float),
-        critical_y=np.asarray([0.0, 0.0, 1.0, 0.0], dtype=float),
-        caustic_area_arcsec2=0.02,
-        critical_area_arcsec2=1.0,
-    )
-    subhalo_contour = mock_generation.CausticContour(
-        caustic_index=1,
-        caustic_class="subhalo",
-        beta_x=np.asarray([0.2, 0.3, 0.2, 0.2], dtype=float),
-        beta_y=np.asarray([0.2, 0.2, 0.3, 0.2], dtype=float),
-        critical_x=np.asarray([2.0, 3.0, 2.0, 2.0], dtype=float),
-        critical_y=np.asarray([2.0, 2.0, 3.0, 2.0], dtype=float),
-        caustic_area_arcsec2=0.01,
-        critical_area_arcsec2=0.5,
-    )
-
-    monkeypatch.setattr(
-        mock_generation,
-        "_mock_model_and_kwargs",
-        lambda _config, _subhalo_components, _z_source, _cosmo, _cosmo_config: (FakeModel(), []),
-    )
-    monkeypatch.setattr(mock_generation, "LensEquationSolver", FakeSolver)
-    monkeypatch.setattr(
-        mock_generation,
-        "_compute_tangential_caustic_contours",
-        lambda _model, _kwargs_lens, _config: [primary_contour, subhalo_contour],
-    )
-
-    def sample_candidate(contours, caustic_class, _rng, *, inside_caustic=True):
-        contour = next(contour for contour in contours if contour.caustic_class == caustic_class)
-        return 0.01, 0.02, contour
-
-    monkeypatch.setattr(mock_generation, "_sample_caustic_source_candidate", sample_candidate)
-    config = SingleBCGMockConfig(
-        seed=7,
-        n_primary_families=3,
-        n_subhalo_families=2,
-        primary_source_redshifts=(2.0, 3.0),
-        subhalo_source_redshifts=(5.0,),
-        pos_sigma_arcsec=0.0,
-    )
-
-    _paths, images, truth = generate_single_bcg_mock(tmp_path, config)
-
-    primary_sources = [source for source in truth["sources"] if source["caustic_class"] == "primary"]
-    subhalo_sources = [source for source in truth["sources"] if source["caustic_class"] == "subhalo"]
-    assert [source["z_source"] for source in primary_sources] == [2.0, 3.0, 2.0]
-    assert [source["z_source"] for source in subhalo_sources] == [5.0, 5.0]
-    assert images["family_id"].nunique() == 5
-    assert sorted(truth["caustics_by_source_redshift"]) == ["2.00000000", "3.00000000", "5.00000000"]
+def test_mock_generation_has_no_lenstronomy_image_solver_surface() -> None:
+    source_text = Path(mock_generation.__file__).read_text(encoding="utf-8")
+    assert not hasattr(mock_generation, "LensEquationSolver")
+    assert not hasattr(mock_generation, "LensModel")
+    assert not hasattr(SingleBCGMockConfig, "image_generation_backend")
+    assert "image_position_from_source" not in source_text
+    assert "DPIENIE" not in source_text
 
 
 def test_load_best_par_defaults_missing_potfile_slopes_to_four(tmp_path: Path) -> None:
@@ -2314,7 +2016,15 @@ def test_multi_cluster_solver_parses_fov_limit_args() -> None:
 
 
 def test_generate_single_bcg_mock_with_subhalos_uses_potfile(tmp_path: Path) -> None:
-    config = SingleBCGMockConfig(seed=11, n_primary_families=1, n_subhalos=8, pos_sigma_arcsec=0.0)
+    config = SingleBCGMockConfig(
+        seed=11,
+        n_primary_families=1,
+        n_subhalos=8,
+        pos_sigma_arcsec=0.0,
+        caustic_compute_window_arcsec=60.0,
+        caustic_grid_scale_arcsec=2.0,
+        mock_image_candidate_batch_size=8,
+    )
 
     paths, images, truth = generate_single_bcg_mock(tmp_path, config)
     parsed, _potentials_df, images_df, _arcs_df, potentials_with_priors = load_best_par(paths.par_path)
@@ -2453,6 +2163,112 @@ def test_subhalo_schechter_selection_raises_when_mag_cut_rejects_candidates() ->
 
     with pytest.raises(RuntimeError, match="Failed to select 3 Schechter subhalos"):
         mock_generation._generate_subhalo_catalog(config, np.random.default_rng(5))
+
+
+def test_subhalo_spatial_default_compact_gamma_preserves_forced_core() -> None:
+    config = SingleBCGMockConfig(n_primary_families=1, n_subhalos=8, subhalo_parent_factor=5)
+
+    subhalos, selection = mock_generation._generate_subhalo_catalog_payload(config, np.random.default_rng(4))
+
+    radii = np.asarray([math.hypot(float(row["x_arcsec"]), float(row["y_arcsec"])) for row in subhalos])
+    assert len(subhalos) == config.n_subhalos
+    assert np.all(radii[: config.subhalo_force_core_count] >= config.subhalo_force_core_min_arcsec)
+    assert np.all(radii[: config.subhalo_force_core_count] <= config.subhalo_force_core_max_arcsec)
+    assert selection is not None
+    assert selection["spatial_distribution"] == "compact_gamma"
+    assert selection["force_core_count"] == config.subhalo_force_core_count
+
+
+def test_subhalo_spatial_dpie_positions_are_finite_and_within_field() -> None:
+    config = SingleBCGMockConfig(
+        n_primary_families=1,
+        n_subhalos=32,
+        subhalo_parent_factor=5,
+        subhalo_spatial_distribution="dpie",
+        subhalo_field_radius_arcsec=250.0,
+        subhalo_spatial_core_radius_arcsec=25.0,
+        subhalo_spatial_cut_radius_arcsec=180.0,
+        subhalo_force_core_count=0,
+    )
+
+    subhalos, selection = mock_generation._generate_subhalo_catalog_payload(config, np.random.default_rng(8))
+
+    radii = np.asarray([math.hypot(float(row["x_arcsec"]), float(row["y_arcsec"])) for row in subhalos])
+    assert len(subhalos) == config.n_subhalos
+    assert np.isfinite(radii).all()
+    assert np.all(radii >= 0.0)
+    assert np.all(radii <= config.subhalo_field_radius_arcsec)
+    assert selection is not None
+    assert selection["spatial_distribution"] == "dpie"
+    assert selection["spatial_core_radius_arcsec"] == pytest.approx(config.subhalo_spatial_core_radius_arcsec)
+    assert selection["spatial_cut_radius_arcsec"] == pytest.approx(config.subhalo_spatial_cut_radius_arcsec)
+
+
+def test_subhalo_spatial_dpie_is_broader_than_compact_gamma() -> None:
+    common = dict(n_primary_families=1, n_subhalos=300, subhalo_parent_factor=3)
+    compact = SingleBCGMockConfig(seed=3, **common)
+    dpie = SingleBCGMockConfig(
+        seed=3,
+        subhalo_spatial_distribution="dpie",
+        subhalo_field_radius_arcsec=250.0,
+        subhalo_spatial_core_radius_arcsec=25.0,
+        subhalo_spatial_cut_radius_arcsec=180.0,
+        subhalo_force_core_count=0,
+        **common,
+    )
+
+    compact_radii = mock_generation._sample_subhalo_radii(compact, np.random.default_rng(12), compact.n_subhalos)
+    dpie_radii = mock_generation._sample_subhalo_radii(dpie, np.random.default_rng(12), dpie.n_subhalos)
+
+    assert np.median(dpie_radii) > np.median(compact_radii)
+    assert np.count_nonzero(dpie_radii > compact.subhalo_field_radius_arcsec) > 0
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"subhalo_spatial_distribution": "unknown"}, "subhalo_spatial_distribution"),
+        ({"subhalo_field_radius_arcsec": 0.0}, "subhalo_field_radius_arcsec"),
+        ({"subhalo_spatial_core_radius_arcsec": 30.0, "subhalo_spatial_cut_radius_arcsec": 30.0}, "must exceed"),
+        ({"subhalo_force_core_count": -1}, "subhalo_force_core_count"),
+        ({"subhalo_force_core_min_arcsec": 20.0, "subhalo_force_core_max_arcsec": 10.0}, "must exceed"),
+        ({"subhalo_field_radius_arcsec": 10.0, "subhalo_force_core_max_arcsec": 18.0}, "must not exceed"),
+        ({"mock_image_candidate_batch_size": 0}, "mock_image_candidate_batch_size"),
+        ({"mock_image_seed_cap": 0}, "mock_image_seed_cap"),
+        ({"mock_image_lm_max_iter": 0}, "mock_image_lm_max_iter"),
+        ({"mock_generation_workers": 0}, "mock_generation_workers"),
+        ({"mock_image_search_window_arcsec": 0.0}, "mock_image_search_window_arcsec"),
+        ({"mock_image_precision_limit": 0.0}, "mock_image_precision_limit"),
+        ({"mock_caustic_grid_chunk_memory_gb": 0.0}, "mock_caustic_grid_chunk_memory_gb"),
+        ({"mock_caustic_grid_chunk_memory_gb": -1.0}, "mock_caustic_grid_chunk_memory_gb"),
+        ({"mock_caustic_grid_chunk_memory_gb": float("nan")}, "mock_caustic_grid_chunk_memory_gb"),
+        ({"mock_caustic_grid_chunk_memory_gb": float("inf")}, "mock_caustic_grid_chunk_memory_gb"),
+    ],
+)
+def test_subhalo_spatial_invalid_config_raises(updates: dict[str, Any], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        SingleBCGMockConfig(n_primary_families=1, **updates).validate()
+
+
+def test_subhalo_spatial_config_round_trips_from_truth() -> None:
+    truth = {
+        "config": SingleBCGMockConfig(
+            n_primary_families=1,
+            subhalo_spatial_distribution="dpie",
+            subhalo_field_radius_arcsec=250.0,
+            subhalo_spatial_core_radius_arcsec=25.0,
+            subhalo_spatial_cut_radius_arcsec=180.0,
+            subhalo_force_core_count=0,
+        ).to_json_dict()
+    }
+
+    config = mock_generation._caustic_config_from_truth(truth)
+
+    assert config.subhalo_spatial_distribution == "dpie"
+    assert config.subhalo_field_radius_arcsec == pytest.approx(250.0)
+    assert config.subhalo_spatial_core_radius_arcsec == pytest.approx(25.0)
+    assert config.subhalo_spatial_cut_radius_arcsec == pytest.approx(180.0)
+    assert config.subhalo_force_core_count == 0
 
 
 def test_plot_subhalo_shmf_writes_pdf(tmp_path: Path) -> None:
@@ -3880,6 +3696,9 @@ def test_generate_single_bcg_mock_can_request_subhalo_caustic_family(tmp_path: P
         pos_sigma_arcsec=0.0,
         primary_source_redshifts=(2.0,),
         subhalo_source_redshifts=(2.0,),
+        caustic_compute_window_arcsec=60.0,
+        caustic_grid_scale_arcsec=2.0,
+        mock_image_candidate_batch_size=8,
     )
 
     _paths, images, truth = generate_single_bcg_mock(tmp_path, config)
@@ -3889,7 +3708,7 @@ def test_generate_single_bcg_mock_can_request_subhalo_caustic_family(tmp_path: P
     assert (images.groupby("family_id").size() >= config.min_images_per_family).all()
 
 
-def test_caustic_classifier_marks_largest_closed_curve_primary() -> None:
+def test_caustic_classifier_marks_largest_critical_curve_primary() -> None:
     small = validation.CausticContour(
         caustic_index=0,
         caustic_class="subhalo",
@@ -3911,7 +3730,50 @@ def test_caustic_classifier_marks_largest_closed_curve_primary() -> None:
         critical_area_arcsec2=36.0,
     )
 
-    assert max([small, large], key=lambda item: item.caustic_area_arcsec2).caustic_class == "primary"
+    assert max([small, large], key=lambda item: item.critical_area_arcsec2).caustic_class == "primary"
+
+
+def test_primary_contour_position_uses_critical_area_and_keeps_paired_caustic() -> None:
+    larger_caustic_smaller_critical = (
+        np.asarray([0.0, 1.0, 1.0, 0.0, 0.0]),
+        np.asarray([0.0, 0.0, 1.0, 1.0, 0.0]),
+        np.asarray([10.0, 11.0, 11.0, 10.0, 10.0]),
+        np.asarray([20.0, 20.0, 21.0, 21.0, 20.0]),
+        1.0,
+        100.0,
+    )
+    smaller_caustic_larger_critical = (
+        np.asarray([0.0, 3.0, 3.0, 0.0, 0.0]),
+        np.asarray([0.0, 0.0, 3.0, 3.0, 0.0]),
+        np.asarray([-2.0, -1.5, -1.5, -2.0, -2.0]),
+        np.asarray([4.0, 4.0, 4.5, 4.5, 4.0]),
+        9.0,
+        0.25,
+    )
+
+    contours = [larger_caustic_smaller_critical, smaller_caustic_larger_critical]
+    primary_position = mock_generation._primary_contour_position(contours)
+    results = []
+    for index, (crit_x, crit_y, beta_x, beta_y, crit_area, caustic_area) in enumerate(contours):
+        results.append(
+            validation.CausticContour(
+                caustic_index=index,
+                caustic_class="primary" if index == primary_position else "subhalo",
+                beta_x=beta_x,
+                beta_y=beta_y,
+                critical_x=crit_x,
+                critical_y=crit_y,
+                caustic_area_arcsec2=caustic_area,
+                critical_area_arcsec2=crit_area,
+            )
+        )
+
+    primary = next(contour for contour in results if contour.caustic_class == "primary")
+    assert primary.caustic_index == 1
+    assert primary.critical_area_arcsec2 == pytest.approx(9.0)
+    assert primary.caustic_area_arcsec2 == pytest.approx(0.25)
+    np.testing.assert_allclose(primary.beta_x, smaller_caustic_larger_critical[2])
+    np.testing.assert_allclose(primary.beta_y, smaller_caustic_larger_critical[3])
 
 
 def test_sample_point_in_caustic_returns_inside_point() -> None:
@@ -12492,6 +12354,7 @@ def _fast_solver_template(
         runtime=RuntimeConfig(skip_plots=True, quick_diagnostics=quick_diagnostics),
         workflow=WorkflowConfig(stage2_forward_mode=stage2_forward_mode),
         schedule=schedule,
+        likelihood=LikelihoodConfig(pos_sigma_arcsec=0.05),
         truth=TruthRecoveryConfig(
             posterior_truth_recovery_draws=4,
             caustic_plot_grid_scale_arcsec=0.2,
@@ -12688,15 +12551,20 @@ def test_mock_validation_config_rejects_invalid_values(
 
 
 def test_single_bcg_mock_lens_model_config_without_subhalos(tmp_path: Path) -> None:
-    mock = _small_mock_config(n_subhalos=0)
+    mock = _small_mock_config(n_subhalos=0, pos_sigma_arcsec=0.0)
     paths, _images, _truth = _write_minimal_mock_files(tmp_path / "mock")
 
-    model = mock_validation_api.single_bcg_mock_lens_model_config(mock, paths)
+    model = mock_validation_api.single_bcg_mock_lens_model_config(
+        mock,
+        paths,
+        image_constraints_sigma_arcsec=0.05,
+    )
 
     assert [halo.id for halo in model.large_halos] == ["halo", "bcg"]
     assert model.member_populations == ()
     assert model.image_constraints is not None
     assert Path(model.image_constraints.catalog_path) == paths.image_catalog_path
+    assert model.image_constraints.sigma_arcsec == pytest.approx(0.05)
     assert model.large_halos[0].priors["v_disp"].kind == "uniform"
 
 
@@ -12704,7 +12572,11 @@ def test_single_bcg_mock_lens_model_config_with_subhalos(tmp_path: Path) -> None
     mock = _small_mock_config(n_subhalos=2)
     paths, _images, _truth = _write_minimal_mock_files(tmp_path / "mock", with_members=True)
 
-    model = mock_validation_api.single_bcg_mock_lens_model_config(mock, paths)
+    model = mock_validation_api.single_bcg_mock_lens_model_config(
+        mock,
+        paths,
+        image_constraints_sigma_arcsec=0.05,
+    )
 
     assert len(model.member_populations) == 1
     population = model.member_populations[0]
@@ -12712,6 +12584,18 @@ def test_single_bcg_mock_lens_model_config_with_subhalos(tmp_path: Path) -> None
     assert Path(population.catalog_path) == paths.root / "members.cat"
     assert population.sigma_prior.kind == "normal"
     assert population.cutkpc_prior.kind == "uniform"
+
+
+def test_single_bcg_mock_lens_model_config_requires_positive_image_constraint_sigma(tmp_path: Path) -> None:
+    mock = _small_mock_config(pos_sigma_arcsec=0.0)
+    paths, _images, _truth = _write_minimal_mock_files(tmp_path / "mock")
+
+    with pytest.raises(ValueError, match="image_constraints_sigma_arcsec"):
+        mock_validation_api.single_bcg_mock_lens_model_config(
+            mock,
+            paths,
+            image_constraints_sigma_arcsec=0.0,
+        )
 
 
 def test_solver_config_for_single_bcg_mock_sets_paths_seed_model_and_recovery_inputs(tmp_path: Path) -> None:
@@ -12736,7 +12620,22 @@ def test_solver_config_for_single_bcg_mock_sets_paths_seed_model_and_recovery_in
     assert solver_config.model is not None
     assert solver_config.model.image_constraints is not None
     assert Path(solver_config.model.image_constraints.catalog_path) == paths.image_catalog_path
+    assert solver_config.model.image_constraints.sigma_arcsec == pytest.approx(0.05)
     assert planning.compile_run_plan(solver_config).stages[-1].name == "stage1_backprojected_centroid_fit"
+
+
+def test_solver_config_for_single_bcg_mock_requires_solver_image_constraint_sigma(tmp_path: Path) -> None:
+    paths, _images, _truth = _write_minimal_mock_files(tmp_path / "mock")
+    solver_template = replace(_fast_solver_template(), likelihood=LikelihoodConfig(pos_sigma_arcsec=None))
+    config = _mock_validation_config(tmp_path, solver_template=solver_template)
+
+    with pytest.raises(ValueError, match="pos_sigma_arcsec is required"):
+        mock_validation_api.solver_config_for_single_bcg_mock(
+            config,
+            paths=paths,
+            seed=77,
+            output_dir=tmp_path / "solver",
+        )
 
 
 def test_mock_validation_has_no_cli_or_legacy_runner_surface() -> None:

@@ -165,7 +165,12 @@ def _validate_solver_schedule_shape(template: LensClusterSolverConfig) -> None:
 def single_bcg_mock_lens_model_config(
     mock_config: SingleBCGMockConfig,
     paths: MockClusterPaths,
+    *,
+    image_constraints_sigma_arcsec: float,
 ) -> LensModelConfig:
+    sigma_arcsec = float(image_constraints_sigma_arcsec)
+    if not math.isfinite(sigma_arcsec) or sigma_arcsec <= 0.0:
+        raise ValueError("image_constraints_sigma_arcsec must be positive and finite.")
     kpc_per_arcsec = float(kpc_per_arcsec_from_config(mock_config.z_lens, flat_wcdm_config(h0=70.0, om0=0.3)))
     large_halos = (
         _dpie_halo_config(mock_config.halo, mock_config, kpc_per_arcsec, position_half_width_arcsec=8.0),
@@ -211,7 +216,7 @@ def single_bcg_mock_lens_model_config(
         member_populations=member_populations,
         image_constraints=ImageConstraintsConfig(
             catalog_path=paths.image_catalog_path,
-            sigma_arcsec=float(mock_config.pos_sigma_arcsec),
+            sigma_arcsec=sigma_arcsec,
         ),
     )
 
@@ -224,9 +229,15 @@ def solver_config_for_single_bcg_mock(
     output_dir: str | Path,
 ) -> LensClusterSolverConfig:
     template = config.solver.template
+    if template.likelihood.pos_sigma_arcsec is None:
+        raise ValueError("solver.template.likelihood.pos_sigma_arcsec is required for mock image constraints.")
     return replace(
         template,
-        model=single_bcg_mock_lens_model_config(config.mock, paths),
+        model=single_bcg_mock_lens_model_config(
+            config.mock,
+            paths,
+            image_constraints_sigma_arcsec=float(template.likelihood.pos_sigma_arcsec),
+        ),
         paths=RunPathsConfig(
             output_dir=output_dir,
             run_name=str(config.solver.run_name),

@@ -154,6 +154,7 @@ from .model import (
     physical_to_latent as _physical_to_latent_numpy,
     positive_lognormal_parameters as _positive_lognormal_parameters,
 )
+from . import jax_lensing
 from .plotting import (
     CAUSTIC_PLOT_GRID_SCALE_ARCSEC,
     _active_scaling_diagnostics_table,
@@ -770,219 +771,6 @@ UNSUPPORTED_PJAFFE_PROFILE_NAMES = {
     "PJAFFE_ELLIPSE_POTENTIAL_COMPACT",
 }
 GROUPED_DPIE_BACKEND_LABEL = "grouped_dpie_nie"
-
-
-def _grouped_dpie_derivatives(
-    x: jnp.ndarray,
-    y: jnp.ndarray,
-    sigma0: jnp.ndarray,
-    ra: jnp.ndarray,
-    rs: jnp.ndarray,
-    e1: jnp.ndarray,
-    e2: jnp.ndarray,
-    center_x: jnp.ndarray,
-    center_y: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    def one_component(
-        sigma0_i: jnp.ndarray,
-        ra_i: jnp.ndarray,
-        rs_i: jnp.ndarray,
-        e1_i: jnp.ndarray,
-        e2_i: jnp.ndarray,
-        center_x_i: jnp.ndarray,
-        center_y_i: jnp.ndarray,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        return DPIENIE.derivatives(x, y, sigma0_i, ra_i, rs_i, e1_i, e2_i, center_x_i, center_y_i)
-
-    alpha_x, alpha_y = jax.vmap(one_component)(sigma0, ra, rs, e1, e2, center_x, center_y)
-    return jnp.sum(alpha_x, axis=0), jnp.sum(alpha_y, axis=0)
-
-
-def _grouped_dpie_hessian(
-    x: jnp.ndarray,
-    y: jnp.ndarray,
-    sigma0: jnp.ndarray,
-    ra: jnp.ndarray,
-    rs: jnp.ndarray,
-    e1: jnp.ndarray,
-    e2: jnp.ndarray,
-    center_x: jnp.ndarray,
-    center_y: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    def one_component(
-        sigma0_i: jnp.ndarray,
-        ra_i: jnp.ndarray,
-        rs_i: jnp.ndarray,
-        e1_i: jnp.ndarray,
-        e2_i: jnp.ndarray,
-        center_x_i: jnp.ndarray,
-        center_y_i: jnp.ndarray,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        return DPIENIE.hessian(x, y, sigma0_i, ra_i, rs_i, e1_i, e2_i, center_x_i, center_y_i)
-
-    h_xx, h_xy, h_yx, h_yy = jax.vmap(one_component)(sigma0, ra, rs, e1, e2, center_x, center_y)
-    return jnp.sum(h_xx, axis=0), jnp.sum(h_xy, axis=0), jnp.sum(h_yx, axis=0), jnp.sum(h_yy, axis=0)
-
-
-def _grouped_dpie_derivatives_and_hessian(
-    x: jnp.ndarray,
-    y: jnp.ndarray,
-    sigma0: jnp.ndarray,
-    ra: jnp.ndarray,
-    rs: jnp.ndarray,
-    e1: jnp.ndarray,
-    e2: jnp.ndarray,
-    center_x: jnp.ndarray,
-    center_y: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    def one_component(
-        sigma0_i: jnp.ndarray,
-        ra_i: jnp.ndarray,
-        rs_i: jnp.ndarray,
-        e1_i: jnp.ndarray,
-        e2_i: jnp.ndarray,
-        center_x_i: jnp.ndarray,
-        center_y_i: jnp.ndarray,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        alpha_x, alpha_y = DPIENIE.derivatives(
-            x,
-            y,
-            sigma0_i,
-            ra_i,
-            rs_i,
-            e1_i,
-            e2_i,
-            center_x_i,
-            center_y_i,
-        )
-        h_xx, h_xy, h_yx, h_yy = DPIENIE.hessian(
-            x,
-            y,
-            sigma0_i,
-            ra_i,
-            rs_i,
-            e1_i,
-            e2_i,
-            center_x_i,
-            center_y_i,
-        )
-        return alpha_x, alpha_y, h_xx, h_xy, h_yx, h_yy
-
-    alpha_x, alpha_y, h_xx, h_xy, h_yx, h_yy = jax.vmap(one_component)(
-        sigma0,
-        ra,
-        rs,
-        e1,
-        e2,
-        center_x,
-        center_y,
-    )
-    return (
-        jnp.sum(alpha_x, axis=0),
-        jnp.sum(alpha_y, axis=0),
-        jnp.sum(h_xx, axis=0),
-        jnp.sum(h_xy, axis=0),
-        jnp.sum(h_yx, axis=0),
-        jnp.sum(h_yy, axis=0),
-    )
-
-
-def _grouped_dpie_rows_derivatives_and_hessian(
-    x: jnp.ndarray,
-    y: jnp.ndarray,
-    sigma0: jnp.ndarray,
-    ra: jnp.ndarray,
-    rs: jnp.ndarray,
-    e1: jnp.ndarray,
-    e2: jnp.ndarray,
-    center_x: jnp.ndarray,
-    center_y: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    def one_component(
-        sigma0_i: jnp.ndarray,
-        ra_i: jnp.ndarray,
-        rs_i: jnp.ndarray,
-        e1_i: jnp.ndarray,
-        e2_i: jnp.ndarray,
-        center_x_i: jnp.ndarray,
-        center_y_i: jnp.ndarray,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        alpha_x, alpha_y = DPIENIE.derivatives(
-            x,
-            y,
-            sigma0_i,
-            ra_i,
-            rs_i,
-            e1_i,
-            e2_i,
-            center_x_i,
-            center_y_i,
-        )
-        h_xx, h_xy, h_yx, h_yy = DPIENIE.hessian(
-            x,
-            y,
-            sigma0_i,
-            ra_i,
-            rs_i,
-            e1_i,
-            e2_i,
-            center_x_i,
-            center_y_i,
-        )
-        return alpha_x, alpha_y, -h_xx, -h_xy, -h_yx, -h_yy
-
-    return jax.vmap(one_component)(sigma0, ra, rs, e1, e2, center_x, center_y)
-
-
-def _grouped_dpie_pair_derivatives_and_hessian(
-    x: jnp.ndarray,
-    y: jnp.ndarray,
-    sigma0: jnp.ndarray,
-    ra: jnp.ndarray,
-    rs: jnp.ndarray,
-    e1: jnp.ndarray,
-    e2: jnp.ndarray,
-    center_x: jnp.ndarray,
-    center_y: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    def one_component(
-        x_i: jnp.ndarray,
-        y_i: jnp.ndarray,
-        sigma0_i: jnp.ndarray,
-        ra_i: jnp.ndarray,
-        rs_i: jnp.ndarray,
-        e1_i: jnp.ndarray,
-        e2_i: jnp.ndarray,
-        center_x_i: jnp.ndarray,
-        center_y_i: jnp.ndarray,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        x_one = jnp.reshape(x_i, (1,))
-        y_one = jnp.reshape(y_i, (1,))
-        alpha_x, alpha_y = DPIENIE.derivatives(
-            x_one,
-            y_one,
-            sigma0_i,
-            ra_i,
-            rs_i,
-            e1_i,
-            e2_i,
-            center_x_i,
-            center_y_i,
-        )
-        h_xx, h_xy, h_yx, h_yy = DPIENIE.hessian(
-            x_one,
-            y_one,
-            sigma0_i,
-            ra_i,
-            rs_i,
-            e1_i,
-            e2_i,
-            center_x_i,
-            center_y_i,
-        )
-        return alpha_x[0], alpha_y[0], -h_xx[0], -h_xy[0], -h_yx[0], -h_yy[0]
-
-    return jax.vmap(one_component)(x, y, sigma0, ra, rs, e1, e2, center_x, center_y)
 
 
 def _validate_supported_lens_model_list(lens_model_list: list[str], context: str) -> None:
@@ -22344,7 +22132,7 @@ class ClusterJAXEvaluator:
         h_yx = zeros
         h_yy = zeros
         if dpie_indices.size:
-            dpie_values = _grouped_dpie_derivatives_and_hessian(
+            dpie_values = jax_lensing.grouped_dpie_derivatives_and_hessian(
                 x,
                 y,
                 *self._grouped_dpie_params(packed_state, dpie_indices),
@@ -22387,7 +22175,7 @@ class ClusterJAXEvaluator:
         rows = [jnp.zeros((indices.size, x.shape[0]), dtype=jnp.float64) for _ in range(6)]
         dpie_mask_np = selected_profiles == DP_IE_PROFILE
         if np.any(dpie_mask_np):
-            dpie_rows = _grouped_dpie_rows_derivatives_and_hessian(
+            dpie_rows = jax_lensing.grouped_dpie_rows_derivatives_and_hessian(
                 x,
                 y,
                 *self._grouped_dpie_params(packed_state, indices[dpie_mask_np].astype(np.int32)),
@@ -22501,7 +22289,7 @@ class ClusterJAXEvaluator:
         dpie_mask_np = selected_profiles == DP_IE_PROFILE
         if np.any(dpie_mask_np):
             dpie_positions = jnp.asarray(np.where(dpie_mask_np)[0], dtype=jnp.int32)
-            dpie_values = _grouped_dpie_pair_derivatives_and_hessian(
+            dpie_values = jax_lensing.grouped_dpie_pair_derivatives_and_hessian(
                 jnp.take(x, dpie_positions, axis=0),
                 jnp.take(y, dpie_positions, axis=0),
                 *self._grouped_dpie_params(packed_state, component_indices_np[dpie_mask_np].astype(np.int32)),

@@ -4,8 +4,8 @@ import json
 import math
 import os
 import threading
-from collections import deque
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -14,21 +14,20 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl_lenscluster_validation")
 os.environ.setdefault("NUMBA_CACHE_DIR", f"/tmp/numba_cache_{os.getuid()}")
 os.makedirs(os.environ["NUMBA_CACHE_DIR"], exist_ok=True)
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pandas as pd
-from astropy.cosmology import FlatLambdaCDM
-from lenstronomy.LensModel.lens_model import LensModel
-from lenstronomy.LensModel.Solver.lens_equation_solver import LensEquationSolver
 from matplotlib.path import Path as MplPath
 from scipy.special import gammainc, gammaincinv
 from skimage.measure import find_contours
 
+from .. import jax_lensing
 from ..jax_cosmology import (
     dpie_sigma0_from_vel_disp as _jax_dpie_sigma0_from_vel_disp,
     flat_wcdm_config,
     kpc_per_arcsec_from_config,
 )
-from ..utils import jax_cpu_worker_count
 
 ORIGINAL_DPIE_PROFILE_NAME = "DPIE_NIE"
 DEFAULT_CAUSTIC_COMPUTE_WINDOW_ARCSEC = 160.0
@@ -106,6 +105,13 @@ class SingleBCGMockConfig:
     caustic_grid_scale_arcsec: float = DEFAULT_CAUSTIC_GRID_SCALE_ARCSEC
     caustic_min_area_arcsec2: float = DEFAULT_CAUSTIC_MIN_AREA_ARCSEC2
     caustic_boundary_margin_arcsec: float = DEFAULT_CAUSTIC_BOUNDARY_MARGIN_ARCSEC
+    mock_caustic_grid_chunk_memory_gb: float = 1.0
+    mock_image_candidate_batch_size: int = 256
+    mock_image_seed_cap: int = 32
+    mock_image_search_window_arcsec: float = 80.0
+    mock_image_lm_max_iter: int = 100
+    mock_image_precision_limit: float = 1.0e-8
+    mock_generation_workers: int = 1
     n_subhalos: int = 0
     subhalo_schechter_alpha: float = -0.7
     subhalo_parent_factor: int = 1000
@@ -113,7 +119,13 @@ class SingleBCGMockConfig:
     subhalo_mass_min: float = 1.0e9
     subhalo_mass_max: float = 1.0e13
     subhalo_mass_ref: float = 1.0e12
+    subhalo_spatial_distribution: str = "compact_gamma"
     subhalo_field_radius_arcsec: float = 65.0
+    subhalo_spatial_core_radius_arcsec: float = 25.0
+    subhalo_spatial_cut_radius_arcsec: float = 180.0
+    subhalo_force_core_count: int = 4
+    subhalo_force_core_min_arcsec: float = 4.0
+    subhalo_force_core_max_arcsec: float = 18.0
     subhalo_mag0: float = 17.0
     subhalo_sigma_ref: float = 245.0
     subhalo_sigma_ref_std: float = 35.0
@@ -204,10 +216,16 @@ def validate_single_bcg_mock_config(config: SingleBCGMockConfig) -> None:
         "caustic_compute_window_arcsec",
         "caustic_grid_scale_arcsec",
         "caustic_min_area_arcsec2",
+        "mock_caustic_grid_chunk_memory_gb",
+        "mock_image_search_window_arcsec",
+        "mock_image_precision_limit",
     ):
         value = float(getattr(config, name))
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError(f"{name} must be positive and finite.")
+    for name in ("mock_image_candidate_batch_size", "mock_image_seed_cap", "mock_image_lm_max_iter", "mock_generation_workers"):
+        if isinstance(getattr(config, name), bool) or int(getattr(config, name)) <= 0:
+            raise ValueError(f"{name} must be a positive integer.")
     if float(config.caustic_boundary_margin_arcsec) < 0.0:
         raise ValueError("caustic_boundary_margin_arcsec must be nonnegative.")
     if int(config.n_subhalos) < 0:
@@ -220,6 +238,29 @@ def validate_single_bcg_mock_config(config: SingleBCGMockConfig) -> None:
         raise ValueError("subhalo_mass bounds must be positive and ordered.")
     if float(config.subhalo_mass_ref) <= 0.0:
         raise ValueError("subhalo_mass_ref must be positive.")
+    spatial_distribution = str(config.subhalo_spatial_distribution).strip().lower()
+    if spatial_distribution not in {"compact_gamma", "dpie"}:
+        raise ValueError("subhalo_spatial_distribution must be one of: compact_gamma, dpie.")
+    for name in (
+        "subhalo_field_radius_arcsec",
+        "subhalo_spatial_core_radius_arcsec",
+        "subhalo_spatial_cut_radius_arcsec",
+    ):
+        value = float(getattr(config, name))
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be positive and finite.")
+    if float(config.subhalo_spatial_cut_radius_arcsec) <= float(config.subhalo_spatial_core_radius_arcsec):
+        raise ValueError("subhalo_spatial_cut_radius_arcsec must exceed subhalo_spatial_core_radius_arcsec.")
+    if int(config.subhalo_force_core_count) < 0:
+        raise ValueError("subhalo_force_core_count must be nonnegative.")
+    force_min = float(config.subhalo_force_core_min_arcsec)
+    force_max = float(config.subhalo_force_core_max_arcsec)
+    if not math.isfinite(force_min) or force_min < 0.0:
+        raise ValueError("subhalo_force_core_min_arcsec must be finite and nonnegative.")
+    if not math.isfinite(force_max) or force_max <= force_min:
+        raise ValueError("subhalo_force_core_max_arcsec must exceed subhalo_force_core_min_arcsec.")
+    if force_max > float(config.subhalo_field_radius_arcsec):
+        raise ValueError("subhalo_force_core_max_arcsec must not exceed subhalo_field_radius_arcsec.")
 
 
 def _lenstool_ellipticite_to_axis_ratio(ellipticite: float) -> float:
@@ -502,6 +543,65 @@ def _scaled_subhalo_params(row: dict[str, Any], config: SingleBCGMockConfig) -> 
     )
 
 
+def _subhalo_spatial_metadata(config: SingleBCGMockConfig) -> dict[str, Any]:
+    return {
+        "spatial_distribution": str(config.subhalo_spatial_distribution).strip().lower(),
+        "field_radius_arcsec": float(config.subhalo_field_radius_arcsec),
+        "spatial_core_radius_arcsec": float(config.subhalo_spatial_core_radius_arcsec),
+        "spatial_cut_radius_arcsec": float(config.subhalo_spatial_cut_radius_arcsec),
+        "force_core_count": int(config.subhalo_force_core_count),
+        "force_core_min_arcsec": float(config.subhalo_force_core_min_arcsec),
+        "force_core_max_arcsec": float(config.subhalo_force_core_max_arcsec),
+    }
+
+
+def _sample_dpie_subhalo_radii(config: SingleBCGMockConfig, rng: np.random.Generator, count: int) -> np.ndarray:
+    count = int(count)
+    if count <= 0:
+        return np.empty(0, dtype=float)
+    r_max = float(config.subhalo_field_radius_arcsec)
+    r_core = float(config.subhalo_spatial_core_radius_arcsec)
+    r_cut = float(config.subhalo_spatial_cut_radius_arcsec)
+    grid_size = 8192
+    radius_grid = np.linspace(0.0, r_max, grid_size, dtype=float)
+    surface_density = 1.0 / np.sqrt(radius_grid * radius_grid + r_core * r_core) - 1.0 / np.sqrt(
+        radius_grid * radius_grid + r_cut * r_cut
+    )
+    pdf = np.maximum(radius_grid * surface_density, 0.0)
+    increments = 0.5 * (pdf[1:] + pdf[:-1]) * np.diff(radius_grid)
+    cdf = np.concatenate([[0.0], np.cumsum(increments)])
+    total = float(cdf[-1])
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("dPIE subhalo spatial distribution produced a nonpositive normalization.")
+    cdf /= total
+    return np.asarray(np.interp(rng.random(count), cdf, radius_grid), dtype=float)
+
+
+def _sample_subhalo_radii(config: SingleBCGMockConfig, rng: np.random.Generator, count: int) -> np.ndarray:
+    count = int(count)
+    if count <= 0:
+        return np.empty(0, dtype=float)
+    distribution = str(config.subhalo_spatial_distribution).strip().lower()
+    if distribution == "dpie":
+        return _sample_dpie_subhalo_radii(config, rng, count)
+    if distribution != "compact_gamma":
+        raise ValueError(f"Unsupported subhalo_spatial_distribution={config.subhalo_spatial_distribution!r}.")
+    radii = np.empty(count, dtype=float)
+    forced_count = min(int(config.subhalo_force_core_count), count)
+    if forced_count > 0:
+        radii[:forced_count] = rng.uniform(
+            float(config.subhalo_force_core_min_arcsec),
+            float(config.subhalo_force_core_max_arcsec),
+            size=forced_count,
+        )
+    if forced_count < count:
+        radii[forced_count:] = np.minimum(
+            float(config.subhalo_field_radius_arcsec),
+            rng.gamma(shape=2.0, scale=14.0, size=count - forced_count) + 3.0,
+        )
+    return radii
+
+
 def _generate_subhalo_catalog_payload(
     config: SingleBCGMockConfig,
     rng: np.random.Generator,
@@ -509,14 +609,12 @@ def _generate_subhalo_catalog_payload(
     if config.n_subhalos <= 0:
         return [], None
     candidates, subhalo_selection = _generate_subhalo_candidates(config, rng)
+    if subhalo_selection is not None:
+        subhalo_selection.update(_subhalo_spatial_metadata(config))
     rows: list[dict[str, Any]] = []
-    # A compact projected member distribution, with a few selected candidates
-    # deliberately allowed near the strong-lensing zone.
+    radii = _sample_subhalo_radii(config, rng, len(candidates))
     for idx, candidate in enumerate(candidates):
-        if idx < min(4, config.n_subhalos):
-            radius = rng.uniform(4.0, 18.0)
-        else:
-            radius = min(config.subhalo_field_radius_arcsec, rng.gamma(shape=2.0, scale=14.0) + 3.0)
+        radius = float(radii[idx])
         theta = rng.uniform(0.0, 2.0 * np.pi)
         x_arcsec = float(radius * np.cos(theta))
         y_arcsec = float(radius * np.sin(theta))
@@ -801,9 +899,16 @@ def _curve_hits_boundary(
     )
 
 
+def _primary_contour_position(
+    contours: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]]
+) -> int:
+    if not contours:
+        raise ValueError("Cannot choose a primary contour from an empty contour list.")
+    return int(np.argmax([item[4] for item in contours]))
+
+
 def _compute_tangential_caustic_contours(
-    lens_model: LensModel,
-    kwargs_lens: list[dict[str, float]],
+    lens_state: jax_lensing.StaticLensState,
     config: SingleBCGMockConfig,
     *,
     center_x: float = 0.0,
@@ -819,7 +924,13 @@ def _compute_tangential_caustic_contours(
     x_axis = np.linspace(center_x - 0.5 * compute_window, center_x + 0.5 * compute_window, num_pix)
     y_axis = np.linspace(center_y - 0.5 * compute_window, center_y + 0.5 * compute_window, num_pix)
     xx, yy = np.meshgrid(x_axis, y_axis)
-    f_xx, f_xy, f_yx, f_yy = lens_model.hessian(xx.ravel(), yy.ravel(), kwargs_lens)
+    chunk_size = jax_lensing.estimated_alpha_hessian_chunk_size(float(config.mock_caustic_grid_chunk_memory_gb))
+    _alpha_x, _alpha_y, f_xx, f_xy, f_yx, f_yy = jax_lensing.alpha_and_hessian_tiled(
+        jnp.asarray(xx.ravel(), dtype=jnp.float64),
+        jnp.asarray(yy.ravel(), dtype=jnp.float64),
+        lens_state,
+        chunk_size=chunk_size,
+    )
     f_xx = np.asarray(f_xx, dtype=float).reshape(xx.shape)
     f_yy = np.asarray(f_yy, dtype=float).reshape(xx.shape)
     f_xy = np.asarray(f_xy, dtype=float).reshape(xx.shape)
@@ -828,7 +939,7 @@ def _compute_tangential_caustic_contours(
     gamma1 = 0.5 * (f_xx - f_yy)
     gamma2 = 0.5 * (f_xy + f_yx)
     lambda_tan = 1.0 - kappa - np.hypot(gamma1, gamma2)
-    contours: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]] = []
+    critical_contours: list[tuple[np.ndarray, np.ndarray, float]] = []
     for vertices in find_contours(lambda_tan, 0.0):
         if vertices.shape[0] < 4:
             continue
@@ -850,19 +961,39 @@ def _compute_tangential_caustic_contours(
         close_gap = math.hypot(float(crit_x[0] - crit_x[-1]), float(crit_y[0] - crit_y[-1]))
         if close_gap > 1.5 * grid_scale:
             continue
-        beta_x, beta_y = lens_model.ray_shooting(crit_x, crit_y, kwargs_lens)
-        beta_x = np.asarray(beta_x, dtype=float)
-        beta_y = np.asarray(beta_y, dtype=float)
+        crit_area = _closed_polygon_area(crit_x, crit_y)
+        critical_contours.append((crit_x, crit_y, crit_area))
+    contours: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]] = []
+    if critical_contours:
+        vertex_counts = [int(crit_x.size) for crit_x, _crit_y, _crit_area in critical_contours]
+        all_crit_x = np.concatenate([crit_x for crit_x, _crit_y, _crit_area in critical_contours])
+        all_crit_y = np.concatenate([crit_y for _crit_x, crit_y, _crit_area in critical_contours])
+        all_beta_x, all_beta_y = jax_lensing.ray_shooting_tiled(
+            jnp.asarray(all_crit_x, dtype=jnp.float64),
+            jnp.asarray(all_crit_y, dtype=jnp.float64),
+            lens_state,
+            chunk_size=chunk_size,
+        )
+        all_beta_x_np = np.asarray(all_beta_x, dtype=float)
+        all_beta_y_np = np.asarray(all_beta_y, dtype=float)
+    else:
+        vertex_counts = []
+        all_beta_x_np = np.asarray([], dtype=float)
+        all_beta_y_np = np.asarray([], dtype=float)
+    offset = 0
+    for (crit_x, crit_y, crit_area), vertex_count in zip(critical_contours, vertex_counts):
+        beta_x = all_beta_x_np[offset : offset + vertex_count]
+        beta_y = all_beta_y_np[offset : offset + vertex_count]
+        offset += vertex_count
         if not np.all(np.isfinite(beta_x)) or not np.all(np.isfinite(beta_y)):
             continue
-        crit_area = _closed_polygon_area(crit_x, crit_y)
         caustic_area = _closed_polygon_area(beta_x, beta_y)
         if caustic_area < float(config.caustic_min_area_arcsec2):
             continue
         contours.append((crit_x, crit_y, beta_x, beta_y, crit_area, caustic_area))
     if not contours:
         return []
-    primary_position = int(np.argmax([item[5] for item in contours]))
+    primary_position = _primary_contour_position(contours)
     results: list[CausticContour] = []
     for index, (crit_x, crit_y, beta_x, beta_y, crit_area, caustic_area) in enumerate(contours):
         results.append(
@@ -1039,6 +1170,26 @@ def _ordered_unique_source_redshifts(*groups: tuple[float, ...]) -> tuple[float,
     return tuple(ordered)
 
 
+def _mock_family_source_redshifts(
+    config: SingleBCGMockConfig,
+) -> tuple[tuple[float, ...], tuple[float, ...], tuple[float, ...]]:
+    primary_source_redshifts = _family_source_redshifts(config, "primary")
+    subhalo_source_redshifts = _family_source_redshifts(config, "subhalo")
+    primary_family_redshifts = tuple(
+        primary_source_redshifts[index % len(primary_source_redshifts)]
+        for index in range(int(config.n_primary_families))
+    )
+    subhalo_family_redshifts = tuple(
+        subhalo_source_redshifts[index % len(subhalo_source_redshifts)]
+        for index in range(int(config.n_subhalo_families))
+    )
+    needed_source_redshifts = _ordered_unique_source_redshifts(
+        primary_family_redshifts,
+        subhalo_family_redshifts,
+    )
+    return primary_family_redshifts, subhalo_family_redshifts, needed_source_redshifts
+
+
 def _image_count_requirement_text(min_images: int, max_images: int | None) -> str:
     if max_images is None:
         return f"at least {int(min_images)} images"
@@ -1051,27 +1202,188 @@ def _image_count_within_requirement(n_images: int, min_images: int, max_images: 
     return int(n_images) >= int(min_images) and (max_images is None or int(n_images) <= int(max_images))
 
 
-def _mock_model_and_kwargs(
+@dataclass(frozen=True)
+class MockMappedGrid:
+    x_grid: np.ndarray
+    y_grid: np.ndarray
+    beta_x_grid: np.ndarray
+    beta_y_grid: np.ndarray
+    num_pix: int
+    pixel_width: float
+
+
+@dataclass(frozen=True)
+class MockImageCandidateResult:
+    attempt_index: int
+    beta_x: float
+    beta_y: float
+    contour: CausticContour
+    x_img: np.ndarray
+    y_img: np.ndarray
+
+
+def _mock_static_lens_state(
     config: SingleBCGMockConfig,
     subhalo_components: list[DPIETruth],
     z_source: float,
-    cosmo: Any,
     cosmo_config: dict[str, Any],
-) -> tuple[LensModel, list[dict[str, float]]]:
+) -> jax_lensing.StaticLensState:
+    lens_model_list, kwargs_lens = _mock_lens_model_list_and_kwargs(
+        config,
+        subhalo_components,
+        float(z_source),
+        cosmo_config,
+    )
+    return jax_lensing.static_lens_state_from_kwargs(lens_model_list, kwargs_lens)
+
+
+def _mock_mapped_grid(
+    lens_state: jax_lensing.StaticLensState,
+    *,
+    search_window_arcsec: float,
+    min_distance_arcsec: float,
+    x_center: float = 0.0,
+    y_center: float = 0.0,
+) -> MockMappedGrid:
+    num_pix = int(search_window_arcsec / min_distance_arcsec) + 1
+    x_axis = np.linspace(
+        -0.5 * float(search_window_arcsec) + float(x_center),
+        0.5 * float(search_window_arcsec) + float(x_center),
+        num_pix,
+    )
+    y_axis = np.linspace(
+        -0.5 * float(search_window_arcsec) + float(y_center),
+        0.5 * float(search_window_arcsec) + float(y_center),
+        num_pix,
+    )
+    xx, yy = np.meshgrid(x_axis, y_axis)
+    beta_x, beta_y = jax_lensing.ray_shooting(
+        jnp.asarray(xx.ravel(), dtype=jnp.float64),
+        jnp.asarray(yy.ravel(), dtype=jnp.float64),
+        lens_state,
+    )
+    pixel_width = float(x_axis[1] - x_axis[0]) if num_pix > 1 else float(search_window_arcsec)
+    return MockMappedGrid(
+        x_grid=xx.ravel().astype(float),
+        y_grid=yy.ravel().astype(float),
+        beta_x_grid=np.asarray(beta_x, dtype=float),
+        beta_y_grid=np.asarray(beta_y, dtype=float),
+        num_pix=int(num_pix),
+        pixel_width=float(pixel_width),
+    )
+
+
+def _mock_candidate_seed_grid(
+    beta_x_grid: jnp.ndarray,
+    beta_y_grid: jnp.ndarray,
+    source_x: jnp.ndarray,
+    source_y: jnp.ndarray,
+    *,
+    num_pix: int,
+    seed_cap: int,
+    pixel_width: float,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    source_x = jnp.asarray(source_x, dtype=jnp.float64).reshape(-1, 1)
+    source_y = jnp.asarray(source_y, dtype=jnp.float64).reshape(-1, 1)
+    dist2 = jnp.square(beta_x_grid[jnp.newaxis, :] - source_x) + jnp.square(beta_y_grid[jnp.newaxis, :] - source_y)
+    maps = jnp.reshape(dist2, (dist2.shape[0], int(num_pix), int(num_pix)))
+    padded = jnp.pad(maps, ((0, 0), (1, 1), (1, 1)), constant_values=jnp.inf)
+    local = jax.lax.reduce_window(
+        padded,
+        jnp.inf,
+        jax.lax.min,
+        window_dimensions=(1, 3, 3),
+        window_strides=(1, 1, 1),
+        padding="VALID",
+    )
+    is_min = (maps <= local) & (maps <= float(pixel_width) ** 2)
+    masked = jnp.where(is_min.reshape(dist2.shape), dist2, jnp.inf)
+    order = jnp.argsort(masked, axis=1)[:, : int(seed_cap)]
+    values = jnp.take_along_axis(masked, order, axis=1)
+    valid = jnp.isfinite(values)
+    return order, values, valid
+
+
+def _refine_mock_image_seeds_jax(
+    lens_state: jax_lensing.StaticLensState,
+    source_x: float,
+    source_y: float,
+    start_x: np.ndarray,
+    start_y: np.ndarray,
+    *,
+    max_iter: int,
+    precision_limit: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    current_x = jnp.asarray(start_x, dtype=jnp.float64).reshape(-1)
+    current_y = jnp.asarray(start_y, dtype=jnp.float64).reshape(-1)
+    source_x_j = jnp.asarray(float(source_x), dtype=jnp.float64)
+    source_y_j = jnp.asarray(float(source_y), dtype=jnp.float64)
+
+    def step(carry: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray], _idx: jnp.ndarray) -> tuple[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray], None]:
+        x, y, active = carry
+        beta_x, beta_y, h_xx, h_xy, h_yx, h_yy = jax_lensing.alpha_and_hessian(x, y, lens_state)
+        beta_x = x - beta_x
+        beta_y = y - beta_y
+        r0 = beta_x - source_x_j
+        r1 = beta_y - source_y_j
+        a00 = 1.0 - h_xx
+        a01 = -h_xy
+        a10 = -h_yx
+        a11 = 1.0 - h_yy
+        det = a00 * a11 - a01 * a10
+        finite = active & jnp.isfinite(det) & (jnp.abs(det) > 1.0e-14)
+        dx = -(a11 * r0 - a01 * r1) / det
+        dy = -(-a10 * r0 + a00 * r1) / det
+        step_norm = jnp.hypot(dx, dy)
+        scale = jnp.minimum(1.0, 5.0 / jnp.maximum(step_norm, 1.0e-12))
+        dx = jnp.where(finite, dx * scale, 0.0)
+        dy = jnp.where(finite, dy * scale, 0.0)
+        x_next = x + dx
+        y_next = y + dy
+        source_resid = jnp.hypot(r0, r1)
+        still_active = finite & (source_resid > float(precision_limit)) & (jnp.hypot(dx, dy) > 0.1 * float(precision_limit))
+        return (x_next, y_next, still_active), None
+
+    active0 = jnp.isfinite(current_x) & jnp.isfinite(current_y)
+    (final_x, final_y, _active), _unused = jax.lax.scan(step, (current_x, current_y, active0), jnp.arange(int(max_iter)))
+    beta_x, beta_y = jax_lensing.ray_shooting(final_x, final_y, lens_state)
+    residual = jnp.hypot(beta_x - source_x_j, beta_y - source_y_j)
+    ok = jnp.isfinite(final_x) & jnp.isfinite(final_y) & jnp.isfinite(residual) & (residual <= float(precision_limit))
+    return np.asarray(final_x, dtype=float), np.asarray(final_y, dtype=float), np.asarray(ok, dtype=bool)
+
+
+def _mock_magnification(
+    lens_state: jax_lensing.StaticLensState,
+    x: np.ndarray,
+    y: np.ndarray,
+) -> np.ndarray:
+    _alpha_x, _alpha_y, h_xx, h_xy, h_yx, h_yy = jax_lensing.alpha_and_hessian(
+        jnp.asarray(x, dtype=jnp.float64),
+        jnp.asarray(y, dtype=jnp.float64),
+        lens_state,
+    )
+    a00 = 1.0 - np.asarray(h_xx, dtype=float)
+    a01 = -np.asarray(h_xy, dtype=float)
+    a10 = -np.asarray(h_yx, dtype=float)
+    a11 = 1.0 - np.asarray(h_yy, dtype=float)
+    det = a00 * a11 - a01 * a10
+    return np.where(np.isfinite(det) & (det != 0.0), 1.0 / det, np.nan)
+
+
+def _mock_lens_model_list_and_kwargs(
+    config: SingleBCGMockConfig,
+    subhalo_components: list[DPIETruth],
+    z_source: float,
+    cosmo_config: dict[str, Any],
+) -> tuple[list[str], list[dict[str, float]]]:
     lens_model_list = [ORIGINAL_DPIE_PROFILE_NAME, ORIGINAL_DPIE_PROFILE_NAME] + [
         ORIGINAL_DPIE_PROFILE_NAME for _ in subhalo_components
     ]
-    model = LensModel(
-        lens_model_list=lens_model_list,
-        z_lens=config.z_lens,
-        z_source=float(z_source),
-        cosmo=cosmo,
-    )
     kwargs_lens = [
         _component_kwargs(config.halo, config, float(z_source), cosmo_config),
         _component_kwargs(config.bcg, config, float(z_source), cosmo_config),
     ] + [_component_kwargs(component, config, float(z_source), cosmo_config) for component in subhalo_components]
-    return model, kwargs_lens
+    return lens_model_list, kwargs_lens
 
 
 def _current_truth_model_and_kwargs(
@@ -1151,7 +1463,6 @@ def generate_single_bcg_mock(
 
     rng = np.random.default_rng(config.seed)
     cosmo_config = flat_wcdm_config(h0=70.0, om0=0.3)
-    cosmo = FlatLambdaCDM(H0=70.0, Om0=0.3)
     kpc_per_arcsec = kpc_per_arcsec_from_config(config.z_lens, cosmo_config)
     _emit_mock_progress(
         progress_callback,
@@ -1183,21 +1494,7 @@ def generate_single_bcg_mock(
         mag_faint_limit=float(config.subhalo_mag_faint_limit),
     )
     subhalo_components = [_scaled_subhalo_params(row, config) for row in subhalos]
-    primary_source_redshifts = _family_source_redshifts(config, "primary")
-    subhalo_source_redshifts = _family_source_redshifts(config, "subhalo")
-    primary_family_redshifts = tuple(
-        primary_source_redshifts[index % len(primary_source_redshifts)]
-        for index in range(int(config.n_primary_families))
-    )
-    subhalo_family_redshifts = tuple(
-        subhalo_source_redshifts[index % len(subhalo_source_redshifts)]
-        for index in range(int(config.n_subhalo_families))
-    )
-    needed_source_redshifts = _ordered_unique_source_redshifts(
-        primary_family_redshifts,
-        subhalo_family_redshifts,
-        (float(config.source_redshift),),
-    )
+    primary_family_redshifts, subhalo_family_redshifts, needed_source_redshifts = _mock_family_source_redshifts(config)
     redshift_index_by_value = {float(z): index + 1 for index, z in enumerate(needed_source_redshifts)}
     caustic_num_pix = 0
     if float(config.caustic_compute_window_arcsec) > 0.0 and float(config.caustic_grid_scale_arcsec) > 0.0:
@@ -1207,19 +1504,26 @@ def generate_single_bcg_mock(
         )
         if caustic_num_pix % 2 == 0:
             caustic_num_pix += 1
-    model_cache: dict[float, tuple[LensModel, LensEquationSolver, list[dict[str, float]]]] = {}
+    caustic_grid_points = int(caustic_num_pix * caustic_num_pix)
+    caustic_chunk_points = min(
+        caustic_grid_points,
+        jax_lensing.estimated_alpha_hessian_chunk_size(float(config.mock_caustic_grid_chunk_memory_gb)),
+    )
+    caustic_chunk_count = int(math.ceil(caustic_grid_points / max(caustic_chunk_points, 1))) if caustic_grid_points else 0
+    lens_state_cache: dict[float, jax_lensing.StaticLensState] = {}
     caustic_cache: dict[float, list[CausticContour]] = {}
+    mapped_grid_cache: dict[tuple[float, float], MockMappedGrid] = {}
 
-    def get_model(z_source: float) -> tuple[LensModel, LensEquationSolver, list[dict[str, float]]]:
+    def get_lens_state(z_source: float) -> jax_lensing.StaticLensState:
         z_key = float(z_source)
-        if z_key not in model_cache:
-            model, kwargs_lens = _mock_model_and_kwargs(config, subhalo_components, z_key, cosmo, cosmo_config)
-            model_cache[z_key] = (model, LensEquationSolver(model), kwargs_lens)
-        return model_cache[z_key]
+        if z_key not in lens_state_cache:
+            lens_state_cache[z_key] = _mock_static_lens_state(config, subhalo_components, z_key, cosmo_config)
+        return lens_state_cache[z_key]
 
     def get_caustics(z_source: float) -> list[CausticContour]:
         z_key = float(z_source)
         if z_key not in caustic_cache:
+            start_time = time.perf_counter()
             _emit_mock_progress(
                 progress_callback,
                 "redshift_start",
@@ -1230,10 +1534,15 @@ def generate_single_bcg_mock(
                 caustic_compute_window_arcsec=float(config.caustic_compute_window_arcsec),
                 caustic_grid_scale_arcsec=float(config.caustic_grid_scale_arcsec),
                 caustic_grid_pixels=int(caustic_num_pix),
+                caustic_grid_points=int(caustic_grid_points),
+                caustic_grid_chunk_memory_gb=float(config.mock_caustic_grid_chunk_memory_gb),
+                caustic_grid_chunk_points=int(caustic_chunk_points),
+                caustic_grid_chunk_count=int(caustic_chunk_count),
+                mock_generation_workers=int(config.mock_generation_workers),
             )
-            model, _solver, kwargs_lens = get_model(z_key)
-            contours = _compute_tangential_caustic_contours(model, kwargs_lens, config)
+            contours = _compute_tangential_caustic_contours(get_lens_state(z_key), config)
             caustic_cache[z_key] = contours
+            elapsed = time.perf_counter() - start_time
             _emit_mock_progress(
                 progress_callback,
                 "redshift_complete",
@@ -1244,19 +1553,44 @@ def generate_single_bcg_mock(
                 caustic_compute_window_arcsec=float(config.caustic_compute_window_arcsec),
                 caustic_grid_scale_arcsec=float(config.caustic_grid_scale_arcsec),
                 caustic_grid_pixels=int(caustic_num_pix),
+                caustic_grid_points=int(caustic_grid_points),
+                caustic_grid_chunk_memory_gb=float(config.mock_caustic_grid_chunk_memory_gb),
+                caustic_grid_chunk_points=int(caustic_chunk_points),
+                caustic_grid_chunk_count=int(caustic_chunk_count),
+                elapsed_s=float(elapsed),
+                mock_generation_workers=int(config.mock_generation_workers),
                 caustic_count=int(len(contours)),
                 primary_caustic_count=int(sum(1 for contour in contours if contour.caustic_class == "primary")),
                 subhalo_caustic_count=int(sum(1 for contour in contours if contour.caustic_class == "subhalo")),
             )
         return caustic_cache[z_key]
 
+    def get_mapped_grid(z_source: float, image_min_distance_arcsec: float) -> MockMappedGrid:
+        key = (float(z_source), float(image_min_distance_arcsec))
+        if key not in mapped_grid_cache:
+            start_time = time.perf_counter()
+            mapped_grid_cache[key] = _mock_mapped_grid(
+                get_lens_state(float(z_source)),
+                search_window_arcsec=float(config.mock_image_search_window_arcsec),
+                min_distance_arcsec=float(image_min_distance_arcsec),
+            )
+            _emit_mock_progress(
+                progress_callback,
+                "mapped_grid_complete",
+                z_source=float(z_source),
+                mock_image_search_window_arcsec=float(config.mock_image_search_window_arcsec),
+                image_min_distance_arcsec=float(image_min_distance_arcsec),
+                mapped_grid_pixels=int(mapped_grid_cache[key].num_pix),
+                mapped_grid_points=int(mapped_grid_cache[key].x_grid.size),
+                elapsed_s=float(time.perf_counter() - start_time),
+            )
+        return mapped_grid_cache[key]
+
     image_rows: list[dict[str, Any]] = []
     source_rows: list[dict[str, Any]] = []
     target_families = [("primary", z_source) for z_source in primary_family_redshifts] + [
         ("subhalo", z_source) for z_source in subhalo_family_redshifts
     ]
-    image_solver_worker_count = max(1, int(jax_cpu_worker_count()))
-    worker_local = threading.local()
 
     @dataclass
     class FamilySearchState:
@@ -1273,51 +1607,29 @@ def generate_single_bcg_mock(
         next_attempt_index: int = 1
         accepted: tuple[float, float, CausticContour, np.ndarray, np.ndarray] | None = None
 
-    def get_worker_model(z_source: float) -> tuple[LensModel, LensEquationSolver, list[dict[str, float]]]:
-        z_key = float(z_source)
-        worker_model_cache = getattr(worker_local, "model_cache", None)
-        if worker_model_cache is None:
-            worker_model_cache = {}
-            worker_local.model_cache = worker_model_cache
-        if z_key not in worker_model_cache:
-            worker_model, worker_kwargs_lens = _mock_model_and_kwargs(
-                config,
-                subhalo_components,
-                z_key,
-                cosmo,
-                cosmo_config,
-            )
-            worker_model_cache[z_key] = (worker_model, LensEquationSolver(worker_model), worker_kwargs_lens)
-        return worker_model_cache[z_key]
+    caustic_workers = max(1, min(int(config.mock_generation_workers), len(needed_source_redshifts)))
+    if caustic_workers > 1:
+        with ThreadPoolExecutor(max_workers=caustic_workers) as executor:
+            future_by_z = {
+                executor.submit(get_caustics, float(z_source)): float(z_source)
+                for z_source in needed_source_redshifts
+            }
+            for future in as_completed(future_by_z):
+                future.result()
+    else:
+        for z_source in needed_source_redshifts:
+            get_caustics(float(z_source))
 
-    def solve_candidate_images(
-        z_source: float,
-        attempt_index: int,
-        beta_x: float,
-        beta_y: float,
-        contour: CausticContour,
-        image_min_distance_arcsec: float,
-    ) -> tuple[int, float, float, CausticContour, np.ndarray, np.ndarray]:
-        _model, solver, kwargs_lens = get_worker_model(z_source)
-        x_img, y_img = solver.image_position_from_source(
-            beta_x,
-            beta_y,
-            kwargs_lens,
-            solver="lenstronomy",
-            search_window=80.0,
-            min_distance=float(image_min_distance_arcsec),
-            num_iter_max=300,
-            precision_limit=1.0e-8,
-        )
-        x_arr, y_arr = _deduplicate_images(np.asarray(x_img, dtype=float), np.asarray(y_img, dtype=float))
-        return int(attempt_index), float(beta_x), float(beta_y), contour, x_arr, y_arr
+    progress_lock = threading.Lock()
+    accepted_family_lock = threading.Lock()
+    accepted_family_count = 0
 
-    for z_source in needed_source_redshifts:
-        get_caustics(float(z_source))
+    def emit_mock_progress(event: str, **payload: Any) -> None:
+        with progress_lock:
+            _emit_mock_progress(progress_callback, event, **payload)
 
     max_attempts = max(1, int(config.max_sources_to_try))
     family_count = int(len(target_families))
-    max_queue_workers = min(image_solver_worker_count, family_count) if family_count else 0
     if family_count:
         family_seed_values = rng.integers(
             0,
@@ -1344,8 +1656,7 @@ def generate_single_bcg_mock(
             observation_rng=np.random.default_rng(int(family_seed_values[family_index - 1, 1])),
         )
         family_states.append(family_state)
-        _emit_mock_progress(
-            progress_callback,
+        emit_mock_progress(
             "family_start",
             family_index=int(family_index),
             family_count=int(family_count),
@@ -1353,17 +1664,30 @@ def generate_single_bcg_mock(
             z_source=float(z_source),
             max_attempts=int(max_attempts),
             image_min_distance_arcsec=float(family_state.image_min_distance_arcsec),
-            image_solver_workers=int(max_queue_workers),
-            queued_families=int(family_count),
+            mock_image_search_window_arcsec=float(config.mock_image_search_window_arcsec),
+            image_candidate_batch_size=int(config.mock_image_candidate_batch_size),
+            mock_image_seed_cap=int(config.mock_image_seed_cap),
         )
 
-    _emit_mock_progress(
-        progress_callback,
+    for z_source, image_min_distance_arcsec in sorted(
+        {
+            (float(state.z_source), float(state.image_min_distance_arcsec))
+            for state in family_states
+        }
+    ):
+        get_mapped_grid(z_source, image_min_distance_arcsec)
+
+    family_workers = max(1, min(int(config.mock_generation_workers), len(family_states)))
+
+    emit_mock_progress(
         "family_queue_start",
         family_count=int(family_count),
-        image_solver_workers=int(max_queue_workers),
+        image_solver_workers=int(family_workers),
+        queued_families=int(len(family_states)),
+        mock_image_search_window_arcsec=float(config.mock_image_search_window_arcsec),
+        image_candidate_batch_size=int(config.mock_image_candidate_batch_size),
+        mock_image_seed_cap=int(config.mock_image_seed_cap),
         max_attempts=int(max_attempts),
-        queued_families=int(family_count),
     )
 
     def sample_candidate_attempt(state: FamilySearchState) -> tuple[int, float, float, CausticContour]:
@@ -1378,8 +1702,7 @@ def generate_single_bcg_mock(
         return int(attempt_index), float(beta_x), float(beta_y), contour
 
     def fail_family(state: FamilySearchState) -> RuntimeError:
-        _emit_mock_progress(
-            progress_callback,
+        emit_mock_progress(
             "family_fail",
             family_index=int(state.family_index),
             family_count=int(family_count),
@@ -1387,7 +1710,10 @@ def generate_single_bcg_mock(
             z_source=float(state.z_source),
             max_attempts=int(state.max_attempts),
             image_min_distance_arcsec=float(state.image_min_distance_arcsec),
-            image_solver_workers=int(max_queue_workers),
+            mock_image_search_window_arcsec=float(config.mock_image_search_window_arcsec),
+            image_candidate_batch_size=int(config.mock_image_candidate_batch_size),
+            mock_image_seed_cap=int(config.mock_image_seed_cap),
+            image_solver_workers=int(family_workers),
         )
         return RuntimeError(
             f"Failed to generate a {state.caustic_class} source with "
@@ -1396,109 +1722,131 @@ def generate_single_bcg_mock(
             f"{config.max_sources_to_try} attempts."
         )
 
-    if family_states:
-        pending_families: deque[FamilySearchState] = deque(family_states)
-        in_flight: dict[Future[Any], tuple[FamilySearchState, tuple[int, float, float, CausticContour]]] = {}
-        accepted_family_count = 0
-        executor = ThreadPoolExecutor(max_workers=max_queue_workers)
-
-        def schedule_next_family_attempt(state: FamilySearchState) -> None:
-            if state.next_attempt_index > state.max_attempts:
-                raise fail_family(state)
-            candidate = sample_candidate_attempt(state)
+    def evaluate_candidate_batch(
+        state: FamilySearchState,
+        candidates: list[tuple[int, float, float, CausticContour]],
+    ) -> list[MockImageCandidateResult]:
+        if not candidates:
+            return []
+        mapped = get_mapped_grid(state.z_source, state.image_min_distance_arcsec)
+        source_x = np.asarray([candidate[1] for candidate in candidates], dtype=float)
+        source_y = np.asarray([candidate[2] for candidate in candidates], dtype=float)
+        seed_indices, _seed_values, valid_seeds = _mock_candidate_seed_grid(
+            jnp.asarray(mapped.beta_x_grid, dtype=jnp.float64),
+            jnp.asarray(mapped.beta_y_grid, dtype=jnp.float64),
+            jnp.asarray(source_x, dtype=jnp.float64),
+            jnp.asarray(source_y, dtype=jnp.float64),
+            num_pix=int(mapped.num_pix),
+            seed_cap=int(config.mock_image_seed_cap),
+            pixel_width=float(mapped.pixel_width),
+        )
+        seed_indices_np = np.asarray(seed_indices, dtype=int)
+        valid_seeds_np = np.asarray(valid_seeds, dtype=bool)
+        lens_state = get_lens_state(state.z_source)
+        results: list[MockImageCandidateResult] = []
+        for row_index, candidate in enumerate(candidates):
             attempt_index, beta_x, beta_y, contour = candidate
-            future = executor.submit(
-                solve_candidate_images,
-                state.z_source,
-                attempt_index,
+            valid = valid_seeds_np[row_index]
+            if not np.any(valid):
+                results.append(MockImageCandidateResult(attempt_index, beta_x, beta_y, contour, np.asarray([]), np.asarray([])))
+                continue
+            indices = seed_indices_np[row_index][valid]
+            start_x = mapped.x_grid[indices]
+            start_y = mapped.y_grid[indices]
+            refined_x, refined_y, ok = _refine_mock_image_seeds_jax(
+                lens_state,
                 beta_x,
                 beta_y,
-                contour,
-                state.image_min_distance_arcsec,
+                start_x,
+                start_y,
+                max_iter=int(config.mock_image_lm_max_iter),
+                precision_limit=float(config.mock_image_precision_limit),
             )
-            in_flight[future] = (state, candidate)
+            x_arr, y_arr = _deduplicate_images(refined_x[ok], refined_y[ok], tolerance=1.0e-3)
+            results.append(MockImageCandidateResult(attempt_index, beta_x, beta_y, contour, x_arr, y_arr))
+        return results
 
-        def fill_worker_queue() -> None:
-            while pending_families and len(in_flight) < max_queue_workers:
-                state = pending_families.popleft()
-                if state.accepted is not None:
-                    continue
-                schedule_next_family_attempt(state)
-
-        def shutdown_executor(*, wait_for_running: bool, cancel_futures: bool = False) -> None:
-            shutdown = getattr(executor, "shutdown", None)
-            if shutdown is None:
-                return
-            try:
-                shutdown(wait=wait_for_running, cancel_futures=cancel_futures)
-            except TypeError:
-                shutdown(wait=wait_for_running)
-
-        try:
-            fill_worker_queue()
-            while in_flight:
-                done_futures, _pending_futures = wait(set(in_flight), return_when=FIRST_COMPLETED)
-                for future in done_futures:
-                    state, candidate = in_flight.pop(future)
-                    attempt_index, beta_x, beta_y, contour = candidate
-                    _result_attempt, _beta_x, _beta_y, _contour, x_arr, y_arr = future.result()
-                    accepted_attempt = _image_count_within_requirement(
-                        len(x_arr),
-                        int(config.min_images_per_family),
-                        config.max_images_per_family,
+    def search_family(state: FamilySearchState) -> FamilySearchState:
+        nonlocal accepted_family_count
+        while state.accepted is None and state.next_attempt_index <= state.max_attempts:
+            batch: list[tuple[int, float, float, CausticContour]] = []
+            while state.next_attempt_index <= state.max_attempts and len(batch) < int(config.mock_image_candidate_batch_size):
+                batch.append(sample_candidate_attempt(state))
+            for result in evaluate_candidate_batch(state, batch):
+                accepted_attempt = _image_count_within_requirement(
+                    len(result.x_img),
+                    int(config.min_images_per_family),
+                    config.max_images_per_family,
+                )
+                with accepted_family_lock:
+                    current_accepted_family_count = int(accepted_family_count)
+                emit_mock_progress(
+                    "family_attempt",
+                    family_index=int(state.family_index),
+                    family_count=int(family_count),
+                    caustic_class=str(state.caustic_class),
+                    z_source=float(state.z_source),
+                    attempt=int(result.attempt_index),
+                    max_attempts=int(state.max_attempts),
+                    image_count=int(len(result.x_img)),
+                    accepted=bool(accepted_attempt),
+                    image_min_distance_arcsec=float(state.image_min_distance_arcsec),
+                    mock_image_search_window_arcsec=float(config.mock_image_search_window_arcsec),
+                    image_candidate_batch_size=int(config.mock_image_candidate_batch_size),
+                    mock_image_seed_cap=int(config.mock_image_seed_cap),
+                    image_solver_workers=int(family_workers),
+                    accepted_families=int(current_accepted_family_count),
+                )
+                if accepted_attempt:
+                    state.accepted = (
+                        float(result.beta_x),
+                        float(result.beta_y),
+                        result.contour,
+                        result.x_img,
+                        result.y_img,
                     )
-                    _emit_mock_progress(
-                        progress_callback,
-                        "family_attempt",
+                    with accepted_family_lock:
+                        accepted_family_count += 1
+                        current_accepted_family_count = int(accepted_family_count)
+                    emit_mock_progress(
+                        "family_accept",
                         family_index=int(state.family_index),
                         family_count=int(family_count),
                         caustic_class=str(state.caustic_class),
                         z_source=float(state.z_source),
-                        attempt=int(attempt_index),
+                        attempt=int(result.attempt_index),
                         max_attempts=int(state.max_attempts),
-                        image_count=int(len(x_arr)),
-                        accepted=bool(accepted_attempt),
+                        image_count=int(len(result.x_img)),
                         image_min_distance_arcsec=float(state.image_min_distance_arcsec),
-                        image_solver_workers=int(max_queue_workers),
-                        queued_families=int(len(pending_families)),
-                        in_flight_families=int(len(in_flight)),
-                        accepted_families=int(accepted_family_count),
+                        mock_image_search_window_arcsec=float(config.mock_image_search_window_arcsec),
+                        caustic_index=int(result.contour.caustic_index),
+                        caustic_area_arcsec2=float(result.contour.caustic_area_arcsec2),
+                        image_candidate_batch_size=int(config.mock_image_candidate_batch_size),
+                        mock_image_seed_cap=int(config.mock_image_seed_cap),
+                        image_solver_workers=int(family_workers),
+                        accepted_families=int(current_accepted_family_count),
                     )
-                    if accepted_attempt:
-                        state.accepted = (float(beta_x), float(beta_y), contour, x_arr, y_arr)
-                        accepted_family_count += 1
-                        _emit_mock_progress(
-                            progress_callback,
-                            "family_accept",
-                            family_index=int(state.family_index),
-                            family_count=int(family_count),
-                            caustic_class=str(state.caustic_class),
-                            z_source=float(state.z_source),
-                            attempt=int(attempt_index),
-                            max_attempts=int(state.max_attempts),
-                            image_count=int(len(x_arr)),
-                            image_min_distance_arcsec=float(state.image_min_distance_arcsec),
-                            caustic_index=int(contour.caustic_index),
-                            caustic_area_arcsec2=float(contour.caustic_area_arcsec2),
-                            image_solver_workers=int(max_queue_workers),
-                            queued_families=int(len(pending_families)),
-                            in_flight_families=int(len(in_flight)),
-                            accepted_families=int(accepted_family_count),
-                        )
-                    elif state.next_attempt_index <= state.max_attempts:
-                        pending_families.append(state)
-                    else:
-                        for pending_future in in_flight:
-                            pending_future.cancel()
-                        raise fail_family(state)
-                fill_worker_queue()
+                    break
+        if state.accepted is None:
+            raise fail_family(state)
+        return state
+
+    if family_workers > 1:
+        executor = ThreadPoolExecutor(max_workers=family_workers)
+        futures = [executor.submit(search_family, state) for state in family_states]
+        try:
+            for future in as_completed(futures):
+                future.result()
         except BaseException:
-            for pending_future in in_flight:
-                pending_future.cancel()
-            shutdown_executor(wait_for_running=False, cancel_futures=True)
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
             raise
         else:
-            shutdown_executor(wait_for_running=True)
+            executor.shutdown(wait=True)
+    else:
+        for state in family_states:
+            search_family(state)
 
     for state in sorted(family_states, key=lambda item: item.family_index):
         if state.accepted is None:
@@ -1507,7 +1855,6 @@ def generate_single_bcg_mock(
             )
         beta_x, beta_y, contour, x_arr, y_arr = state.accepted
         family_id = state.family_id
-        model, _solver, kwargs_lens = get_model(state.z_source)
         source_rows.append(
             {
                 "family_id": family_id,
@@ -1521,7 +1868,7 @@ def generate_single_bcg_mock(
                 "critical_area_arcsec2": float(contour.critical_area_arcsec2),
             }
         )
-        magnification = np.asarray(model.magnification(x_arr, y_arr, kwargs_lens), dtype=float)
+        magnification = _mock_magnification(get_lens_state(state.z_source), x_arr, y_arr)
         for image_index, (x_true, y_true, mu_true) in enumerate(zip(x_arr, y_arr, magnification), start=1):
             x_obs = float(x_true + state.observation_rng.normal(0.0, config.pos_sigma_arcsec))
             y_obs = float(y_true + state.observation_rng.normal(0.0, config.pos_sigma_arcsec))
@@ -1585,14 +1932,18 @@ def generate_single_bcg_mock(
         float(config.source_redshift),
         cosmo_config,
     )
+    truth_source_redshifts = _ordered_unique_source_redshifts(
+        needed_source_redshifts,
+        (float(config.source_redshift),),
+    )
     truth_kwargs_lens_by_z = {
         f"{z:.8f}": _current_truth_model_and_kwargs(config, subhalo_components, float(z), cosmo_config)[1]
-        for z in needed_source_redshifts
+        for z in truth_source_redshifts
     }
     truth_lens_components = _current_truth_component_records(
         config,
         subhalo_components,
-        needed_source_redshifts,
+        truth_source_redshifts,
         cosmo_config,
     )
 
@@ -1688,6 +2039,25 @@ def _caustic_config_from_truth(truth: dict[str, Any]) -> SingleBCGMockConfig:
         subhalo_mass_min=float(config.get("subhalo_mass_min", defaults.subhalo_mass_min)),
         subhalo_mass_max=float(config.get("subhalo_mass_max", defaults.subhalo_mass_max)),
         subhalo_mass_ref=float(config.get("subhalo_mass_ref", defaults.subhalo_mass_ref)),
+        subhalo_spatial_distribution=str(
+            config.get("subhalo_spatial_distribution", defaults.subhalo_spatial_distribution)
+        ),
+        subhalo_field_radius_arcsec=float(
+            config.get("subhalo_field_radius_arcsec", defaults.subhalo_field_radius_arcsec)
+        ),
+        subhalo_spatial_core_radius_arcsec=float(
+            config.get("subhalo_spatial_core_radius_arcsec", defaults.subhalo_spatial_core_radius_arcsec)
+        ),
+        subhalo_spatial_cut_radius_arcsec=float(
+            config.get("subhalo_spatial_cut_radius_arcsec", defaults.subhalo_spatial_cut_radius_arcsec)
+        ),
+        subhalo_force_core_count=int(config.get("subhalo_force_core_count", defaults.subhalo_force_core_count)),
+        subhalo_force_core_min_arcsec=float(
+            config.get("subhalo_force_core_min_arcsec", defaults.subhalo_force_core_min_arcsec)
+        ),
+        subhalo_force_core_max_arcsec=float(
+            config.get("subhalo_force_core_max_arcsec", defaults.subhalo_force_core_max_arcsec)
+        ),
         subhalo_sigma_scatter_dex=float(
             config.get("subhalo_sigma_scatter_dex", defaults.subhalo_sigma_scatter_dex)
         ),
@@ -1700,4 +2070,19 @@ def _caustic_config_from_truth(truth: dict[str, Any]) -> SingleBCGMockConfig:
         caustic_boundary_margin_arcsec=float(
             config.get("caustic_boundary_margin_arcsec", defaults.caustic_boundary_margin_arcsec)
         ),
+        mock_caustic_grid_chunk_memory_gb=float(
+            config.get("mock_caustic_grid_chunk_memory_gb", defaults.mock_caustic_grid_chunk_memory_gb)
+        ),
+        mock_image_candidate_batch_size=int(
+            config.get("mock_image_candidate_batch_size", defaults.mock_image_candidate_batch_size)
+        ),
+        mock_image_seed_cap=int(config.get("mock_image_seed_cap", defaults.mock_image_seed_cap)),
+        mock_image_search_window_arcsec=float(
+            config.get("mock_image_search_window_arcsec", defaults.mock_image_search_window_arcsec)
+        ),
+        mock_image_lm_max_iter=int(config.get("mock_image_lm_max_iter", defaults.mock_image_lm_max_iter)),
+        mock_image_precision_limit=float(
+            config.get("mock_image_precision_limit", defaults.mock_image_precision_limit)
+        ),
+        mock_generation_workers=int(config.get("mock_generation_workers", defaults.mock_generation_workers)),
     )
